@@ -2,26 +2,28 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ....kernel.agent_state_hygiene import build_mind_context_mini, evaluate_agent_state_hygiene
 from ....kernel.group import load_group
-from ....kernel.group_space import get_group_space_prompt_state
 from ....kernel.prompt_files import load_builtin_help_markdown as _load_builtin_help_markdown
-from ....util.fs import read_json
+from ....util.time import parse_utc_iso
 from ..common import MCPError, _call_daemon_or_raise
 from . import cccc_group_actor as _group_actor_mod
 from . import context as _context_mod
 
 
 _CCCC_HELP_BUILTIN = _load_builtin_help_markdown().strip()
-_RUNTIME_HELP_SECTION_HEADERS = {
-    "## Active Skills (Runtime)",
-    "## Group Space (Runtime)",
+
+_PACK_QUICK_USE_EXAMPLES: Dict[str, str] = {
+    "pack:space": 'cccc_capability_use(tool_name="cccc_space", tool_arguments={"action":"status"})',
+    "pack:group-runtime": 'cccc_capability_use(tool_name="cccc_group", tool_arguments={"action":"info"})',
+    "pack:file-im": 'cccc_capability_use(tool_name="cccc_file", tool_arguments={"action":"blob_path","rel_path":"state/blobs/..."})',
+    "pack:automation": 'cccc_capability_use(tool_name="cccc_automation", tool_arguments={"action":"state"})',
+    "pack:context-advanced": 'cccc_capability_use(tool_name="cccc_memory_admin", tool_arguments={"action":"index_sync","mode":"scan"})',
 }
+
 
 def _trim_text(value: Any, *, max_chars: int) -> str:
     text = str(value or "").strip()
@@ -30,37 +32,6 @@ def _trim_text(value: Any, *, max_chars: int) -> str:
     if max_chars <= 3:
         return text[:max_chars]
     return text[: max_chars - 3].rstrip() + "..."
-
-
-def _strip_reserved_runtime_help_sections(markdown: str) -> str:
-    raw = str(markdown or "")
-    if not raw:
-        return raw
-    keep_trailing_newline = raw.endswith("\n")
-    lines = raw.splitlines()
-    out: List[str] = []
-    current: List[str] = []
-    skip_current = False
-
-    def _flush() -> None:
-        nonlocal current
-        if current and not skip_current:
-            out.extend(current)
-        current = []
-
-    for line in lines:
-        stripped = str(line or "").strip()
-        is_h2 = stripped.startswith("## ") and not stripped.startswith("###")
-        if is_h2:
-            _flush()
-            skip_current = stripped in _RUNTIME_HELP_SECTION_HEADERS
-        current.append(line)
-    _flush()
-
-    result = "\n".join(out)
-    if keep_trailing_newline:
-        result += "\n"
-    return result
 
 
 def _find_actor_state(*, context: Dict[str, Any], actor_id: str) -> Optional[Dict[str, Any]]:
@@ -74,25 +45,10 @@ def _find_actor_state(*, context: Dict[str, Any], actor_id: str) -> Optional[Dic
     return None
 
 
-def _load_actor_mind_context_runtime(*, group_id: str, actor_id: str) -> Dict[str, Any]:
-    gid = str(group_id or "").strip()
-    aid = str(actor_id or "").strip()
-    if not gid or not aid:
-        return {}
-    group = load_group(gid)
-    if group is None:
-        return {}
-    state = read_json(group.path / "state" / "automation.json")
-    actors = state.get("actors") if isinstance(state.get("actors"), dict) else {}
-    actor_state = actors.get(aid)
-    return actor_state if isinstance(actor_state, dict) else {}
-
-
 def _memory_recall_query_from_context(*, context: Dict[str, Any], actor_id: str) -> str:
     actor_state = context.get("agent_state") if isinstance(context.get("agent_state"), dict) else {}
     hot = actor_state.get("hot") if isinstance(actor_state.get("hot"), dict) else {}
     warm = actor_state.get("warm") if isinstance(actor_state.get("warm"), dict) else {}
-    mini = actor_state.get("mind_context_mini") if isinstance(actor_state.get("mind_context_mini"), dict) else {}
     brief = context.get("coordination_brief") if isinstance(context.get("coordination_brief"), dict) else {}
     tasks = context.get("tasks") if isinstance(context.get("tasks"), dict) else {}
 
@@ -125,9 +81,9 @@ def _memory_recall_query_from_context(*, context: Dict[str, Any], actor_id: str)
     _add(6, warm.get("what_changed"), max_chars=120)
     _add(7, warm.get("resume_hint"), max_chars=120)
     _add(9, brief.get("objective"), max_chars=120)
-    _add(10, warm.get("environment_summary") or mini.get("environment_summary"), max_chars=100)
-    _add(11, warm.get("user_model") or mini.get("user_model"), max_chars=100)
-    _add(12, warm.get("persona_notes") or mini.get("persona_notes"), max_chars=100)
+    _add(10, warm.get("environment_summary"), max_chars=100)
+    _add(11, warm.get("user_model"), max_chars=100)
+    _add(12, warm.get("persona_notes"), max_chars=100)
 
     if not ranked:
         return "recent decisions constraints preferences"
@@ -144,8 +100,8 @@ def _build_memory_recall_gate(*, group_id: str, actor_id: str, context: Dict[str
         "query": query,
         "hits": [],
         "note": (
-            "Recall gate: read this before planning or implementation. "
-            "If it is empty, expand with local cccc_memory(search/get)."
+            "Recall gate: read bootstrap.memory_recall_gate before planning/implementation. "
+            "If empty, run cccc_memory(search/get) manually."
         ),
     }
     try:
@@ -183,33 +139,55 @@ def _build_memory_recall_gate(*, group_id: str, actor_id: str, context: Dict[str
     return gate
 
 
-def _build_context_hygiene_hint(*, context: Dict[str, Any], actor_id: str, group_id: str = "") -> Dict[str, Any]:
+def _build_context_hygiene_hint(*, context: Dict[str, Any], actor_id: str) -> Dict[str, Any]:
     aid = str(actor_id or "").strip()
-    hint: Dict[str, Any] = evaluate_agent_state_hygiene(
-        actor_id=aid,
-        hot={},
-        warm={},
-        updated_at=None,
-        present=False,
-    )
+    hint: Dict[str, Any] = {
+        "actor_id": aid,
+        "present": False,
+        "stale": True,
+        "age_seconds": None,
+        "min_fields_ready": False,
+        "update_command": (
+            'cccc_agent_state(action="update", actor_id="<self>", '
+            'focus="...", next_action="...", what_changed="...")'
+        ),
+        "recommendation": "update_agent_state_now",
+    }
     if not aid or not isinstance(context, dict):
         return hint
     target = _find_actor_state(context=context, actor_id=aid)
     if target is None:
         return hint
+    hint["present"] = True
     hot = target.get("hot") if isinstance(target.get("hot"), dict) else {}
     warm = target.get("warm") if isinstance(target.get("warm"), dict) else {}
-    runtime_meta = _load_actor_mind_context_runtime(group_id=group_id, actor_id=aid)
-    return evaluate_agent_state_hygiene(
-        actor_id=aid,
-        hot=hot,
-        warm=warm,
-        updated_at=target.get("updated_at"),
-        mind_touched_at=runtime_meta.get("mind_context_touched_at"),
-        hot_only_updates_since_mind_touch=int(runtime_meta.get("hot_only_updates_since_mind_touch") or 0),
-        present=True,
-        now=datetime.now(timezone.utc),
-    )
+    blockers = hot.get("blockers") if isinstance(hot.get("blockers"), list) else []
+    min_fields_ready = any(
+        str(value or "").strip()
+        for value in (
+            hot.get("focus"),
+            hot.get("next_action"),
+            warm.get("what_changed"),
+            warm.get("resume_hint"),
+        )
+    ) or bool(blockers)
+    hint["min_fields_ready"] = bool(min_fields_ready)
+    updated_at = str(target.get("updated_at") or "").strip()
+    age_seconds: Optional[int] = None
+    if updated_at:
+        dt = parse_utc_iso(updated_at)
+        if dt is not None:
+            age_seconds = max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+    hint["age_seconds"] = age_seconds
+    stale = (age_seconds is None) or (age_seconds > 20 * 60)
+    hint["stale"] = bool(stale)
+    if (not stale) and min_fields_ready:
+        hint["recommendation"] = "state_healthy"
+    elif stale and min_fields_ready:
+        hint["recommendation"] = "refresh_agent_state"
+    else:
+        hint["recommendation"] = "fill_agent_state_basics"
+    return hint
 
 
 def _estimate_payload_tokens(value: Any) -> int:
@@ -248,7 +226,7 @@ def _slim_task_for_bootstrap(task: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in slim.items() if value not in (None, "", [], {})}
 
 
-def _build_bootstrap_context(*, context: Dict[str, Any], actor_id: str, group_id: str = "") -> Dict[str, Any]:
+def _build_bootstrap_context(*, context: Dict[str, Any], actor_id: str) -> Dict[str, Any]:
     actor_state = _find_actor_state(context=context, actor_id=actor_id) or {
         "id": str(actor_id or "").strip(),
         "hot": {},
@@ -311,11 +289,6 @@ def _build_bootstrap_context(*, context: Dict[str, Any], actor_id: str, group_id
 
     raw_hot = actor_state.get("hot") if isinstance(actor_state.get("hot"), dict) else {}
     raw_warm = actor_state.get("warm") if isinstance(actor_state.get("warm"), dict) else {}
-    runtime_meta = _load_actor_mind_context_runtime(
-        group_id=group_id,
-        actor_id=str(actor_state.get("id") or actor_id or "").strip(),
-    )
-    mind_context_mini = build_mind_context_mini(raw_warm, max_chars=84)
     warm = {
         "what_changed": _trim_text(raw_warm.get("what_changed"), max_chars=180),
         "resume_hint": _trim_text(raw_warm.get("resume_hint"), max_chars=180),
@@ -330,7 +303,6 @@ def _build_bootstrap_context(*, context: Dict[str, Any], actor_id: str, group_id
             "id": actor_state.get("id"),
             "hot": raw_hot if isinstance(raw_hot, dict) else {},
             "warm": warm,
-            "mind_context_mini": mind_context_mini,
             "updated_at": actor_state.get("updated_at"),
         },
         "coordination_brief": {
@@ -364,19 +336,19 @@ def _build_bootstrap_context(*, context: Dict[str, Any], actor_id: str, group_id
             for item in recent_handoffs[:2]
             if isinstance(item, dict)
         ],
-        "context_hygiene": evaluate_agent_state_hygiene(
-            actor_id=str(actor_state.get("id") or actor_id or "").strip(),
-            hot=raw_hot,
-            warm=raw_warm,
-            updated_at=actor_state.get("updated_at"),
-            mind_touched_at=runtime_meta.get("mind_context_touched_at"),
-            hot_only_updates_since_mind_touch=int(runtime_meta.get("hot_only_updates_since_mind_touch") or 0),
-            present=True,
-            now=datetime.now(timezone.utc),
-        ),
     }
 
     hard_cap = 1100
+    optional_warm_drop_order = ("persona_notes", "user_model", "environment_summary")
+    while _estimate_payload_tokens(pack) > hard_cap and pack["agent_state"]["warm"]:
+        dropped = False
+        for field in optional_warm_drop_order:
+            if field in pack["agent_state"]["warm"]:
+                pack["agent_state"]["warm"].pop(field, None)
+                dropped = True
+                break
+        if not dropped:
+            break
     while _estimate_payload_tokens(pack) > hard_cap and pack["recent_handoffs"]:
         pack["recent_handoffs"].pop()
     while _estimate_payload_tokens(pack) > hard_cap and pack["recent_decisions"]:
@@ -391,28 +363,6 @@ def _build_bootstrap_context(*, context: Dict[str, Any], actor_id: str, group_id
                 item.pop("notes", None)
                 if isinstance(item.get("checklist"), list) and len(item["checklist"]) > 1:
                     item["checklist"] = item["checklist"][:1]
-    if _estimate_payload_tokens(pack) > hard_cap:
-        brief_pack = pack.get("coordination_brief") if isinstance(pack.get("coordination_brief"), dict) else {}
-        brief_pack.pop("project_brief", None)
-    if _estimate_payload_tokens(pack) > hard_cap:
-        compact_warm = {
-            "what_changed": _trim_text(raw_warm.get("what_changed"), max_chars=96),
-            "resume_hint": _trim_text(raw_warm.get("resume_hint"), max_chars=96),
-            "environment_summary": _trim_text(raw_warm.get("environment_summary"), max_chars=72),
-            "user_model": _trim_text(raw_warm.get("user_model"), max_chars=72),
-            "persona_notes": _trim_text(raw_warm.get("persona_notes"), max_chars=72),
-        }
-        pack["agent_state"]["warm"] = {key: value for key, value in compact_warm.items() if value}
-    optional_warm_drop_order = ("resume_hint", "what_changed", "persona_notes", "user_model", "environment_summary")
-    while _estimate_payload_tokens(pack) > hard_cap and pack["agent_state"]["warm"]:
-        dropped = False
-        for field in optional_warm_drop_order:
-            if field in pack["agent_state"]["warm"]:
-                pack["agent_state"]["warm"].pop(field, None)
-                dropped = True
-                break
-        if not dropped:
-            break
     return pack
 
 
@@ -465,9 +415,6 @@ def _build_bootstrap_recovery(*, pack: Dict[str, Any]) -> Dict[str, Any]:
         "self_state": {
             "hot": agent_state.get("hot") if isinstance(agent_state.get("hot"), dict) else {},
             "recovery": agent_state.get("warm") if isinstance(agent_state.get("warm"), dict) else {},
-            "mind_context_mini": (
-                agent_state.get("mind_context_mini") if isinstance(agent_state.get("mind_context_mini"), dict) else {}
-            ),
             "updated_at": agent_state.get("updated_at"),
         },
         "task_slice": pack.get("tasks") if isinstance(pack.get("tasks"), dict) else {"assigned_active": [], "attention": []},
@@ -510,9 +457,11 @@ def _build_bootstrap_inbox_preview(*, inbox: Dict[str, Any], limit: int) -> Dict
     }
 
 
-def _append_runtime_help_addenda(markdown: str, *, group_id: str, actor_id: str) -> str:
-    base = _strip_reserved_runtime_help_sections(markdown)
+def _append_runtime_skill_digest(markdown: str, *, group_id: str, actor_id: str) -> str:
+    base = str(markdown or "")
     if not base.strip():
+        return base
+    if "## Active Skills (Runtime)" in base or "## Capability Quick Use (Runtime)" in base:
         return base
     gid = str(group_id or "").strip()
     aid = str(actor_id or "").strip()
@@ -526,52 +475,14 @@ def _append_runtime_help_addenda(markdown: str, *, group_id: str, actor_id: str)
     except Exception:
         return base
     enabled_caps = state.get("enabled_capabilities") if isinstance(state, dict) else []
+    hidden_caps = state.get("hidden_capabilities") if isinstance(state, dict) else []
     active = state.get("active_capsule_skills") if isinstance(state, dict) else []
     autoload = state.get("autoload_skills") if isinstance(state, dict) else []
     enabled_list = enabled_caps if isinstance(enabled_caps, list) else []
+    hidden_list = hidden_caps if isinstance(hidden_caps, list) else []
     active_list = active if isinstance(active, list) else []
     autoload_list = autoload if isinstance(autoload, list) else []
     sections: List[str] = []
-    enabled_pack_ids = {
-        str(item).strip()
-        for item in enabled_list
-        if str(item).strip().startswith("pack:")
-    }
-
-    try:
-        space_state = get_group_space_prompt_state(gid, provider="notebooklm")
-    except Exception:
-        space_state = {}
-    if isinstance(space_state, dict):
-        provider = str(space_state.get("provider") or "notebooklm")
-        mode = str(space_state.get("mode") or "disabled")
-        work_bound = bool(space_state.get("work_bound"))
-        memory_bound = bool(space_state.get("memory_bound"))
-        if work_bound or memory_bound:
-            lines_space: List[str] = [
-                "## Group Space (Runtime)",
-                f"- NotebookLM provider: {provider} ({mode}); work_bound={str(work_bound).lower()} memory_bound={str(memory_bound).lower()}.",
-            ]
-            if "pack:space" not in enabled_pack_ids:
-                lines_space.append(
-                    '- If `cccc_space` is hidden in this session, use `cccc_capability_use(tool_name="cccc_space", tool_arguments={"action":"status"})` to expose it.'
-                )
-            if work_bound:
-                lines_space.append(
-                    '- Use `cccc_space(action="query", lane="work")` for shared/project knowledge lookup.'
-                )
-                lines_space.append(
-                    '- For long artifact jobs that return `accepted=true` with `status="pending"` or `status="queued"`, do not poll. Wait for the later `system.notify`, continue other work or standby, and use a one-shot reminder only if the result blocks delivery and nothing else can proceed.'
-                )
-            if memory_bound:
-                lines_space.append(
-                    '- Keep local memory first; use `cccc_space(action="query", lane="memory")` only as a deeper recall fallback.'
-                )
-            if mode != "active":
-                lines_space.append(
-                    "- If the provider is degraded, continue with Context + local memory and report the fallback explicitly."
-                )
-            sections.append("\n".join(lines_space).rstrip())
 
     if active_list or autoload_list:
         def _append_skill_preview(lines_ref: List[str], item: Dict[str, Any]) -> None:
@@ -619,6 +530,58 @@ def _append_runtime_help_addenda(markdown: str, *, group_id: str, actor_id: str)
             ]
         )
         sections.append("\n".join(lines).rstrip())
+
+    enabled_packs = [
+        str(x).strip()
+        for x in enabled_list
+        if str(x).strip().startswith("pack:")
+    ]
+    suggested_packs: List[str] = []
+    seen: set[str] = set()
+    for item in hidden_list:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("capability_id") or "").strip()
+        reason = str(item.get("reason") or "").strip().lower()
+        if not cid.startswith("pack:"):
+            continue
+        if reason not in {"not_enabled", "scope_mismatch"}:
+            continue
+        if cid in seen:
+            continue
+        seen.add(cid)
+        suggested_packs.append(cid)
+        if len(suggested_packs) >= 4:
+            break
+    if not suggested_packs:
+        for cid in ("pack:space", "pack:file-im", "pack:group-runtime", "pack:context-advanced"):
+            if cid in seen:
+                continue
+            seen.add(cid)
+            suggested_packs.append(cid)
+            if len(suggested_packs) >= 4:
+                break
+
+    if enabled_packs or suggested_packs:
+        lines_cap: List[str] = [
+            "## Capability Quick Use (Runtime)",
+            '- list packs quickly: `cccc_capability_search(kind="mcp_toolpack")`',
+        ]
+        if enabled_packs:
+            lines_cap.append(
+                "- enabled_packs: " + ", ".join(enabled_packs[:8])
+            )
+        if suggested_packs:
+            lines_cap.append("- one-step examples:")
+            for cid in suggested_packs:
+                example = _PACK_QUICK_USE_EXAMPLES.get(cid)
+                if example:
+                    lines_cap.append(f"  - {cid}: `{example}`")
+                else:
+                    lines_cap.append(
+                        f'  - {cid}: `cccc_capability_use(capability_id="{cid}", scope="session")`'
+                    )
+        sections.append("\n".join(lines_cap).rstrip())
 
     if not sections:
         return base
@@ -677,7 +640,6 @@ def bootstrap(
     recovery_pack = _build_bootstrap_context(
         context=context_full if isinstance(context_full, dict) else {},
         actor_id=actor_id,
-        group_id=group_id,
     )
     preview_limit = max(1, int(inbox_limit or 50))
     inbox = inbox_list(group_id=group_id, actor_id=actor_id, limit=preview_limit + 1, kind_filter=inbox_kind_filter)
@@ -699,9 +661,6 @@ def bootstrap(
         "inbox_preview": _build_bootstrap_inbox_preview(
             inbox=inbox if isinstance(inbox, dict) else {},
             limit=int(inbox_limit or 50),
-        ),
-        "context_hygiene": (
-            recovery_pack.get("context_hygiene") if isinstance(recovery_pack.get("context_hygiene"), dict) else {}
         ),
         "memory_recall_gate": memory_recall_gate,
         "next_calls": {

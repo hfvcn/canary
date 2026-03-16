@@ -35,7 +35,7 @@ export interface AppHeaderProps {
   onStartGroup: () => void;
   onStopGroup: () => void;
   onSetGroupState: (state: "active" | "paused" | "idle") => void | Promise<void>;
-  onOpenSettings: () => void;
+  onOpenSettings?: () => void;
   onOpenMobileMenu: () => void;
 }
 

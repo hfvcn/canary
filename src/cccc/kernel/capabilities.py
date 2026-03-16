@@ -50,17 +50,17 @@ BUILTIN_CAPABILITY_PACKS: Dict[str, Dict[str, object]] = {
             "cccc_group",
             "cccc_actor",
             "cccc_runtime_list",
-            "cccc_role_notes",
         ),
         "tags": ("group", "actor", "runtime"),
     },
     "pack:file-im": {
-        "title": "IM Bind",
-        "description": "IM account bind and connection support.",
+        "title": "File + IM",
+        "description": "File attachment operations and IM bind support.",
         "tool_names": (
+            "cccc_file",
             "cccc_im_bind",
         ),
-        "tags": ("im", "bind"),
+        "tags": ("file", "attachment", "im"),
     },
     "pack:space": {
         "title": "Group Space",

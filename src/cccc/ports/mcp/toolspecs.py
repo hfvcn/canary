@@ -37,9 +37,8 @@ MCP_TOOLS = [
     {
         "name": "cccc_bootstrap",
         "description": (
-            "Cold-start bootstrap: session + recovery + inbox_preview + context_hygiene + memory_recall_gate + next_calls. "
-            "Use it first on cold start or resume; usually follow with cccc_help once, then pull "
-            "cccc_project_info / cccc_context_get only when colder detail is needed."
+            "Cold-start bootstrap: session + recovery + inbox_preview + memory_recall_gate + next_calls. "
+            "Use cccc_help / cccc_project_info / cccc_context_get on demand for cold detail."
         ),
         "inputSchema": _obj(
             {
@@ -116,7 +115,7 @@ MCP_TOOLS = [
                         {"type": "array", "items": {"type": "string"}},
                     ]
                 },
-                "priority": {"type": "string", "enum": ["normal", "attention"], "default": "normal"},
+                "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal"},
                 "reply_required": {"type": "boolean", "default": False},
                 "refs": {"type": "array", "items": {"type": "object"}},
             },
@@ -139,7 +138,7 @@ MCP_TOOLS = [
                         {"type": "array", "items": {"type": "string"}},
                     ]
                 },
-                "priority": {"type": "string", "enum": ["normal", "attention"], "default": "normal"},
+                "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal"},
                 "reply_required": {"type": "boolean", "default": False},
                 "refs": {"type": "array", "items": {"type": "object"}},
             },
@@ -162,7 +161,7 @@ MCP_TOOLS = [
                         {"type": "array", "items": {"type": "string"}},
                     ]
                 },
-                "priority": {"type": "string", "enum": ["normal", "attention"], "default": "normal"},
+                "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal"},
                 "reply_required": {"type": "boolean", "default": False},
                 "rel_path": {"type": "string", "description": "Required for action=blob_path. Can be just the blob filename (e.g. 'sha256_image.png') or full relative path ('state/blobs/sha256_image.png')."},
             }
@@ -439,9 +438,7 @@ MCP_TOOLS = [
         "name": "cccc_space",
         "description": (
             "Group Space hub tool. NotebookLM has two lanes: work and memory. action: status|capabilities|bind|ingest|query|sources|artifact|jobs|sync|"
-            "provider_auth|provider_credential_status|provider_credential_update. provider_auth sub_action: status|start|cancel|disconnect; "
-            "use force_reauth=true with provider_auth/start to switch Google account. For artifact runs with wait=false, accepted=true plus "
-            "status=pending|queued means background accepted: do not poll in a loop; wait for the later system.notify."
+            "provider_auth|provider_credential_status|provider_credential_update"
         ),
         "inputSchema": _obj(
             {
@@ -470,10 +467,6 @@ MCP_TOOLS = [
                 "sub_action": {
                     "type": "string",
                     "description": "Optional secondary action for sources/jobs/sync/provider_auth/artifact branches.",
-                },
-                "force_reauth": {
-                    "type": "boolean",
-                    "description": "Only for provider_auth/start. Skip saved credential reuse and start with a fresh auth browser profile.",
                 },
                 "remote_space_id": {"type": "string"},
                 "kind": {"type": "string"},
@@ -637,28 +630,6 @@ MCP_TOOLS = [
                 "user_model": {"type": "string"},
                 "persona_notes": {"type": "string"},
                 "resume_hint": {"type": "string"},
-            }
-        ),
-    },
-    {
-        "name": "cccc_role_notes",
-        "description": (
-            "Manage actor-scoped role notes in CCCC_HELP.md (`## @actor: <actor_id>` blocks): action=get|set|clear. "
-            "Foreman can read/write any actor's role notes; other actors can only read their own notes."
-        ),
-        "inputSchema": _obj(
-            {
-                **_COMMON_GROUP,
-                "action": {"type": "string", "enum": ["get", "set", "clear"], "default": "get"},
-                "target_actor_id": {
-                    "type": "string",
-                    "description": "The actor whose help-scoped role notes to read/write. Omit for get only when listing all as foreman.",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "New markdown body for this actor's `## @actor:` help block (required for set).",
-                },
-                "by": {"type": "string", "description": "Caller actor id override (normally auto-resolved)"},
             }
         ),
     },

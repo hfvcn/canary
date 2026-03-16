@@ -62,7 +62,7 @@ export function AutomationRuleList({
         </label>
         <button
           type="button"
-          className={secondaryButtonClass("sm")}
+          className="glass-btn px-2 py-1.5 rounded-md text-[11px] min-h-[32px] font-medium transition-colors text-[var(--color-text-secondary)] disabled:opacity-50"
           onClick={onClearCompleted}
           disabled={rulesBusy || completedOneTimeRuleIds.length === 0}
           title={t("ruleList.clearCompletedTitle")}
@@ -159,14 +159,14 @@ export function AutomationRuleList({
                 </label>
                 <button
                   type="button"
-                  className={secondaryButtonClass("sm")}
+                  className="glass-btn px-3 py-2 rounded-lg text-xs min-h-[36px] transition-colors text-[var(--color-text-secondary)]"
                   onClick={() => onEditRule(ruleId)}
                 >
                   {t("common:edit")}
                 </button>
                 <button
                   type="button"
-                  className={dangerButtonClass("sm")}
+                  className="glass-btn px-3 py-2 rounded-lg text-xs min-h-[36px] transition-colors text-[var(--color-text-secondary)]"
                   onClick={() => onDeleteRule(ruleId)}
                   title={t("automation.deleteRuleTitle")}
                 >
@@ -179,7 +179,7 @@ export function AutomationRuleList({
               <span className="font-mono">{actionLabel}</span>
             </div>
             <div className="mt-1 text-[11px] text-[var(--color-text-muted)]">
-              {t("ruleList.lastShort")}: {lastFireAt || "—"} • {t("ruleList.nextShort")}: {nextFireAt || "—"}
+              Last: {lastFireAt || "—"} • Next: {nextFireAt || "—"}
             </div>
             {completed ? (
               <div className="mt-1 text-[11px] text-emerald-700 dark:text-emerald-300">

@@ -284,15 +284,8 @@ def handle_send(
     src_event_id = str(args.get("src_event_id") or "").strip()
     dst_group_id = str(args.get("dst_group_id") or "").strip()
     client_id = str(args.get("client_id") or "").strip()
-    source_platform = str(args.get("source_platform") or "").strip()
-    source_user_name = str(args.get("source_user_name") or "").strip()
-    source_user_id = str(args.get("source_user_id") or "").strip()
-    mention_user_ids_raw = args.get("mention_user_ids")
-    mention_user_ids = (
-        [str(item).strip() for item in mention_user_ids_raw if str(item).strip()]
-        if isinstance(mention_user_ids_raw, list)
-        else []
-    )
+    sender_user_id = str(args.get("sender_user_id") or "").strip()
+    sender_is_admin = bool(args.get("sender_is_admin", False))
     dst_to_raw = args.get("dst_to")
     dst_to: list[str] = []
     if isinstance(dst_to_raw, list):
@@ -417,6 +410,8 @@ def handle_send(
             dst_group_id=dst_group_id or None,
             dst_to=dst_to if dst_group_id else None,
             client_id=client_id or None,
+            sender_user_id=sender_user_id or None,
+            sender_is_admin=sender_is_admin,
         ).model_dump(),
     )
     _touch_registry_updated_at(group.group_id, str(event.get("ts") or utc_now_iso()))
@@ -502,6 +497,8 @@ def handle_reply(
     priority = str(args.get("priority") or "normal").strip() or "normal"
     reply_required = coerce_bool(args.get("reply_required"))
     client_id = str(args.get("client_id") or "").strip()
+    sender_user_id = str(args.get("sender_user_id") or "").strip()
+    sender_is_admin = bool(args.get("sender_is_admin", False))
     to_raw = args.get("to")
     to_tokens: list[str] = []
     if isinstance(to_raw, list):
@@ -590,11 +587,9 @@ def handle_reply(
             quote_text=quote_text,
             refs=refs,
             attachments=attachments,
-            source_platform=original_source_platform or None,
-            source_user_name=original_source_user_name or None,
-            source_user_id=original_source_user_id or None,
-            mention_user_ids=original_mention_user_ids or None,
             client_id=client_id or None,
+            sender_user_id=sender_user_id or None,
+            sender_is_admin=sender_is_admin,
         ).model_dump(),
     )
 

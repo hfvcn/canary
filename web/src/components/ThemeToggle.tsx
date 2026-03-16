@@ -60,7 +60,7 @@ export function ThemeToggleCompact({ theme, onThemeChange, isDark: _isDark, vari
       className={classNames(
         variant === "rail"
           ? "flex items-center justify-center w-10 h-10 rounded-xl transition-all min-h-[40px] min-w-[40px] shrink-0 border border-transparent bg-transparent text-[var(--color-text-secondary)] hover:bg-[var(--glass-tab-bg-hover)] hover:text-[var(--color-text-primary)]"
-          : "flex items-center justify-center w-11 h-11 rounded-xl transition-all min-h-[44px] min-w-[44px] shrink-0 glass-btn text-[var(--color-text-secondary)]",
+          : "flex items-center justify-center w-9 h-9 rounded-xl transition-all min-h-[44px] min-w-[44px] shrink-0 glass-btn text-[var(--color-text-secondary)]",
         className
       )}
       title={t('themeClickToChange', { theme: label })}

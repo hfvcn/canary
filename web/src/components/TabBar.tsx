@@ -5,15 +5,29 @@ import { classNames } from "../utils/classNames";
 
 interface TabBarProps {
   actors: Actor[];
-  activeTab: string; // "chat" or actor id
+  activeTab: string; // "chat" | "board" | "workspace" | "panorama" | actor id
   onTabChange: (tab: string) => void;
   unreadChatCount: number;
   isDark: boolean;
   onAddAgent?: () => void;
   canAddAgent?: boolean;
+  showPanorama?: boolean;
+  showBoard?: boolean;
+  showWorkspace?: boolean;
 }
 
-export function TabBar({ actors, activeTab, onTabChange, unreadChatCount, isDark: _isDark, onAddAgent, canAddAgent = true }: TabBarProps) {
+export function TabBar({
+  actors,
+  activeTab,
+  onTabChange,
+  unreadChatCount,
+  isDark: _isDark,
+  onAddAgent,
+  canAddAgent = true,
+  showPanorama = true,
+  showBoard = true,
+  showWorkspace = false,
+}: TabBarProps) {
   const { t } = useTranslation("layout");
   const rootRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -158,6 +172,58 @@ export function TabBar({ actors, activeTab, onTabChange, unreadChatCount, isDark
               </span>
             )}
           </button>
+
+          {showBoard && (
+            <button
+              ref={activeTab === "board" ? activeTabRef : null}
+              onClick={() => onTabChange("board")}
+              className={classNames(
+                "glass-tab relative flex items-center gap-2 px-3 py-2 text-sm font-medium whitespace-nowrap flex-shrink-0 focus:outline-none",
+                activeTab === "board"
+                  ? "glass-tab-active text-[var(--color-text-primary)]"
+                  : "text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)]"
+              )}
+              role="tab"
+              aria-selected={activeTab === "board"}
+            >
+              <span>{t("board")}</span>
+            </button>
+          )}
+
+          {showWorkspace && (
+            <button
+              ref={activeTab === "workspace" ? activeTabRef : null}
+              onClick={() => onTabChange("workspace")}
+              className={classNames(
+                "glass-tab relative flex items-center gap-2 px-3 py-2 text-sm font-medium whitespace-nowrap flex-shrink-0 focus:outline-none",
+                activeTab === "workspace"
+                  ? "glass-tab-active text-[var(--color-text-primary)]"
+                  : "text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)]"
+              )}
+              role="tab"
+              aria-selected={activeTab === "workspace"}
+            >
+              <span>{t("workspace")}</span>
+            </button>
+          )}
+
+          {/* Panorama Tab — hidden when GPU/3D not supported */}
+          {showPanorama && (
+            <button
+              ref={activeTab === "panorama" ? activeTabRef : null}
+              onClick={() => onTabChange("panorama")}
+              className={classNames(
+                "glass-tab relative flex items-center gap-2 px-3 py-2 text-sm font-medium whitespace-nowrap flex-shrink-0 focus:outline-none",
+                activeTab === "panorama"
+                  ? "glass-tab-active text-[var(--color-text-primary)]"
+                  : "text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)]"
+              )}
+              role="tab"
+              aria-selected={activeTab === "panorama"}
+            >
+              <span>{t("panorama")}</span>
+            </button>
+          )}
 
           {/* Separator */}
           {actors.length > 0 && (

@@ -6,11 +6,13 @@ This module keeps IM config shape consistent across Web/CLI/bridge paths.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Set
+from typing import Any, Dict, Optional, Set
 
 from ...util.conv import coerce_bool
 
 SUPPORTED_IM_PLATFORMS: Set[str] = {"telegram", "slack", "discord", "feishu", "dingtalk", "wecom"}
+SUPPORTED_FEISHU_MESSAGE_STYLES: Set[str] = {"text", "card"}
+_GROUP_LOCAL_ONLY_KEYS: Set[str] = {"enabled"}
 
 _LEGACY_KEYS: Set[str] = {
     "token_env",
@@ -64,6 +66,13 @@ def normalize_feishu_domain(value: str) -> str:
     return "https://open.feishu.cn"
 
 
+def normalize_feishu_message_style(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in SUPPORTED_FEISHU_MESSAGE_STYLES:
+        return raw
+    return "text"
+
+
 def _first_nonempty(raw: Dict[str, Any], *keys: str) -> str:
     for key in keys:
         value = str(raw.get(key) or "").strip()
@@ -112,6 +121,7 @@ def canonicalize_im_config(raw: Any) -> Dict[str, Any]:
         domain = normalize_feishu_domain(str(raw.get("feishu_domain") or ""))
         if domain:
             out["feishu_domain"] = domain
+        out["feishu_message_style"] = normalize_feishu_message_style(raw.get("feishu_message_style"))
         _set_secret_ref(
             out,
             env_key="feishu_app_id_env",
@@ -124,6 +134,12 @@ def canonicalize_im_config(raw: Any) -> Dict[str, Any]:
             value_key="feishu_app_secret",
             raw_value=_first_nonempty(raw, "feishu_app_secret_env", "feishu_app_secret"),
         )
+        title = str(raw.get("feishu_card_title") or "").strip()
+        if title:
+            out["feishu_card_title"] = title
+        template_id = str(raw.get("feishu_card_template_id") or "").strip()
+        if template_id:
+            out["feishu_card_template_id"] = template_id
     elif platform == "dingtalk":
         _set_secret_ref(
             out,
@@ -168,3 +184,31 @@ def canonicalize_im_config(raw: Any) -> Dict[str, Any]:
         out[key] = value
 
     return out
+
+
+def canonicalize_im_defaults(raw: Any) -> Dict[str, Any]:
+    out = canonicalize_im_config(raw)
+    for key in _GROUP_LOCAL_ONLY_KEYS:
+        out.pop(key, None)
+    return out
+
+
+def resolve_im_config(group_raw: Any, global_raw: Any) -> Dict[str, Any]:
+    global_cfg = canonicalize_im_defaults(global_raw)
+    group_cfg = canonicalize_im_config(group_raw)
+    if not global_cfg:
+        return group_cfg
+    if not group_cfg:
+        return global_cfg
+    merged = dict(global_cfg)
+    for key, value in group_cfg.items():
+        if key in _GROUP_LOCAL_ONLY_KEYS:
+            continue
+        merged[key] = value
+    return merged
+
+
+def get_group_im_enabled(raw: Any) -> Optional[bool]:
+    if not isinstance(raw, dict) or "enabled" not in raw:
+        return None
+    return coerce_bool(raw.get("enabled"), default=False)

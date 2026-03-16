@@ -8,3 +8,4 @@ export { useFormStore } from "./useFormStore";
 export { useObservabilityStore } from "./useObservabilityStore";
 export { useWebPetStore } from "./useWebPetStore";
 export { useBrandingStore } from "./useBrandingStore";
+export { useWorkspaceStore, getWorkspaceGroupState } from "./useWorkspaceStore";

@@ -20,21 +20,13 @@ export default defineConfig({
         chunkFileNames: "assets/chunk-[name].js",
         assetFileNames: "assets/[name][extname]",
         // Split large deps into dedicated chunks to avoid oversized bundles.
-        manualChunks(id) {
-          if (!id.includes("node_modules")) return;
-          // React core + libs that import react (must stay in the same chunk
-          // to avoid circular cross-chunk dependencies during initialisation)
-          if (/[\\/]node_modules[\\/](react|react-dom|zustand|@tanstack|scheduler)[\\/]/.test(id)) return "react-vendor";
-          // xterm terminal
-          if (/[\\/]node_modules[\\/]@xterm[\\/]/.test(id)) return "xterm";
-          // Markdown rendering
-          if (/[\\/]node_modules[\\/](markdown-it|mdurl|uc\.micro|entities|linkify-it)[\\/]/.test(id)) return "markdown";
-          // i18n
-          if (/[\\/]node_modules[\\/](i18next|react-i18next)[\\/]/.test(id)) return "i18n";
-          // Drag-and-drop + floating UI
-          if (/[\\/]node_modules[\\/](@dnd-kit|@floating-ui)[\\/]/.test(id)) return "ui-utils";
-          // Remaining third-party deps
-          return "vendor";
+        manualChunks: {
+          // xterm (~400KB): keep separate to avoid bloating AgentTab.
+          xterm: ["@xterm/xterm", "@xterm/addon-fit"],
+          // React core
+          "react-vendor": ["react", "react-dom"],
+          // Three.js 3D scene: keep separate, loaded on demand.
+          "three-vendor": ["three", "@react-three/fiber", "@react-three/drei"],
         },
       },
     },

@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ...contracts.v1 import DaemonError, DaemonResponse
-from ...kernel.agent_state_hygiene import sync_mind_context_runtime_state
 from ...kernel.context import (
     AgentState,
     AgentStateHot,
@@ -38,15 +37,9 @@ from ...kernel.context import (
     _utc_now_iso,
 )
 from ...kernel.actors import get_effective_role, list_actors
+from ...kernel.agent_state_hygiene import sync_mind_context_runtime_state
 from ...kernel.group import load_group
 from ...kernel.ledger import append_event
-from ...kernel.prompt_files import (
-    HELP_FILENAME,
-    delete_group_prompt_file,
-    load_builtin_help_markdown,
-    read_group_prompt_file,
-    write_group_prompt_file,
-)
 from ...util.conv import coerce_bool
 from ...util.fs import atomic_write_json, read_json
 from ..space.group_space_projection import sync_group_space_projection
@@ -402,11 +395,6 @@ def _check_permission(
             return f"Permission denied: {op_name} for {target_actor_id} (caller is {by})"
         return None
 
-    if op_name == "role_notes.set":
-        if role not in {"user", "foreman"}:
-            return "Permission denied: role_notes.set requires foreman or user"
-        return None
-
     if op_name == "coordination.brief.update":
         return "Permission denied: coordination brief updates require foreman or user"
 
@@ -429,11 +417,9 @@ def _check_permission(
             return None
         assignee = str(task.assignee or "").strip()
         handoff_to = str(task.handoff_to or "").strip()
-        if assignee == by or handoff_to == by:
-            return None
-        if assignee:
+        if assignee and assignee != by and handoff_to != by:
             return f"Permission denied: {op_name} on {task.id} (assigned to {assignee}, caller is {by})"
-        return f"Permission denied: {op_name} on {task.id} (task is not assigned or handed off to {by})"
+        return None
 
     return None
 
@@ -494,7 +480,7 @@ def _task_delete_plan(
 
 
 def _get_or_create_agent(agents_state: AgentsData, agent_id: str) -> AgentState:
-    canonical = str(agent_id or "").strip()
+    canonical = str(agent_id or "").strip().replace("_", "-").lower()
     if not canonical:
         raise ValueError("actor_id must be non-empty")
     for agent in agents_state.agents:
@@ -503,26 +489,6 @@ def _get_or_create_agent(agents_state: AgentsData, agent_id: str) -> AgentState:
     created = AgentState(id=canonical)
     agents_state.agents.append(created)
     return created
-
-
-def _group_actor_ids(group: Any) -> List[str]:
-    return [
-        str(item.get("id") or "").strip()
-        for item in list_actors(group)
-        if isinstance(item, dict) and str(item.get("id") or "").strip()
-    ]
-
-
-def _canonical_actor_id(actor_ids: List[str], target_actor_id: str) -> str:
-    target = str(target_actor_id or "").strip()
-    if not target:
-        return ""
-    target_fold = target.casefold()
-    for candidate in list(actor_ids or []):
-        normalized = str(candidate or "").strip()
-        if normalized.casefold() == target_fold:
-            return normalized
-    return target
 
 
 def _record_note(notes: List[CoordinationNote], *, by: str, summary: str, task_id: Optional[str]) -> None:
@@ -1100,7 +1066,7 @@ def handle_context_sync(args: Dict[str, Any]) -> DaemonResponse:
                 if perm_err:
                     raise ValueError(perm_err)
                 if task.status != TaskStatus.ARCHIVED:
-                    raise ValueError(f"op[{idx}] task.restore requires archived task")
+                    continue
                 restore_to = str(task.archived_from or TaskStatus.PLANNED.value).strip().lower() or TaskStatus.PLANNED.value
                 try:
                     task.status = TaskStatus(restore_to)
@@ -1158,7 +1124,7 @@ def handle_context_sync(args: Dict[str, Any]) -> DaemonResponse:
                 continue
 
             if op_name == "agent_state.update":
-                actor_id = str(raw.get("actor_id") or raw.get("agent_id") or "").strip()
+                actor_id = str(raw.get("actor_id") or raw.get("agent_id") or "").strip().lower()
                 if not actor_id:
                     raise ValueError(f"op[{idx}] agent_state.update actor_id is required")
                 perm_err = _check_permission(by, op_name, group_id, target_actor_id=actor_id)
@@ -1235,7 +1201,7 @@ def handle_context_sync(args: Dict[str, Any]) -> DaemonResponse:
                 continue
 
             if op_name == "agent_state.clear":
-                actor_id = str(raw.get("actor_id") or raw.get("agent_id") or "").strip()
+                actor_id = str(raw.get("actor_id") or raw.get("agent_id") or "").strip().lower()
                 if not actor_id:
                     raise ValueError(f"op[{idx}] agent_state.clear actor_id is required")
                 perm_err = _check_permission(by, op_name, group_id, target_actor_id=actor_id)
@@ -1247,44 +1213,6 @@ def handle_context_sync(args: Dict[str, Any]) -> DaemonResponse:
                 agent.updated_at = _utc_now_iso()
                 agents_dirty = True
                 _mark_change(idx, op_name, f"Cleared agent state {actor_id}")
-                continue
-
-            if op_name == "role_notes.set":
-                actor_id = str(raw.get("actor_id") or "").strip()
-                if not actor_id:
-                    raise ValueError(f"op[{idx}] role_notes.set actor_id is required")
-                perm_err = _check_permission(by, op_name, group_id)
-                if perm_err:
-                    raise ValueError(perm_err)
-                group = load_group(group_id)
-                if group is None:
-                    raise ValueError(f"group not found: {group_id}")
-                actor_ids = _group_actor_ids(group)
-                target_actor_id = _canonical_actor_id(actor_ids, actor_id)
-                if target_actor_id not in actor_ids:
-                    raise ValueError(f"op[{idx}] role_notes.set actor not found: {actor_id}")
-
-                from ...ports.mcp.utils.help_markdown import update_actor_help_note
-
-                prompt_file = read_group_prompt_file(group, HELP_FILENAME)
-                builtin_help = str(load_builtin_help_markdown() or "")
-                current_content = builtin_help if not prompt_file.found else str(prompt_file.content or "")
-                source = raw.get("content")
-                if source is None:
-                    source = raw.get("persona_notes") if "persona_notes" in raw else raw.get("notes")
-                value = _normalize_text(source, max_len=600)
-                next_content = update_actor_help_note(
-                    current_content,
-                    target_actor_id,
-                    value,
-                    actor_order=actor_ids,
-                )
-                if next_content != current_content:
-                    if not next_content.strip() or next_content == builtin_help:
-                        delete_group_prompt_file(group, HELP_FILENAME)
-                    else:
-                        write_group_prompt_file(group, HELP_FILENAME, next_content)
-                    _mark_change(idx, op_name, f"Set role notes for {target_actor_id}")
                 continue
 
             if op_name == "meta.merge":
@@ -1330,7 +1258,6 @@ def handle_context_sync(args: Dict[str, Any]) -> DaemonResponse:
                     storage.save_task(task)
             if agents_dirty:
                 storage.save_agents(agents_state)
-                _sync_agents_mind_context_runtime(storage, agents_state)
 
         version = storage.compute_version() if not dry_run else current_version
 

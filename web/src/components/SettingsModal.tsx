@@ -1,7 +1,7 @@
 // SettingsModal renders the settings modal.
 import { useState, useEffect, useRef, useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { Actor, GroupDoc, GroupSettings, IMStatus, IMPlatform, WebAccessSession } from "../types";
+import { Actor, GroupDoc, GroupSettings, IMConfig, IMStatus, IMPlatform } from "../types";
 import * as api from "../services/api";
 import { useObservabilityStore } from "../stores";
 import {
@@ -53,10 +53,9 @@ export function SettingsModal({
   const { t } = useTranslation("settings");
   const { modalRef } = useModalA11y(isOpen, onClose);
   const [scope, setScope] = useState<SettingsScope>(groupId ? "group" : "global");
-  const [groupTab, setGroupTab] = useState<GroupTabId>("guidance");
+  const [groupTab, setGroupTab] = useState<GroupTabId>("automation");
   const [globalTab, setGlobalTab] = useState<GlobalTabId>("capabilities");
   const [canAccessGlobalSettings, setCanAccessGlobalSettings] = useState<boolean | null>(null);
-  const [webAccessSession, setWebAccessSession] = useState<WebAccessSession | null>(null);
 
   // Automation + delivery settings state
   const [nudgeSeconds, setNudgeSeconds] = useState(300);
@@ -95,6 +94,8 @@ export function SettingsModal({
 
   // IM Bridge state
   const [imStatus, setImStatus] = useState<IMStatus | null>(null);
+  const [imHasLocalOverride, setImHasLocalOverride] = useState(false);
+  const [imUsesGlobalDefaults, setImUsesGlobalDefaults] = useState(false);
   const [imPlatform, setImPlatform] = useState<IMPlatform>("telegram");
   const [imBotTokenEnv, setImBotTokenEnv] = useState("");
   const [imAppTokenEnv, setImAppTokenEnv] = useState("");
@@ -102,6 +103,9 @@ export function SettingsModal({
   const [imFeishuDomain, setImFeishuDomain] = useState("https://open.feishu.cn");
   const [imFeishuAppId, setImFeishuAppId] = useState("");
   const [imFeishuAppSecret, setImFeishuAppSecret] = useState("");
+  const [imFeishuMessageStyle, setImFeishuMessageStyle] = useState<"text" | "card">("text");
+  const [imFeishuCardTitle, setImFeishuCardTitle] = useState("");
+  const [imFeishuCardTemplateId, setImFeishuCardTemplateId] = useState("");
   // DingTalk fields
   const [imDingtalkAppKey, setImDingtalkAppKey] = useState("");
   const [imDingtalkAppSecret, setImDingtalkAppSecret] = useState("");
@@ -113,6 +117,19 @@ export function SettingsModal({
   const imLoadSeq = useRef(0);
 
   // IM config drafts cache (per-platform local edits, not yet saved to server)
+  type IMConfigDraft = {
+    botTokenEnv: string;
+    appTokenEnv: string;
+    feishuDomain: string;
+    feishuAppId: string;
+    feishuAppSecret: string;
+    feishuMessageStyle: "text" | "card";
+    feishuCardTitle: string;
+    feishuCardTemplateId: string;
+    dingtalkAppKey: string;
+    dingtalkAppSecret: string;
+    dingtalkRobotCode: string;
+  };
   const [imConfigDrafts, setImConfigDrafts] = useState<Partial<Record<IMPlatform, IMConfigDraft>>>({});
 
   // Global observability (developer mode)
@@ -180,16 +197,11 @@ export function SettingsModal({
         const resp = await api.fetchWebAccessSession();
         if (cancelled) return;
         const session = resp.ok ? resp.result?.web_access_session ?? null : null;
-        setWebAccessSession(session);
         const allowed = Boolean(session?.can_access_global_settings ?? !(session?.login_active ?? false));
         setCanAccessGlobalSettings(allowed);
-        const allowGlobalScope = Boolean(allowed || session?.current_browser_signed_in);
-        if (!allowGlobalScope && groupId) setScope("group");
+        if (!allowed && groupId) setScope("group");
       } catch {
-        if (!cancelled) {
-          setWebAccessSession(null);
-          setCanAccessGlobalSettings(true);
-        }
+        if (!cancelled) setCanAccessGlobalSettings(true);
       }
     };
     void loadWebAccessSession();
@@ -200,9 +212,15 @@ export function SettingsModal({
 
   useEffect(() => {
     if (!isOpen) return;
-    loadIMStatus({ resetFirst: true });
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- Only load when the modal opens or groupId changes.
-  }, [isOpen, groupId]);
+    if (scope === "group") {
+      void loadIMStatus({ resetFirst: true });
+      return;
+    }
+    if (canAccessGlobalSettings !== false) {
+      void loadGlobalIMConfig({ resetFirst: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- IM config is reloaded when scope or target changes.
+  }, [isOpen, groupId, scope, canAccessGlobalSettings]);
 
   useEffect(() => {
     if (isOpen && canAccessGlobalSettings === true) loadObservability();
@@ -229,17 +247,47 @@ export function SettingsModal({
 
   const resetIMState = () => {
     setImStatus(null);
+    setImHasLocalOverride(false);
+    setImUsesGlobalDefaults(false);
     setImPlatform("telegram");
     setImBotTokenEnv("");
     setImAppTokenEnv("");
     setImFeishuDomain("https://open.feishu.cn");
     setImFeishuAppId("");
     setImFeishuAppSecret("");
+    setImFeishuMessageStyle("text");
+    setImFeishuCardTitle("");
+    setImFeishuCardTemplateId("");
     setImDingtalkAppKey("");
     setImDingtalkAppSecret("");
     setImDingtalkRobotCode("");
     setImWecomBotId("");
     setImWecomSecret("");
+  };
+
+  const applyIMConfig = (im: IMConfig | null | undefined) => {
+    if (!im) return;
+    if (im.platform) setImPlatform(im.platform);
+    setImBotTokenEnv(im.bot_token_env || im.bot_token || im.token_env || im.token || "");
+    setImAppTokenEnv(im.app_token_env || im.app_token || "");
+    {
+      const raw = String(im.feishu_domain || "https://open.feishu.cn").trim();
+      const canon = raw
+        .replace(/\/+$/, "")
+        .replace(/\/open-apis$/, "")
+        .replace(/^open\.larksuite\.com$/i, "https://open.larkoffice.com")
+        .replace(/^https?:\/\/open\.larksuite\.com$/i, "https://open.larkoffice.com")
+        .replace(/^open\.larkoffice\.com$/i, "https://open.larkoffice.com");
+      setImFeishuDomain(canon);
+    }
+    setImFeishuAppId(im.feishu_app_id || im.feishu_app_id_env || "");
+    setImFeishuAppSecret(im.feishu_app_secret || im.feishu_app_secret_env || "");
+    setImFeishuMessageStyle(im.feishu_message_style === "card" ? "card" : "text");
+    setImFeishuCardTitle(im.feishu_card_title || "");
+    setImFeishuCardTemplateId(im.feishu_card_template_id || "");
+    setImDingtalkAppKey(im.dingtalk_app_key || im.dingtalk_app_key_env || "");
+    setImDingtalkAppSecret(im.dingtalk_app_secret || im.dingtalk_app_secret_env || "");
+    setImDingtalkRobotCode(im.dingtalk_robot_code || im.dingtalk_robot_code_env || "");
   };
 
   const loadIMStatus = async (opts?: { resetFirst?: boolean }) => {
@@ -258,34 +306,30 @@ export function SettingsModal({
       }
       const configResp = await api.fetchIMConfig(gid);
       if (seq !== imLoadSeq.current) return;
-      if (configResp.ok && configResp.result.im) {
-        const im = configResp.result.im;
-        if (im.platform) setImPlatform(im.platform);
-        setImBotTokenEnv(im.bot_token_env || im.bot_token || im.token_env || im.token || "");
-        setImAppTokenEnv(im.app_token_env || im.app_token || "");
-        // Feishu fields
-        {
-          const raw = String(im.feishu_domain || "https://open.feishu.cn").trim();
-          const canon = raw
-            .replace(/\/+$/, "")
-            .replace(/\/open-apis$/, "")
-            .replace(/^open\.larksuite\.com$/i, "https://open.larkoffice.com")
-            .replace(/^https?:\/\/open\.larksuite\.com$/i, "https://open.larkoffice.com")
-            .replace(/^open\.larkoffice\.com$/i, "https://open.larkoffice.com");
-          setImFeishuDomain(canon);
-        }
-        setImFeishuAppId(im.feishu_app_id || im.feishu_app_id_env || "");
-        setImFeishuAppSecret(im.feishu_app_secret || im.feishu_app_secret_env || "");
-        // DingTalk fields
-        setImDingtalkAppKey(im.dingtalk_app_key || im.dingtalk_app_key_env || "");
-        setImDingtalkAppSecret(im.dingtalk_app_secret || im.dingtalk_app_secret_env || "");
-        setImDingtalkRobotCode(im.dingtalk_robot_code || im.dingtalk_robot_code_env || "");
-        // WeCom fields
-        setImWecomBotId(im.wecom_bot_id || "");
-        setImWecomSecret(im.wecom_secret || "");
+      if (configResp.ok) {
+        setImHasLocalOverride(Boolean(configResp.result.has_local_override));
+        setImUsesGlobalDefaults(Boolean(configResp.result.uses_global_defaults));
+        applyIMConfig(configResp.result.im);
       }
     } catch (e) {
       console.error("Failed to load IM status:", e);
+    }
+  };
+
+  const loadGlobalIMConfig = async (opts?: { resetFirst?: boolean }) => {
+    const seq = ++imLoadSeq.current;
+    if (opts?.resetFirst) resetIMState();
+    try {
+      const resp = await api.fetchGlobalIMConfig();
+      if (seq !== imLoadSeq.current) return;
+      setImStatus(null);
+      setImHasLocalOverride(false);
+      setImUsesGlobalDefaults(false);
+      if (resp.ok) {
+        applyIMConfig(resp.result.im);
+      }
+    } catch (e) {
+      console.error("Failed to load global IM defaults:", e);
     }
   };
 
@@ -461,6 +505,9 @@ export function SettingsModal({
     feishuDomain: imFeishuDomain,
     feishuAppId: imFeishuAppId,
     feishuAppSecret: imFeishuAppSecret,
+    feishuMessageStyle: imFeishuMessageStyle,
+    feishuCardTitle: imFeishuCardTitle,
+    feishuCardTemplateId: imFeishuCardTemplateId,
     dingtalkAppKey: imDingtalkAppKey,
     dingtalkAppSecret: imDingtalkAppSecret,
     dingtalkRobotCode: imDingtalkRobotCode,
@@ -475,6 +522,9 @@ export function SettingsModal({
     setImFeishuDomain(draft.feishuDomain);
     setImFeishuAppId(draft.feishuAppId);
     setImFeishuAppSecret(draft.feishuAppSecret);
+    setImFeishuMessageStyle(draft.feishuMessageStyle);
+    setImFeishuCardTitle(draft.feishuCardTitle);
+    setImFeishuCardTemplateId(draft.feishuCardTemplateId);
     setImDingtalkAppKey(draft.dingtalkAppKey);
     setImDingtalkAppSecret(draft.dingtalkAppSecret);
     setImDingtalkRobotCode(draft.dingtalkRobotCode);
@@ -509,6 +559,9 @@ export function SettingsModal({
       setImFeishuDomain("https://open.feishu.cn");
       setImFeishuAppId("");
       setImFeishuAppSecret("");
+      setImFeishuMessageStyle("text");
+      setImFeishuCardTitle("");
+      setImFeishuCardTemplateId("");
       setImDingtalkAppKey("");
       setImDingtalkAppSecret("");
       setImDingtalkRobotCode("");
@@ -521,11 +574,28 @@ export function SettingsModal({
   };
 
   const handleSaveIMConfig = async () => {
-    if (!groupId) return;
     setImBusy(true);
     try {
-      const resp = await saveIMConfigDraft(getCurrentIMSaveRequest());
-      if (resp.ok) await loadIMStatus();
+      const payload = {
+        feishu_domain: imFeishuDomain,
+        feishu_app_id: imFeishuAppId,
+        feishu_app_secret: imFeishuAppSecret,
+        feishu_message_style: imFeishuMessageStyle,
+        feishu_card_title: imFeishuCardTitle,
+        feishu_card_template_id: imFeishuCardTemplateId,
+        dingtalk_app_key: imDingtalkAppKey,
+        dingtalk_app_secret: imDingtalkAppSecret,
+        dingtalk_robot_code: imDingtalkRobotCode,
+      };
+      const resp = scope === "global"
+        ? await api.setGlobalIMConfig(imPlatform, imBotTokenEnv, imAppTokenEnv, payload)
+        : (groupId
+          ? await api.setIMConfig(groupId, imPlatform, imBotTokenEnv, imAppTokenEnv, payload)
+          : null);
+      if (resp?.ok) {
+        if (scope === "global") await loadGlobalIMConfig();
+        else await loadIMStatus();
+      }
     } catch (e) {
       console.error("Failed to save IM config:", e);
     } finally {
@@ -534,22 +604,15 @@ export function SettingsModal({
   };
 
   const handleRemoveIMConfig = async () => {
-    if (!groupId) return;
     setImBusy(true);
     try {
-      const resp = await api.unsetIMConfig(groupId);
-      if (resp.ok) {
-        setImBotTokenEnv("");
-        setImAppTokenEnv("");
-        setImFeishuDomain("https://open.feishu.cn");
-        setImFeishuAppId("");
-        setImFeishuAppSecret("");
-        setImDingtalkAppKey("");
-        setImDingtalkAppSecret("");
-        setImDingtalkRobotCode("");
-        setImWecomBotId("");
-        setImWecomSecret("");
-        await loadIMStatus();
+      const resp = scope === "global"
+        ? await api.unsetGlobalIMConfig()
+        : (groupId ? await api.unsetIMConfig(groupId) : null);
+      if (resp?.ok) {
+        resetIMState();
+        if (scope === "global") await loadGlobalIMConfig();
+        else await loadIMStatus();
       }
     } catch (e) {
       console.error("Failed to remove IM config:", e);
@@ -791,6 +854,8 @@ export function SettingsModal({
     return String((active || first)?.url || "").trim();
   })();
 
+  const globalSettingsEnabled = canAccessGlobalSettings !== false;
+
   const groupTabs: { id: GroupTabId; label: string }[] = [
     { id: "guidance", label: t("tabs.guidance") },
     { id: "automation", label: t("tabs.automation") },
@@ -801,7 +866,14 @@ export function SettingsModal({
     { id: "transcript", label: t("tabs.transcript") },
     { id: "blueprint", label: t("tabs.blueprint") },
   ];
-  const tabs = scope === "group" ? groupTabs : (globalScopeEnabled ? globalTabs : []);
+  const globalTabs: { id: GlobalTabId; label: string }[] = [
+    { id: "capabilities", label: t("tabs.capabilities") },
+    { id: "actorProfiles", label: t("tabs.actorProfiles") },
+    { id: "im", label: t("tabs.im") },
+    { id: "webAccess", label: t("tabs.webAccess") },
+    { id: "developer", label: t("tabs.developer") },
+  ];
+  const tabs = scope === "group" ? groupTabs : (globalSettingsEnabled ? globalTabs : []);
   const activeTab = scope === "group" ? groupTab : globalTab;
   const setActiveTab = (tab: GroupTabId | GlobalTabId) => {
     if (scope === "group") setGroupTab(tab as GroupTabId);
@@ -824,7 +896,7 @@ export function SettingsModal({
           groupId={groupId}
           scope={scope}
           scopeRootUrl={scopeRootUrl}
-          globalEnabled={globalScopeEnabled}
+          globalEnabled={globalSettingsEnabled}
           tabs={tabs}
           activeTab={activeTab}
           onScopeChange={setScope}
@@ -832,9 +904,9 @@ export function SettingsModal({
         />
 
         {/* Main Content Area */}
-        <div className="min-h-0 flex-1 overflow-y-auto scrollbar-subtle flex flex-col [scrollbar-gutter:stable]">
-          <div className="p-5 pb-8 sm:p-8 sm:pb-10 space-y-6">
-            {scope === "global" && !globalSettingsEnabled && !currentBrowserSignedIn ? (
+        <div className="flex-1 overflow-y-auto flex flex-col">
+          <div className="p-5 sm:p-8 space-y-6">
+            {scope === "global" && canAccessGlobalSettings === false ? (
               <div className={`rounded-xl border p-6 ${isDark ? "border-amber-700/40 bg-amber-900/10 text-amber-200" : "border-amber-200 bg-amber-50 text-amber-800"}`}>
                 <div className="text-sm font-semibold">{t("navigation.globalLockedTitle")}</div>
                 <div className="mt-2 text-sm leading-6">{t("navigation.globalLockedContent")}</div>
@@ -848,7 +920,7 @@ export function SettingsModal({
                   </button>
                 ) : null}
               </div>
-            ) : !tabs.some((tab) => tab.id === activeTab) ? null : (
+            ) : (
               <>
               {activeTab === "automation" && (
                 <AutomationTab
@@ -910,8 +982,11 @@ export function SettingsModal({
               {activeTab === "im" && (
                 <IMBridgeTab
                   isDark={isDark}
-                  groupId={groupId}
+                  scope={scope}
+                  groupId={scope === "group" ? groupId : undefined}
                   imStatus={imStatus}
+                  hasLocalOverride={imHasLocalOverride}
+                  usesGlobalDefaults={imUsesGlobalDefaults}
                   imPlatform={imPlatform}
                   onPlatformChange={handlePlatformChange}
                   imBotTokenEnv={imBotTokenEnv}
@@ -924,6 +999,12 @@ export function SettingsModal({
                   setImFeishuAppSecret={setImFeishuAppSecret}
                   imFeishuDomain={imFeishuDomain}
                   setImFeishuDomain={setImFeishuDomain}
+                  imFeishuMessageStyle={imFeishuMessageStyle}
+                  setImFeishuMessageStyle={setImFeishuMessageStyle}
+                  imFeishuCardTitle={imFeishuCardTitle}
+                  setImFeishuCardTitle={setImFeishuCardTitle}
+                  imFeishuCardTemplateId={imFeishuCardTemplateId}
+                  setImFeishuCardTemplateId={setImFeishuCardTemplateId}
                   imDingtalkAppKey={imDingtalkAppKey}
                   setImDingtalkAppKey={setImDingtalkAppKey}
                   imDingtalkAppSecret={imDingtalkAppSecret}
@@ -1013,6 +1094,13 @@ export function SettingsModal({
                 <BrandingTab
                   isDark={isDark}
                   isActive={scope === "global" && activeTab === "branding"}
+                />
+              )}
+
+              {activeTab === "webAccess" && (
+                <WebAccessTab
+                  isDark={isDark}
+                  isActive={scope === "global" && activeTab === "webAccess"}
                 />
               )}
 

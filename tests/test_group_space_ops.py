@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-import shutil
 import sys
 import tempfile
 import threading
@@ -111,253 +109,6 @@ class TestGroupSpaceOps(unittest.TestCase):
             self.assertEqual(str(provider.get("readiness_reason") or ""), "ok")
         finally:
             cleanup_stub()
-            cleanup()
-
-    def test_work_sync_status_hides_stale_remote_after_unbind(self) -> None:
-        _, cleanup = self._with_home()
-        project_ctx = tempfile.TemporaryDirectory()
-        project_dir = Path(project_ctx.__enter__()).resolve()
-        try:
-            from cccc.daemon.space.group_space_paths import resolve_space_root, space_state_path
-
-            gid = self._create_group("space-work-unbind-status")
-            self._attach_scope(gid, str(project_dir))
-
-            bind, _ = self._call(
-                "group_space_bind",
-                {
-                    "group_id": gid,
-                    "provider": "notebooklm",
-                    "lane": "work",
-                    "action": "bind",
-                    "remote_space_id": "nb_work_1",
-                    "by": "user",
-                },
-            )
-            self.assertTrue(bind.ok, getattr(bind, "error", None))
-
-            space_root = resolve_space_root(gid, create=False)
-            self.assertIsNotNone(space_root)
-            state_path = space_state_path(space_root or project_dir)
-            state_path.write_text(
-                json.dumps(
-                    {
-                        "v": 1,
-                        "group_id": gid,
-                        "provider": "notebooklm",
-                        "remote_space_id": "nb_work_1",
-                        "last_run_at": "2026-03-13T00:00:00Z",
-                        "converged": True,
-                        "unsynced_count": 0,
-                        "failed_count": 0,
-                        "uploaded": 2,
-                        "updated": 1,
-                        "deleted": 0,
-                        "reused": 4,
-                        "remote_sources": 7,
-                        "materialized_sources": 7,
-                        "last_error": "",
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-
-            unbind, _ = self._call(
-                "group_space_bind",
-                {
-                    "group_id": gid,
-                    "provider": "notebooklm",
-                    "lane": "work",
-                    "action": "unbind",
-                    "by": "user",
-                },
-            )
-            self.assertTrue(unbind.ok, getattr(unbind, "error", None))
-            unbind_result = unbind.result if isinstance(unbind.result, dict) else {}
-            unbind_sync = unbind_result.get("sync") if isinstance(unbind_result.get("sync"), dict) else {}
-            self.assertEqual(str(unbind_sync.get("remote_space_id") or ""), "")
-            self.assertEqual(str(unbind_sync.get("reason") or ""), "work_lane_unbound")
-            self.assertEqual(int(unbind_sync.get("remote_sources", -1)), 0)
-            self.assertEqual(str(unbind_sync.get("last_run_at") or ""), "")
-
-            status, _ = self._call("group_space_status", {"group_id": gid})
-            self.assertTrue(status.ok, getattr(status, "error", None))
-            status_result = status.result if isinstance(status.result, dict) else {}
-            status_sync = status_result.get("sync") if isinstance(status_result.get("sync"), dict) else {}
-            self.assertEqual(str(status_sync.get("remote_space_id") or ""), "")
-            self.assertEqual(str(status_sync.get("reason") or ""), "work_lane_unbound")
-            self.assertEqual(int(status_sync.get("remote_sources", -1)), 0)
-            self.assertEqual(str(status_sync.get("last_run_at") or ""), "")
-
-            sync_status, _ = self._call(
-                "group_space_sync",
-                {
-                    "group_id": gid,
-                    "provider": "notebooklm",
-                    "lane": "work",
-                    "action": "status",
-                },
-            )
-            self.assertTrue(sync_status.ok, getattr(sync_status, "error", None))
-            sync_result = sync_status.result if isinstance(sync_status.result, dict) else {}
-            sync_payload = sync_result.get("sync") if isinstance(sync_result.get("sync"), dict) else {}
-            self.assertEqual(str(sync_payload.get("remote_space_id") or ""), "")
-            self.assertEqual(str(sync_payload.get("reason") or ""), "work_lane_unbound")
-            self.assertEqual(int(sync_payload.get("remote_sources", -1)), 0)
-        finally:
-            project_ctx.__exit__(None, None, None)
-            cleanup()
-
-    def test_status_hides_stale_work_queue_after_rebind(self) -> None:
-        _, cleanup = self._with_home()
-        try:
-            from cccc.daemon.space.group_space_store import enqueue_space_job, mark_space_job_failed
-
-            gid = self._create_group("space-status-rebind-queue")
-            bind_old, _ = self._call(
-                "group_space_bind",
-                {
-                    "group_id": gid,
-                    "provider": "notebooklm",
-                    "lane": "work",
-                    "action": "bind",
-                    "remote_space_id": "nb_status_old",
-                    "by": "user",
-                },
-            )
-            self.assertTrue(bind_old.ok, getattr(bind_old, "error", None))
-
-            failed_job, _ = enqueue_space_job(
-                group_id=gid,
-                provider="notebooklm",
-                lane="work",
-                remote_space_id="nb_status_old",
-                kind="context_sync",
-                payload={"summary": {"tasks": []}},
-                idempotency_key="status-old-failed",
-            )
-            mark_space_job_failed(str(failed_job.get("job_id") or ""), code="space_failed", message="old notebook failed")
-
-            bind_new, _ = self._call(
-                "group_space_bind",
-                {
-                    "group_id": gid,
-                    "provider": "notebooklm",
-                    "lane": "work",
-                    "action": "bind",
-                    "remote_space_id": "nb_status_new",
-                    "by": "user",
-                },
-            )
-            self.assertTrue(bind_new.ok, getattr(bind_new, "error", None))
-
-            status, _ = self._call("group_space_status", {"group_id": gid})
-            self.assertTrue(status.ok, getattr(status, "error", None))
-            result = status.result if isinstance(status.result, dict) else {}
-            summary = (((result.get("queue_summary") or {}).get("work")) if isinstance(result.get("queue_summary"), dict) else {})
-            self.assertEqual(int(summary.get("pending") or 0), 0)
-            self.assertEqual(int(summary.get("running") or 0), 0)
-            self.assertEqual(int(summary.get("failed") or 0), 0)
-        finally:
-            cleanup()
-
-    def test_memory_sync_status_hides_stale_summary_after_unbind(self) -> None:
-        _, cleanup = self._with_home()
-        try:
-            from cccc.kernel.memory_reme.layout import resolve_memory_layout
-
-            gid = self._create_group("space-memory-unbind-status")
-            bind, _ = self._call(
-                "group_space_bind",
-                {
-                    "group_id": gid,
-                    "provider": "notebooklm",
-                    "lane": "memory",
-                    "action": "bind",
-                    "remote_space_id": "nb_memory_1",
-                    "by": "user",
-                },
-            )
-            self.assertTrue(bind.ok, getattr(bind, "error", None))
-
-            layout = resolve_memory_layout(gid, ensure_files=True)
-            manifest_path = layout.memory_root / "notebooklm_sync.json"
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "v": 1,
-                        "provider": "notebooklm",
-                        "lane": "memory",
-                        "group_id": gid,
-                        "group_label": layout.group_label,
-                        "remote_space_id": "nb_memory_1",
-                        "last_scan_at": "2026-03-13T00:00:00Z",
-                        "last_success_at": "2026-03-13T00:05:00Z",
-                        "files": {
-                            "2026-03-12": {
-                                "date": "2026-03-12",
-                                "file_path": str(layout.daily_dir / f"2026-03-12__{layout.group_label}.md"),
-                                "relative_path": f"daily/2026-03-12__{layout.group_label}.md",
-                                "content_hash": "abc",
-                                "entry_count": 1,
-                                "word_count": 20,
-                                "source_strategy": "single",
-                                "source_ids": ["src_1"],
-                                "part_count": 1,
-                                "state": "succeeded",
-                                "attempt": 1,
-                                "job_id": "job_1",
-                                "synced_at": "2026-03-13T00:05:00Z",
-                            }
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-
-            unbind, _ = self._call(
-                "group_space_bind",
-                {
-                    "group_id": gid,
-                    "provider": "notebooklm",
-                    "lane": "memory",
-                    "action": "unbind",
-                    "by": "user",
-                },
-            )
-            self.assertTrue(unbind.ok, getattr(unbind, "error", None))
-            unbind_result = unbind.result if isinstance(unbind.result, dict) else {}
-            unbind_summary = unbind_result.get("memory_sync") if isinstance(unbind_result.get("memory_sync"), dict) else {}
-            self.assertEqual(str(unbind_summary.get("last_success_at") or ""), "")
-            self.assertEqual(int(unbind_summary.get("synced_daily_files", -1)), 0)
-
-            status, _ = self._call("group_space_status", {"group_id": gid})
-            self.assertTrue(status.ok, getattr(status, "error", None))
-            status_result = status.result if isinstance(status.result, dict) else {}
-            status_summary = status_result.get("memory_sync") if isinstance(status_result.get("memory_sync"), dict) else {}
-            self.assertEqual(str(status_summary.get("last_success_at") or ""), "")
-            self.assertEqual(int(status_summary.get("synced_daily_files", -1)), 0)
-
-            sync_status, _ = self._call(
-                "group_space_sync",
-                {
-                    "group_id": gid,
-                    "provider": "notebooklm",
-                    "lane": "memory",
-                    "action": "status",
-                },
-            )
-            self.assertTrue(sync_status.ok, getattr(sync_status, "error", None))
-            sync_result = sync_status.result if isinstance(sync_status.result, dict) else {}
-            sync_payload = sync_result.get("sync") if isinstance(sync_result.get("sync"), dict) else {}
-            sync_summary = sync_result.get("summary") if isinstance(sync_result.get("summary"), dict) else {}
-            self.assertEqual(str(sync_payload.get("remote_space_id") or ""), "")
-            self.assertEqual(str(sync_payload.get("last_success_at") or ""), "")
-            self.assertEqual(str(sync_summary.get("last_success_at") or ""), "")
-            self.assertEqual(int(sync_summary.get("synced_daily_files", -1)), 0)
-        finally:
             cleanup()
 
     def test_group_space_capabilities_reports_local_policy_and_ingest_schema(self) -> None:
@@ -713,79 +464,6 @@ class TestGroupSpaceOps(unittest.TestCase):
             self.assertEqual(str(result.get("latest_context_sync_at") or ""), "2026-03-08T10:00:00Z")
             self.assertEqual(int(result.get("remote_sources", -1)), 0)
             self.assertEqual(int(result.get("materialized_sources", -1)), 0)
-        finally:
-            cleanup_stub()
-            cleanup()
-
-    def test_group_space_query_ignores_old_context_sync_after_rebind(self) -> None:
-        _, cleanup = self._with_home()
-        cleanup_stub = self._with_env("CCCC_NOTEBOOKLM_STUB", "1")
-        try:
-            from cccc.daemon.space.group_space_store import enqueue_space_job, mark_space_job_succeeded
-
-            gid = self._create_group("space-query-rebind-diagnostics")
-            bind_old, _ = self._call(
-                "group_space_bind",
-                {
-                    "group_id": gid,
-                    "provider": "notebooklm",
-                    "lane": "work",
-                    "action": "bind",
-                    "remote_space_id": "nb_diag_old",
-                    "by": "user",
-                },
-            )
-            self.assertTrue(bind_old.ok, getattr(bind_old, "error", None))
-
-            old_job, _ = enqueue_space_job(
-                group_id=gid,
-                provider="notebooklm",
-                lane="work",
-                remote_space_id="nb_diag_old",
-                kind="context_sync",
-                payload={"summary": {"tasks": []}},
-                idempotency_key="diag-old-success",
-            )
-            mark_space_job_succeeded(
-                str(old_job.get("job_id") or ""),
-                result={"ok": True},
-            )
-
-            bind_new, _ = self._call(
-                "group_space_bind",
-                {
-                    "group_id": gid,
-                    "provider": "notebooklm",
-                    "lane": "work",
-                    "action": "bind",
-                    "remote_space_id": "nb_diag_new",
-                    "by": "user",
-                },
-            )
-            self.assertTrue(bind_new.ok, getattr(bind_new, "error", None))
-
-            with patch(
-                "cccc.daemon.space.group_space_ops.read_group_space_sync_state",
-                return_value={
-                    "available": True,
-                    "remote_space_id": "nb_diag_new",
-                    "remote_sources": 0,
-                    "materialized_sources": 0,
-                },
-            ):
-                query, _ = self._call(
-                    "group_space_query",
-                    {
-                        "group_id": gid,
-                        "provider": "notebooklm",
-                        "lane": "work",
-                        "query": "What is the current focus?",
-                    },
-                )
-            self.assertTrue(query.ok, getattr(query, "error", None))
-            result = query.result if isinstance(query.result, dict) else {}
-            self.assertEqual(str(result.get("source_basis_hint") or ""), "unknown")
-            self.assertEqual(str(result.get("latest_context_sync_at") or ""), "")
         finally:
             cleanup_stub()
             cleanup()
@@ -1340,9 +1018,6 @@ class TestGroupSpaceOps(unittest.TestCase):
                 first_result = first.result if isinstance(first.result, dict) else {}
                 self.assertEqual(str(first_result.get("status") or ""), "pending")
                 self.assertFalse(bool(first_result.get("queued")))
-                self.assertEqual(str(first_result.get("recommended_next_action") or ""), "wait_for_notify")
-                self.assertEqual(bool(first_result.get("polling_discouraged")), True)
-                self.assertIn("Do not poll in a loop.", str(first_result.get("wait_guidance") or ""))
 
                 second, _ = self._call(
                     "group_space_artifact",
@@ -1361,9 +1036,6 @@ class TestGroupSpaceOps(unittest.TestCase):
                 second_result = second.result if isinstance(second.result, dict) else {}
                 self.assertEqual(str(second_result.get("status") or ""), "queued")
                 self.assertTrue(bool(second_result.get("queued")))
-                self.assertEqual(str(second_result.get("recommended_next_action") or ""), "wait_for_notify")
-                self.assertEqual(bool(second_result.get("polling_discouraged")), True)
-                self.assertIn("one-shot reminder", str(second_result.get("wait_guidance") or ""))
 
                 third, _ = self._call(
                     "group_space_artifact",
@@ -1430,7 +1102,7 @@ class TestGroupSpaceOps(unittest.TestCase):
                 )
                 self.assertTrue(generated.ok, getattr(generated, "error", None))
 
-            matched_notify = None
+            found = False
             for _ in range(30):
                 inbox, _ = self._call(
                     "inbox_list",
@@ -1453,21 +1125,12 @@ class TestGroupSpaceOps(unittest.TestCase):
                         data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
                         context = data.get("context") if isinstance(data.get("context"), dict) else {}
                         if str(context.get("task_id") or "") == "task_notify_1":
-                            matched_notify = ev
+                            found = True
                             break
-                if matched_notify is not None:
+                if found:
                     break
                 time.sleep(0.1)
-            self.assertIsNotNone(matched_notify, "expected async generate completion notify in inbox")
-            assert isinstance(matched_notify, dict)
-            data = matched_notify.get("data") if isinstance(matched_notify.get("data"), dict) else {}
-            context = data.get("context") if isinstance(data.get("context"), dict) else {}
-            self.assertEqual(str(data.get("title") or ""), "Group Space artifact ready")
-            self.assertIn("No extra polling is needed.", str(data.get("message") or ""))
-            self.assertEqual(str(context.get("completion_signal") or ""), "system.notify")
-            self.assertEqual(bool(context.get("polling_discouraged")), True)
-            self.assertEqual(str(context.get("recommended_next_action") or ""), "download_or_list_artifact")
-            self.assertIn("do not poll again", str(context.get("completion_guidance") or "").lower())
+            self.assertTrue(found, "expected async generate completion notify in inbox")
         finally:
             cleanup_stub()
             cleanup()
@@ -1521,11 +1184,6 @@ class TestGroupSpaceOps(unittest.TestCase):
                 result = generated.result if isinstance(generated.result, dict) else {}
                 self.assertEqual(str(result.get("status") or ""), "pending")
                 self.assertFalse(bool(result.get("queued")))
-                self.assertEqual(bool(result.get("background")), True)
-                self.assertEqual(str(result.get("completion_signal") or ""), "system.notify")
-                self.assertEqual(str(result.get("recommended_next_action") or ""), "wait_for_notify")
-                self.assertEqual(bool(result.get("polling_discouraged")), True)
-                self.assertIn("Do not poll in a loop.", str(result.get("wait_guidance") or ""))
                 self.assertLess(elapsed, 1.0, f"expected async return, elapsed={elapsed:.3f}s")
                 # Let background worker consume patched provider fns before exiting patch scope.
                 time.sleep(2.3)
@@ -1888,7 +1546,7 @@ class TestGroupSpaceOps(unittest.TestCase):
                     },
                 )
                 self.assertTrue(started.ok, getattr(started, "error", None))
-                start_mock.assert_called_once_with(timeout_seconds=120, force_reauth=False)
+                start_mock.assert_called_once_with(timeout_seconds=120)
                 started_result = started.result if isinstance(started.result, dict) else {}
                 started_auth = started_result.get("auth") if isinstance(started_result.get("auth"), dict) else {}
                 self.assertEqual(str(started_auth.get("state") or ""), "running")
@@ -1924,76 +1582,6 @@ class TestGroupSpaceOps(unittest.TestCase):
                 cancel_mock.assert_called_once()
                 canceled_auth = (canceled.result or {}).get("auth") if isinstance(canceled.result, dict) else {}
                 self.assertEqual(str((canceled_auth or {}).get("phase") or ""), "canceling")
-        finally:
-            cleanup()
-
-    def test_provider_auth_flow_start_force_reauth_and_disconnect(self) -> None:
-        _, cleanup = self._with_home()
-        try:
-            with patch(
-                "cccc.daemon.space.group_space_ops.start_notebooklm_auth_flow",
-                return_value={
-                    "provider": "notebooklm",
-                    "state": "running",
-                    "phase": "starting",
-                    "session_id": "nbl_auth_switch",
-                },
-            ) as start_mock, patch(
-                "cccc.daemon.space.group_space_ops.disconnect_notebooklm_auth_flow",
-                return_value={
-                    "provider": "notebooklm",
-                    "state": "idle",
-                    "phase": "idle",
-                    "session_id": "",
-                },
-            ) as disconnect_mock:
-                started, _ = self._call(
-                    "group_space_provider_auth",
-                    {
-                        "provider": "notebooklm",
-                        "by": "user",
-                        "action": "start",
-                        "timeout_seconds": 180,
-                        "force_reauth": True,
-                    },
-                )
-                self.assertTrue(started.ok, getattr(started, "error", None))
-                start_mock.assert_called_once_with(timeout_seconds=180, force_reauth=True)
-
-                disconnected, _ = self._call(
-                    "group_space_provider_auth",
-                    {
-                        "provider": "notebooklm",
-                        "by": "user",
-                        "action": "disconnect",
-                    },
-                )
-                self.assertTrue(disconnected.ok, getattr(disconnected, "error", None))
-                disconnect_mock.assert_called_once_with()
-                result = disconnected.result if isinstance(disconnected.result, dict) else {}
-                provider_state = result.get("provider_state") if isinstance(result.get("provider_state"), dict) else {}
-                self.assertEqual(bool(provider_state.get("enabled")), False)
-                self.assertEqual(str(provider_state.get("mode") or ""), "disabled")
-        finally:
-            cleanup()
-
-    def test_provider_auth_disconnect_rejects_running_flow(self) -> None:
-        _, cleanup = self._with_home()
-        try:
-            with patch(
-                "cccc.daemon.space.group_space_ops.disconnect_notebooklm_auth_flow",
-                side_effect=RuntimeError("cannot disconnect while Google connect flow is running"),
-            ):
-                resp, _ = self._call(
-                    "group_space_provider_auth",
-                    {
-                        "provider": "notebooklm",
-                        "by": "user",
-                        "action": "disconnect",
-                    },
-                )
-                self.assertFalse(resp.ok)
-                self.assertEqual(str(getattr(resp.error, "code", "")), "space_provider_auth_flow_running")
         finally:
             cleanup()
 
@@ -2084,12 +1672,9 @@ class TestGroupSpaceOps(unittest.TestCase):
                 "cccc.daemon.space.group_space_ops.provider_create_space",
                 return_value={"provider": "notebooklm", "remote_space_id": "nb_auto_1", "created": True},
             ) as create_mock, patch(
-                "cccc.daemon.space.group_space_ops.read_group_space_sync_state",
-                return_value={"available": False, "reason": "no_local_scope"},
-            ), patch(
-                "cccc.daemon.space.group_space_ops.mark_group_space_sync_pending",
-                return_value={"ok": True, "state": "pending", "remote_space_id": "nb_auto_1"},
-            ) as pending_mock:
+                "cccc.daemon.space.group_space_ops.sync_group_space_files",
+                return_value={"ok": True, "converged": True, "unsynced_count": 0},
+            ):
                 bind, _ = self._call(
                     "group_space_bind",
                     {
@@ -2103,83 +1688,11 @@ class TestGroupSpaceOps(unittest.TestCase):
                 )
             self.assertTrue(bind.ok, getattr(bind, "error", None))
             create_mock.assert_called_once_with("notebooklm", title="CCCC · Space Auto Bind")
-            pending_mock.assert_called_once_with(gid, provider="notebooklm", remote_space_id="nb_auto_1")
             result = bind.result if isinstance(bind.result, dict) else {}
             binding = (((result.get("bindings") or {}).get("work")) if isinstance(result.get("bindings"), dict) else {})
             self.assertEqual(str(binding.get("remote_space_id") or ""), "nb_auto_1")
             sync_result = result.get("sync_result") if isinstance(result.get("sync_result"), dict) else {}
             self.assertEqual(bool(sync_result.get("ok")), True)
-            self.assertEqual(bool(sync_result.get("deferred")), True)
-        finally:
-            cleanup()
-
-    def test_bind_work_lane_defers_sync_and_marks_pending_when_remote_changes(self) -> None:
-        _, cleanup = self._with_home()
-        try:
-            gid = self._create_group("Space Rebind Fast Path")
-            with patch(
-                "cccc.daemon.space.group_space_ops.read_group_space_sync_state",
-                return_value={"available": True, "remote_space_id": "nb_old_1", "converged": True},
-            ), patch(
-                "cccc.daemon.space.group_space_ops.mark_group_space_sync_pending",
-                return_value={"ok": True, "state": "pending", "remote_space_id": "nb_existing_1"},
-            ) as pending_mock, patch(
-                "cccc.daemon.space.group_space_ops.sync_group_space_files",
-                return_value={"ok": True, "converged": True, "unsynced_count": 0},
-            ) as sync_mock:
-                bind, _ = self._call(
-                    "group_space_bind",
-                    {
-                        "group_id": gid,
-                        "provider": "notebooklm",
-                        "lane": "work",
-                        "action": "bind",
-                        "remote_space_id": "nb_existing_1",
-                        "by": "user",
-                    },
-                )
-            self.assertTrue(bind.ok, getattr(bind, "error", None))
-            sync_mock.assert_not_called()
-            pending_mock.assert_called_once_with(gid, provider="notebooklm", remote_space_id="nb_existing_1")
-            result = bind.result if isinstance(bind.result, dict) else {}
-            sync_result = result.get("sync_result") if isinstance(result.get("sync_result"), dict) else {}
-            self.assertEqual(bool(sync_result.get("ok")), True)
-            self.assertEqual(bool(sync_result.get("deferred")), True)
-            self.assertEqual(str(sync_result.get("reason") or ""), "background_sync")
-        finally:
-            cleanup()
-
-    def test_bind_work_lane_same_remote_keeps_existing_sync_state_fast_path(self) -> None:
-        _, cleanup = self._with_home()
-        try:
-            gid = self._create_group("Space Same Remote Rebind")
-            with patch(
-                "cccc.daemon.space.group_space_ops.read_group_space_sync_state",
-                return_value={"available": True, "remote_space_id": "nb_existing_1", "converged": True},
-            ), patch(
-                "cccc.daemon.space.group_space_ops.mark_group_space_sync_pending",
-            ) as pending_mock, patch(
-                "cccc.daemon.space.group_space_ops.sync_group_space_files",
-                return_value={"ok": True, "converged": True, "unsynced_count": 0},
-            ):
-                bind, _ = self._call(
-                    "group_space_bind",
-                    {
-                        "group_id": gid,
-                        "provider": "notebooklm",
-                        "lane": "work",
-                        "action": "bind",
-                        "remote_space_id": "nb_existing_1",
-                        "by": "user",
-                    },
-                )
-            self.assertTrue(bind.ok, getattr(bind, "error", None))
-            pending_mock.assert_not_called()
-            result = bind.result if isinstance(bind.result, dict) else {}
-            sync_result = result.get("sync_result") if isinstance(result.get("sync_result"), dict) else {}
-            self.assertEqual(bool(sync_result.get("ok")), True)
-            self.assertEqual(bool(sync_result.get("deferred")), True)
-            self.assertEqual(str(sync_result.get("remote_space_id") or ""), "nb_existing_1")
         finally:
             cleanup()
 
@@ -2237,21 +1750,6 @@ class TestGroupSpaceOps(unittest.TestCase):
         finally:
             cleanup()
 
-    def test_notebooklm_auth_browser_profile_session_dir_is_unique_under_home(self) -> None:
-        _, cleanup = self._with_home()
-        try:
-            from cccc.daemon.space import notebooklm_auth_flow as auth_flow
-
-            session_a = auth_flow._fresh_managed_browser_profile_session_dir()
-            session_b = auth_flow._fresh_managed_browser_profile_session_dir()
-            self.assertNotEqual(session_a, session_b)
-            self.assertTrue(session_a.exists())
-            self.assertTrue(session_b.exists())
-            self.assertIn(str(auth_flow._managed_browser_profile_dir()), str(session_a))
-            self.assertIn(str(auth_flow._managed_browser_profile_dir()), str(session_b))
-        finally:
-            cleanup()
-
     def test_notebooklm_auth_flow_reuses_saved_credential_without_browser(self) -> None:
         from cccc.daemon.space import notebooklm_auth_flow as auth_flow
 
@@ -2284,417 +1782,6 @@ class TestGroupSpaceOps(unittest.TestCase):
             state = auth_flow.get_notebooklm_auth_flow_status()
             self.assertEqual(str(state.get("state") or ""), "succeeded")
             self.assertIn("connected", str(state.get("message") or "").lower())
-
-    def test_notebooklm_auth_flow_force_reauth_skips_saved_credential_reuse(self) -> None:
-        from cccc.daemon.space import notebooklm_auth_flow as auth_flow
-
-        saved_storage = {
-            "cookies": [{"name": "SID", "value": "saved", "domain": ".google.com", "path": "/"}],
-            "origins": [],
-        }
-        with patch.object(auth_flow, "_load_saved_storage_state", return_value=saved_storage), patch.object(
-            auth_flow,
-            "_verify_storage_state",
-            side_effect=AssertionError("saved credential reuse must be skipped for force_reauth"),
-        ), patch.object(
-            auth_flow,
-            "_ensure_sync_playwright",
-            side_effect=RuntimeError("browser unavailable"),
-        ), patch.object(
-            auth_flow,
-            "_fresh_managed_browser_profile_session_dir",
-        ) as fresh_profile_mock, patch.object(
-            auth_flow,
-            "_start_browser_session",
-            side_effect=AssertionError("browser session should not start when browser runtime is unavailable"),
-        ), patch.object(
-            auth_flow,
-            "get_space_provider_state",
-            return_value={"enabled": False, "real_enabled": False},
-        ), patch.object(
-            auth_flow,
-            "set_space_provider_state",
-            return_value={"enabled": False, "real_enabled": False, "mode": "disabled"},
-        ):
-            auth_flow._connect_worker(
-                session_id="nbl_auth_test_force_reauth",
-                timeout_seconds=120,
-                cancel_event=threading.Event(),
-                force_reauth=True,
-            )
-            fresh_profile_mock.assert_not_called()
-            state = auth_flow.get_notebooklm_auth_flow_status()
-            self.assertEqual(str(state.get("state") or ""), "failed")
-            self.assertIn("failed to prepare browser runtime", str(state.get("message") or "").lower())
-
-    def test_notebooklm_auth_flow_disconnect_ignores_locked_browser_profile_dir(self) -> None:
-        _, cleanup = self._with_home()
-        try:
-            from cccc.daemon.space import notebooklm_auth_flow as auth_flow
-            from cccc.daemon.space.group_space_store import update_space_provider_secrets
-
-            _ = update_space_provider_secrets(
-                "notebooklm",
-                set_vars={
-                    "NOTEBOOKLM_AUTH_JSON": '{"cookies":[{"name":"SID","value":"saved","domain":".google.com"}]}'
-                },
-                unset_keys=[],
-                clear=False,
-            )
-            os.environ["CCCC_NOTEBOOKLM_AUTH_JSON"] = '{"cookies":[{"name":"SID","value":"env","domain":".google.com"}]}'
-
-            profile_dir = auth_flow._managed_browser_profile_dir()
-            marker = profile_dir / "locked.txt"
-            marker.write_text("x", encoding="utf-8")
-
-            real_rmtree = shutil.rmtree
-            call_count = {"value": 0}
-
-            def _flaky_rmtree(path: str | os.PathLike[str], *args: Any, **kwargs: Any) -> None:
-                if Path(path) == profile_dir:
-                    call_count["value"] += 1
-                    raise PermissionError(32, "sharing violation", str(path))
-                real_rmtree(path, *args, **kwargs)
-
-            with patch.object(auth_flow.shutil, "rmtree", side_effect=_flaky_rmtree):
-                state = auth_flow.disconnect_notebooklm_auth_flow()
-
-            self.assertGreater(call_count["value"], 0)
-            self.assertEqual(str(state.get("state") or ""), "idle")
-            self.assertNotIn("CCCC_NOTEBOOKLM_AUTH_JSON", os.environ)
-            self.assertTrue(profile_dir.exists())
-        finally:
-            cleanup()
-
-    def test_notebooklm_auth_flow_closes_windows_system_browser_process_tree(self) -> None:
-        from cccc.daemon.space import notebooklm_auth_flow as auth_flow
-
-        class _FakeClosable:
-            def __init__(self) -> None:
-                self.closed = False
-
-            def close(self) -> None:
-                self.closed = True
-
-        class _FakeProc:
-            def __init__(self) -> None:
-                self.pid = 4321
-                self.terminated = False
-                self.killed = False
-                self.wait_calls: list[float] = []
-
-            def poll(self) -> None:
-                return None
-
-            def wait(self, timeout: float | None = None) -> int:
-                self.wait_calls.append(float(timeout or 0.0))
-                return 0
-
-            def terminate(self) -> None:
-                self.terminated = True
-
-            def kill(self) -> None:
-                self.killed = True
-
-        context = _FakeClosable()
-        browser = _FakeClosable()
-        proc = _FakeProc()
-        session = auth_flow._AuthBrowserSession(
-            browser=browser,
-            context=context,
-            strategy="system_browser_cdp:chrome.exe",
-            process=proc,
-        )
-
-        with patch.object(auth_flow.os, "name", "nt"), patch.object(
-            auth_flow.subprocess,
-            "run",
-            return_value=None,
-        ) as taskkill_mock:
-            session.close()
-
-        self.assertTrue(context.closed)
-        self.assertTrue(browser.closed)
-        taskkill_mock.assert_called_once()
-        self.assertEqual(
-            taskkill_mock.call_args.args[0],
-            ["taskkill", "/PID", "4321", "/T", "/F"],
-        )
-        self.assertEqual(proc.wait_calls, [1.0])
-        self.assertFalse(proc.terminated)
-        self.assertFalse(proc.killed)
-
-    def test_notebooklm_auth_flow_waits_for_notebook_before_collecting_cookies(self) -> None:
-        from cccc.daemon.space import notebooklm_auth_flow as auth_flow
-
-        class _FakePage:
-            def __init__(self) -> None:
-                self.url = "https://notebooklm.google.com/"
-
-            def goto(self, url: str, **_kwargs) -> None:
-                self.url = url
-
-        class _FakeContext:
-            def __init__(self) -> None:
-                self.pages = [_FakePage()]
-
-            def new_page(self) -> _FakePage:
-                page = _FakePage()
-                self.pages.append(page)
-                return page
-
-        class _FakeBrowserSession:
-            def __init__(self, context: _FakeContext) -> None:
-                self.context = context
-                self.strategy = "test_browser"
-                self.closed = False
-
-            def close(self) -> None:
-                self.closed = True
-
-        class _FakePlaywrightContextManager:
-            def __enter__(self) -> object:
-                return object()
-
-            def __exit__(self, exc_type, exc, tb) -> bool:
-                _ = exc_type, exc, tb
-                return False
-
-        fake_context = _FakeContext()
-        fake_session = _FakeBrowserSession(fake_context)
-        observed_urls = iter(
-            [
-                ["https://accounts.google.com/signin/v2/identifier"],
-                ["https://accounts.google.com/signin/v2/challenge/pwd"],
-                ["https://notebooklm.google.com/"],
-            ]
-        )
-        collect_calls: list[int] = []
-        fake_now = {"value": 1000.0}
-
-        def _fake_time() -> float:
-            return float(fake_now["value"])
-
-        def _fake_sleep(seconds: float) -> None:
-            fake_now["value"] += max(0.0, float(seconds))
-
-        def _fake_page_urls(_context: Any) -> list[str]:
-            try:
-                return list(next(observed_urls))
-            except StopIteration:
-                return ["https://notebooklm.google.com/"]
-
-        def _fake_collect_storage(_context: Any) -> Dict[str, Any]:
-            collect_calls.append(1)
-            return {
-                "cookies": [{"name": "SID", "value": "fresh", "domain": ".google.com", "path": "/"}],
-                "origins": [],
-            }
-
-        with patch.object(auth_flow, "_load_saved_storage_state", return_value=None), patch.object(
-            auth_flow,
-            "_ensure_sync_playwright",
-            return_value=_FakePlaywrightContextManager,
-        ), patch.object(
-            auth_flow,
-            "_start_browser_session",
-            return_value=fake_session,
-        ), patch.object(
-            auth_flow,
-            "_page_urls",
-            side_effect=_fake_page_urls,
-        ), patch.object(
-            auth_flow,
-            "_collect_storage_state",
-            side_effect=_fake_collect_storage,
-        ), patch.object(
-            auth_flow,
-            "_verify_storage_state",
-            return_value=None,
-        ), patch.object(
-            auth_flow,
-            "_persist_storage_state",
-            return_value=None,
-        ), patch.object(
-            auth_flow,
-            "get_space_provider_state",
-            return_value={"enabled": False, "real_enabled": False},
-        ), patch.object(
-            auth_flow,
-            "set_space_provider_state",
-            return_value={"enabled": True, "real_enabled": True, "mode": "active"},
-        ), patch.object(
-            auth_flow.time,
-            "time",
-            side_effect=_fake_time,
-        ), patch.object(
-            auth_flow.time,
-            "sleep",
-            side_effect=_fake_sleep,
-        ):
-            auth_flow._connect_worker(
-                session_id="nbl_auth_wait_for_notebook",
-                timeout_seconds=120,
-                cancel_event=threading.Event(),
-            )
-
-        self.assertEqual(len(collect_calls), 1)
-        self.assertTrue(fake_session.closed)
-        state = auth_flow.get_notebooklm_auth_flow_status()
-        self.assertEqual(str(state.get("state") or ""), "succeeded")
-        self.assertIn("connected", str(state.get("message") or "").lower())
-
-    def test_notebooklm_auth_flow_cookie_peek_recovers_when_notebook_page_detection_misses(self) -> None:
-        from cccc.daemon.space import notebooklm_auth_flow as auth_flow
-
-        class _FakePage:
-            def __init__(self) -> None:
-                self.url = "https://accounts.google.com/signin/v2/identifier"
-
-            def goto(self, url: str, **_kwargs) -> None:
-                self.url = url
-
-        class _FakeContext:
-            def __init__(self) -> None:
-                self.pages = [_FakePage()]
-
-            def new_page(self) -> _FakePage:
-                page = _FakePage()
-                self.pages.append(page)
-                return page
-
-        class _FakeBrowserSession:
-            def __init__(self, context: _FakeContext) -> None:
-                self.context = context
-                self.strategy = "test_browser"
-                self.closed = False
-
-            def close(self) -> None:
-                self.closed = True
-
-        class _FakePlaywrightContextManager:
-            def __enter__(self) -> object:
-                return object()
-
-            def __exit__(self, exc_type, exc, tb) -> bool:
-                _ = exc_type, exc, tb
-                return False
-
-        fake_context = _FakeContext()
-        fake_session = _FakeBrowserSession(fake_context)
-        collect_calls: list[int] = []
-        peek_results = iter(
-            [
-                [],
-                [{"name": "SID", "value": "fresh", "domain": ".google.com", "path": "/"}],
-            ]
-        )
-        fake_now = {"value": 2000.0}
-
-        def _fake_time() -> float:
-            return float(fake_now["value"])
-
-        def _fake_sleep(seconds: float) -> None:
-            fake_now["value"] += max(0.0, float(seconds))
-
-        def _fake_peek(_context: Any) -> list[Dict[str, Any]]:
-            try:
-                return list(next(peek_results))
-            except StopIteration:
-                return [{"name": "SID", "value": "fresh", "domain": ".google.com", "path": "/"}]
-
-        def _fake_collect_storage(_context: Any) -> Dict[str, Any]:
-            collect_calls.append(1)
-            return {
-                "cookies": [{"name": "SID", "value": "fresh", "domain": ".google.com", "path": "/"}],
-                "origins": [],
-            }
-
-        with patch.object(auth_flow, "_load_saved_storage_state", return_value=None), patch.object(
-            auth_flow,
-            "_ensure_sync_playwright",
-            return_value=_FakePlaywrightContextManager,
-        ), patch.object(
-            auth_flow,
-            "_start_browser_session",
-            return_value=fake_session,
-        ), patch.object(
-            auth_flow,
-            "_page_urls",
-            return_value=["https://accounts.google.com/signin/v2/identifier"],
-        ), patch.object(
-            auth_flow,
-            "_peek_google_cookies",
-            side_effect=_fake_peek,
-        ), patch.object(
-            auth_flow,
-            "_collect_storage_state",
-            side_effect=_fake_collect_storage,
-        ), patch.object(
-            auth_flow,
-            "_verify_storage_state",
-            return_value=None,
-        ), patch.object(
-            auth_flow,
-            "_persist_storage_state",
-            return_value=None,
-        ), patch.object(
-            auth_flow,
-            "get_space_provider_state",
-            return_value={"enabled": False, "real_enabled": False},
-        ), patch.object(
-            auth_flow,
-            "set_space_provider_state",
-            return_value={"enabled": True, "real_enabled": True, "mode": "active"},
-        ), patch.object(
-            auth_flow.time,
-            "time",
-            side_effect=_fake_time,
-        ), patch.object(
-            auth_flow.time,
-            "sleep",
-            side_effect=_fake_sleep,
-        ):
-            auth_flow._connect_worker(
-                session_id="nbl_auth_cookie_peek_fallback",
-                timeout_seconds=120,
-                cancel_event=threading.Event(),
-            )
-
-        self.assertEqual(len(collect_calls), 1)
-        self.assertTrue(fake_session.closed)
-        state = auth_flow.get_notebooklm_auth_flow_status()
-        self.assertEqual(str(state.get("state") or ""), "succeeded")
-        self.assertIn("connected", str(state.get("message") or "").lower())
-
-    def test_notebooklm_auth_flow_disconnect_clears_saved_state(self) -> None:
-        _, cleanup = self._with_home()
-        try:
-            from cccc.daemon.space import notebooklm_auth_flow as auth_flow
-            from cccc.daemon.space.group_space_store import load_space_provider_secrets, update_space_provider_secrets
-
-            _ = update_space_provider_secrets(
-                "notebooklm",
-                set_vars={
-                    "NOTEBOOKLM_AUTH_JSON": '{"cookies":[{"name":"SID","value":"saved","domain":".google.com"}]}'
-                },
-                unset_keys=[],
-                clear=False,
-            )
-            os.environ["CCCC_NOTEBOOKLM_AUTH_JSON"] = '{"cookies":[{"name":"SID","value":"env","domain":".google.com"}]}'
-            profile_dir = auth_flow._managed_browser_profile_dir()
-            marker = profile_dir / "marker.txt"
-            marker.write_text("x", encoding="utf-8")
-
-            state = auth_flow.disconnect_notebooklm_auth_flow()
-
-            self.assertEqual(str(state.get("state") or ""), "idle")
-            self.assertEqual(str(state.get("phase") or ""), "idle")
-            self.assertNotIn("CCCC_NOTEBOOKLM_AUTH_JSON", os.environ)
-            self.assertFalse(profile_dir.exists())
-            self.assertEqual(load_space_provider_secrets("notebooklm"), {})
-        finally:
-            cleanup()
 
 
 if __name__ == "__main__":

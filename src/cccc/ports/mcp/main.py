@@ -73,14 +73,6 @@ def _encode_cursor(offset: int) -> str:
     return str(max(0, int(offset)))
 
 
-def _stdin_buffer() -> Any:
-    return getattr(sys.stdin, "buffer", None)
-
-
-def _stdout_buffer() -> Any:
-    return getattr(sys.stdout, "buffer", None)
-
-
 def _read_message() -> Optional[Dict[str, Any]]:
     """Read a single JSON-RPC message from stdin."""
     try:

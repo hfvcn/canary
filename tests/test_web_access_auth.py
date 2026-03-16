@@ -74,6 +74,11 @@ class TestWebAccessAuth(unittest.TestCase):
             self.assertEqual(session.get("allowed_groups"), [])
             self.assertEqual(int(session.get("access_token_count") or 0), 1)
             self.assertTrue(bool(session.get("can_access_global_settings")))
+            self.assertTrue(bool(session.get("can_manage_actors")))
+            self.assertTrue(bool(session.get("can_access_terminal")))
+            self.assertTrue(bool(session.get("can_access_prompts")))
+            self.assertTrue(bool(session.get("can_access_capabilities")))
+            self.assertTrue(bool(session.get("can_view_message_bodies")))
         finally:
             cleanup()
 
@@ -95,6 +100,11 @@ class TestWebAccessAuth(unittest.TestCase):
             self.assertEqual(bool(session.get("is_admin")), False)
             self.assertEqual(int(session.get("access_token_count") or 0), 2)
             self.assertFalse(bool(session.get("can_access_global_settings")))
+            self.assertFalse(bool(session.get("can_manage_actors")))
+            self.assertFalse(bool(session.get("can_access_terminal")))
+            self.assertFalse(bool(session.get("can_access_prompts")))
+            self.assertFalse(bool(session.get("can_access_capabilities")))
+            self.assertFalse(bool(session.get("can_view_message_bodies")))
         finally:
             cleanup()
 

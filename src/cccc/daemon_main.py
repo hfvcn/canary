@@ -81,15 +81,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             if pid_is_alive(pid):
                 print(f"ccccd: pid file points to a live process (pid={pid}) but IPC is not responding; refusing to spawn duplicate daemon")
                 return 1
-            # 进程不存在，清理陈旧状态文件。
-            print("ccccd: cleaning up stale state from crashed daemon")
-            try:
-                paths.sock_path.unlink(missing_ok=True)
-                paths.addr_path.unlink(missing_ok=True)
-                paths.pid_path.unlink(missing_ok=True)
-            except Exception as e:
-                print(f"ccccd: failed to clean stale daemon state: {e}")
-                return 1
+            else:
+                # Process doesn't exist, clean up stale files
+                print("ccccd: cleaning up stale state from crashed daemon")
+                try:
+                    paths.sock_path.unlink(missing_ok=True)
+                    paths.addr_path.unlink(missing_ok=True)
+                    paths.pid_path.unlink(missing_ok=True)
+                except Exception as e:
+                    print(f"ccccd: failed to clean stale daemon state: {e}")
+                    return 1
         pid = _spawn_daemon(paths)
         print(f"ccccd: started pid={pid}")
         return 0

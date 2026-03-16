@@ -77,8 +77,8 @@ def cmd_status(_: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Check environment and show available agent runtimes."""
-    from ..kernel.runtime import detect_all_runtimes
-    from ..runners.platform_support import pty_support_details
+    import shutil
+    from ..kernel.runtime import detect_all_runtimes, PRIMARY_RUNTIMES
     
     print("[DOCTOR] CCCC Environment Check")
     print()
@@ -100,32 +100,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"Daemon: running (pid={r.get('pid')}, version={r.get('version')})")
     else:
         print("Daemon: not running")
-
-    pty_diag = pty_support_details()
-    if sys.platform.startswith("win"):
-        print()
-        if bool(pty_diag.get("supported")):
-            print("Windows PTY: OK (ConPTY backend available)")
-        else:
-            print(f"Windows PTY: NOT READY ({pty_diag.get('code')})")
-            print(f"  {pty_diag.get('message')}")
-            for hint in pty_diag.get("hints") if isinstance(pty_diag.get("hints"), list) else []:
-                print(f"  - {hint}")
-
+    
     print()
     print("Agent Runtimes:")
     
     # Check all runtimes
     all_runtimes = args.all if hasattr(args, 'all') else False
     runtimes = detect_all_runtimes(primary_only=not all_runtimes)
-
-    encoding = str(getattr(sys.stdout, "encoding", "") or "").lower()
-    ascii_only = sys.platform.startswith("win") and encoding not in ("utf-8", "utf8")
-
+    
     available_count = 0
     for rt in runtimes:
         status = "OK" if rt.available else "NOT FOUND"
-        mark = "[OK]" if rt.available else "[NO]" if ascii_only else ("✓" if rt.available else "✗")
+        mark = "✓" if rt.available else "✗"
         path_info = f" ({rt.path})" if rt.available else ""
         print(f"  {mark} {rt.name}: {status}{path_info}")
         if rt.available:
@@ -133,9 +119,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     
     print()
     if available_count == 0:
-        print("No agent runtimes detected.")
-        print("First-class supported runtimes: claude, codex, droid, amp, auggie, neovate, gemini, kimi")
-        print("Manual fallback: custom (bring your own command and MCP wiring)")
+        print("No agent runtimes detected. Install one of:")
+        print("  - Claude Code: https://claude.ai/code")
+        print("  - Codex CLI: https://github.com/openai/codex")
+        print("  - Droid: https://github.com/anthropics/droid")
+        print("  - OpenCode: https://github.com/opencode-ai/opencode")
     else:
         print(f"{available_count} runtime(s) available.")
         print()
@@ -180,7 +168,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
     project_path = Path(args.path or ".").resolve()
 
     # Supported runtimes
-    # - claude/codex/droid/amp/auggie/neovate/gemini/kimi: MCP setup can be automated via their CLIs
+    # - claude/codex/droid/amp/auggie/neovate/gemini: MCP setup can be automated via their CLIs
+    # - cursor/kilocode/opencode/copilot: MCP setup is manual (cccc prints config guidance)
     # - custom: user-provided runtime; MCP setup is manual (generic guidance only)
     SUPPORTED_RUNTIMES = [
         "claude",
@@ -190,7 +179,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
         "auggie",
         "neovate",
         "gemini",
-        "kimi",
+        "cursor",
+        "kilocode",
+        "opencode",
+        "copilot",
         "custom",
     ]
 

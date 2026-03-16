@@ -103,6 +103,7 @@ export type LedgerEvent = {
   group_id?: string;
   by?: string;
   data?: LedgerEventData;
+  _message_body_hidden?: boolean;
   _read_status?: Record<string, boolean>;
   _ack_status?: Record<string, boolean>;
   _obligation_status?: Record<string, ObligationStatus>;
@@ -465,6 +466,9 @@ export type GroupContext = {
   attention?: ContextAttention | null;
   board?: ContextBoard | null;
   tasks_summary?: GroupTasksSummary;
+  panorama?: {
+    mermaid?: string | null;
+  };
   meta?: {
     project_status?: string | null;
     [key: string]: unknown;
@@ -500,7 +504,7 @@ export type GroupSettings = {
   terminal_transcript_notify_tail: boolean;
   terminal_transcript_notify_lines: number;
 
-  desktop_pet_enabled: boolean;
+  panorama_enabled: boolean;
 };
 
 export type RemoteAccessState = {
@@ -568,6 +572,60 @@ export type WebAccessSession = {
   allowed_groups?: string[];
   access_token_count?: number;
   can_access_global_settings?: boolean;
+  can_manage_actors?: boolean;
+  can_manage_group_runtime?: boolean;
+  can_access_terminal?: boolean;
+  can_access_prompts?: boolean;
+  can_access_capabilities?: boolean;
+  can_access_group_settings?: boolean;
+  can_view_message_bodies?: boolean;
+};
+
+export type WorkspaceItemKind = "folder" | "task" | "file";
+
+export type WorkspaceTaskInfo = {
+  title?: string;
+  status?: string;
+  task_ref?: string;
+  id?: string;
+  assignee?: string;
+  updated_at?: string;
+};
+
+export type WorkspaceEntry = {
+  name: string;
+  rel_path: string;
+  path: string;
+  is_dir: boolean;
+  kind: WorkspaceItemKind;
+  is_task: boolean;
+  updated_at?: string;
+  size_bytes?: number;
+  task?: WorkspaceTaskInfo;
+};
+
+export type WorkspaceTree = {
+  root_path: string;
+  path: string;
+  rel_path: string;
+  parent_rel_path?: string | null;
+  items: WorkspaceEntry[];
+};
+
+export type WorkspaceTaskList = {
+  root_path: string;
+  items: WorkspaceEntry[];
+};
+
+export type WorkspaceFile = {
+  name: string;
+  path: string;
+  rel_path: string;
+  mime_type: string;
+  size_bytes: number;
+  is_text: boolean;
+  truncated: boolean;
+  content?: string | null;
 };
 
 export type WebBranding = {
@@ -837,6 +895,9 @@ export type IMConfig = {
   feishu_app_id_env?: string;
   feishu_app_secret?: string;
   feishu_app_secret_env?: string;
+  feishu_message_style?: "text" | "card";
+  feishu_card_title?: string;
+  feishu_card_template_id?: string;
   // DingTalk fields
   dingtalk_app_key?: string;
   dingtalk_app_key_env?: string;
@@ -856,6 +917,8 @@ export type IMStatus = {
   running: boolean;
   pid?: number;
   subscribers: number;
+  has_local_override?: boolean;
+  uses_global_defaults?: boolean;
 };
 
 export type DirItem = { name: string; path: string; is_dir: boolean };

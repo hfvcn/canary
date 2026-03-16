@@ -337,28 +337,12 @@ input,
 textarea,
 select,
 [role="button"] {
+  cursor: pointer;
   transition: color 0.15s ease-out,
               background-color 0.15s ease-out,
               border-color 0.15s ease-out,
               box-shadow 0.15s ease-out,
               opacity 0.15s ease-out;
-}
-
-input,
-textarea {
-  cursor: text;
-}
-
-input[type="checkbox"],
-input[type="radio"],
-input[type="range"],
-input[type="color"],
-input[type="file"],
-input[type="button"],
-input[type="submit"],
-input[type="reset"],
-select {
-  cursor: pointer;
 }
 
 @media (display-mode: standalone) {

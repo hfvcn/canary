@@ -6,13 +6,16 @@ import {
   RUNTIME_INFO,
 } from "../../types";
 import { useTranslation } from "react-i18next";
-import { BASIC_MCP_CONFIG_SNIPPET } from "../../utils/mcpConfigSnippets";
+import {
+  BASIC_MCP_CONFIG_SNIPPET,
+  COPILOT_MCP_CONFIG_SNIPPET,
+  OPENCODE_MCP_CONFIG_SNIPPET,
+} from "../../utils/mcpConfigSnippets";
 import { classNames } from "../../utils/classNames";
 import { useModalA11y } from "../../hooks/useModalA11y";
 import { CapabilityPicker } from "../CapabilityPicker";
 import { RolePresetPicker } from "../RolePresetPicker";
 import { formatCapabilityIdInput, parseCapabilityIdInput } from "../../utils/capabilityAutoload";
-import { actorProfileIdentityKey } from "../../utils/actorProfiles";
 
 export interface AddActorModalProps {
   isOpen: boolean;
@@ -68,13 +71,6 @@ export interface AddActorModalProps {
 function commandPreview(command: string[] | undefined): string {
   const cmd = Array.isArray(command) ? command.filter((item) => typeof item === "string" && item.trim()) : [];
   return cmd.join(" ");
-}
-
-function profileScopeLabel(profile: ActorProfile, t: (key: string, options?: Record<string, unknown>) => string): string {
-  if (String(profile.scope || "global").trim() === "user") {
-    return t("profileScopeOwnedBy", { owner: String(profile.owner_id || "").trim() || "?" });
-  }
-  return t("profileScopeGlobal");
 }
 
 function modeButtonClass(selected: boolean): string {
@@ -133,10 +129,16 @@ export function AddActorModal({
   const runtimeInfo = runtimes.find((r) => r.name === newActorRuntime);
   const runtimeAvailable = runtimeInfo?.available ?? false;
   const defaultCommand = runtimeInfo?.recommended_command || "";
-  const selectedProfile = actorProfiles.find((item) => actorProfileIdentityKey(item) === String(newActorProfileId || "").trim());
+  const selectedProfile = actorProfiles.find((item) => String(item.id || "") === String(newActorProfileId || ""));
   const selectedProfileRuntime = String(selectedProfile?.runtime || "").trim() as SupportedRuntime;
   const selectedProfileCommand = commandPreview(selectedProfile?.command);
-  const showRuntimeSetup = !newActorUseProfile && newActorRuntime === "custom";
+  const showRuntimeSetup =
+    !newActorUseProfile &&
+    (newActorRuntime === "cursor" ||
+      newActorRuntime === "kilocode" ||
+      newActorRuntime === "opencode" ||
+      newActorRuntime === "copilot" ||
+      newActorRuntime === "custom");
   const showCommandEditor = !newActorUseProfile && (newActorRuntime === "custom" || !newActorUseDefaultCommand);
 
   const sectionCardClass = "rounded-2xl p-4 sm:p-5 glass-panel";
@@ -287,8 +289,8 @@ export function AddActorModal({
                       >
                         <option value="">{actorProfilesBusy ? t("loadingProfiles") : t("selectActorProfile")}</option>
                         {actorProfiles.map((profile) => (
-                          <option key={actorProfileIdentityKey(profile)} value={actorProfileIdentityKey(profile)}>
-                            {(profile.name || profile.id) + " · " + profileScopeLabel(profile, t)}
+                          <option key={profile.id} value={profile.id}>
+                            {profile.name || profile.id}
                           </option>
                         ))}
                       </select>
@@ -298,9 +300,6 @@ export function AddActorModal({
                       <div className="rounded-xl border px-3 py-3 border-[var(--glass-border-subtle)] bg-[var(--glass-bg)] text-[var(--color-text-secondary)]">
                         <div className="text-sm font-medium text-[var(--color-text-primary)]">
                           {selectedProfile.name || selectedProfile.id}
-                        </div>
-                        <div className="mt-1 text-xs">
-                          {profileScopeLabel(selectedProfile, t)}
                         </div>
                         <div className="mt-1 text-xs">
                           {RUNTIME_INFO[selectedProfileRuntime]?.label || selectedProfile.runtime}
@@ -438,11 +437,53 @@ export function AddActorModal({
                               <code className="px-1 rounded bg-amber-500/15">cccc mcp</code>.
                             </div>
                           </>
-                        ) : null}
+                        ) : newActorRuntime === "cursor" ? (
+                          <>
+                            <div className="mt-1">
+                              {t("createEditFile")}{" "}
+                              <code className="px-1 rounded bg-amber-500/15">~/.cursor/mcp.json</code> (or{" "}
+                              <code className="px-1 rounded bg-amber-500/15">.cursor/mcp.json</code> {t("orInProject")})
+                            </div>
+                            <div className="mt-1">{t("addMcpConfig")}</div>
+                          </>
+                        ) : newActorRuntime === "kilocode" ? (
+                          <>
+                            <div className="mt-1">
+                              {t("createEditFile")}{" "}
+                              <code className="px-1 rounded bg-amber-500/15">.kilocode/mcp.json</code> {t("inProjectRoot")}
+                            </div>
+                            <div className="mt-1">{t("addMcpConfig")}</div>
+                          </>
+                        ) : newActorRuntime === "opencode" ? (
+                          <>
+                            <div className="mt-1">
+                              {t("createEditFile")}{" "}
+                              <code className="px-1 rounded bg-amber-500/15">~/.config/opencode/opencode.json</code>
+                            </div>
+                            <div className="mt-1">{t("addMcpConfig")}</div>
+                          </>
+                        ) : (
+                          <>
+                            <div className="mt-1">
+                              {t("createEditFile")}{" "}
+                              <code className="px-1 rounded bg-amber-500/15">~/.copilot/mcp-config.json</code>
+                            </div>
+                            <div className="mt-1">
+                              {t("addMcpConfigOrFlag")}{" "}
+                              <code className="px-1 rounded bg-amber-500/15">--additional-mcp-config</code>):
+                            </div>
+                          </>
+                        )}
 
-                        {newActorRuntime === "custom" ? (
+                        {newActorRuntime !== "custom" ? (
                           <pre className="mt-1.5 p-2 rounded overflow-x-auto whitespace-pre bg-amber-500/10 text-amber-800 dark:text-amber-200">
-                            <code>{BASIC_MCP_CONFIG_SNIPPET}</code>
+                            <code>
+                              {newActorRuntime === "opencode"
+                                ? OPENCODE_MCP_CONFIG_SNIPPET
+                                : newActorRuntime === "copilot"
+                                  ? COPILOT_MCP_CONFIG_SNIPPET
+                                  : BASIC_MCP_CONFIG_SNIPPET}
+                            </code>
                           </pre>
                         ) : null}
 

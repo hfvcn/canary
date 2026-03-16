@@ -3,17 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import signal
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 
-from ....daemon.im.im_bridge_ops import stop_im_bridges_for_group
 from ....kernel.group import load_group
-from ....paths import ensure_home
-from ....ports.im.config_schema import canonicalize_im_config
+from ....kernel.settings import get_im_defaults
+from ....ports.im.config_schema import canonicalize_im_config, resolve_im_config
 from ....util.conv import coerce_bool
 from ....util.process import SOFT_TERMINATE_SIGNAL, best_effort_signal_pid, pid_is_alive, resolve_background_python_argv, supervised_process_popen_kwargs
+from ..message_visibility import filter_events_for_principal
 from ..schemas import (
     IMActionRequest,
     IMBindRequest,
@@ -23,9 +22,36 @@ from ..schemas import (
     RouteContext,
     check_group,
     get_principal,
+    require_group_admin,
     require_group,
 )
 from .actors import invalidate_readonly_actor_list
+
+
+def _group_local_im_doc(group: Any) -> Dict[str, Any]:
+    raw = group.doc.get("im")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _group_effective_im(group: Any) -> Dict[str, Any]:
+    return resolve_im_config(_group_local_im_doc(group), get_im_defaults())
+
+
+def _group_im_source_flags(group: Any) -> Dict[str, bool]:
+    global_im = get_im_defaults()
+    local_im = canonicalize_im_config(_group_local_im_doc(group))
+    effective_im = resolve_im_config(local_im, global_im)
+    return {
+        "has_local_override": bool(local_im),
+        "uses_global_defaults": bool(global_im) and effective_im != local_im,
+    }
+
+
+def _persist_group_im_enabled(group: Any, enabled: bool) -> None:
+    local_im = _group_local_im_doc(group)
+    local_im["enabled"] = bool(enabled)
+    group.doc["im"] = local_im
+    group.save()
 
 
 def create_routers(ctx: RouteContext) -> list[APIRouter]:
@@ -41,16 +67,18 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
     # Group-scoped endpoints (guard via router dependency)
     # =========================================================================
 
-    def _profile_auth_args(request: Request) -> Dict[str, Any]:
-        principal = get_principal(request)
-        return {
-            "caller_id": str(getattr(principal, "user_id", "") or "").strip(),
-            "is_admin": bool(getattr(principal, "is_admin", False)),
-        }
-
     @group_router.get("/inbox/{actor_id}")
-    async def inbox_list(group_id: str, actor_id: str, by: str = "user", limit: int = 50) -> Dict[str, Any]:
-        return await ctx.daemon({"op": "inbox_list", "args": {"group_id": group_id, "actor_id": actor_id, "by": by, "limit": int(limit)}})
+    async def inbox_list(request: Request, group_id: str, actor_id: str, by: str = "user", limit: int = 50) -> Dict[str, Any]:
+        resp = await ctx.daemon({"op": "inbox_list", "args": {"group_id": group_id, "actor_id": actor_id, "by": by, "limit": int(limit)}})
+        result = resp.get("result") if isinstance(resp, dict) else None
+        messages = result.get("messages") if isinstance(result, dict) else None
+        if isinstance(messages, list):
+            filtered = filter_events_for_principal(messages, get_principal(request))
+            resp = dict(resp)
+            next_result = dict(result)
+            next_result["messages"] = filtered
+            resp["result"] = next_result
+        return resp
 
     @group_router.post("/inbox/{actor_id}/read")
     async def inbox_mark_read(group_id: str, actor_id: str, req: InboxReadRequest) -> Dict[str, Any]:
@@ -61,14 +89,14 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
     @group_router.post("/start")
     async def group_start(request: Request, group_id: str, by: str = "user") -> Dict[str, Any]:
         await invalidate_readonly_actor_list(group_id)
-        return await ctx.daemon({"op": "group_start", "args": {"group_id": group_id, "by": by, **_profile_auth_args(request)}})
+        return await ctx.daemon({"op": "group_start", "args": {"group_id": group_id, "by": by}})
 
-    @group_router.post("/stop")
+    @group_router.post("/stop", dependencies=[Depends(require_group_admin)])
     async def group_stop(group_id: str, by: str = "user") -> Dict[str, Any]:
         await invalidate_readonly_actor_list(group_id)
         return await ctx.daemon({"op": "group_stop", "args": {"group_id": group_id, "by": by}})
 
-    @group_router.post("/state")
+    @group_router.post("/state", dependencies=[Depends(require_group_admin)])
     async def group_set_state(group_id: str, state: str, by: str = "user") -> Dict[str, Any]:
         """Set group state (active/idle/paused) to control automation behavior."""
         await invalidate_readonly_actor_list(group_id)
@@ -86,8 +114,9 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         if group is None:
             raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
 
-        im_config = canonicalize_im_config(group.doc.get("im", {}))
+        im_config = _group_effective_im(group)
         platform = im_config.get("platform") if im_config else None
+        source_flags = _group_im_source_flags(group)
 
         # Check if running
         pid_path = group.path / "state" / "im_bridge.pid"
@@ -103,12 +132,12 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                         pid = None
                         pid_path.unlink(missing_ok=True)
                     else:
-                        running = pid_is_alive(pid)
+                        os.kill(pid, 0)  # Check if process exists
+                        running = True
                 except (AttributeError, ChildProcessError):
-                    running = pid_is_alive(pid)
-                if not running:
-                    pid = None
-            except ValueError:
+                    os.kill(pid, 0)  # Check if process exists
+                    running = True
+            except (ValueError, ProcessLookupError, PermissionError):
                 pid = None
 
         # Get subscriber count
@@ -125,11 +154,12 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             "ok": True,
             "result": {
                 "group_id": group_id,
-                "configured": bool(im_config),
+                "configured": bool(platform),
                 "platform": platform,
                 "running": running,
                 "pid": pid,
                 "subscribers": subscriber_count,
+                **source_flags,
             }
         }
 
@@ -141,8 +171,20 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         if group is None:
             raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
 
-        im_cfg = canonicalize_im_config(group.doc.get("im"))
-        return {"ok": True, "result": {"group_id": group_id, "im": im_cfg}}
+        local_im = canonicalize_im_config(_group_local_im_doc(group))
+        global_im = get_im_defaults()
+        im_cfg = resolve_im_config(local_im, global_im)
+        return {
+            "ok": True,
+            "result": {
+                "group_id": group_id,
+                "im": im_cfg or None,
+                "local_im": local_im or None,
+                "global_im": global_im or None,
+                "has_local_override": bool(local_im),
+                "uses_global_defaults": bool(global_im) and im_cfg != local_im,
+            },
+        }
 
     @im_router.post("/api/im/set")
     async def im_set(request: Request, req: IMSetRequest) -> Dict[str, Any]:
@@ -185,6 +227,9 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             im_cfg["feishu_domain"] = str(req.feishu_domain or "").strip()
             app_id = str(req.feishu_app_id or "").strip()
             app_secret = str(req.feishu_app_secret or "").strip()
+            im_cfg["feishu_message_style"] = str(req.feishu_message_style or "text").strip()
+            im_cfg["feishu_card_title"] = str(req.feishu_card_title or "").strip()
+            im_cfg["feishu_card_template_id"] = str(req.feishu_card_template_id or "").strip()
             if app_id:
                 im_cfg["feishu_app_id"] = app_id
             if app_secret:
@@ -223,23 +268,6 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         if group is None:
             raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {req.group_id}"})
 
-        # 1. Stop bridge (pid file + orphan scan) via reusable helper
-        def _killpg(pid: int, sig: signal.Signals) -> None:
-            best_effort_signal_pid(pid, sig, include_group=True)
-
-        stop_im_bridges_for_group(
-            ensure_home(), group_id=req.group_id, best_effort_killpg=_killpg,
-        )
-
-        # 2. Clean up IM state files (graceful — ignore missing files)
-        state_dir = group.path / "state"
-        for fname in ("im_subscribers.json", "im_authorized_chats.json", "im_pending_keys.json"):
-            try:
-                (state_dir / fname).unlink(missing_ok=True)
-            except Exception:
-                pass
-
-        # 3. Remove IM config from group doc
         if "im" in group.doc:
             del group.doc["im"]
             group.save()
@@ -268,25 +296,21 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                     if waited_pid == pid:
                         pid_path.unlink(missing_ok=True)
                     else:
-                        if pid_is_alive(pid):
-                            return {"ok": False, "error": {"code": "already_running", "message": f"bridge already running (pid={pid})"}}
-                        pid_path.unlink(missing_ok=True)
-                except (AttributeError, ChildProcessError):
-                    if pid_is_alive(pid):
+                        os.kill(pid, 0)
                         return {"ok": False, "error": {"code": "already_running", "message": f"bridge already running (pid={pid})"}}
-                    pid_path.unlink(missing_ok=True)
-            except ValueError:
+                except (AttributeError, ChildProcessError):
+                    os.kill(pid, 0)
+                    return {"ok": False, "error": {"code": "already_running", "message": f"bridge already running (pid={pid})"}}
+            except (ValueError, ProcessLookupError, PermissionError):
                 pass
 
         # Check IM config
-        im_cfg = canonicalize_im_config(group.doc.get("im", {}))
+        im_cfg = _group_effective_im(group)
         if not im_cfg:
             return {"ok": False, "error": {"code": "no_im_config", "message": "no IM configuration"}}
 
         # Persist desired run-state for restart/autostart.
-        im_cfg["enabled"] = True
-        group.doc["im"] = im_cfg
-        group.save()
+        _persist_group_im_enabled(group, enabled=True)
 
         platform = im_cfg.get("platform", "telegram")
 
@@ -410,21 +434,18 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
     @im_router.post("/api/im/stop")
     async def im_stop(request: Request, req: IMActionRequest) -> Dict[str, Any]:
         """Stop IM bridge for a group."""
+        import signal as sig
+
         check_group(request, req.group_id)
         group = load_group(req.group_id)
         if group is None:
             raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {req.group_id}"})
 
         # Persist desired run-state for restart/autostart.
-        raw_im_cfg = group.doc.get("im")
-        if isinstance(raw_im_cfg, dict):
-            im_cfg = canonicalize_im_config(raw_im_cfg)
-            im_cfg["enabled"] = False
-            group.doc["im"] = im_cfg
-            try:
-                group.save()
-            except Exception:
-                pass
+        try:
+            _persist_group_im_enabled(group, enabled=False)
+        except Exception:
+            pass
 
         stopped = 0
         pid_path = group.path / "state" / "im_bridge.pid"
@@ -432,7 +453,13 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         if pid_path.exists():
             try:
                 pid = int(pid_path.read_text(encoding="utf-8").strip())
-                best_effort_signal_pid(pid, SOFT_TERMINATE_SIGNAL, include_group=True)
+                try:
+                    os.killpg(os.getpgid(pid), sig.SIGTERM)
+                except Exception:
+                    try:
+                        os.kill(pid, sig.SIGTERM)
+                    except Exception:
+                        pass
                 stopped += 1
             except Exception:
                 pass

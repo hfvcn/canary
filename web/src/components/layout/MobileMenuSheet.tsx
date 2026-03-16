@@ -30,7 +30,7 @@ export interface MobileMenuSheetProps {
   onToggleTheme: () => void;
   onOpenSearch: () => void;
   onOpenContext: () => void;
-  onOpenSettings: () => void;
+  onOpenSettings?: () => void;
   onOpenGroupEdit?: () => void;
   onStartGroup: () => void;
   onStopGroup: () => void;
@@ -194,7 +194,7 @@ export function MobileMenuSheet({
               className={rowButtonClass}
               onClick={() => {
                 onClose();
-                onOpenSettings();
+                onOpenSettings?.();
               }}
               disabled={!selectedGroupId}
             >

@@ -48,8 +48,8 @@ from .toolspecs import MCP_TOOLS
 # ---------------------------------------------------------------------------
 from .handlers.cccc_core import (  # noqa: F401
     _CCCC_HELP_BUILTIN,
-    _append_runtime_help_addenda,
     _build_context_hygiene_hint,
+    _append_runtime_skill_digest,
     bootstrap,
     inbox_list,
     inbox_mark_all_read,
@@ -184,7 +184,7 @@ def _handle_cccc_namespace(name: str, arguments: Dict[str, Any]) -> Optional[Dic
                 pf = read_group_prompt_file(g, HELP_FILENAME)
                 if pf.found and isinstance(pf.content, str) and pf.content.strip():
                     help_result = {
-                        "markdown": _append_runtime_help_addenda(
+                        "markdown": _append_runtime_skill_digest(
                             _select_help_markdown(pf.content, role=role, actor_id=aid),
                             group_id=gid,
                             actor_id=aid,
@@ -193,7 +193,7 @@ def _handle_cccc_namespace(name: str, arguments: Dict[str, Any]) -> Optional[Dic
                     }
                 else:
                     help_result = {
-                        "markdown": _append_runtime_help_addenda(
+                        "markdown": _append_runtime_skill_digest(
                             _select_help_markdown(_CCCC_HELP_BUILTIN, role=role, actor_id=aid),
                             group_id=gid,
                             actor_id=aid,
@@ -202,7 +202,7 @@ def _handle_cccc_namespace(name: str, arguments: Dict[str, Any]) -> Optional[Dic
                     }
             else:
                 help_result = {
-                    "markdown": _append_runtime_help_addenda(
+                    "markdown": _append_runtime_skill_digest(
                         _select_help_markdown(_CCCC_HELP_BUILTIN, role=role, actor_id=aid),
                         group_id=gid,
                         actor_id=aid,
@@ -211,7 +211,7 @@ def _handle_cccc_namespace(name: str, arguments: Dict[str, Any]) -> Optional[Dic
                 }
         else:
             help_result = {
-                "markdown": _append_runtime_help_addenda(
+                "markdown": _append_runtime_skill_digest(
                     _select_help_markdown(_CCCC_HELP_BUILTIN, role=role, actor_id=aid),
                     group_id=gid,
                     actor_id=aid,
@@ -226,7 +226,6 @@ def _handle_cccc_namespace(name: str, arguments: Dict[str, Any]) -> Optional[Dic
                 help_result["context_hygiene"] = _build_context_hygiene_hint(
                     context=context_payload if isinstance(context_payload, dict) else {},
                     actor_id=aid,
-                    group_id=gid,
                 )
             except Exception:
                 pass
@@ -669,7 +668,6 @@ def _handle_cccc_namespace(name: str, arguments: Dict[str, Any]) -> Optional[Dic
                 by=by,
                 action=str(arguments.get("provider_action") or arguments.get("sub_action") or "status"),
                 timeout_seconds=timeout_seconds,
-                force_reauth=coerce_bool(arguments.get("force_reauth"), default=False),
             )
         if action == "provider_credential_status":
             by = _resolve_caller_from_by(arguments)
@@ -736,23 +734,6 @@ def _handle_cccc_namespace(name: str, arguments: Dict[str, Any]) -> Optional[Dic
 
 
 def _handle_context_namespace(name: str, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if name == "cccc_role_notes":
-        gid = _resolve_group_id(arguments)
-        by = _resolve_caller_from_by(arguments)
-        action = str(arguments.get("action") or "get").strip().lower()
-        target = str(arguments.get("target_actor_id") or "").strip() or None
-        if action == "get":
-            return role_notes_get(group_id=gid, caller_actor_id=by, target_actor_id=target)
-        if action == "set":
-            if not target:
-                raise MCPError(code="invalid_request", message="target_actor_id is required for set")
-            content = str(arguments.get("content") or "")
-            return role_notes_set(group_id=gid, target_actor_id=target, content=content, by=by)
-        if action == "clear":
-            if not target:
-                raise MCPError(code="invalid_request", message="target_actor_id is required for clear")
-            return role_notes_clear(group_id=gid, target_actor_id=target, by=by)
-        raise MCPError(code="invalid_request", message="cccc_role_notes action must be get|set|clear")
     return _handle_context_namespace_impl(
         name,
         arguments,

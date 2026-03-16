@@ -1,4 +1,4 @@
-"""Tests for the slimmed system prompt surface."""
+"""Tests for system prompt memory guidance (T099)."""
 
 import os
 import tempfile
@@ -6,7 +6,7 @@ import unittest
 
 
 class TestSystemPromptMemory(unittest.TestCase):
-    """System prompt should stay lean and route rich guidance elsewhere."""
+    """Test that memory policy lines appear in rendered system prompt."""
 
     def _with_home(self):
         old_home = os.environ.get("CCCC_HOME")
@@ -47,7 +47,7 @@ class TestSystemPromptMemory(unittest.TestCase):
         self.assertTrue(add.ok, getattr(add, "error", None))
         return gid, "agent1"
 
-    def test_prompt_routes_to_bootstrap_and_help(self) -> None:
+    def test_prompt_includes_memory_block(self) -> None:
         from cccc.kernel.actors import find_actor
         from cccc.kernel.group import load_group
         from cccc.kernel.system_prompt import render_system_prompt
@@ -73,14 +73,61 @@ class TestSystemPromptMemory(unittest.TestCase):
             self.assertIn("Once scope is approved, finish it end-to-end; do not ask to continue on obvious next steps.", prompt)
             self.assertIn("For strategy or scope discussion, align first; implement only after explicit action intent.", prompt)
 
-            self.assertNotIn("Memory:", prompt)
-            self.assertNotIn("state/memory/MEMORY.md + state/memory/daily/*.md", prompt)
-            self.assertNotIn("cccc_memory(action=search)", prompt)
-            self.assertNotIn("Planning gate (6D)", prompt)
-            self.assertNotIn("Todo discipline:", prompt)
-            self.assertNotIn("Gap policy:", prompt)
+            # Memory header
+            self.assertIn("Memory:", prompt)
+
+            # Memory vs short-term Context boundary
+            self.assertIn("Context agent state is short-term execution memory", prompt)
+            self.assertIn("state/memory/MEMORY.md + state/memory/daily/*.md", prompt)
+
+            # Core memory workflow mentioned
+            self.assertIn("cccc_memory(action=search)", prompt)
+            self.assertIn("cccc_memory(action=get)", prompt)
+            self.assertIn('cccc_memory(action="write", target="daily"|"memory", ...)', prompt)
+            self.assertIn('cccc_memory_admin(action="context_check")', prompt)
+            self.assertIn("Fact-Goal gate: strategy/scope discussion first; implement only after explicit action intent", prompt)
+            self.assertIn("Planning gate (6D) for non-trivial changes: value/ROI", prompt)
+            self.assertIn("Todo discipline: track every concrete or implicit user ask as a runtime todo", prompt)
+            self.assertIn("Reconcile the full current approved scope before implementation", prompt)
+            self.assertIn("Delivery rule: once implementation is approved, complete the agreed scope in one pass", prompt)
+            self.assertIn("Completion rule (current approved scope): report each in-scope ask as done/pending/blocked(owner)", prompt)
+            self.assertIn("Gap policy: info gap -> search evidence first", prompt)
+            self.assertIn("Prefer simplification/removal over stacking fallback patches", prompt)
         finally:
             cleanup()
+
+    def test_memory_block_before_group_space(self) -> None:
+        """Memory block appears before Group Space block in prompt."""
+        from cccc.kernel.system_prompt import _memory_policy_lines, _group_space_policy_lines
+
+        mem_lines = _memory_policy_lines("g_test")
+        self.assertGreater(len(mem_lines), 0)
+        self.assertEqual(mem_lines[0], "Memory:")
+
+    def test_memory_lines_empty_for_empty_group_id(self) -> None:
+        from cccc.kernel.system_prompt import _memory_policy_lines
+
+        lines = _memory_policy_lines("")
+        self.assertEqual(lines, [])
+
+    def test_memory_lines_content(self) -> None:
+        """Verify all key guidance points are present."""
+        from cccc.kernel.system_prompt import _memory_policy_lines
+
+        lines = _memory_policy_lines("g_test")
+        text = "\n".join(lines)
+
+        # Memory vs short-term Context boundary
+        self.assertIn("Context agent state is short-term execution memory", text)
+        self.assertIn("state/memory/MEMORY.md + state/memory/daily/*.md", text)
+
+        # Tool guidance
+        self.assertIn("cccc_memory(action=search)", text)
+        self.assertIn("cccc_memory(action=get)", text)
+        self.assertIn('cccc_memory(action="write", target="daily"|"memory", ...)', text)
+
+        # Lifecycle guidance
+        self.assertIn("Compaction path", text)
 
 
 if __name__ == "__main__":

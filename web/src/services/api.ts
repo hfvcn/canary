@@ -49,6 +49,10 @@ import type {
   PresentationWorkspaceItem,
   PresentationWorkspaceListing,
   PresentationBrowserSurfaceState,
+  WorkspaceEntry,
+  WorkspaceFile,
+  WorkspaceTaskList,
+  WorkspaceTree,
 } from "../types";
 import { actorProfileIdentityKey } from "../utils/actorProfiles";
 
@@ -447,6 +451,7 @@ function normalizeContext(raw: unknown): GroupContext {
   const summary = normalizeTaskSummary(record.tasks_summary, tasks);
   const boardRecord = asRecord(record.board);
   const attentionRecord = asRecord(record.attention);
+  const panoramaRecord = asRecord(record.panorama);
   const metaRecord = asRecord(record.meta);
 
   return {
@@ -504,6 +509,9 @@ function normalizeContext(raw: unknown): GroupContext {
         }
       : null,
     tasks_summary: summary,
+    panorama: {
+      mermaid: asOptionalString(panoramaRecord?.mermaid),
+    },
     meta: metaRecord ? { ...metaRecord } : {},
   };
 }
@@ -1086,6 +1094,113 @@ export async function attachScope(groupId: string, path: string) {
   });
 }
 
+export async function fetchWorkspaceTree(groupId: string, path: string = "", showHidden = false) {
+  const params = new URLSearchParams();
+  if (path) params.set("path", path);
+  if (showHidden) params.set("show_hidden", "true");
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return apiJson<WorkspaceTree>(
+    `/api/v1/groups/${encodeURIComponent(groupId)}/workspace/tree${suffix}`
+  );
+}
+
+export async function fetchWorkspaceFile(groupId: string, path: string) {
+  const params = new URLSearchParams({ path });
+  return apiJson<WorkspaceFile>(
+    `/api/v1/groups/${encodeURIComponent(groupId)}/workspace/file?${params.toString()}`
+  );
+}
+
+function appendWorkspaceAuthToken(params: URLSearchParams): void {
+  const token = getAuthToken();
+  if (token && !params.has("token")) {
+    params.set("token", token);
+  }
+}
+
+export function workspaceFileDownloadUrl(groupId: string, path: string): string {
+  const params = new URLSearchParams({ path });
+  appendWorkspaceAuthToken(params);
+  return `/api/v1/groups/${encodeURIComponent(groupId)}/workspace/download?${params.toString()}`;
+}
+
+export async function fetchWorkspaceTasks(groupId: string) {
+  return apiJson<WorkspaceTaskList>(
+    `/api/v1/groups/${encodeURIComponent(groupId)}/workspace/tasks`
+  );
+}
+
+export async function createWorkspaceFolder(groupId: string, args: {
+  parentPath?: string;
+  name: string;
+  kind?: "folder" | "task";
+}) {
+  return apiJson<{ item: WorkspaceEntry }>(
+    `/api/v1/groups/${encodeURIComponent(groupId)}/workspace/folders`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        parent_path: args.parentPath || "",
+        name: args.name,
+        kind: args.kind || "folder",
+        by: "user",
+      }),
+    }
+  );
+}
+
+export async function createWorkspaceFile(groupId: string, args: {
+  parentPath?: string;
+  name: string;
+  content?: string;
+}) {
+  return apiJson<{ item: WorkspaceEntry }>(
+    `/api/v1/groups/${encodeURIComponent(groupId)}/workspace/files`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        parent_path: args.parentPath || "",
+        name: args.name,
+        content: args.content || "",
+        by: "user",
+      }),
+    }
+  );
+}
+
+export async function updateWorkspaceFile(groupId: string, args: {
+  path: string;
+  content: string;
+}) {
+  return apiJson<{ file: WorkspaceFile }>(
+    `/api/v1/groups/${encodeURIComponent(groupId)}/workspace/file`,
+    {
+      method: "PUT",
+      body: JSON.stringify({
+        path: args.path,
+        content: args.content,
+        by: "user",
+      }),
+    }
+  );
+}
+
+export async function uploadWorkspaceFiles(groupId: string, args: {
+  parentPath?: string;
+  files: File[];
+}) {
+  const form = new FormData();
+  form.append("parent_path", args.parentPath || "");
+  form.append("by", "user");
+  for (const file of args.files) {
+    form.append("files", file);
+  }
+  return apiForm<{ items: WorkspaceEntry[] }>(
+    `/api/v1/groups/${encodeURIComponent(groupId)}/workspace/upload`,
+    form
+  );
+}
+
 export async function startGroup(groupId: string) {
   clearActorsReadOnlyRequest(groupId);
   clearGroupsReadRequest();
@@ -1295,8 +1410,6 @@ export async function addActor(
   envPrivate?: Record<string, string>,
   options?: {
     profileId?: string;
-    profileScope?: ProfileScope;
-    profileOwner?: string;
     title?: string;
     capabilityAutoload?: string[];
   }
@@ -1314,8 +1427,6 @@ export async function addActor(
       env: {},
       env_private: envPrivate && Object.keys(envPrivate).length ? envPrivate : undefined,
       profile_id: options?.profileId || undefined,
-      profile_scope: options?.profileScope || undefined,
-      profile_owner: options?.profileOwner || undefined,
       capability_autoload: Array.isArray(options?.capabilityAutoload)
         ? options?.capabilityAutoload
         : [],
@@ -2086,7 +2197,13 @@ export async function fetchIMStatus(groupId: string) {
 }
 
 export async function fetchIMConfig(groupId: string) {
-  return apiJson<{ im: IMConfig | null }>(`/api/im/config?group_id=${encodeURIComponent(groupId)}`);
+  return apiJson<{
+    im: IMConfig | null;
+    local_im?: IMConfig | null;
+    global_im?: IMConfig | null;
+    has_local_override?: boolean;
+    uses_global_defaults?: boolean;
+  }>(`/api/im/config?group_id=${encodeURIComponent(groupId)}`);
 }
 
 export async function setIMConfig(
@@ -2098,6 +2215,9 @@ export async function setIMConfig(
     feishu_domain?: string;
     feishu_app_id?: string;
     feishu_app_secret?: string;
+    feishu_message_style?: "text" | "card";
+    feishu_card_title?: string;
+    feishu_card_template_id?: string;
     dingtalk_app_key?: string;
     dingtalk_app_secret?: string;
     dingtalk_robot_code?: string;
@@ -2123,6 +2243,9 @@ export async function setIMConfig(
     body.feishu_domain = extra.feishu_domain;
     body.feishu_app_id = extra.feishu_app_id;
     body.feishu_app_secret = extra.feishu_app_secret;
+    body.feishu_message_style = extra.feishu_message_style;
+    body.feishu_card_title = extra.feishu_card_title;
+    body.feishu_card_template_id = extra.feishu_card_template_id;
   }
 
   // DingTalk uses app_key and app_secret
@@ -2142,6 +2265,56 @@ export async function setIMConfig(
     method: "POST",
     body: JSON.stringify(body),
   });
+}
+
+export async function fetchGlobalIMConfig() {
+  return apiJson<{ im: IMConfig | null }>("/api/v1/im/defaults");
+}
+
+export async function setGlobalIMConfig(
+  platform: IMPlatform,
+  botTokenEnv: string,
+  appTokenEnv?: string,
+  extra?: {
+    feishu_domain?: string;
+    feishu_app_id?: string;
+    feishu_app_secret?: string;
+    feishu_message_style?: "text" | "card";
+    feishu_card_title?: string;
+    feishu_card_template_id?: string;
+    dingtalk_app_key?: string;
+    dingtalk_app_secret?: string;
+    dingtalk_robot_code?: string;
+  }
+) {
+  const body: Record<string, unknown> = { platform };
+  if (platform === "telegram" || platform === "slack" || platform === "discord") {
+    body.bot_token_env = botTokenEnv;
+    if (platform === "slack" && appTokenEnv) {
+      body.app_token_env = appTokenEnv;
+    }
+  }
+  if (platform === "feishu" && extra) {
+    body.feishu_domain = extra.feishu_domain;
+    body.feishu_app_id = extra.feishu_app_id;
+    body.feishu_app_secret = extra.feishu_app_secret;
+    body.feishu_message_style = extra.feishu_message_style;
+    body.feishu_card_title = extra.feishu_card_title;
+    body.feishu_card_template_id = extra.feishu_card_template_id;
+  }
+  if (platform === "dingtalk" && extra) {
+    body.dingtalk_app_key = extra.dingtalk_app_key;
+    body.dingtalk_app_secret = extra.dingtalk_app_secret;
+    body.dingtalk_robot_code = extra.dingtalk_robot_code;
+  }
+  return apiJson("/api/v1/im/defaults", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function unsetGlobalIMConfig() {
+  return apiJson("/api/v1/im/defaults", { method: "DELETE" });
 }
 
 export async function unsetIMConfig(groupId: string) {
@@ -2749,9 +2922,8 @@ export async function checkGroupSpaceProviderHealth(provider: string = "notebook
 
 export async function controlGroupSpaceProviderAuth(args: {
   provider?: string;
-  action: "status" | "start" | "cancel" | "disconnect";
+  action: "status" | "start" | "cancel";
   timeoutSeconds?: number;
-  forceReauth?: boolean;
 }) {
   const provider = args.provider || "notebooklm";
   if (args.action === "status") {
@@ -2775,7 +2947,6 @@ export async function controlGroupSpaceProviderAuth(args: {
       by: "user",
       action: args.action,
       timeout_seconds: Number(args.timeoutSeconds || 900),
-      force_reauth: Boolean(args.forceReauth),
     }),
   });
 }

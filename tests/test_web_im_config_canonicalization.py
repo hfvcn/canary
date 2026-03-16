@@ -65,61 +65,62 @@ class TestWebImConfigCanonicalization(unittest.TestCase):
         _, cleanup = self._with_home()
         try:
             gid = self._create_group("im-cfg-canon")
-            with TestClient(create_app()) as client:
-                r1 = client.post(
-                    "/api/im/set",
-                    json={
-                        "group_id": gid,
-                        "platform": "telegram",
-                        "token_env": "TELEGRAM_BOT_TOKEN",
-                    },
-                )
-                self.assertEqual(r1.status_code, 200)
-                self.assertTrue(r1.json().get("ok"))
+            client = TestClient(create_app())
 
-                c1 = client.get(f"/api/im/config?group_id={gid}")
-                self.assertEqual(c1.status_code, 200)
-                im1 = ((c1.json().get("result") or {}).get("im") or {})
-                self.assertEqual(str(im1.get("platform") or ""), "telegram")
-                self.assertEqual(str(im1.get("bot_token_env") or ""), "TELEGRAM_BOT_TOKEN")
-                self.assertNotIn("token_env", im1)
+            r1 = client.post(
+                "/api/im/set",
+                json={
+                    "group_id": gid,
+                    "platform": "telegram",
+                    "token_env": "TELEGRAM_BOT_TOKEN",
+                },
+            )
+            self.assertEqual(r1.status_code, 200)
+            self.assertTrue(r1.json().get("ok"))
 
-                r2 = client.post(
-                    "/api/im/set",
-                    json={
-                        "group_id": gid,
-                        "platform": "telegram",
-                        "token_env": "raw-secret-token",
-                    },
-                )
-                self.assertEqual(r2.status_code, 200)
-                self.assertTrue(r2.json().get("ok"))
+            c1 = client.get(f"/api/im/config?group_id={gid}")
+            self.assertEqual(c1.status_code, 200)
+            im1 = ((c1.json().get("result") or {}).get("im") or {})
+            self.assertEqual(str(im1.get("platform") or ""), "telegram")
+            self.assertEqual(str(im1.get("bot_token_env") or ""), "TELEGRAM_BOT_TOKEN")
+            self.assertNotIn("token_env", im1)
 
-                c2 = client.get(f"/api/im/config?group_id={gid}")
-                self.assertEqual(c2.status_code, 200)
-                im2 = ((c2.json().get("result") or {}).get("im") or {})
-                self.assertEqual(str(im2.get("bot_token") or ""), "raw-secret-token")
-                self.assertNotIn("token", im2)
-                self.assertNotIn("token_env", im2)
+            r2 = client.post(
+                "/api/im/set",
+                json={
+                    "group_id": gid,
+                    "platform": "telegram",
+                    "token_env": "raw-secret-token",
+                },
+            )
+            self.assertEqual(r2.status_code, 200)
+            self.assertTrue(r2.json().get("ok"))
 
-                r3 = client.post(
-                    "/api/im/set",
-                    json={
-                        "group_id": gid,
-                        "platform": "slack",
-                        "token_env": "SLACK_BOT_TOKEN",
-                        "app_token_env": "SLACK_APP_TOKEN",
-                    },
-                )
-                self.assertEqual(r3.status_code, 200)
-                self.assertTrue(r3.json().get("ok"))
+            c2 = client.get(f"/api/im/config?group_id={gid}")
+            self.assertEqual(c2.status_code, 200)
+            im2 = ((c2.json().get("result") or {}).get("im") or {})
+            self.assertEqual(str(im2.get("bot_token") or ""), "raw-secret-token")
+            self.assertNotIn("token", im2)
+            self.assertNotIn("token_env", im2)
 
-                c3 = client.get(f"/api/im/config?group_id={gid}")
-                self.assertEqual(c3.status_code, 200)
-                im3 = ((c3.json().get("result") or {}).get("im") or {})
-                self.assertEqual(str(im3.get("platform") or ""), "slack")
-                self.assertEqual(str(im3.get("bot_token_env") or ""), "SLACK_BOT_TOKEN")
-                self.assertEqual(str(im3.get("app_token_env") or ""), "SLACK_APP_TOKEN")
+            r3 = client.post(
+                "/api/im/set",
+                json={
+                    "group_id": gid,
+                    "platform": "slack",
+                    "token_env": "SLACK_BOT_TOKEN",
+                    "app_token_env": "SLACK_APP_TOKEN",
+                },
+            )
+            self.assertEqual(r3.status_code, 200)
+            self.assertTrue(r3.json().get("ok"))
+
+            c3 = client.get(f"/api/im/config?group_id={gid}")
+            self.assertEqual(c3.status_code, 200)
+            im3 = ((c3.json().get("result") or {}).get("im") or {})
+            self.assertEqual(str(im3.get("platform") or ""), "slack")
+            self.assertEqual(str(im3.get("bot_token_env") or ""), "SLACK_BOT_TOKEN")
+            self.assertEqual(str(im3.get("app_token_env") or ""), "SLACK_APP_TOKEN")
         finally:
             cleanup()
 

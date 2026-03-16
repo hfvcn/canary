@@ -58,7 +58,7 @@ class PtySession:
         rows: int = 40,
     ) -> None:
         if not PTY_SUPPORTED:
-            raise RuntimeError(pty_support_error_message() or "PTY runner is not supported in this environment.")
+            raise RuntimeError("pty runner is not supported on this platform; install pywinpty for Windows ConPTY")
 
         self.group_id = group_id
         self.actor_id = actor_id

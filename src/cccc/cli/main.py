@@ -138,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_actor_add.add_argument("--title", default="", help="Display title (optional)")
     p_actor_add.add_argument(
         "--runtime",
-        choices=["claude", "codex", "droid", "amp", "auggie", "neovate", "gemini", "kimi", "custom"],
+        choices=["claude", "codex", "droid", "amp", "auggie", "neovate", "gemini", "cursor", "kilocode", "opencode", "copilot", "custom"],
         default="codex",
         help="Agent runtime (auto-sets command if not provided)",
     )
@@ -177,7 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_actor_update = actor_sub.add_parser("update", help="Update an actor (title/command/env/scope/enabled/runtime)")
     p_actor_update.add_argument("actor_id", help="Actor id")
     p_actor_update.add_argument("--title", default=None, help="New title")
-    p_actor_update.add_argument("--runtime", choices=["claude", "codex", "droid", "amp", "auggie", "neovate", "gemini", "kimi", "custom"], default=None, help="New runtime")
+    p_actor_update.add_argument("--runtime", choices=["claude", "codex", "droid", "amp", "auggie", "neovate", "gemini", "cursor", "kilocode", "opencode", "copilot", "custom"], default=None, help="New runtime")
     p_actor_update.add_argument("--command", default=None, help="Replace command (shell-like string); use empty to clear")
     p_actor_update.add_argument("--env", action="append", default=[], help="Replace env with these KEY=VAL entries (repeatable)")
     p_actor_update.add_argument("--scope", default="", help="Set default scope path (must be attached)")
@@ -229,7 +229,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Recipients/selectors (repeatable, supports comma-separated, e.g. --to peer-a --to @foreman,@peers)",
     )
-    p_send.add_argument("--priority", choices=["normal", "attention"], default="normal", help="Message mode")
+    p_send.add_argument("--priority", choices=["normal", "attention"], default="normal", help="Message priority")
     p_send.add_argument("--reply-required", action="store_true", help="Require recipients to reply")
     p_send.add_argument("--path", default="", help="Send message under this scope (path inside repo/scope)")
     p_send.set_defaults(func=cmd_send)
@@ -245,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Recipients (default: original sender); repeatable, comma-separated",
     )
-    p_reply.add_argument("--priority", choices=["normal", "attention"], default="normal", help="Message mode")
+    p_reply.add_argument("--priority", choices=["normal", "attention"], default="normal", help="Message priority")
     p_reply.add_argument("--reply-required", action="store_true", help="Require recipients to reply")
     p_reply.set_defaults(func=cmd_reply)
 
@@ -354,7 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_setup = sub.add_parser("setup", help="Setup MCP for agent runtimes (configure MCP, print guidance)")
     p_setup.add_argument(
         "--runtime",
-        choices=["claude", "codex", "droid", "amp", "auggie", "neovate", "gemini", "kimi", "custom"],
+        choices=["claude", "codex", "droid", "amp", "auggie", "neovate", "gemini", "cursor", "kilocode", "opencode", "copilot", "custom"],
         default="",
         help="Target runtime (default: all supported runtimes)",
     )
@@ -422,22 +422,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=900,
         help="Auth flow timeout seconds (60-1800, default: 900)",
     )
-    p_space_auth_start.add_argument(
-        "--force-reauth",
-        action="store_true",
-        help="Force browser-based account switch instead of reusing a saved Google credential",
-    )
     p_space_auth_start.set_defaults(func=cmd_space_auth_start)
 
     p_space_auth_cancel = space_auth_sub.add_parser("cancel", help="Cancel provider auth flow")
     p_space_auth_cancel.add_argument("--provider", choices=["notebooklm"], default="notebooklm", help="Provider (default: notebooklm)")
     p_space_auth_cancel.add_argument("--by", default="user", help="Requester (default: user)")
     p_space_auth_cancel.set_defaults(func=cmd_space_auth_cancel)
-
-    p_space_auth_disconnect = space_auth_sub.add_parser("disconnect", help="Disconnect stored provider auth and clear local browser session")
-    p_space_auth_disconnect.add_argument("--provider", choices=["notebooklm"], default="notebooklm", help="Provider (default: notebooklm)")
-    p_space_auth_disconnect.add_argument("--by", default="user", help="Requester (default: user)")
-    p_space_auth_disconnect.set_defaults(func=cmd_space_auth_disconnect)
 
     p_space_bind = space_sub.add_parser("bind", help="Bind group to a provider remote space")
     p_space_bind.add_argument("remote_space_id", nargs="?", default="", help="Provider remote space/notebook ID (optional; auto-create when omitted)")

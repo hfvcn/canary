@@ -8,8 +8,10 @@ class TestPromptDefaults(unittest.TestCase):
         from cccc.kernel.prompt_files import DEFAULT_PREAMBLE_BODY
 
         body = str(DEFAULT_PREAMBLE_BODY or "")
-        self.assertIn("Startup routes:", body)
-        self.assertIn("Working stance:", body)
+        self.assertIn("Quick start:", body)
+        self.assertIn("Execution checklist:", body)
+        self.assertIn("Gap routing:", body)
+        self.assertIn("Memory boundary:", body)
         self.assertIn("cccc_bootstrap", body)
         self.assertIn("context_hygiene", body)
         self.assertIn("cccc_help", body)
@@ -25,11 +27,9 @@ class TestPromptDefaults(unittest.TestCase):
         from cccc.kernel.prompt_files import DEFAULT_PREAMBLE_BODY
 
         body = str(DEFAULT_PREAMBLE_BODY or "")
-        self.assertNotIn("Execution checklist:", body)
-        self.assertNotIn("Gap routing:", body)
-        self.assertNotIn("Memory boundary:", body)
-        self.assertNotIn("cccc_capability_search", body)
-        self.assertNotIn("cccc_agent_state(action=update", body)
+        self.assertNotIn("Todo loop (runtime-first):", body)
+        self.assertNotIn("Completion gate: no full-done summary", body)
+        self.assertNotIn("For non-trivial plans, run a 6D check", body)
 
     def test_builtin_help_is_compact(self) -> None:
         from cccc.kernel.prompt_files import load_builtin_help_markdown

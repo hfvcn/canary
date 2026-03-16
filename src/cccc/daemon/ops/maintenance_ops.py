@@ -88,6 +88,8 @@ def handle_send_cross_group(
     dst_group_id = str(args.get("dst_group_id") or "").strip()
     text = str(args.get("text") or "")
     by = str(args.get("by") or "user").strip() or "user"
+    sender_user_id = str(args.get("sender_user_id") or "").strip()
+    sender_is_admin = bool(args.get("sender_is_admin", False))
     priority = str(args.get("priority") or "normal").strip() or "normal"
     reply_required = coerce_bool(args.get("reply_required"), default=False)
     to_raw = args.get("to")
@@ -135,6 +137,8 @@ def handle_send_cross_group(
             "reply_required": reply_required,
             "dst_group_id": dst_group_id,
             "dst_to": dst_to_canon,
+            "sender_user_id": sender_user_id,
+            "sender_is_admin": sender_is_admin,
         },
     )
     if not src_resp.ok:
@@ -156,6 +160,8 @@ def handle_send_cross_group(
             "reply_required": reply_required,
             "src_group_id": src_group_id,
             "src_event_id": src_event_id,
+            "sender_user_id": sender_user_id,
+            "sender_is_admin": sender_is_admin,
         },
     )
     if not dst_resp.ok:

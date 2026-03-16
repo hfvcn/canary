@@ -253,12 +253,16 @@ export function useSSE({ activeTabRef, chatAtBottomRef, actorsRef }: UseSSEOptio
         appendEvent(ev, groupId);
 
         // Reconcile outbox: when a user's chat.message arrives via SSE,
-        // remove only the exact optimistic entry that produced this canonical event.
+        // remove matching outbox entries to prevent optimistic/canonical double-display.
         if (isChatMessageEvent(ev) && String(ev.by || "") === "user") {
-          const msgData = ev.data && typeof ev.data === "object" ? (ev.data as { client_id?: unknown }) : null;
-          const clientId = msgData && typeof msgData.client_id === "string" ? msgData.client_id.trim() : "";
-          if (clientId) {
-            useChatOutboxStore.getState().remove(groupId, clientId);
+          const outboxState = useChatOutboxStore.getState();
+          const pending = outboxState.entriesByGroup[groupId];
+          if (pending && pending.length > 0) {
+            // Remove the oldest pending entry (FIFO: the SSE event corresponds to the first pending send)
+            const oldest = pending.find((e) => e.status === "pending");
+            if (oldest) {
+              outboxState.remove(groupId, oldest.localId);
+            }
           }
         }
 

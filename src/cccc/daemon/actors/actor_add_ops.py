@@ -11,9 +11,7 @@ from ...kernel.inbox import set_cursor
 from ...kernel.ledger import append_event
 from ...kernel.permissions import require_actor_permission
 from ...kernel.runtime import get_runtime_command_with_flags
-from ...util.conv import coerce_bool
-from .actor_profile_runtime import actor_profile_ref, apply_profile_link_to_actor
-from .actor_profile_store import ProfileResolver, get_actor_profile_by_ref, normalize_actor_profile_ref
+from .actor_profile_runtime import apply_profile_link_to_actor
 
 
 def _error(code: str, message: str, *, details: Optional[Dict[str, Any]] = None) -> DaemonResponse:
@@ -35,7 +33,7 @@ def handle_actor_add(
     private_env_max_keys: int,
     supported_runtimes: Sequence[str],
     get_actor_profile: Callable[[str], Optional[Dict[str, Any]]],
-    load_actor_profile_secrets: Callable[[Any], Dict[str, str]],
+    load_actor_profile_secrets: Callable[[str], Dict[str, str]],
 ) -> DaemonResponse:
     group_id = str(args.get("group_id") or "").strip()
     actor_id = str(args.get("actor_id") or "").strip()
@@ -81,7 +79,6 @@ def handle_actor_add(
 
         linked_profile: Optional[Dict[str, Any]] = None
         linked_profile_id = ""
-        linked_profile_ref: Any = None
         if profile_id:
             linked_profile_ref = normalize_actor_profile_ref(
                 {
@@ -102,7 +99,7 @@ def handle_actor_add(
             runtime = str(linked_profile.get("runtime") or "codex").strip() or "codex"
             requested_runner = str(linked_profile.get("runner") or "pty").strip() or "pty"
             submit = str(linked_profile.get("submit") or submit or "enter").strip() or "enter"
-            linked_profile_secrets = load_actor_profile_secrets(linked_profile_ref)
+            linked_profile_secrets = load_actor_profile_secrets(linked_profile_id)
             if len(linked_profile_secrets) > private_env_max_keys:
                 raise ValueError("too many profile private env keys configured")
 

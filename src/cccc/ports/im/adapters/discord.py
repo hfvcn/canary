@@ -276,14 +276,7 @@ class DiscordAdapter(IMAdapter):
             self._log(f"[warn] Channel {chat_id} not found (cache miss + fetch failed: {e})")
             return None
 
-    def send_message(
-        self,
-        chat_id: str,
-        text: str,
-        thread_id: Optional[int] = None,
-        *,
-        mention_user_ids: Optional[List[str]] = None,
-    ) -> bool:
+    def send_message(self, chat_id: str, text: str, thread_id: Optional[int] = None) -> bool:
         """
         Send a message to a Discord channel.
         """

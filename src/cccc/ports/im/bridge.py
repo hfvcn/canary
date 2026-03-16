@@ -25,6 +25,7 @@ from ...kernel.actors import list_actors, resolve_recipient_tokens
 from ...kernel.blobs import resolve_blob_attachment_path, store_blob_bytes
 from ...kernel.group import Group, load_group
 from ...kernel.messaging import disabled_recipient_actor_ids, get_default_send_to
+from ...kernel.settings import get_im_defaults
 from ...paths import ensure_home
 from ...util.conv import coerce_bool
 from .adapters.base import IMAdapter, OutboundStreamHandle
@@ -39,7 +40,7 @@ from .commands import (
     format_status,
     parse_message,
 )
-from .config_schema import canonicalize_im_config
+from .config_schema import resolve_im_config
 from .auth import KeyManager
 from .subscribers import SubscriberManager
 from ...util.file_lock import LockUnavailableError, acquire_lockfile
@@ -259,11 +260,13 @@ class IMBridge:
         adapter: IMAdapter,
         log_path: Optional[Path] = None,
         skip_pending_on_start: bool = False,
+        im_config: Optional[Dict[str, Any]] = None,
     ):
         self.group = group
         self.adapter = adapter
         self.log_path = log_path
         self.skip_pending_on_start = skip_pending_on_start
+        self.im_config = dict(im_config or {})
 
         self.subscribers = SubscriberManager(group.path / "state")
         self.key_manager = KeyManager(group.path / "state")
@@ -813,7 +816,7 @@ class IMBridge:
             # Try file delivery first (if any attachments)
             sent_any_file = False
             delivered_user_facing = False
-            file_cfg = (self.group.doc.get("im") or {}) if isinstance(self.group.doc.get("im"), dict) else {}
+            file_cfg = self.im_config
             files_cfg = file_cfg.get("files") if isinstance(file_cfg.get("files"), dict) else {}
             files_enabled = coerce_bool(files_cfg.get("enabled"), default=True)
             platform = str(getattr(self.adapter, "platform", "") or "").strip().lower()
@@ -865,18 +868,8 @@ class IMBridge:
                             delivered_user_facing = True
 
             # If we didn't send any files, or if there's text with no files, send message.
-            if formatted and not sent_any_file and not skip_text_due_to_stream:
-                if mention_user_ids is None:
-                    sent_msg = bool(self.adapter.send_message(sub.chat_id, formatted, thread_id=sub.thread_id))
-                else:
-                    sent_msg = bool(
-                        self.adapter.send_message(
-                            sub.chat_id,
-                            formatted,
-                            thread_id=sub.thread_id,
-                            mention_user_ids=mention_user_ids,
-                        )
-                    )
+            if formatted and not sent_any_file:
+                sent_msg = bool(self.adapter.send_message(sub.chat_id, formatted, thread_id=sub.thread_id))
                 if sent_msg and is_user_facing:
                     delivered_user_facing = True
 
@@ -969,9 +962,6 @@ class IMBridge:
 
     def _handle_unsubscribe(self, chat_id: str, thread_id: int = 0) -> None:
         """Handle /unsubscribe command — also revokes authorization so re-subscribe requires key."""
-        # Reload auth state — authorization may have been granted by the daemon
-        # process (im_bind_chat), so in-memory _authorized can be stale.
-        self.key_manager._load()
         was_subscribed = self.subscribers.unsubscribe(chat_id, thread_id=thread_id)
         self.key_manager.revoke(chat_id, thread_id)
         if was_subscribed:
@@ -1239,7 +1229,7 @@ class IMBridge:
             self._log(f"[message] chat={chat_id} thread={thread_id} auto-wake candidates: {disabled_matches}")
 
         # File settings (only after recipients are validated)
-        im_cfg = group.doc.get("im") if isinstance(group.doc.get("im"), dict) else {}
+        im_cfg = self.im_config
         files_cfg = im_cfg.get("files") if isinstance(im_cfg.get("files"), dict) else {}
         files_enabled = coerce_bool(files_cfg.get("enabled"), default=True)
         platform = str(getattr(self.adapter, "platform", "") or "").strip().lower()
@@ -1339,8 +1329,8 @@ def start_bridge(group_id: str, platform: str = "telegram") -> None:
         print(f"[error] Group not found: {group_id}")
         sys.exit(1)
 
-    # Get IM config from group
-    im_config = canonicalize_im_config(group.doc.get("im", {}))
+    # Get effective IM config from group-local overrides + global defaults.
+    im_config = resolve_im_config(group.doc.get("im", {}), get_im_defaults())
     if not im_config:
         print(f"[error] No IM configuration for group {group_id}")
         print("Run: cccc im set telegram --group " + group_id)
@@ -1561,6 +1551,17 @@ def start_bridge(group_id: str, platform: str = "telegram") -> None:
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(os.getpid()), encoding="utf-8")
 
+    feishu_card_context_path = ""
+    active_scope_key = str(group.doc.get("active_scope_key") or "").strip()
+    scopes = group.doc.get("scopes") if isinstance(group.doc.get("scopes"), list) else []
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        if str(scope.get("scope_key") or "").strip() != active_scope_key:
+            continue
+        feishu_card_context_path = str(scope.get("url") or "").strip()
+        break
+
     # Create adapter
     if platform.lower() == "telegram":
         adapter = TelegramAdapter(token=bot_token, log_path=log_path)
@@ -1575,6 +1576,10 @@ def start_bridge(group_id: str, platform: str = "telegram") -> None:
             app_secret=feishu_app_secret,
             domain=str(im_config.get("feishu_domain") or "https://open.feishu.cn"),
             log_path=log_path,
+            message_style=str(im_config.get("feishu_message_style") or "text"),
+            card_title=str(im_config.get("feishu_card_title") or ""),
+            card_template_id=str(im_config.get("feishu_card_template_id") or ""),
+            card_context_path=feishu_card_context_path,
         )
     elif platform.lower() == "dingtalk":
         from .adapters.dingtalk import DingTalkAdapter
@@ -1606,6 +1611,7 @@ def start_bridge(group_id: str, platform: str = "telegram") -> None:
         adapter=adapter,
         log_path=log_path,
         skip_pending_on_start=skip_pending,
+        im_config=im_config,
     )
 
     # Setup signal handlers

@@ -35,7 +35,6 @@ from ...providers.notebooklm.health import notebooklm_health_check, parse_notebo
 from ..messaging.delivery import emit_system_notify
 from .notebooklm_auth_flow import (
     cancel_notebooklm_auth_flow,
-    disconnect_notebooklm_auth_flow,
     get_notebooklm_auth_flow_status,
     start_notebooklm_auth_flow,
 )
@@ -44,12 +43,7 @@ from .group_space_memory_sync import (
     summarize_memory_notebooklm_sync,
     sync_memory_daily_files,
 )
-from .group_space_sync import (
-    group_space_local_file_policy,
-    mark_group_space_sync_pending,
-    read_group_space_sync_state,
-    sync_group_space_files,
-)
+from .group_space_sync import group_space_local_file_policy, read_group_space_sync_state, sync_group_space_files
 from .group_space_projection import sync_group_space_projection
 from .group_space_runtime import acquire_space_provider_write, execute_space_job, retry_space_job, run_space_query
 from .group_space_store import (
@@ -105,7 +99,7 @@ _SPACE_ARTIFACT_KIND_ALIASES = {
     "summary": "report",
     "briefing": "report",
 }
-_SPACE_PROVIDER_AUTH_ACTIONS = {"status", "start", "cancel", "disconnect"}
+_SPACE_PROVIDER_AUTH_ACTIONS = {"status", "start", "cancel"}
 _SPACE_PROVIDER_SECRET_KEYS = {"notebooklm": "NOTEBOOKLM_AUTH_JSON"}
 _SPACE_RESOURCE_INGEST_TYPES = {
     "file",
@@ -124,29 +118,6 @@ _GENERATE_LANES: Dict[str, "_GenerateLaneState"] = {}
 _GENERATE_LANES_LOCK = threading.Lock()
 _DEFAULT_QUERY_RETRY_AFTER_SECONDS = 2
 _DEFAULT_GENERATE_RETRY_AFTER_SECONDS = 5
-
-
-def _artifact_wait_guidance_text() -> str:
-    return (
-        "Do not poll in a loop. Wait for system.notify, continue other work or standby, "
-        "and only set one one-shot reminder if this result blocks delivery and nothing else can proceed."
-    )
-
-
-def _artifact_notify_recommended_action(*, ok: bool, output_path: str) -> str:
-    if ok:
-        if str(output_path or "").strip():
-            return "use_output_path"
-        return "download_or_list_artifact"
-    return "report_failure_or_fallback"
-
-
-def _artifact_completion_guidance(*, ok: bool, output_path: str) -> str:
-    if ok:
-        if str(output_path or "").strip():
-            return "Artifact is ready. Use output_path from this notify context directly and do not poll again."
-        return "Artifact is ready. If you still need the file, do one direct fetch step and do not poll again."
-    return "Artifact generation failed. Stop polling, switch to a fallback path, or report the failure clearly."
 _DEFAULT_ASYNC_GENERATE_WAIT_TIMEOUT_SECONDS = 7200.0
 
 
@@ -577,20 +548,8 @@ def _release_query_slot(*, lane_key: str) -> None:
 
 
 def _latest_context_sync_at(*, group_id: str, provider: str) -> str:
-    binding = get_space_binding(group_id, provider=provider, lane="work") or {}
-    binding_status = str(binding.get("status") or "").strip().lower()
-    bound_remote_id = str(binding.get("remote_space_id") or "").strip()
-    if binding_status != "bound" or not bound_remote_id:
-        return ""
     fallback = ""
-    for item in list_space_jobs(
-        group_id=group_id,
-        provider=provider,
-        lane="work",
-        state="",
-        remote_space_id=bound_remote_id,
-        limit=20,
-    ):
+    for item in list_space_jobs(group_id=group_id, provider=provider, lane="work", state="", limit=20):
         if not isinstance(item, dict):
             continue
         if str(item.get("kind") or "").strip() != "context_sync":
@@ -643,104 +602,6 @@ def _explicit_source_basis_hint(*, requested_source_ids: List[str], referenced_s
     return ""
 
 
-def _neutral_work_sync_state(
-    *,
-    group_id: str,
-    provider: str,
-    raw_state: Dict[str, Any],
-    remote_space_id: str,
-    reason: str,
-) -> Dict[str, Any]:
-    state = dict(raw_state) if isinstance(raw_state, dict) else {}
-    return {
-        "available": bool(state.get("available")),
-        "reason": str(reason or "").strip(),
-        "space_root": str(state.get("space_root") or ""),
-        "group_id": str(state.get("group_id") or group_id or ""),
-        "provider": str(state.get("provider") or provider or "notebooklm"),
-        "remote_space_id": str(remote_space_id or ""),
-        "last_run_at": "",
-        "converged": False,
-        "unsynced_count": 0,
-        "failed_count": 0,
-        "failed_items": [],
-        "uploaded": 0,
-        "updated": 0,
-        "deleted": 0,
-        "reused": 0,
-        "remote_sources": 0,
-        "materialized_sources": 0,
-        "remote_artifacts": 0,
-        "downloaded_artifacts": 0,
-        "pruned_artifacts": 0,
-        "last_error": "",
-        "failure_signature": "",
-        "last_fingerprint": {},
-        "errors": [],
-    }
-
-
-def _live_work_sync_state(*, group_id: str, provider: str, binding: Dict[str, Any]) -> Dict[str, Any]:
-    raw_state = read_group_space_sync_state(group_id)
-    if not bool(raw_state.get("available")):
-        return raw_state
-
-    binding_status = str(binding.get("status") or "").strip().lower()
-    bound_remote_id = str(binding.get("remote_space_id") or "").strip()
-    if binding_status != "bound" or not bound_remote_id:
-        return _neutral_work_sync_state(
-            group_id=group_id,
-            provider=provider,
-            raw_state=raw_state,
-            remote_space_id="",
-            reason="work_lane_unbound",
-        )
-
-    raw_remote_id = str(raw_state.get("remote_space_id") or "").strip()
-    if raw_remote_id != bound_remote_id:
-        return _neutral_work_sync_state(
-            group_id=group_id,
-            provider=provider,
-            raw_state=raw_state,
-            remote_space_id=bound_remote_id,
-            reason=("sync_state_not_ready" if not raw_remote_id else "binding_remote_mismatch"),
-        )
-    return raw_state
-
-
-def _live_work_queue_summary(*, group_id: str, provider: str, binding: Dict[str, Any]) -> Dict[str, Any]:
-    binding_status = str(binding.get("status") or "").strip().lower()
-    bound_remote_id = str(binding.get("remote_space_id") or "").strip()
-    if binding_status != "bound" or not bound_remote_id:
-        return {"pending": 0, "running": 0, "failed": 0}
-    return space_queue_summary(
-        group_id=group_id,
-        provider=provider,
-        lane="work",
-        remote_space_id=bound_remote_id,
-    )
-
-
-def _cancel_stale_pending_work_jobs(*, group_id: str, provider: str, current_remote_space_id: str = "") -> int:
-    keep_remote_id = str(current_remote_space_id or "").strip()
-    canceled = 0
-    for item in list_space_jobs(group_id=group_id, provider=provider, lane="work", state="pending", limit=500):
-        if not isinstance(item, dict):
-            continue
-        remote_space_id = str(item.get("remote_space_id") or "").strip()
-        if keep_remote_id and remote_space_id == keep_remote_id:
-            continue
-        job_id = str(item.get("job_id") or "").strip()
-        if not job_id:
-            continue
-        try:
-            cancel_space_job(job_id)
-            canceled += 1
-        except Exception:
-            continue
-    return canceled
-
-
 def _build_space_query_diagnostics(
     *,
     group_id: str,
@@ -769,7 +630,7 @@ def _build_space_query_diagnostics(
     )
     if lane == "work":
         latest_context_sync_at = _latest_context_sync_at(group_id=group_id, provider=provider)
-        sync_state = _live_work_sync_state(group_id=group_id, provider=provider, binding=binding)
+        sync_state = read_group_space_sync_state(group_id)
         has_sync_state = bool(sync_state.get("available")) or any(
             key in sync_state for key in ("remote_sources", "materialized_sources")
         )
@@ -891,18 +752,10 @@ def _emit_artifact_async_notify(
         if group is None:
             return
         title = "Group Space artifact ready" if ok else "Group Space artifact failed"
-        recommended_next_action = _artifact_notify_recommended_action(ok=ok, output_path=output_path)
-        completion_guidance = _artifact_completion_guidance(ok=ok, output_path=output_path)
         if ok:
-            if str(output_path or "").strip():
-                message = f"{kind} generation completed. Use output_path from context; no extra polling is needed."
-            else:
-                message = f"{kind} generation completed. No extra polling is needed."
+            message = f"{kind} generation completed."
         else:
-            message = (
-                f"{kind} generation failed: {error_message or error_code or 'unknown error'}. "
-                "Stop polling and switch to a fallback or report the failure."
-            )
+            message = f"{kind} generation failed: {error_message or error_code or 'unknown error'}"
         context = {
             "group_id": str(group_id or ""),
             "provider": str(provider or "notebooklm"),
@@ -910,10 +763,6 @@ def _emit_artifact_async_notify(
             "task_id": str(task_id or ""),
             "status": str(status or ""),
             "output_path": str(output_path or ""),
-            "completion_signal": "system.notify",
-            "polling_discouraged": True,
-            "recommended_next_action": recommended_next_action,
-            "completion_guidance": completion_guidance,
             "error": {"code": str(error_code or ""), "message": str(error_message or "")},
         }
         notify = SystemNotifyData(
@@ -1309,10 +1158,8 @@ def handle_group_space_status(args: Dict[str, Any]) -> DaemonResponse:
         provider_state = get_space_provider_state(provider)
         provider_state.update(_provider_runtime_readiness(provider))
         bindings = get_space_bindings(group.group_id, provider=provider)
-        work_binding = bindings.get("work") if isinstance(bindings.get("work"), dict) else {}
         summary = space_queue_summaries(group_id=group.group_id, provider=provider)
-        summary["work"] = _live_work_queue_summary(group_id=group.group_id, provider=provider, binding=work_binding)
-        sync_state = _live_work_sync_state(group_id=group.group_id, provider=provider, binding=work_binding)
+        sync_state = read_group_space_sync_state(group.group_id)
         memory_binding = bindings.get("memory") if isinstance(bindings.get("memory"), dict) else {}
         return DaemonResponse(
             ok=True,
@@ -1410,12 +1257,21 @@ def handle_group_space_bind(args: Dict[str, Any]) -> DaemonResponse:
                 by=by,
                 status="bound",
             )
-            if lane == "work":
-                _cancel_stale_pending_work_jobs(
-                    group_id=group.group_id,
-                    provider=provider,
-                    current_remote_space_id=remote_space_id,
-                )
+            provider_state = set_space_provider_state(
+                provider,
+                enabled=True,
+                mode="degraded",
+                last_error=f"binding {lane} lane",
+                touch_health=True,
+            )
+            try:
+                if lane == "work":
+                    sync_result = sync_group_space_files(group.group_id, provider=provider, force=True, by=by)
+                else:
+                    sync_result = sync_memory_daily_files(group.group_id, provider=provider, force=False, by=by)
+            except Exception as e:
+                sync_result = {"ok": False, "code": "space_sync_failed", "message": str(e)}
+            if isinstance(sync_result, dict) and bool(sync_result.get("ok")):
                 provider_state = set_space_provider_state(
                     provider,
                     enabled=True,
@@ -1423,61 +1279,17 @@ def handle_group_space_bind(args: Dict[str, Any]) -> DaemonResponse:
                     last_error="",
                     touch_health=True,
                 )
-                current_sync_state = read_group_space_sync_state(group.group_id)
-                current_sync_remote_id = str(current_sync_state.get("remote_space_id") or "").strip()
-                if current_sync_remote_id and current_sync_remote_id == remote_space_id:
-                    sync_result = {
-                        "ok": True,
-                        "deferred": True,
-                        "reason": "background_sync",
-                        "remote_space_id": remote_space_id,
-                    }
-                else:
-                    pending_state = mark_group_space_sync_pending(
-                        group.group_id,
-                        provider=provider,
-                        remote_space_id=remote_space_id,
-                    )
-                    sync_result = {
-                        "ok": True,
-                        "deferred": True,
-                        "reason": "background_sync",
-                        "remote_space_id": remote_space_id,
-                        "state": pending_state,
-                    }
             else:
+                last_error = str((sync_result or {}).get("message") or f"{lane} lane sync failed")
                 provider_state = set_space_provider_state(
                     provider,
                     enabled=True,
                     mode="degraded",
-                    last_error=f"binding {lane} lane",
+                    last_error=last_error,
                     touch_health=True,
                 )
-                try:
-                    sync_result = sync_memory_daily_files(group.group_id, provider=provider, force=False, by=by)
-                except Exception as e:
-                    sync_result = {"ok": False, "code": "space_sync_failed", "message": str(e)}
-                if isinstance(sync_result, dict) and bool(sync_result.get("ok")):
-                    provider_state = set_space_provider_state(
-                        provider,
-                        enabled=True,
-                        mode="active",
-                        last_error="",
-                        touch_health=True,
-                    )
-                else:
-                    last_error = str((sync_result or {}).get("message") or f"{lane} lane sync failed")
-                    provider_state = set_space_provider_state(
-                        provider,
-                        enabled=True,
-                        mode="degraded",
-                        last_error=last_error,
-                        touch_health=True,
-                    )
         else:
             binding = set_space_binding_unbound(group.group_id, provider=provider, lane=lane, by=by)
-            if lane == "work":
-                _cancel_stale_pending_work_jobs(group_id=group.group_id, provider=provider)
             has_any_bound = any(
                 str(item.get("status") or "") == "bound" and str(item.get("remote_space_id") or "").strip()
                 for item in list_space_bindings(provider)
@@ -1493,11 +1305,9 @@ def handle_group_space_bind(args: Dict[str, Any]) -> DaemonResponse:
                     touch_health=True,
                 )
         bindings = get_space_bindings(group.group_id, provider=provider)
-        work_binding = bindings.get("work") if isinstance(bindings.get("work"), dict) else {}
         summary = space_queue_summaries(group_id=group.group_id, provider=provider)
-        summary["work"] = _live_work_queue_summary(group_id=group.group_id, provider=provider, binding=work_binding)
         _sync_projection_best_effort(group.group_id, provider)
-        sync_state = _live_work_sync_state(group_id=group.group_id, provider=provider, binding=work_binding)
+        sync_state = read_group_space_sync_state(group.group_id)
         memory_binding = bindings.get("memory") if isinstance(bindings.get("memory"), dict) else {}
         return DaemonResponse(
             ok=True,
@@ -1983,11 +1793,6 @@ def handle_group_space_artifact(args: Dict[str, Any]) -> DaemonResponse:
                     "wait": False,
                     "queued": True,
                     "accepted": True,
-                    "background": True,
-                    "completion_signal": "system.notify",
-                    "recommended_next_action": "wait_for_notify",
-                    "polling_discouraged": True,
-                    "wait_guidance": _artifact_wait_guidance_text(),
                     "saved_to_space": False,
                     "output_path": "",
                     "generate_result": {},
@@ -2015,11 +1820,6 @@ def handle_group_space_artifact(args: Dict[str, Any]) -> DaemonResponse:
                     "wait": False,
                     "queued": False,
                     "accepted": True,
-                    "background": True,
-                    "completion_signal": "system.notify",
-                    "recommended_next_action": "wait_for_notify",
-                    "polling_discouraged": True,
-                    "wait_guidance": _artifact_wait_guidance_text(),
                     "saved_to_space": False,
                     "output_path": "",
                     "generate_result": {},
@@ -2244,14 +2044,13 @@ def handle_group_space_sync(args: Dict[str, Any]) -> DaemonResponse:
         action = _sync_action_or_error(action_raw)
         if action == "status":
             if lane == "work":
-                binding = get_space_binding(group.group_id, provider=provider, lane="work") or {}
                 return DaemonResponse(
                     ok=True,
                     result={
                         "group_id": group.group_id,
                         "provider": provider,
                         "lane": lane,
-                        "sync": _live_work_sync_state(group_id=group.group_id, provider=provider, binding=binding),
+                        "sync": read_group_space_sync_state(group.group_id),
                     },
                 )
             binding = get_space_binding(group.group_id, provider=provider, lane="memory") or {}
@@ -2283,8 +2082,8 @@ def handle_group_space_sync(args: Dict[str, Any]) -> DaemonResponse:
                 str(result.get("message") or "group space sync failed"),
                 details=result,
             )
-        binding = get_space_binding(group.group_id, provider=provider, lane=("work" if lane == "work" else "memory")) or {}
-        sync_payload = _live_work_sync_state(group_id=group.group_id, provider=provider, binding=binding) if lane == "work" else read_memory_notebooklm_sync_state(
+        binding = get_space_binding(group.group_id, provider=provider, lane="memory") or {}
+        sync_payload = read_group_space_sync_state(group.group_id) if lane == "work" else read_memory_notebooklm_sync_state(
             group.group_id,
             remote_space_id=str(binding.get("remote_space_id") or ""),
         )
@@ -2425,7 +2224,6 @@ def handle_group_space_provider_auth(args: Dict[str, Any]) -> DaemonResponse:
     by = str(args.get("by") or "user").strip() or "user"
     action_raw = args.get("action")
     timeout_seconds = int(args.get("timeout_seconds") or 900)
-    force_reauth = bool(args.get("force_reauth") is True)
     if not _is_user_writer(by):
         return _error("space_permission_denied", "only user can run provider auth flow")
     try:
@@ -2434,21 +2232,9 @@ def handle_group_space_provider_auth(args: Dict[str, Any]) -> DaemonResponse:
             return _error("space_job_invalid", f"unsupported provider auth flow: {provider}")
         action = _provider_auth_action_or_error(action_raw)
         if action == "start":
-            auth = start_notebooklm_auth_flow(
-                timeout_seconds=timeout_seconds,
-                force_reauth=force_reauth,
-            )
+            auth = start_notebooklm_auth_flow(timeout_seconds=timeout_seconds)
         elif action == "cancel":
             auth = cancel_notebooklm_auth_flow()
-        elif action == "disconnect":
-            auth = disconnect_notebooklm_auth_flow()
-            _ = set_space_provider_state(
-                provider,
-                enabled=False,
-                mode="disabled",
-                last_error="",
-                touch_health=True,
-            )
         else:
             auth = get_notebooklm_auth_flow_status()
         provider_state = get_space_provider_state(provider)
@@ -2465,11 +2251,6 @@ def handle_group_space_provider_auth(args: Dict[str, Any]) -> DaemonResponse:
         )
     except ValueError as e:
         return _error("space_job_invalid", str(e))
-    except RuntimeError as e:
-        message = str(e)
-        if "connect flow is running" in message:
-            return _error("space_provider_auth_flow_running", message)
-        return _error("group_space_provider_auth_failed", message)
     except Exception as e:
         return _error("group_space_provider_auth_failed", str(e))
 

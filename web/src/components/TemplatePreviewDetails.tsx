@@ -307,10 +307,10 @@ export function TemplatePreviewDetails({
             <div>
               <div className="text-xs font-medium text-[var(--color-text-secondary)]">Settings</div>
               <div className="mt-1 space-y-1">
-                {stableSettingsKeys.slice(0, 16).map((k) => formatSettingLine(k))}
-                {stableSettingsKeys.length > 16 ? (
+                {stableSettingsKeys.slice(0, 12).map((k) => formatSettingLine(k))}
+                {stableSettingsKeys.length > 12 ? (
                   <div className="text-[11px] text-[var(--color-text-muted)]">
-                    …and {stableSettingsKeys.length - 16} more
+                    …and {stableSettingsKeys.length - 12} more
                   </div>
                 ) : null}
               </div>

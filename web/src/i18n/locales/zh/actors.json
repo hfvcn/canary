@@ -85,7 +85,7 @@
   "runtimeSetupSectionHint": "只有在需要手动接入客户端时，才展开查看运行时专属的 MCP 设置说明。",
   "secretsSection": "Secrets 与环境",
   "secretsSectionHint": "只有在需要轮换密钥或修改私有运行环境时才展开。",
-  "capabilitiesSection": "能力",
+  "capabilitiesSection": "Capabilities",
   "capabilitiesSectionHint": "只有在需要调整 actor 启动时自动加载的 capability 时才展开。",
   "profileToolsSection": "运行配置工具",
   "profileToolsSectionHint": "把当前自定义运行时配置保存到可复用的 runtime profile 库中。",

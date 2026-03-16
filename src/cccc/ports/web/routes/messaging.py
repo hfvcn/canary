@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse
 
 from ....kernel.blobs import resolve_blob_attachment_path, store_blob_bytes
 from ....kernel.group import load_group
+from ..message_visibility import sender_is_admin_for_principal, sender_user_id_for_principal
 from ..schemas import (
     ReplyRequest,
     RouteContext,
@@ -18,8 +19,17 @@ from ..schemas import (
     WEB_MAX_FILE_MB,
     _normalize_reply_required,
     check_group,
+    get_principal,
     require_group,
 )
+
+
+def _sender_metadata(request: Request) -> Dict[str, Any]:
+    principal = get_principal(request)
+    return {
+        "sender_user_id": sender_user_id_for_principal(principal) or None,
+        "sender_is_admin": sender_is_admin_for_principal(principal),
+    }
 
 
 def create_routers(ctx: RouteContext) -> list[APIRouter]:
@@ -42,7 +52,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         return refs
 
     @group_router.post("/send")
-    async def send(group_id: str, req: SendRequest) -> Dict[str, Any]:
+    async def send(request: Request, group_id: str, req: SendRequest) -> Dict[str, Any]:
         return await ctx.daemon(
             {
                 "op": "send",
@@ -58,6 +68,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                     "src_event_id": req.src_event_id,
                     "client_id": req.client_id,
                     "refs": list(req.refs),
+                    **_sender_metadata(request),
                 },
             }
         )
@@ -81,12 +92,13 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                     "to": list(req.to),
                     "priority": req.priority,
                     "reply_required": _normalize_reply_required(req.reply_required),
+                    **_sender_metadata(request),
                 },
             }
         )
 
     @group_router.post("/reply")
-    async def reply(group_id: str, req: ReplyRequest) -> Dict[str, Any]:
+    async def reply(request: Request, group_id: str, req: ReplyRequest) -> Dict[str, Any]:
         return await ctx.daemon(
             {
                 "op": "reply",
@@ -100,6 +112,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                     "reply_required": _normalize_reply_required(req.reply_required),
                     "client_id": req.client_id,
                     "refs": list(req.refs),
+                    **_sender_metadata(request),
                 },
             }
         )
@@ -118,6 +131,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
 
     @group_router.post("/send_upload")
     async def send_upload(
+        request: Request,
         group_id: str,
         by: str = Form("user"),
         text: str = Form(""),
@@ -218,12 +232,14 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                     "reply_required": _normalize_reply_required(reply_required),
                     "client_id": str(client_id or "").strip(),
                     "refs": refs,
+                    **_sender_metadata(request),
                 },
             }
         )
 
     @group_router.post("/reply_upload")
     async def reply_upload(
+        request: Request,
         group_id: str,
         by: str = Form("user"),
         text: str = Form(""),
@@ -313,6 +329,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                     "reply_required": _normalize_reply_required(reply_required),
                     "client_id": str(client_id or "").strip(),
                     "refs": refs,
+                    **_sender_metadata(request),
                 },
             }
         )

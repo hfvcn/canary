@@ -34,67 +34,8 @@ class _RuntimeContext:
     actor_id: str
 
 
-def _proc_parent_pid_windows(pid: int) -> int:
-    if pid <= 0 or os.name != "nt":
-        return 0
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        TH32CS_SNAPPROCESS = 0x00000002
-        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-
-        class PROCESSENTRY32W(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.c_size_t),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", ctypes.c_long),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", wintypes.WCHAR * 260),
-            ]
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-        kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-        kernel32.Process32FirstW.restype = wintypes.BOOL
-        kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-        kernel32.Process32NextW.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-
-        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-        if snapshot in (0, INVALID_HANDLE_VALUE, None):
-            return 0
-        try:
-            entry = PROCESSENTRY32W()
-            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-            if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
-                return 0
-            while True:
-                if int(entry.th32ProcessID or 0) == int(pid):
-                    parent = int(entry.th32ParentProcessID or 0)
-                    return 0 if parent == int(pid) else parent
-                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
-                    break
-        finally:
-            kernel32.CloseHandle(snapshot)
-    except Exception:
-        return 0
-    return 0
-
-
 def _proc_parent_pid(pid: int) -> int:
-    if pid <= 0:
-        return 0
-    if os.name == "nt":
-        return _proc_parent_pid_windows(pid)
-    if os.name != "posix":
+    if pid <= 0 or os.name != "posix":
         return 0
     try:
         status_path = Path("/proc") / str(pid) / "status"

@@ -23,8 +23,6 @@ from zoneinfo import ZoneInfo
 
 from ...contracts.v1 import AutomationRule, AutomationRuleSet, SystemNotifyData
 from ...kernel.actors import list_actors, find_foreman
-from ...kernel.agent_state_hygiene import evaluate_agent_state_hygiene, sync_mind_context_runtime_state
-from ...kernel.context import ContextStorage
 from ...kernel.group import Group, load_group, get_group_state, set_group_state
 from ...kernel.inbox import iter_events, is_message_for_actor, get_cursor, get_obligation_status_batch
 from ...kernel.ledger import append_event
@@ -425,7 +423,7 @@ def _get_last_group_activity(group: Group) -> Optional[datetime]:
     automation notifications, and replies that only acknowledge those
     notifications, must not keep the group artificially "active".
     """
-    automated_notify_meta: Dict[str, Tuple[str, str, str]] = {}
+    automated_notify_meta: Dict[str, Tuple[str, str]] = {}
     last_ts: Optional[datetime] = None
     for ev in iter_events(group.ledger_path):
         notify_meta = _get_automation_activity_notify_meta(ev)
@@ -459,33 +457,27 @@ _AUTOMATION_ACTIVITY_NOTIFY_KINDS = frozenset(
 
 _NON_ACTIVITY_REPLY_NOTIFY_KINDS = frozenset({"silence_check", "auto_idle"})
 
-# Automation rule IDs whose target-actor replies should not count as group activity.
-# This prevents standup responses from resetting the silence counter and blocking auto-idle.
-_NON_ACTIVITY_REPLY_RULE_IDS = frozenset({"standup"})
 
-
-def _get_automation_activity_notify_meta(ev: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
-    """Return `(notify_kind, target_actor_id, rule_id)` for automation notifications ignored by silence detection."""
+def _get_automation_activity_notify_meta(ev: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """Return `(notify_kind, target_actor_id)` for automation notifications ignored by silence detection."""
     if str(ev.get("kind") or "") != "system.notify":
         return None
     data = ev.get("data")
     if not isinstance(data, dict):
         return None
     notify_kind = str(data.get("kind") or "").strip()
-    ctx = data.get("context") if isinstance(data.get("context"), dict) else {}
-    rule_id = str(ctx.get("rule_id") or "").strip()
     if notify_kind in _AUTOMATION_ACTIVITY_NOTIFY_KINDS:
-        return (notify_kind, str(data.get("target_actor_id") or "").strip(), rule_id)
+        return (notify_kind, str(data.get("target_actor_id") or "").strip())
     # Defensive fallback for future notify kind namespaces.
     if notify_kind.startswith("automation.") or notify_kind.startswith("system."):
-        return (notify_kind, str(data.get("target_actor_id") or "").strip(), rule_id)
+        return (notify_kind, str(data.get("target_actor_id") or "").strip())
     return None
 
 
 def _is_group_activity_event(
     ev: Dict[str, Any],
     *,
-    automated_notify_meta: Dict[str, Tuple[str, str, str]],
+    automated_notify_meta: Dict[str, Tuple[str, str]],
 ) -> bool:
     """Return True only for business chat activity that should reset silence detection."""
     if str(ev.get("kind") or "") != "chat.message":
@@ -500,14 +492,10 @@ def _is_group_activity_event(
     if reply_to:
         notify_meta = automated_notify_meta.get(reply_to)
         if notify_meta is not None:
-            notify_kind, target_actor_id, rule_id = notify_meta
-            # Suppress the pure "system ping -> target actor ack" chain.
-            if by and by == target_actor_id:
-                if notify_kind in _NON_ACTIVITY_REPLY_NOTIFY_KINDS:
-                    return False
-                # Suppress replies to specific automation rules (e.g. standup).
-                if notify_kind == "automation" and rule_id in _NON_ACTIVITY_REPLY_RULE_IDS:
-                    return False
+            notify_kind, target_actor_id = notify_meta
+            # Only suppress the pure "system ping -> target actor ack" chain used by silence auto-idle.
+            if notify_kind in _NON_ACTIVITY_REPLY_NOTIFY_KINDS and by and by == target_actor_id:
+                return False
     return True
 
 
@@ -1963,8 +1951,11 @@ class AutomationManager:
             notify_data = SystemNotifyData(
                 kind="help_nudge",
                 priority="normal",
-                title="Refresh collaboration context",
-                message=message,
+                title="Refresh collaboration rules",
+                message=(
+                    "Run `cccc_help` now to refresh collaboration rules; then update your agent state "
+                    "(`cccc_agent_state`: focus/next_action/what_changed)."
+                ),
                 target_actor_id=aid,
                 requires_ack=False,
             )

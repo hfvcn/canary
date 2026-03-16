@@ -28,9 +28,9 @@ from ....kernel.prompt_files import (
     resolve_active_scope_root,
     write_group_prompt_file,
 )
-from ....kernel.access_tokens import list_access_tokens
 from ....util.conv import coerce_bool
 from ....util.fs import atomic_write_text
+from ..message_visibility import filter_events_for_principal, principal_can_view_message_bodies, sse_ledger_tail_for_principal
 from ..schemas import (
     AttachRequest,
     CreateGroupRequest,
@@ -52,7 +52,9 @@ from ..schemas import (
     _safe_int,
     check_group,
     filter_groups_for_principal,
+    get_principal,
     require_admin,
+    require_group_admin,
     require_group,
     require_user,
     resolve_websocket_principal,
@@ -344,7 +346,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         ttl = max(0.0, min(5.0, ctx.exhibit_cache_ttl_s))
         return await ctx.cached_json(f"group:{gid}", ttl, _fetch)
 
-    @group_router.put("")
+    @group_router.put("", dependencies=[Depends(require_group_admin)])
     async def group_update(group_id: str, req: GroupUpdateRequest) -> Dict[str, Any]:
         """Update group metadata (title/topic)."""
         patch: Dict[str, Any] = {}
@@ -390,15 +392,15 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             return await _fetch()
         return await _deduped_context_get(gid, detail_mode, _fetch)
 
-    @group_router.get("/template/export")
+    @group_router.get("/template/export", dependencies=[Depends(require_group_admin)])
     async def group_template_export(group_id: str) -> Dict[str, Any]:
         return await ctx.daemon({"op": "group_template_export", "args": {"group_id": group_id}})
 
-    @group_router.post("/template/preview")
+    @group_router.post("/template/preview", dependencies=[Depends(require_group_admin)])
     async def group_template_preview(group_id: str, req: GroupTemplatePreviewRequest) -> Dict[str, Any]:
         return await ctx.daemon({"op": "group_template_preview", "args": {"group_id": group_id, "template": req.template, "by": req.by}})
 
-    @group_router.post("/template/preview_upload")
+    @group_router.post("/template/preview_upload", dependencies=[Depends(require_group_admin)])
     async def group_template_preview_upload(
         group_id: str,
         by: str = Form("user"),
@@ -410,7 +412,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         template_text = raw.decode("utf-8", errors="replace")
         return await ctx.daemon({"op": "group_template_preview", "args": {"group_id": group_id, "template": template_text, "by": by}})
 
-    @group_router.post("/template/import_replace")
+    @group_router.post("/template/import_replace", dependencies=[Depends(require_group_admin)])
     async def group_template_import_replace(
         group_id: str,
         confirm: str = Form(""),
@@ -777,7 +779,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         except Exception as e:
             return {"ok": True, "result": {"found": False, "path": str(project_md_path), "content": None, "error": f"Failed to read PROJECT.md: {e}"}}
 
-    @group_router.put("/project_md")
+    @group_router.put("/project_md", dependencies=[Depends(require_group_admin)])
     async def project_md_put(group_id: str, req: ProjectMdUpdateRequest) -> Dict[str, Any]:
         """Create or update PROJECT.md in the group's active scope root (repo root)."""
         group = load_group(group_id)
@@ -894,51 +896,6 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             out.append(item)
         return out
 
-    def _help_update_reason_labels(*, actor: dict[str, Any], changed_blocks: list[str], editor_mode: str) -> list[str]:
-        mode = str(editor_mode or "").strip().lower()
-        if mode != "structured":
-            return []
-        aid = str(actor.get("id") or "").strip()
-        role = str(actor.get("role") or "").strip().lower()
-        if not aid:
-            return []
-        labels: list[str] = []
-        seen: set[str] = set()
-
-        def _add(label: str) -> None:
-            if label and label not in seen:
-                seen.add(label)
-                labels.append(label)
-
-        blocks = list(changed_blocks or [])
-        if "common" in blocks:
-            _add("common guidance")
-        if "role:foreman" in blocks and role == "foreman":
-            _add("foreman notes")
-        if "role:peer" in blocks and role == "peer":
-            _add("peer notes")
-        if f"actor:{aid}" in blocks:
-            _add("your actor note")
-        return labels
-
-    def _help_update_notify_copy(*, labels: list[str]) -> tuple[str, str]:
-        reasons = [str(label or "").strip() for label in labels if str(label or "").strip()]
-        if not reasons:
-            return (
-                "Help updated",
-                "Group help changed. Run `cccc_help` now to refresh your effective playbook.",
-            )
-        if len(reasons) == 1:
-            title = f"Help updated: {reasons[0]}"
-        else:
-            title = "Help updated: multiple sections"
-        joined = ", ".join(reasons)
-        message = (
-            f"Updated: {joined}. Run `cccc_help` now to refresh your effective playbook; "
-            "then update `cccc_agent_state` if your plan changes."
-        )
-        return title, message
-
     async def _notify_help_update(
         group_id: str,
         *,
@@ -953,28 +910,45 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         if not running:
             return []
 
-        target_reasons: dict[str, list[str]] = {}
-        for actor in running:
-            aid = str(actor.get("id") or "").strip()
-            if not aid:
-                continue
-            reasons = _help_update_reason_labels(
-                actor=actor,
-                changed_blocks=changed_blocks,
-                editor_mode=editor_mode,
-            )
-            if reasons:
-                target_reasons[aid] = reasons
-
-        if not target_reasons:
+        targets: set[str] = set()
+        mode = str(editor_mode or "").strip().lower()
+        blocks = list(changed_blocks or [])
+        if mode == "structured" and blocks:
+            for block in blocks:
+                if block == "common":
+                    for actor in running:
+                        aid = str(actor.get("id") or "").strip()
+                        if aid:
+                            targets.add(aid)
+                    continue
+                if block == "role:foreman":
+                    for actor in running:
+                        if str(actor.get("role") or "").strip().lower() != "foreman":
+                            continue
+                        aid = str(actor.get("id") or "").strip()
+                        if aid:
+                            targets.add(aid)
+                    continue
+                if block == "role:peer":
+                    for actor in running:
+                        if str(actor.get("role") or "").strip().lower() != "peer":
+                            continue
+                        aid = str(actor.get("id") or "").strip()
+                        if aid:
+                            targets.add(aid)
+                    continue
+                if block.startswith("actor:"):
+                    aid = str(block[len("actor:"):]).strip()
+                    if aid and any(str(actor.get("id") or "").strip() == aid for actor in running):
+                        targets.add(aid)
+        else:
             for actor in running:
                 aid = str(actor.get("id") or "").strip()
                 if aid:
-                    target_reasons[aid] = []
+                    targets.add(aid)
 
         notified: list[str] = []
-        for aid in sorted(target_reasons.keys()):
-            title, message = _help_update_notify_copy(labels=target_reasons.get(aid) or [])
+        for aid in sorted(targets):
             try:
                 resp = await ctx.daemon({
                     "op": "system_notify",
@@ -983,8 +957,8 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                         "by": "system",
                         "kind": "info",
                         "priority": "normal",
-                        "title": title,
-                        "message": message,
+                        "title": "Help updated",
+                        "message": "Group help changed. Run `cccc_help` now to refresh your playbook, then update your agent state if your plan changes.",
                         "target_actor_id": aid,
                         "requires_ack": False,
                     },
@@ -995,7 +969,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                 continue
         return notified
 
-    @group_router.get("/prompts")
+    @group_router.get("/prompts", dependencies=[Depends(require_group_admin)])
     async def prompts_get(group_id: str) -> Dict[str, Any]:
         """Get effective group guidance markdown (preamble/help) and override status."""
         group = load_group(group_id)
@@ -1023,7 +997,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             },
         }
 
-    @group_router.put("/prompts/{kind}")
+    @group_router.put("/prompts/{kind}", dependencies=[Depends(require_group_admin)])
     async def prompts_put(group_id: str, kind: str, req: RepoPromptUpdateRequest) -> Dict[str, Any]:
         """Create or update a group prompt override file under CCCC_HOME."""
         group = load_group(group_id)
@@ -1064,7 +1038,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         except Exception as e:
             return {"ok": False, "error": {"code": "WRITE_FAILED", "message": f"Failed to write {filename}: {e}"}}
 
-    @group_router.delete("/prompts/{kind}")
+    @group_router.delete("/prompts/{kind}", dependencies=[Depends(require_group_admin)])
     async def prompts_delete(group_id: str, kind: str, confirm: str = "") -> Dict[str, Any]:
         """Reset a group prompt override by deleting the CCCC_HOME file (requires confirm=kind)."""
         if str(confirm or "").strip().lower() != str(kind or "").strip().lower():
@@ -1094,7 +1068,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         except Exception as e:
             return {"ok": False, "error": {"code": "DELETE_FAILED", "message": f"Failed to delete {filename}: {e}"}}
 
-    @group_router.post("/context")
+    @group_router.post("/context", dependencies=[Depends(require_group_admin)])
     async def group_context_sync(group_id: str, request: Request) -> Dict[str, Any]:
         """Update group context via batch operations (v3).
 
@@ -1147,10 +1121,10 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                     "nudge_digest_min_interval_seconds": _safe_int(automation.get("nudge_digest_min_interval_seconds", 120), default=120, min_value=0),
                     "nudge_max_repeats_per_obligation": _safe_int(automation.get("nudge_max_repeats_per_obligation", 3), default=3, min_value=0),
                     "nudge_escalate_after_repeats": _safe_int(automation.get("nudge_escalate_after_repeats", 2), default=2, min_value=0),
-                    "actor_idle_timeout_seconds": _safe_int(automation.get("actor_idle_timeout_seconds", 0), default=0, min_value=0),
+                    "actor_idle_timeout_seconds": _safe_int(automation.get("actor_idle_timeout_seconds", 600), default=600, min_value=0),
                     "keepalive_delay_seconds": _safe_int(automation.get("keepalive_delay_seconds", 120), default=120, min_value=0),
                     "keepalive_max_per_actor": _safe_int(automation.get("keepalive_max_per_actor", 3), default=3, min_value=0),
-                    "silence_timeout_seconds": _safe_int(automation.get("silence_timeout_seconds", 0), default=0, min_value=0),
+                    "silence_timeout_seconds": _safe_int(automation.get("silence_timeout_seconds", 600), default=600, min_value=0),
                     "help_nudge_interval_seconds": _safe_int(automation.get("help_nudge_interval_seconds", 600), default=600, min_value=0),
                     "help_nudge_min_messages": _safe_int(automation.get("help_nudge_min_messages", 10), default=10, min_value=0),
                     "min_interval_seconds": _safe_int(delivery.get("min_interval_seconds", 0), default=0, min_value=0),
@@ -1159,25 +1133,11 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                     "terminal_transcript_notify_tail": coerce_bool(tt.get("notify_tail"), default=False),
                     "terminal_transcript_notify_lines": _safe_int(tt.get("notify_lines", 20), default=20, min_value=1, max_value=80),
                     "panorama_enabled": coerce_bool(features.get("panorama_enabled"), default=False),
-                    "desktop_pet_enabled": coerce_bool(features.get("desktop_pet_enabled"), default=False),
                 }
             }
         }
 
-    @group_router.get("/desktop_pet/launch_token")
-    async def group_desktop_pet_launch_token(request: Request, group_id: str) -> Dict[str, Any]:
-        token = _request_access_token(request)
-        if not token:
-            # Empty password mode: no tokens configured → allow with empty token
-            if not list_access_tokens():
-                return {"ok": True, "result": {"token": ""}}
-            raise HTTPException(
-                status_code=403,
-                detail={"code": "permission_denied", "message": "authentication required", "details": {}},
-            )
-        return {"ok": True, "result": {"token": token}}
-
-    @group_router.put("/settings")
+    @group_router.put("/settings", dependencies=[Depends(require_group_admin)])
     async def group_settings_update(group_id: str, req: GroupSettingsRequest) -> Dict[str, Any]:
         """Update group-scoped automation + delivery settings."""
         patch: Dict[str, Any] = {}
@@ -1224,8 +1184,6 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
 
         if req.panorama_enabled is not None:
             patch["panorama_enabled"] = bool(req.panorama_enabled)
-        if req.desktop_pet_enabled is not None:
-            patch["desktop_pet_enabled"] = bool(req.desktop_pet_enabled)
 
         if not patch:
             return {"ok": True, "result": {"message": "no changes"}}
@@ -1240,7 +1198,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         """Get group automation rules + snippets + runtime status."""
         return await ctx.daemon({"op": "group_automation_state", "args": {"group_id": group_id, "by": "user"}})
 
-    @group_router.put("/automation")
+    @group_router.put("/automation", dependencies=[Depends(require_group_admin)])
     async def group_automation_update(group_id: str, req: GroupAutomationRequest) -> Dict[str, Any]:
         """Update group automation rules + snippets."""
         ruleset = AutomationRuleSet(rules=req.rules, snippets=req.snippets).model_dump()
@@ -1251,7 +1209,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             }
         )
 
-    @group_router.post("/automation/manage")
+    @group_router.post("/automation/manage", dependencies=[Depends(require_group_admin)])
     async def group_automation_manage(group_id: str, req: GroupAutomationManageRequest) -> Dict[str, Any]:
         """Manage group automation incrementally via actions."""
         return await ctx.daemon(
@@ -1266,7 +1224,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             }
         )
 
-    @group_router.post("/automation/reset_baseline")
+    @group_router.post("/automation/reset_baseline", dependencies=[Depends(require_group_admin)])
     async def group_automation_reset_baseline(group_id: str, req: GroupAutomationResetBaselineRequest) -> Dict[str, Any]:
         """Reset group automation rules/snippets to baseline defaults."""
         return await ctx.daemon(
@@ -1280,17 +1238,18 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             }
         )
 
-    @group_router.post("/attach")
+    @group_router.post("/attach", dependencies=[Depends(require_group_admin)])
     async def group_attach(group_id: str, req: AttachRequest) -> Dict[str, Any]:
         return await ctx.daemon({"op": "attach", "args": {"path": req.path, "by": req.by, "group_id": group_id}})
 
-    @group_router.delete("/scopes/{scope_key}")
+    @group_router.delete("/scopes/{scope_key}", dependencies=[Depends(require_group_admin)])
     async def group_detach_scope(group_id: str, scope_key: str, by: str = "user") -> Dict[str, Any]:
         """Detach a scope from a group."""
         return await ctx.daemon({"op": "group_detach_scope", "args": {"group_id": group_id, "scope_key": scope_key, "by": by}})
 
     @group_router.get("/ledger/tail")
     async def ledger_tail(
+        request: Request,
         group_id: str,
         lines: int = 50,
         with_read_status: bool = False,
@@ -1334,10 +1293,12 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                 if event_id in obligation_map:
                     ev["_obligation_status"] = obligation_map[event_id]
 
+        events = filter_events_for_principal(events, get_principal(request))
         return {"ok": True, "result": {"events": events}}
 
     @group_router.get("/ledger/search")
     async def ledger_search(
+        request: Request,
         group_id: str,
         q: str = "",
         kind: str = "all",
@@ -1397,6 +1358,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                 if event_id in obligation_map:
                     ev["_obligation_status"] = obligation_map[event_id]
 
+        events = filter_events_for_principal(events, get_principal(request), drop_hidden_matches=bool(str(q or "").strip()))
         return {
             "ok": True,
             "result": {
@@ -1408,6 +1370,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
 
     @group_router.get("/ledger/window")
     async def ledger_window(
+        request: Request,
         group_id: str,
         center: str,
         kind: str = "chat",
@@ -1481,6 +1444,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                 if event_id in obligation_map:
                     ev["_obligation_status"] = obligation_map[event_id]
 
+        events = filter_events_for_principal(events, get_principal(request))
         return {
             "ok": True,
             "result": {
@@ -1637,12 +1601,15 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                 pass
 
     @group_router.get("/ledger/stream")
-    async def ledger_stream(group_id: str) -> StreamingResponse:
+    async def ledger_stream(request: Request, group_id: str) -> StreamingResponse:
         from ..streams import sse_ledger_tail, create_sse_response
         group = load_group(group_id)
         if group is None:
             raise HTTPException(status_code=404, detail={"code": "group_not_found", "message": f"group not found: {group_id}"})
-        return create_sse_response(sse_ledger_tail(group.ledger_path))
+        principal = get_principal(request)
+        if principal_can_view_message_bodies(principal):
+            return create_sse_response(sse_ledger_tail(group.ledger_path))
+        return create_sse_response(sse_ledger_tail_for_principal(group.ledger_path, principal))
 
     return [global_router, group_router]
 

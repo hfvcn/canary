@@ -6,6 +6,7 @@ import ntpath
 import os
 import socket
 import signal
+import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ from ..kernel.settings import (
 )
 from ..kernel.terminal_transcript import get_terminal_transcript_settings
 from ..kernel.messaging import disabled_recipient_actor_ids
+from ..kernel.runtime import get_runtime_command_with_flags
 from ..paths import ensure_home
 from ..runners import pty as pty_runner
 from ..runners import headless as headless_runner
@@ -261,6 +263,15 @@ def _normalize_runtime_command(runtime: str, command: list[str]) -> list[str]:
             has_env_inherit = any("shell_environment_policy.inherit" in str(x) for x in cmd)
             if not has_env_inherit:
                 cmd = [cmd[0], "-c", "shell_environment_policy.inherit=all", *cmd[1:]]
+
+    if rt == "gemini":
+        try:
+            exe = Path(str(cmd[0] or "")).name
+        except Exception:
+            exe = str(cmd[0] or "")
+        if exe == "ge" and shutil.which(str(cmd[0] or "")) is None:
+            # Stored command may use zsh alias ge; normalize to runtime-resolved launch command.
+            cmd = get_runtime_command_with_flags("gemini")
 
     return cmd
 
@@ -540,14 +551,12 @@ def _maybe_autostart_running_groups() -> None:
         throttle_reset_actor=lambda gid, aid: THROTTLE.reset_actor(gid, aid, keep_pending=True),
         automation_on_resume=AUTOMATION.on_resume,
         get_group_state=get_group_state,
-        resolve_linked_actor_before_start=lambda grp, aid, caller_id="", is_admin=False: _resolve_linked_actor_before_start(
+        resolve_linked_actor_before_start=lambda grp, aid: _resolve_linked_actor_before_start(
             grp,
             aid,
             get_actor_profile=_get_actor_profile,
             load_actor_profile_secrets=_load_actor_profile_secrets,
             update_actor_private_env=_update_actor_private_env,
-            caller_id=caller_id,
-            is_admin=is_admin,
         ),
     )
 

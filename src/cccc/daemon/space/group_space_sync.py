@@ -1287,59 +1287,6 @@ def read_group_space_sync_state(group_id: str) -> Dict[str, Any]:
     return state
 
 
-def mark_group_space_sync_pending(
-    group_id: str,
-    *,
-    provider: str = "notebooklm",
-    remote_space_id: str,
-) -> Dict[str, Any]:
-    gid = str(group_id or "").strip()
-    if not gid:
-        return {"ok": False, "code": "missing_group_id", "message": "missing group_id"}
-    group = load_group(gid)
-    if group is None:
-        return {"ok": False, "code": "group_not_found", "message": f"group not found: {gid}"}
-    rid = str(remote_space_id or "").strip()
-    if not rid:
-        return {"ok": False, "code": "space_binding_missing", "message": "binding has no remote_space_id"}
-
-    space_root = resolve_space_root_from_group(group, create=True)
-    if space_root is None:
-        return {"ok": False, "code": "no_local_scope", "message": "group has no local scope"}
-
-    state_doc = _load_state(space_root)
-    state_doc.update(
-        {
-            "group_id": gid,
-            "provider": str(provider or "notebooklm").strip() or "notebooklm",
-            "remote_space_id": rid,
-            "run_id": "",
-            "state": "pending",
-            "converged": False,
-            "unsynced_count": 0,
-            "failed_count": 0,
-            "failed_items": [],
-            "uploaded": 0,
-            "updated": 0,
-            "deleted": 0,
-            "reused": 0,
-            "remote_sources": 0,
-            "materialized_sources": 0,
-            "remote_artifacts": 0,
-            "downloaded_artifacts": 0,
-            "pruned_artifacts": 0,
-            "last_error": "",
-            "failure_signature": "",
-            "errors": [],
-        }
-    )
-    _save_state(space_root, state_doc)
-    state_doc["available"] = True
-    state_doc["space_root"] = str(space_root)
-    state_doc["ok"] = True
-    return state_doc
-
-
 def sync_group_space_files(
     group_id: str,
     *,

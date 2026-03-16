@@ -88,10 +88,7 @@ class TestMcpBootstrapMemoryRecallGate(unittest.TestCase):
         ):
             out = mcp_server.bootstrap(group_id="g_test", actor_id="peer1")
 
-        self.assertEqual(
-            set(out.keys()),
-            {"session", "recovery", "inbox_preview", "context_hygiene", "memory_recall_gate", "next_calls"},
-        )
+        self.assertEqual(set(out.keys()), {"session", "recovery", "inbox_preview", "memory_recall_gate", "next_calls"})
         self.assertNotIn("help", out)
         self.assertNotIn("context", out)
         self.assertNotIn("actors", out)
@@ -113,13 +110,8 @@ class TestMcpBootstrapMemoryRecallGate(unittest.TestCase):
         self.assertEqual(recovery["self_state"]["recovery"]["environment_summary"], "repo dirty but scoped")
         self.assertEqual(recovery["self_state"]["recovery"]["user_model"], "prefers concise evidence")
         self.assertEqual(recovery["self_state"]["recovery"]["persona_notes"], "be precise and low-noise")
-        self.assertEqual(recovery["self_state"]["mind_context_mini"]["environment_summary"], "repo dirty but scoped")
         self.assertEqual(recovery["task_slice"]["assigned_active"][0]["id"], "T001")
         self.assertEqual(recovery["recent_notes"]["decisions"][0]["summary"], "Keep lifecycle deterministic.")
-
-        hygiene = out["context_hygiene"]
-        self.assertEqual(str(hygiene["execution_health"]["status"] or ""), "stale")
-        self.assertEqual(str(hygiene["mind_context_health"]["status"] or ""), "stale")
 
         inbox_preview = out["inbox_preview"]
         self.assertEqual(inbox_preview["messages"][0]["id"], "ev1")
@@ -193,68 +185,6 @@ class TestMcpBootstrapMemoryRecallGate(unittest.TestCase):
         self.assertIn("re-check shared assumptions", query)
         self.assertIn("workspace has multiple parallel edits", query)
         self.assertIn("cares about ROI and low noise", query)
-
-    def test_build_bootstrap_context_preserves_mind_context_mini_under_budget_pressure(self) -> None:
-        from cccc.ports.mcp.handlers.cccc_core import _build_bootstrap_context
-
-        huge_text = "very long project detail " * 160
-        noisy_note = "task note " * 120
-        context_payload = {
-            "coordination": {
-                "brief": {
-                    "objective": "Ship continuity",
-                    "current_focus": "Bootstrap resilience",
-                    "constraints": ["keep continuity under pressure"] * 4,
-                    "project_brief": huge_text,
-                    "project_brief_stale": False,
-                },
-                "tasks": [
-                    {
-                        "id": f"T{i:03d}",
-                        "title": f"Task {i}",
-                        "outcome": noisy_note,
-                        "status": "active" if i == 1 else "planned",
-                        "assignee": "peer1",
-                        "notes": noisy_note,
-                        "checklist": [
-                            {"id": "C001", "text": noisy_note, "status": "pending"},
-                            {"id": "C002", "text": noisy_note, "status": "pending"},
-                        ],
-                    }
-                    for i in range(1, 8)
-                ],
-                "recent_decisions": [{"summary": noisy_note, "by": "foreman", "at": "2026-03-07T00:00:00Z"}] * 3,
-                "recent_handoffs": [{"summary": noisy_note, "by": "peer1", "at": "2026-03-07T00:00:00Z"}] * 3,
-            },
-            "agent_states": [
-                {
-                    "id": "peer1",
-                    "hot": {
-                        "focus": "stabilize recovery",
-                        "next_action": "trim bootstrap safely",
-                        "active_task_id": "T001",
-                        "blockers": [],
-                    },
-                    "warm": {
-                        "what_changed": "picked up recovery hardening",
-                        "resume_hint": "inspect continuity pack",
-                        "environment_summary": "workspace has many parallel changes but current scope is limited",
-                        "user_model": "prefers simple mechanisms with high ROI",
-                        "persona_notes": "preserve continuity and do not overbuild",
-                    },
-                    "updated_at": "2026-03-12T00:00:00Z",
-                }
-            ],
-        }
-
-        pack = _build_bootstrap_context(context=context_payload, actor_id="peer1")
-        agent_state = pack.get("agent_state") if isinstance(pack.get("agent_state"), dict) else {}
-        mini = agent_state.get("mind_context_mini") if isinstance(agent_state.get("mind_context_mini"), dict) else {}
-
-        self.assertTrue(mini)
-        self.assertIn("workspace has many parallel changes", str(mini.get("environment_summary") or ""))
-        self.assertIn("prefers simple mechanisms", str(mini.get("user_model") or ""))
-        self.assertIn("preserve continuity", str(mini.get("persona_notes") or ""))
 
 
 if __name__ == "__main__":

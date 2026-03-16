@@ -25,6 +25,7 @@ export interface VirtualMessageListProps {
   onRelay?: (ev: LedgerEvent) => void;
   onOpenSource?: (srcGroupId: string, srcEventId: string) => void;
   onOpenPresentationRef?: (ref: PresentationMessageRef, event: LedgerEvent) => void;
+  collapseHumanMessageBodiesByDefault?: boolean;
   showScrollButton: boolean;
   onScrollButtonClick: () => void;
   chatUnreadCount: number;
@@ -60,6 +61,7 @@ const VirtualMessageListInner = function VirtualMessageListInner({
   onRelay,
   onOpenSource,
   onOpenPresentationRef,
+  collapseHumanMessageBodiesByDefault,
   showScrollButton,
   onScrollButtonClick,
   chatUnreadCount,
@@ -622,6 +624,7 @@ const VirtualMessageListInner = function VirtualMessageListInner({
                     onRelay={onRelay}
                     onOpenSource={onOpenSource}
                     onOpenPresentationRef={onOpenPresentationRef}
+                    collapseHumanMessageBodiesByDefault={collapseHumanMessageBodiesByDefault}
                   />
                 </div>
               );

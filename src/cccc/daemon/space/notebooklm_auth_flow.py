@@ -43,8 +43,6 @@ _FLOW_STATE: Dict[str, Any] = {
 _FLOW_THREAD: Optional[threading.Thread] = None
 _FLOW_CANCEL_EVENT: Optional[threading.Event] = None
 _SPACE_PROVIDER_SECRET_KEY = "NOTEBOOKLM_AUTH_JSON"
-_LIGHT_LOGIN_PROBE_INTERVAL_SECONDS = 6.0
-_CREDENTIAL_RETRY_INTERVAL_SECONDS = 8.0
 
 
 def _now_iso() -> str:
@@ -188,53 +186,17 @@ class _AuthBrowserSession:
                 self.browser.close()
         except Exception:
             pass
-        _terminate_browser_process(
-            self.process,
-            include_descendants=bool(str(self.strategy or "").startswith("system_browser_cdp:")),
-        )
-
-
-def _terminate_browser_process(
-    proc: Optional[subprocess.Popen[str]],
-    *,
-    include_descendants: bool,
-) -> None:
-    if proc is None:
-        return
-
-    pid = 0
-    try:
-        pid = int(getattr(proc, "pid", 0) or 0)
-    except Exception:
-        pid = 0
-
-    if include_descendants and os.name == "nt" and pid > 0:
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                text=True,
-                timeout=5.0,
-            )
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=1.0)
-            return
-        except Exception:
-            pass
-
-    try:
-        if proc.poll() is None:
-            proc.terminate()
+        proc = self.process
+        if proc is not None:
             try:
-                proc.wait(timeout=3.0)
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3.0)
+                    except Exception:
+                        proc.kill()
             except Exception:
-                proc.kill()
-    except Exception:
-        pass
+                pass
 
 
 def _ensure_dir(path: Path, mode: int = 0o700) -> None:
@@ -249,36 +211,6 @@ def _managed_browser_profile_dir() -> Path:
     root = ensure_home() / "state" / "notebooklm_auth" / "browser_profile"
     _ensure_dir(root, 0o700)
     return root
-
-
-def _remove_tree_with_retries(path: Path, *, strict: bool) -> None:
-    last_error: Exception | None = None
-    for _ in range(6):
-        try:
-            shutil.rmtree(path)
-            return
-        except FileNotFoundError:
-            return
-        except Exception as e:
-            last_error = e
-            time.sleep(0.2)
-    if strict and path.exists():
-        detail = str(last_error or "unknown error")
-        raise RuntimeError(f"failed to clear NotebookLM browser profile: {detail}")
-
-
-def _clear_managed_browser_profile_dir(*, strict: bool = True) -> None:
-    root = ensure_home() / "state" / "notebooklm_auth" / "browser_profile"
-    _remove_tree_with_retries(root, strict=strict)
-
-
-def _fresh_managed_browser_profile_session_dir() -> Path:
-    root = _managed_browser_profile_dir()
-    sessions_dir = root / "sessions"
-    _ensure_dir(sessions_dir, 0o700)
-    session_dir = sessions_dir / f"run_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
-    _ensure_dir(session_dir, 0o700)
-    return session_dir
 
 
 def _pick_free_port() -> int:
@@ -344,10 +276,10 @@ def _system_browser_candidates() -> list[str]:
     return out
 
 
-def _start_system_browser_over_cdp(playwright_obj: Any, *, profile_root: Path) -> Optional[_AuthBrowserSession]:
+def _start_system_browser_over_cdp(playwright_obj: Any) -> Optional[_AuthBrowserSession]:
     for binary in _system_browser_candidates():
         port = _pick_free_port()
-        profile_dir = profile_root / "system_browser"
+        profile_dir = _managed_browser_profile_dir() / "system_browser"
         _ensure_dir(profile_dir, 0o700)
         cmd = [
             binary,
@@ -386,14 +318,23 @@ def _start_system_browser_over_cdp(playwright_obj: Any, *, profile_root: Path) -
                 process=proc,
             )
         except Exception:
-            _terminate_browser_process(proc, include_descendants=True)
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=2.0)
+                        except Exception:
+                            proc.kill()
+                except Exception:
+                    pass
             continue
     return None
 
 
-def _start_channel_browser(playwright_obj: Any, *, channel: str, profile_root: Path) -> Optional[_AuthBrowserSession]:
+def _start_channel_browser(playwright_obj: Any, *, channel: str) -> Optional[_AuthBrowserSession]:
     try:
-        profile_dir = profile_root / f"playwright_{channel}"
+        profile_dir = _managed_browser_profile_dir() / f"playwright_{channel}"
         _ensure_dir(profile_dir, 0o700)
         context = playwright_obj.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
@@ -409,9 +350,9 @@ def _start_channel_browser(playwright_obj: Any, *, channel: str, profile_root: P
         return None
 
 
-def _start_playwright_chromium(playwright_obj: Any, *, profile_root: Path) -> _AuthBrowserSession:
+def _start_playwright_chromium(playwright_obj: Any) -> _AuthBrowserSession:
     try:
-        profile_dir = profile_root / "playwright_chromium"
+        profile_dir = _managed_browser_profile_dir() / "playwright_chromium"
         _ensure_dir(profile_dir, 0o700)
         context = playwright_obj.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
@@ -432,7 +373,7 @@ def _start_playwright_chromium(playwright_obj: Any, *, profile_root: Path) -> _A
                 error={},
             )
             _install_playwright_chromium()
-            profile_dir = profile_root / "playwright_chromium"
+            profile_dir = _managed_browser_profile_dir() / "playwright_chromium"
             _ensure_dir(profile_dir, 0o700)
             context = playwright_obj.chromium.launch_persistent_context(
                 user_data_dir=str(profile_dir),
@@ -446,19 +387,19 @@ def _start_playwright_chromium(playwright_obj: Any, *, profile_root: Path) -> _A
         raise RuntimeError(msg[:1600] or "unable to start Chromium") from e
 
 
-def _start_browser_session(playwright_obj: Any, *, profile_root: Path) -> _AuthBrowserSession:
+def _start_browser_session(playwright_obj: Any) -> _AuthBrowserSession:
     # Strategy order:
     # 1) Real system browser via CDP (best chance to satisfy Google sign-in checks)
     # 2) Playwright channel browser (chrome/msedge if available)
     # 3) Playwright-managed Chromium fallback
-    session = _start_system_browser_over_cdp(playwright_obj, profile_root=profile_root)
+    session = _start_system_browser_over_cdp(playwright_obj)
     if session is not None:
         return session
     for channel in ("chrome", "msedge"):
-        session = _start_channel_browser(playwright_obj, channel=channel, profile_root=profile_root)
+        session = _start_channel_browser(playwright_obj, channel=channel)
         if session is not None:
             return session
-    return _start_playwright_chromium(playwright_obj, profile_root=profile_root)
+    return _start_playwright_chromium(playwright_obj)
 
 
 def _page_urls(context: Any) -> list[str]:
@@ -509,22 +450,6 @@ def _collect_storage_state(context: Any) -> Dict[str, Any]:
     if not isinstance(state.get("origins"), list):
         state["origins"] = []
     return state
-
-
-def _peek_google_cookies(context: Any) -> list[Dict[str, Any]]:
-    try:
-        fetched = context.cookies(
-            [
-                "https://notebooklm.google.com",
-                "https://accounts.google.com",
-                "https://www.google.com",
-            ]
-        )
-    except Exception:
-        return []
-    if not isinstance(fetched, list):
-        return []
-    return [item for item in fetched if isinstance(item, dict)]
 
 
 def _seed_context_with_storage_state(context: Any, storage_state: Dict[str, Any]) -> int:
@@ -650,13 +575,7 @@ def _persist_storage_state(storage_state: Dict[str, Any]) -> None:
     )
 
 
-def _connect_worker(
-    *,
-    session_id: str,
-    timeout_seconds: int,
-    cancel_event: threading.Event,
-    force_reauth: bool = False,
-) -> None:
+def _connect_worker(*, session_id: str, timeout_seconds: int, cancel_event: threading.Event) -> None:
     prior_state = get_space_provider_state("notebooklm")
     prior_enabled = bool(prior_state.get("enabled"))
     prior_real_enabled = bool(prior_state.get("real_enabled"))
@@ -673,7 +592,6 @@ def _connect_worker(
         )
 
     def _mark_provider_connected(*, mode: str = "active", last_error: str = "") -> None:
-        os.environ["CCCC_NOTEBOOKLM_REAL"] = "1"
         _ = set_space_provider_state(
             "notebooklm",
             enabled=True,
@@ -711,12 +629,12 @@ def _connect_worker(
             return True
 
     try:
-        if not force_reauth and _try_reuse_saved_credential():
+        if _try_reuse_saved_credential():
             return
         _update_state(
             state="running",
             phase="preparing_browser",
-            message=("Preparing browser for account switch..." if force_reauth else "Preparing browser..."),
+            message="Preparing browser...",
             error={},
         )
         try:
@@ -731,12 +649,11 @@ def _connect_worker(
             return
 
         deadline = time.time() + max(60, min(timeout_seconds, 1800))
-        profile_root = _fresh_managed_browser_profile_session_dir()
         with sync_playwright() as pw:
-            browser_session = _start_browser_session(pw, profile_root=profile_root)
+            browser_session = _start_browser_session(pw)
             try:
                 context = browser_session.context
-                saved_state = None if force_reauth else _load_saved_storage_state()
+                saved_state = _load_saved_storage_state()
                 restored_count = 0
                 if isinstance(saved_state, dict):
                     restored_count = _seed_context_with_storage_state(context, saved_state)
@@ -749,7 +666,6 @@ def _connect_worker(
                     message=(
                         f"Browser opened ({browser_session.strategy}). "
                         f"{'Restored previous session cookies. ' if restored_count > 0 else ''}"
-                        f"{'Previous browser sign-in was cleared. ' if force_reauth else ''}"
                         "Sign in with Google in the opened window."
                     ),
                     error={},
@@ -774,43 +690,20 @@ def _connect_worker(
 
                     urls = _page_urls(context)
                     has_notebook_page = any(_is_notebooklm_url(u) for u in urls)
-                    cookie_peek: list[Dict[str, Any]] = []
-                    if not has_notebook_page:
-                        cookie_peek = _peek_google_cookies(context)
-                    if not has_notebook_page and not cookie_peek:
-                        _update_state(
-                            state="running",
-                            phase="waiting_user_login",
-                            message="Browser opened. Waiting for NotebookLM sign-in to complete...",
-                            error={},
-                        )
-                        next_probe_at = now_ts + _LIGHT_LOGIN_PROBE_INTERVAL_SECONDS
-                        time.sleep(0.5)
-                        continue
-
                     storage_state = _collect_storage_state(context)
                     cookies = storage_state.get("cookies") if isinstance(storage_state, dict) else None
                     has_any_cookies = isinstance(cookies, list) and len(cookies) > 0
-                    if not has_any_cookies and cookie_peek:
-                        storage_state = {
-                            **(storage_state if isinstance(storage_state, dict) else {}),
-                            "cookies": list(cookie_peek),
-                            "origins": list(storage_state.get("origins") or [])
-                            if isinstance(storage_state, dict) and isinstance(storage_state.get("origins"), list)
-                            else [],
-                        }
-                        cookies = cookie_peek
-                        has_any_cookies = True
                     if not has_any_cookies:
+                        if has_notebook_page:
+                            wait_msg = "NotebookLM opened. Waiting for Google session cookies..."
+                        else:
+                            wait_msg = "Browser opened. Waiting for NotebookLM sign-in to complete..."
                         _update_state(
                             state="running",
                             phase="waiting_user_login",
-                            message="NotebookLM opened. Waiting for Google session cookies...",
+                            message=wait_msg,
                             error={},
                         )
-                        next_probe_at = now_ts + _CREDENTIAL_RETRY_INTERVAL_SECONDS
-                        time.sleep(0.5)
-                        continue
                     if has_any_cookies:
                         persisted = False
                         try:
@@ -827,7 +720,7 @@ def _connect_worker(
                                 message="Waiting for complete Google session cookies...",
                                 error={},
                             )
-                            next_probe_at = now_ts + _CREDENTIAL_RETRY_INTERVAL_SECONDS
+                            next_probe_at = now_ts + 4.0
                             time.sleep(0.5)
                             continue
                         _update_state(
@@ -845,7 +738,7 @@ def _connect_worker(
                                 message="Sign-in detected but session is incomplete. Keep the NotebookLM tab open for a moment...",
                                 error={},
                             )
-                            next_probe_at = now_ts + _CREDENTIAL_RETRY_INTERVAL_SECONDS
+                            next_probe_at = now_ts + 4.0
                             time.sleep(0.5)
                             continue
                         except Exception as e:
@@ -865,13 +758,13 @@ def _connect_worker(
                                 message=f"Sign-in detected, verification pending: {brief}",
                                 error={},
                             )
-                            next_probe_at = now_ts + _CREDENTIAL_RETRY_INTERVAL_SECONDS
+                            next_probe_at = now_ts + 4.0
                             time.sleep(0.5)
                             continue
                         _mark_provider_connected(mode="active", last_error="")
                         _set_succeeded("Google account connected.")
                         return
-                    next_probe_at = now_ts + _LIGHT_LOGIN_PROBE_INTERVAL_SECONDS
+                    next_probe_at = now_ts + 2.0
                     time.sleep(0.5)
             finally:
                 browser_session.close()
@@ -880,7 +773,7 @@ def _connect_worker(
         _set_failed(code="space_provider_auth_flow_failed", message=str(e))
 
 
-def start_notebooklm_auth_flow(*, timeout_seconds: int = 900, force_reauth: bool = False) -> Dict[str, Any]:
+def start_notebooklm_auth_flow(*, timeout_seconds: int = 900) -> Dict[str, Any]:
     global _FLOW_THREAD, _FLOW_CANCEL_EVENT
     with _FLOW_LOCK:
         active = _FLOW_THREAD is not None and _FLOW_THREAD.is_alive()
@@ -896,7 +789,6 @@ def start_notebooklm_auth_flow(*, timeout_seconds: int = 900, force_reauth: bool
                 "session_id": session_id,
                 "timeout_seconds": int(timeout_seconds or 900),
                 "cancel_event": cancel_event,
-                "force_reauth": bool(force_reauth),
             },
             daemon=True,
         )
@@ -909,11 +801,7 @@ def start_notebooklm_auth_flow(*, timeout_seconds: int = 900, force_reauth: bool
                 "started_at": _now_iso(),
                 "updated_at": _now_iso(),
                 "finished_at": "",
-                "message": (
-                    "Starting Google account switch flow..."
-                    if force_reauth
-                    else "Starting Google connect flow..."
-                ),
+                "message": "Starting Google connect flow...",
                 "error": {},
             }
         )
@@ -937,36 +825,3 @@ def cancel_notebooklm_auth_flow() -> Dict[str, Any]:
             message="Cancel requested...",
         )
     return _snapshot_state()
-
-
-def disconnect_notebooklm_auth_flow() -> Dict[str, Any]:
-    global _FLOW_THREAD, _FLOW_CANCEL_EVENT
-    with _FLOW_LOCK:
-        running = _FLOW_THREAD is not None and _FLOW_THREAD.is_alive()
-    if running:
-        raise RuntimeError("cannot disconnect while Google connect flow is running")
-    _ = update_space_provider_secrets(
-        "notebooklm",
-        set_vars={},
-        unset_keys=[_SPACE_PROVIDER_SECRET_KEY],
-        clear=True,
-    )
-    os.environ.pop("CCCC_NOTEBOOKLM_AUTH_JSON", None)
-    _clear_managed_browser_profile_dir(strict=False)
-    with _FLOW_LOCK:
-        _FLOW_THREAD = None
-        _FLOW_CANCEL_EVENT = None
-        _FLOW_STATE.update(
-            {
-                "provider": "notebooklm",
-                "state": "idle",
-                "phase": "idle",
-                "session_id": "",
-                "started_at": "",
-                "updated_at": _now_iso(),
-                "finished_at": "",
-                "message": "",
-                "error": {},
-            }
-        )
-        return deepcopy(_FLOW_STATE)

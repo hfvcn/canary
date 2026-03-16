@@ -73,10 +73,7 @@ def notebooklm_health_check(
     *,
     real_enabled: bool | None = None,
 ) -> Dict[str, Any]:
-    explicit_auth = bool(str(auth_json_raw or "").strip())
     enabled = notebooklm_real_enabled() if real_enabled is None else bool(real_enabled)
-    if explicit_auth:
-        enabled = True
     if not enabled:
         raise NotebookLMProviderError(
             code="space_provider_not_configured",

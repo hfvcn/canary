@@ -245,9 +245,8 @@ def space_provider_auth(
     by: str,
     action: str = "status",
     timeout_seconds: int = 900,
-    force_reauth: bool = False,
 ) -> Dict[str, Any]:
-    """Control Group Space provider auth flow (status/start/cancel/disconnect)."""
+    """Control Group Space provider auth flow (status/start/cancel)."""
     req: Dict[str, Any] = {
         "provider": str(provider or "notebooklm"),
         "by": str(by or "user"),
@@ -255,7 +254,6 @@ def space_provider_auth(
     }
     if str(action or "status") == "start":
         req["timeout_seconds"] = max(60, min(int(timeout_seconds or 900), 1800))
-        req["force_reauth"] = bool(force_reauth)
     return _call_daemon_or_raise({"op": "group_space_provider_auth", "args": req})
 
 

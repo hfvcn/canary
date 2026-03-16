@@ -13,7 +13,7 @@ from ...kernel.permissions import require_actor_permission
 from ...runners import headless as headless_runner
 from ...runners import pty as pty_runner
 from ...util.conv import coerce_bool
-from .actor_profile_runtime import ActorProfileAccessDeniedError, resolve_linked_actor_before_start
+from .actor_profile_runtime import resolve_linked_actor_before_start
 
 
 def _error(code: str, message: str, *, details: Optional[Dict[str, Any]] = None) -> DaemonResponse:

@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Actor, LedgerEvent } from "../../types";
 import { formatFullTime, formatTime } from "../../utils/time";
@@ -36,11 +36,22 @@ export interface InboxModalProps {
   busy: string;
   onClose: () => void;
   onMarkAllRead: () => void;
+  collapseHumanMessageBodiesByDefault?: boolean;
 }
 
-export function InboxModal({ isOpen, actorId, actors, messages, busy, onClose, onMarkAllRead }: InboxModalProps) {
-  const { t } = useTranslation("modals");
+export function InboxModal({
+  isOpen,
+  actorId,
+  actors,
+  messages,
+  busy,
+  onClose,
+  onMarkAllRead,
+  collapseHumanMessageBodiesByDefault,
+}: InboxModalProps) {
+  const { t } = useTranslation(["modals", "chat"]);
   const { modalRef } = useModalA11y(isOpen, onClose);
+  const [expandedEventIds, setExpandedEventIds] = useState<Record<string, boolean>>({});
   // Helper to get display name for actor
   const getDisplayName = useMemo(() => {
     const map = new Map<string, string>();
@@ -53,6 +64,12 @@ export function InboxModal({ isOpen, actorId, actors, messages, busy, onClose, o
       return map.get(id) || id;
     };
   }, [actors]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setExpandedEventIds({});
+    }
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -95,11 +112,14 @@ export function InboxModal({ isOpen, actorId, actors, messages, busy, onClose, o
         </div>
 
         <div className="flex-1 min-h-0 overflow-auto p-4 space-y-2">
-          {messages.map((ev, idx) => (
-            <div
-              key={String(ev.id || idx)}
-              className="rounded-xl px-4 py-3 glass-panel"
-            >
+          {messages.map((ev, idx) => {
+            const eventId = String(ev.id || idx);
+            const bodyHiddenByServer = !!ev._message_body_hidden;
+            const showCollapsedHumanBody = Boolean(
+              collapseHumanMessageBodiesByDefault && ev.by === "user" && !bodyHiddenByServer && !expandedEventIds[eventId]
+            );
+            return (
+            <div key={eventId} className="rounded-xl px-4 py-3 glass-panel">
               <div className="flex items-center justify-between gap-3">
                 <div className="text-xs truncate text-[var(--color-text-muted)]" title={formatFullTime(ev.ts)}>
                   {formatTime(ev.ts)}
@@ -107,13 +127,40 @@ export function InboxModal({ isOpen, actorId, actors, messages, busy, onClose, o
                 <div className="text-xs font-medium truncate text-[var(--color-text-secondary)]">{getDisplayName(ev.by || "") || "—"}</div>
               </div>
               <div className="mt-2 text-sm break-words">
-                <MarkdownRenderer
-                  content={formatEventLine(ev, getDisplayName)}
-                  className="text-[var(--color-text-primary)]"
-                />
+                {bodyHiddenByServer ? (
+                  <div className="text-[var(--color-text-secondary)]">{t("chat:memberMessageHidden")}</div>
+                ) : showCollapsedHumanBody ? (
+                  <button
+                    type="button"
+                    className="rounded-lg border px-2 py-1 text-xs font-medium glass-btn text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
+                    onClick={() => setExpandedEventIds((prev) => ({ ...prev, [eventId]: true }))}
+                  >
+                    {t("chat:showMemberMessage")}
+                  </button>
+                ) : (
+                  <>
+                    {collapseHumanMessageBodiesByDefault && ev.by === "user" ? (
+                      <button
+                        type="button"
+                        className="mb-2 rounded-lg border px-2 py-1 text-[10px] font-medium glass-btn text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
+                        onClick={() => setExpandedEventIds((prev) => {
+                          const next = { ...prev };
+                          delete next[eventId];
+                          return next;
+                        })}
+                      >
+                        {t("chat:hideMemberMessage")}
+                      </button>
+                    ) : null}
+                    <MarkdownRenderer
+                      content={formatEventLine(ev, getDisplayName)}
+                      className="text-[var(--color-text-primary)]"
+                    />
+                  </>
+                )}
               </div>
             </div>
-          ))}
+          )})}
           {!messages.length && (
             <div className="text-center py-8">
               <div className="text-3xl mb-2">📭</div>

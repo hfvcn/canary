@@ -3,6 +3,8 @@ from __future__ import annotations
 """IM bridge related CLI command handlers."""
 
 from .common import *  # noqa: F401,F403
+from ..kernel.settings import get_im_defaults
+from ..ports.im.config_schema import canonicalize_im_config, resolve_im_config
 from ..util.process import SOFT_TERMINATE_SIGNAL, best_effort_signal_pid, pid_is_alive, resolve_background_python_argv, supervised_process_popen_kwargs
 
 __all__ = [
@@ -17,6 +19,22 @@ __all__ = [
     "cmd_im_revoke",
     "cmd_im_logs",
 ]
+
+
+def _group_local_im_doc(group: Any) -> dict[str, Any]:
+    raw = group.doc.get("im")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _group_effective_im(group: Any) -> dict[str, Any]:
+    return resolve_im_config(_group_local_im_doc(group), get_im_defaults())
+
+
+def _persist_group_im_enabled(group: Any, enabled: bool) -> None:
+    local_im = _group_local_im_doc(group)
+    local_im["enabled"] = bool(enabled)
+    group.doc["im"] = local_im
+    group.save()
 
 def cmd_im_set(args: argparse.Namespace) -> int:
     """Set IM bridge configuration for a group."""
@@ -123,6 +141,10 @@ def cmd_im_set(args: argparse.Namespace) -> int:
         if platform == "slack" and app_token_env:
             im_config["app_token_env"] = app_token_env
     elif platform == "feishu":
+        if isinstance(prev_im, dict):
+            for key in ("feishu_message_style", "feishu_card_title", "feishu_card_template_id"):
+                if key in prev_im:
+                    im_config[key] = prev_im.get(key)
         if feishu_domain:
             im_config["feishu_domain"] = feishu_domain
         if app_key_env:
@@ -160,41 +182,6 @@ def cmd_im_unset(args: argparse.Namespace) -> int:
         _print_json({"ok": False, "error": {"code": "group_not_found", "message": f"group not found: {group_id}"}})
         return 2
 
-    state_dir = group.path / "state"
-    killed: set[int] = set()
-
-    # 1. Stop bridge via pid file (same pattern as cmd_im_stop)
-    pid_path = state_dir / "im_bridge.pid"
-    if pid_path.exists():
-        try:
-            pid = int(pid_path.read_text(encoding="utf-8").strip())
-            if pid > 0:
-                best_effort_signal_pid(pid, SOFT_TERMINATE_SIGNAL, include_group=True)
-                killed.add(pid)
-        except Exception:
-            pass
-        try:
-            pid_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    # 1b. Scan for orphan bridge processes (reuse existing helper)
-    for orphan_pid in _im_find_bridge_pids_by_script(group_id):
-        if orphan_pid not in killed:
-            try:
-                best_effort_signal_pid(orphan_pid, SOFT_TERMINATE_SIGNAL, include_group=True)
-            except Exception:
-                pass
-            killed.add(orphan_pid)
-
-    # 2. Clean up IM state files (graceful — ignore missing files)
-    for fname in ("im_subscribers.json", "im_authorized_chats.json", "im_pending_keys.json"):
-        try:
-            (state_dir / fname).unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    # 3. Remove IM config from group doc
     if "im" in group.doc:
         del group.doc["im"]
         group.save()
@@ -214,9 +201,20 @@ def cmd_im_config(args: argparse.Namespace) -> int:
         _print_json({"ok": False, "error": {"code": "group_not_found", "message": f"group not found: {group_id}"}})
         return 2
 
-    raw_im = group.doc.get("im")
-    im_config = canonicalize_im_config(raw_im) if isinstance(raw_im, dict) else raw_im
-    _print_json({"ok": True, "result": {"group_id": group_id, "im": im_config}})
+    local_im = canonicalize_im_config(_group_local_im_doc(group))
+    global_im = get_im_defaults()
+    im_config = resolve_im_config(local_im, global_im)
+    _print_json({
+        "ok": True,
+        "result": {
+            "group_id": group_id,
+            "im": im_config or None,
+            "local_im": local_im or None,
+            "global_im": global_im or None,
+            "has_local_override": bool(local_im),
+            "uses_global_defaults": bool(global_im) and im_config != local_im,
+        },
+    })
     return 0
 
 def _im_find_bridge_pid(group: Any) -> Optional[int]:
@@ -226,8 +224,10 @@ def _im_find_bridge_pid(group: Any) -> Optional[int]:
         return None
     try:
         pid = int(pid_path.read_text(encoding="utf-8").strip())
-        return pid if pid_is_alive(pid) else None
-    except ValueError:
+        # Check if process is alive
+        os.kill(pid, 0)
+        return pid
+    except (ValueError, ProcessLookupError, PermissionError):
         return None
 
 def _im_find_bridge_pids_by_script(group_id: str) -> list[int]:
@@ -282,16 +282,14 @@ def cmd_im_start(args: argparse.Namespace) -> int:
         return 2
 
     # Check IM config
-    im_config = canonicalize_im_config(group.doc.get("im", {}))
+    im_config = _group_effective_im(group)
     if not im_config:
         _print_json({"ok": False, "error": {"code": "no_im_config", "message": "no IM configuration. Run: cccc im set <platform>"}})
         return 2
 
     # Persist desired run-state for restart/autostart.
-    im_config["enabled"] = True
-    group.doc["im"] = im_config
     try:
-        group.save()
+        _persist_group_im_enabled(group, enabled=True)
     except Exception:
         pass
 
@@ -405,6 +403,8 @@ def cmd_im_start(args: argparse.Namespace) -> int:
 
 def cmd_im_stop(args: argparse.Namespace) -> int:
     """Stop IM bridge for a group."""
+    import signal as sig
+
     group_id = _resolve_group_id(getattr(args, "group", ""))
     if not group_id:
         _print_json({"ok": False, "error": {"code": "missing_group_id", "message": "missing group_id (no active group?)"}})
@@ -414,12 +414,7 @@ def cmd_im_stop(args: argparse.Namespace) -> int:
     try:
         group = load_group(group_id)
         if group is not None:
-            raw_im_cfg = group.doc.get("im")
-            if isinstance(raw_im_cfg, dict):
-                im_cfg = canonicalize_im_config(raw_im_cfg)
-                im_cfg["enabled"] = False
-                group.doc["im"] = im_cfg
-                group.save()
+            _persist_group_im_enabled(group, enabled=False)
     except Exception:
         pass
 
@@ -434,9 +429,12 @@ def cmd_im_stop(args: argparse.Namespace) -> int:
             pid = int(pid_path.read_text(encoding="utf-8").strip())
             if pid not in killed:
                 try:
-                    best_effort_signal_pid(pid, SOFT_TERMINATE_SIGNAL, include_group=True)
+                    os.killpg(os.getpgid(pid), sig.SIGTERM)
                 except Exception:
-                    pass
+                    try:
+                        os.kill(pid, sig.SIGTERM)
+                    except Exception:
+                        pass
                 killed.add(pid)
                 stopped += 1
         except Exception:
@@ -452,9 +450,12 @@ def cmd_im_stop(args: argparse.Namespace) -> int:
         if pid in killed:
             continue
         try:
-            best_effort_signal_pid(pid, SOFT_TERMINATE_SIGNAL, include_group=True)
+            os.killpg(os.getpgid(pid), sig.SIGTERM)
         except Exception:
-            pass
+            try:
+                os.kill(pid, sig.SIGTERM)
+            except Exception:
+                pass
         killed.add(pid)
         stopped += 1
 
@@ -470,9 +471,10 @@ def cmd_im_status(args: argparse.Namespace) -> int:
     group = load_group(group_id)
     group_exists = group is not None
 
-    raw_im = group.doc.get("im", {}) if group_exists else {}
-    im_config = canonicalize_im_config(raw_im) if isinstance(raw_im, dict) else {}
+    im_config = _group_effective_im(group) if group_exists else {}
     platform = im_config.get("platform") if im_config else None
+    local_im = canonicalize_im_config(_group_local_im_doc(group)) if group_exists else {}
+    global_im = get_im_defaults()
 
     # Check if running
     pid = _im_find_bridge_pid(group) if group_exists else None
@@ -495,11 +497,13 @@ def cmd_im_status(args: argparse.Namespace) -> int:
     result = {
         "group_id": group_id,
         "group_exists": group_exists,
-        "configured": bool(im_config),
+        "configured": bool(platform),
         "platform": platform,
         "running": running,
         "pid": pid,
         "subscribers": subscriber_count,
+        "has_local_override": bool(local_im),
+        "uses_global_defaults": bool(global_im) and im_config != local_im,
     }
 
     _print_json({"ok": True, "result": result})

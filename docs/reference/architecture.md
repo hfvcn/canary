@@ -173,13 +173,12 @@ The surface is best understood as capability groups instead of a fixed namespace
 
 ### Core Collaboration Capability Groups
 
-- Session and guidance: `cccc_bootstrap`, `cccc_help`, `cccc_project_info`
-- Messaging and files: `cccc_inbox_list`, `cccc_inbox_mark_read`, `cccc_message_send`, `cccc_message_reply`, `cccc_file`
-- Group and actor control: `cccc_group`, `cccc_actor`
-- Coordination and state: `cccc_context_get`, `cccc_coordination`, `cccc_task`, `cccc_agent_state`, `cccc_context_sync`
-- Automation and memory: `cccc_automation`, `cccc_automation_manage`, `cccc_memory`, `cccc_memory_admin`
+### Context Sync (`cccc_context_*` and related, v2)
 
-### Capability-Managed and Optional Groups
+- Context batch operations: `cccc_context_get`, `cccc_context_sync`
+- Vision/overview: `cccc_vision_update`, `cccc_overview_manual_update`
+- Tasks (tree): `cccc_task_list`, `cccc_task_create`, `cccc_task_update`, `cccc_task_status`, `cccc_task_move`, `cccc_task_restore`
+- Agent state: `cccc_context_agent`
 
 - These capability groups expand the surface without hardcoding a fixed namespace count. The current grouped tools include lifecycle and pack control (`cccc_capability_search`, `cccc_capability_enable`, `cccc_capability_block`, `cccc_capability_state`, `cccc_capability_import`, `cccc_capability_uninstall`, `cccc_capability_use`).
 - Space / notebook integrations: `cccc_space`

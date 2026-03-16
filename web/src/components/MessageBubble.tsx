@@ -290,6 +290,7 @@ export interface MessageBubbleProps {
     onRelay?: (ev: LedgerEvent) => void;
     onOpenSource?: (srcGroupId: string, srcEventId: string) => void;
     onOpenPresentationRef?: (ref: PresentationMessageRef, event: LedgerEvent) => void;
+    collapseHumanMessageBodiesByDefault?: boolean;
 }
 
 export const MessageBubble = memo(function MessageBubble({
@@ -308,6 +309,7 @@ export const MessageBubble = memo(function MessageBubble({
     onRelay,
     onOpenSource,
     onOpenPresentationRef,
+    collapseHumanMessageBodiesByDefault,
 }: MessageBubbleProps) {
     const isUserMessage = ev.by === "user";
     const isOptimistic = !!(ev.data as Record<string, unknown> | undefined)?._optimistic;
@@ -507,6 +509,17 @@ export const MessageBubble = memo(function MessageBubble({
         ? "border-white/14 bg-white/8 text-blue-100 shadow-none hover:bg-white/12"
         : "glass-btn border border-[var(--glass-border-subtle)] text-[var(--color-text-secondary)]";
 
+    const bodyHiddenByServer = !!ev._message_body_hidden;
+    const canCollapseHumanMessage = Boolean(collapseHumanMessageBodiesByDefault && isUserMessage && !bodyHiddenByServer);
+    const [isHumanMessageExpanded, setIsHumanMessageExpanded] = useState(!canCollapseHumanMessage);
+
+    useEffect(() => {
+        setIsHumanMessageExpanded(!canCollapseHumanMessage);
+    }, [canCollapseHumanMessage, ev.id]);
+
+    const showCollapsedHumanBody = canCollapseHumanMessage && !isHumanMessageExpanded;
+    const shouldRenderBody = !bodyHiddenByServer && !showCollapsedHumanBody;
+
     useEffect(() => {
         if (!copiedMessageText) return undefined;
         const timer = window.setTimeout(() => {
@@ -529,7 +542,7 @@ export const MessageBubble = memo(function MessageBubble({
                 isUserMessage
                     ? "flex-col items-end sm:items-start sm:flex-row-reverse"
                     : "flex-col items-start sm:flex-row",
-                isOptimistic ? "opacity-95" : ""
+                isOptimistic ? "opacity-60" : ""
             )}
         >
             {/* Desktop Avatar (Hidden on mobile) */}
@@ -597,7 +610,7 @@ export const MessageBubble = memo(function MessageBubble({
                         {senderDisplayName}
                     </span>
                     <span className={`text-[10px] flex-shrink-0 text-[var(--color-text-tertiary)]`}>
-                        <span title={fullMessageTimestamp}>{messageTimestamp}</span>
+                        {isOptimistic ? t('sending', '发送中…') : <span title={fullMessageTimestamp}>{messageTimestamp}</span>}
                     </span>
                     <span
                         className={classNames(
@@ -629,7 +642,7 @@ export const MessageBubble = memo(function MessageBubble({
                         {senderDisplayName}
                     </span>
                     <span className={`text-[10px] flex-shrink-0 text-[var(--color-text-tertiary)]`}>
-                        <span title={fullMessageTimestamp}>{messageTimestamp}</span>
+                        {isOptimistic ? t('sending', '发送中…') : <span title={fullMessageTimestamp}>{messageTimestamp}</span>}
                     </span>
                     <span className={classNames("text-[10px] min-w-0 truncate", "text-[var(--color-text-tertiary)]")} title={`to ${toLabel}`}>
                         to {toLabel}
@@ -654,7 +667,7 @@ export const MessageBubble = memo(function MessageBubble({
                     )}
                 <div
                     className={classNames(
-                        "px-4 py-2.5 text-sm leading-relaxed",
+                        "max-h-[min(70vh,32rem)] overflow-x-hidden overflow-y-auto px-4 py-2.5 text-sm leading-relaxed",
                         isUserMessage
                             ? "bg-blue-600 text-white rounded-2xl rounded-tr-none shadow-sm"
                             : "glass-bubble rounded-2xl rounded-tl-none text-[var(--color-text-primary)]"
@@ -704,7 +717,7 @@ export const MessageBubble = memo(function MessageBubble({
                         );
                     })() : null}
                     {/* Reply Context */}
-                    {quoteText && (
+                    {shouldRenderBody && quoteText && (
                         <div
                             className={`mb-2 text-xs border-l-2 pl-2 italic truncate opacity-80 ${isUserMessage ? "border-blue-400" : "border-[var(--glass-border-subtle)]"
                                 }`}
@@ -735,12 +748,47 @@ export const MessageBubble = memo(function MessageBubble({
                     ) : null}
 
                     {/* Text Content */}
-                    <MarkdownRenderer
-                        content={messageText}
-                        isDark={isDark}
-                        invertText={isUserMessage}
-                        className="break-words [overflow-wrap:anywhere] max-w-full"
-                    />
+                    {bodyHiddenByServer ? (
+                        <div className={classNames("text-xs font-medium opacity-80", isUserMessage ? "text-blue-100" : "text-[var(--color-text-secondary)]")}>
+                            {t('memberMessageHidden')}
+                        </div>
+                    ) : showCollapsedHumanBody ? (
+                        <button
+                            type="button"
+                            className={classNames(
+                                "inline-flex items-center rounded-lg border px-2 py-1 text-xs font-medium transition-colors",
+                                isUserMessage
+                                    ? "border-blue-300/40 bg-blue-500/10 text-blue-50 hover:bg-blue-500/20"
+                                    : "border-[var(--glass-border-subtle)] text-[var(--color-text-secondary)] hover:bg-[var(--glass-tab-bg)]"
+                            )}
+                            onClick={() => setIsHumanMessageExpanded(true)}
+                        >
+                            {t('showMemberMessage')}
+                        </button>
+                    ) : (
+                        <>
+                            {canCollapseHumanMessage ? (
+                                <button
+                                    type="button"
+                                    className={classNames(
+                                        "mb-2 inline-flex items-center rounded-lg border px-2 py-1 text-[10px] font-medium transition-colors",
+                                        isUserMessage
+                                            ? "border-blue-300/40 bg-blue-500/10 text-blue-50 hover:bg-blue-500/20"
+                                            : "border-[var(--glass-border-subtle)] text-[var(--color-text-secondary)] hover:bg-[var(--glass-tab-bg)]"
+                                    )}
+                                    onClick={() => setIsHumanMessageExpanded(false)}
+                                >
+                                    {t('hideMemberMessage')}
+                                </button>
+                            ) : null}
+                            <MarkdownRenderer
+                                content={messageText}
+                                isDark={isDark}
+                                invertText={isUserMessage}
+                                className="break-words [overflow-wrap:anywhere] max-w-full"
+                            />
+                        </>
+                    )}
 
                     {/* Attachments */}
                     {blobAttachments.length > 0 && blobGroupId && (() => {

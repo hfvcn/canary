@@ -8,23 +8,6 @@ from unittest.mock import patch
 
 
 class TestNotebookLMProviderScaffold(unittest.TestCase):
-    def test_health_check_accepts_explicit_auth_even_without_real_env_flag(self) -> None:
-        from cccc.providers.notebooklm.compat import NotebookLMCompatStatus
-        from cccc.providers.notebooklm.health import notebooklm_health_check
-
-        raw_auth = '{"cookies":[{"name":"SID","value":"abc123","domain":".google.com"}]}'
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CCCC_NOTEBOOKLM_REAL", None)
-            with patch(
-                "cccc.providers.notebooklm.health.probe_notebooklm_vendor",
-                return_value=NotebookLMCompatStatus(compatible=True, reason="ok"),
-            ):
-                out = notebooklm_health_check(auth_json_raw=raw_auth)
-
-        self.assertEqual(str(out.get("provider") or ""), "notebooklm")
-        self.assertTrue(bool(out.get("enabled")))
-        self.assertTrue(bool(out.get("compatible")))
-
     def test_adapter_run_with_vendor_auth_injects_env_temporarily(self) -> None:
         from cccc.providers.notebooklm import adapter as notebooklm_adapter
 
@@ -224,52 +207,6 @@ class TestNotebookLMProviderScaffold(unittest.TestCase):
         self.assertEqual(str(out.get("answer") or ""), "ok")
         refs = out.get("references") if isinstance(out.get("references"), list) else []
         self.assertEqual(len(refs), 1)
-
-    def test_create_space_works_from_saved_state_without_real_env_flag(self) -> None:
-        from cccc.daemon.space.group_space_provider import provider_create_space
-        from cccc.daemon.space.group_space_store import set_space_provider_state, update_space_provider_secrets
-        from cccc.providers.notebooklm.compat import NotebookLMCompatStatus
-
-        def _ok(coro):
-            coro.close()
-            return {"remote_space_id": "nb_auth_state", "title": "CCCC Space"}
-
-        raw_auth = '{"cookies":[{"name":"SID","value":"abc123","domain":".google.com"}]}'
-        with patch.dict(os.environ, {}, clear=False):
-            with tempfile.TemporaryDirectory() as td:
-                old_home = os.environ.get("CCCC_HOME")
-                os.environ["CCCC_HOME"] = td
-                os.environ.pop("CCCC_NOTEBOOKLM_REAL", None)
-                try:
-                    set_space_provider_state(
-                        "notebooklm",
-                        enabled=True,
-                        real_enabled=True,
-                        mode="active",
-                        last_error="",
-                        touch_health=True,
-                    )
-                    update_space_provider_secrets(
-                        "notebooklm",
-                        set_vars={"NOTEBOOKLM_AUTH_JSON": raw_auth},
-                        unset_keys=[],
-                        clear=False,
-                    )
-                    with patch(
-                        "cccc.providers.notebooklm.health.probe_notebooklm_vendor",
-                        return_value=NotebookLMCompatStatus(compatible=True, reason="ok"),
-                    ), patch(
-                        "cccc.providers.notebooklm.adapter._run_coroutine_sync",
-                        side_effect=_ok,
-                    ):
-                        out = provider_create_space("notebooklm", title="CCCC Space")
-                finally:
-                    if old_home is None:
-                        os.environ.pop("CCCC_HOME", None)
-                    else:
-                        os.environ["CCCC_HOME"] = old_home
-
-        self.assertEqual(str(out.get("remote_space_id") or ""), "nb_auth_state")
 
     def test_notebooklm_error_flags_are_preserved_by_provider_mapping(self) -> None:
         from cccc.daemon.space.group_space_provider import SpaceProviderError, provider_ingest

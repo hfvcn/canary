@@ -41,7 +41,7 @@ interface ContextModalProps {
   onRefreshContext: () => Promise<void>;
   isDark: boolean;
   settings?: GroupSettings | null;
-  onUpdateSettings?: (settings: Partial<GroupSettings>) => Promise<boolean | void>;
+  onUpdateSettings?: (settings: Partial<GroupSettings>) => Promise<void>;
 }
 
 interface BriefDraft {
@@ -298,241 +298,16 @@ function agentWarm(agent: AgentState | null | undefined) {
   };
 }
 
-function hasMindContext(agent: AgentState | null | undefined): boolean {
-  const warm = agentWarm(agent);
-  return !!(
-    warm.environmentSummary ||
-    warm.userModel ||
-    warm.personaNotes
-  );
-}
-
-function hasRecoveryCues(agent: AgentState | null | undefined): boolean {
+function hasWarmState(agent: AgentState): boolean {
   const warm = agentWarm(agent);
   return !!(
     warm.whatChanged ||
     warm.openLoops.length ||
     warm.commitments.length ||
+    warm.environmentSummary ||
+    warm.userModel ||
+    warm.personaNotes ||
     warm.resumeHint
-  );
-}
-
-function agentUpdatedAtTimestamp(agent: AgentState | null | undefined): number {
-  const raw = String(agent?.updated_at || "").trim();
-  if (!raw) return 0;
-  const timestamp = Date.parse(raw);
-  return Number.isFinite(timestamp) ? timestamp : 0;
-}
-
-function isAgentStale(agent: AgentState | null | undefined): boolean {
-  const timestamp = agentUpdatedAtTimestamp(agent);
-  if (!timestamp) return false;
-  return (Date.now() - timestamp) > 20 * 60 * 1000;
-}
-
-function recoverySummary(agent: AgentState, tr: ContextTranslator): string {
-  const warm = agentWarm(agent);
-  const parts: string[] = [];
-  if (warm.resumeHint) parts.push(tr("context.resumeReady", "resume ready"));
-  if (warm.openLoops.length > 0) {
-    parts.push(tr("context.openLoopsCount", "{{count}} open loops", { count: warm.openLoops.length }));
-  }
-  if (warm.commitments.length > 0) {
-    parts.push(tr("context.commitmentsCount", "{{count}} commitments", { count: warm.commitments.length }));
-  }
-  if (parts.length === 0 && warm.whatChanged) {
-    parts.push(tr("context.changeCaptured", "change captured"));
-  }
-  return parts.join(" · ") || tr("context.noRecoveryCues", "No recovery cues");
-}
-
-function clampTextStyle(lines: number): CSSProperties {
-  return {
-    display: "-webkit-box",
-    WebkitBoxOrient: "vertical",
-    WebkitLineClamp: lines,
-    overflow: "hidden",
-  };
-}
-
-interface ExpandableTextBlockProps {
-  label: string;
-  text: string;
-  mutedTextClass: string;
-  subtleTextClass: string;
-  tr: ContextTranslator;
-  lines?: number;
-}
-
-function ExpandableTextBlock({
-  label,
-  text,
-  mutedTextClass,
-  subtleTextClass,
-  tr,
-  lines = 4,
-}: ExpandableTextBlockProps) {
-  const [expanded, setExpanded] = useState(false);
-  const value = String(text || "").trim();
-  if (!value) return null;
-
-  const lineCount = value.split(/\r?\n/).length;
-  const needsToggle = value.length > 240 || lineCount > lines;
-
-  return (
-    <div>
-      <div className={classNames("text-[11px] font-medium uppercase tracking-wide", mutedTextClass)}>{label}</div>
-      <div
-        className={classNames("mt-1 text-sm leading-6 whitespace-pre-wrap break-words", subtleTextClass)}
-        style={!expanded && needsToggle ? clampTextStyle(lines) : undefined}
-      >
-        {value}
-      </div>
-      {needsToggle ? (
-        <button
-          type="button"
-          onClick={() => setExpanded((prev) => !prev)}
-          aria-expanded={expanded}
-          className={classNames("mt-2 text-xs font-medium transition-colors", "text-[var(--color-accent-primary)] hover:opacity-80")}
-        >
-          {expanded ? tr("context.showLess", "Show less") : tr("context.showMore", "Show more")}
-        </button>
-      ) : null}
-    </div>
-  );
-}
-
-interface AgentStateCardProps {
-  agent: AgentState;
-  tr: ContextTranslator;
-  mutedTextClass: string;
-  subtleTextClass: string;
-}
-
-function AgentStateCard({ agent, tr, mutedTextClass, subtleTextClass }: AgentStateCardProps) {
-  const [recoveryOpen, setRecoveryOpen] = useState(false);
-  const hot = agentHot(agent);
-  const warm = agentWarm(agent);
-  const stale = isAgentStale(agent);
-  const executionEmpty = !(hot.focus || hot.nextAction || hot.activeTaskId || hot.blockers.length > 0);
-  const mindContextEmpty = !hasMindContext(agent);
-  const recoveryEmpty = !hasRecoveryCues(agent);
-  const sectionClass = classNames("rounded-xl border px-3 py-3", "glass-card");
-  const sectionTitleClass = classNames("text-xs font-semibold uppercase tracking-[0.12em]", "text-[var(--color-text-secondary)]");
-  const summary = recoverySummary(agent, tr);
-
-  return (
-    <article className={classNames("rounded-2xl border p-4", "glass-card")}>
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className={classNames("text-sm font-semibold break-words", "text-[var(--color-text-primary)]")}>{agent.id}</div>
-          <div className="mt-1 flex flex-wrap items-center gap-2">
-            <span
-              className={classNames("text-xs", stale ? "text-amber-600 dark:text-amber-300" : mutedTextClass)}
-              title={agent.updated_at ? formatFullTime(agent.updated_at) : undefined}
-            >
-              {agent.updated_at ? tr("context.updated", "Updated {{time}}", { time: formatTime(agent.updated_at) }) : tr("context.notUpdatedYet", "Not updated yet")}
-            </span>
-            {stale ? (
-              <span className={classNames("rounded-full px-2 py-0.5 text-[11px]", "bg-amber-500/15 text-amber-700 dark:text-amber-300")}>
-                {tr("context.stale", "Stale")}
-              </span>
-            ) : null}
-          </div>
-        </div>
-        <div className="flex flex-wrap items-center justify-end gap-2">
-          {hot.activeTaskId ? (
-            <span className={classNames("rounded-full px-2 py-0.5 text-[11px]", "bg-blue-500/15 text-blue-600 dark:text-blue-400")}>
-              {hot.activeTaskId}
-            </span>
-          ) : null}
-          {hot.blockers.length > 0 ? (
-            <span className={classNames("rounded-full px-2 py-0.5 text-[11px]", "bg-rose-500/15 text-rose-600 dark:text-rose-400")}>
-              {tr("context.blocked", "Blocked")}
-            </span>
-          ) : null}
-        </div>
-      </div>
-
-      <section className={classNames(sectionClass, "mt-4")}>
-        <div className={sectionTitleClass}>{tr("context.executionNow", "Execution Now")}</div>
-        {executionEmpty ? (
-          <div className={classNames("mt-2 text-sm", mutedTextClass)}>{tr("context.noExecutionState", "No active execution state")}</div>
-        ) : (
-          <div className="mt-3 space-y-3">
-            <ExpandableTextBlock label={tr("context.focus", "Focus")} text={hot.focus} mutedTextClass={mutedTextClass} subtleTextClass={subtleTextClass} tr={tr} lines={3} />
-            <ExpandableTextBlock label={tr("context.nextAction", "Next action")} text={hot.nextAction} mutedTextClass={mutedTextClass} subtleTextClass={subtleTextClass} tr={tr} lines={3} />
-            {hot.activeTaskId ? (
-              <div>
-                <div className={classNames("text-[11px] font-medium uppercase tracking-wide", mutedTextClass)}>{tr("context.activeTask", "Active task")}</div>
-                <div className={classNames("mt-1 text-sm break-words", subtleTextClass)}>{hot.activeTaskId}</div>
-              </div>
-            ) : null}
-            {hot.blockers.length > 0 ? (
-              <div className={classNames("rounded-xl border px-3 py-3", "border-rose-500/30 bg-rose-500/10")}>
-                <div className={classNames("text-[11px] font-medium uppercase tracking-wide", "text-rose-600 dark:text-rose-300")}>
-                  {tr("context.blockers", "Blockers")}
-                </div>
-                <ul className={classNames("mt-2 space-y-1 text-sm list-disc pl-5", "text-rose-700 dark:text-rose-200")}>
-                  {hot.blockers.map((blocker, index) => <li key={`${agent.id}-blocker-${index}`}>{blocker}</li>)}
-                </ul>
-              </div>
-            ) : null}
-          </div>
-        )}
-      </section>
-
-      <section className={classNames(sectionClass, "mt-3")}>
-        <div className={sectionTitleClass}>{tr("context.mindContext", "Mind Context")}</div>
-        {mindContextEmpty ? (
-          <div className={classNames("mt-2 text-sm", mutedTextClass)}>{tr("context.noMindContext", "No mind context recorded yet")}</div>
-        ) : (
-          <div className="mt-3 space-y-4">
-            <ExpandableTextBlock label={tr("context.environmentContext", "Environment Context")} text={warm.environmentSummary} mutedTextClass={mutedTextClass} subtleTextClass={subtleTextClass} tr={tr} />
-            <ExpandableTextBlock label={tr("context.userPreferences", "User Preferences")} text={warm.userModel} mutedTextClass={mutedTextClass} subtleTextClass={subtleTextClass} tr={tr} />
-            <ExpandableTextBlock label={tr("context.workingStance", "Working Stance")} text={warm.personaNotes} mutedTextClass={mutedTextClass} subtleTextClass={subtleTextClass} tr={tr} />
-          </div>
-        )}
-      </section>
-
-      <section className={classNames(sectionClass, "mt-3")}>
-        <button type="button" onClick={() => setRecoveryOpen((prev) => !prev)} aria-expanded={recoveryOpen} className="flex w-full items-start justify-between gap-3 text-left">
-          <div className="min-w-0">
-            <div className={sectionTitleClass}>{tr("context.recoveryCues", "Recovery Cues")}</div>
-            <div className={classNames("mt-1 text-xs break-words", mutedTextClass)}>{summary}</div>
-          </div>
-          <span className={classNames("mt-0.5 text-sm transition-transform", mutedTextClass, recoveryOpen ? "rotate-180" : "")} aria-hidden="true">
-            ▾
-          </span>
-        </button>
-        {recoveryOpen ? (
-          recoveryEmpty ? (
-            <div className={classNames("mt-3 text-sm", mutedTextClass)}>{tr("context.noRecoveryCues", "No recovery cues")}</div>
-          ) : (
-            <div className="mt-3 space-y-4">
-              <ExpandableTextBlock label={tr("context.whatChanged", "What changed")} text={warm.whatChanged} mutedTextClass={mutedTextClass} subtleTextClass={subtleTextClass} tr={tr} lines={3} />
-              <ExpandableTextBlock label={tr("context.resumeHint", "Resume hint")} text={warm.resumeHint} mutedTextClass={mutedTextClass} subtleTextClass={subtleTextClass} tr={tr} lines={3} />
-              {warm.openLoops.length > 0 ? (
-                <div>
-                  <div className={classNames("text-[11px] font-medium uppercase tracking-wide", mutedTextClass)}>{tr("context.openLoops", "Open loops")}</div>
-                  <ul className={classNames("mt-2 space-y-1 text-sm list-disc pl-5", subtleTextClass)}>
-                    {warm.openLoops.map((item, index) => <li key={`${agent.id}-open-loop-${index}`}>{item}</li>)}
-                  </ul>
-                </div>
-              ) : null}
-              {warm.commitments.length > 0 ? (
-                <div>
-                  <div className={classNames("text-[11px] font-medium uppercase tracking-wide", mutedTextClass)}>{tr("context.commitments", "Commitments")}</div>
-                  <ul className={classNames("mt-2 space-y-1 text-sm list-disc pl-5", subtleTextClass)}>
-                    {warm.commitments.map((item, index) => <li key={`${agent.id}-commitment-${index}`}>{item}</li>)}
-                  </ul>
-                </div>
-              ) : null}
-            </div>
-          )
-        ) : null}
-      </section>
-    </article>
   );
 }
 
@@ -672,12 +447,10 @@ export function ContextModal({
   onUpdateSettings,
 }: ContextModalProps) {
   const { t } = useTranslation("modals");
-  const pendingIntent = useWebPetStore((state) => state.pendingIntent);
-  const setPendingIntent = useWebPetStore((state) => state.setPendingIntent);
   const tr = useCallback((key: string, fallback: string, vars?: Record<string, unknown>) =>
     String(t(key as never, { defaultValue: fallback, ...(vars || {}) } as never)), [t]);
 
-  const [activeView, setActiveView] = useState<"coordination" | "agents" | "desktop_pet">("coordination");
+  const [activeView, setActiveView] = useState<"coordination" | "agents">("coordination");
   const [steeringTab, setSteeringTab] = useState<"summary" | "project" | "log">("summary");
   const [taskFilter, setTaskFilter] = useState<"all" | "blocked" | "waiting_user" | "handoff" | "unassigned">("all");
   const [assigneeFilter, setAssigneeFilter] = useState<string>("__all__");
@@ -693,6 +466,7 @@ export function ContextModal({
   const [syncBusy, setSyncBusy] = useState(false);
   const [syncError, setSyncError] = useState("");
   const [viewBusy, setViewBusy] = useState(false);
+  const [mobileViewMenuOpen, setMobileViewMenuOpen] = useState(false);
 
   const [projectMd, setProjectMd] = useState<ProjectMdInfo | null>(null);
   const [projectBusy, setProjectBusy] = useState(false);
@@ -710,7 +484,7 @@ export function ContextModal({
   const [activityError, setActivityError] = useState("");
 
   const brief = context?.coordination?.brief || null;
-  const desktopPetEnabled = Boolean(settings?.desktop_pet_enabled);
+  const panoramaEnabled = Boolean(settings?.panorama_enabled);
   const tasks = useMemo(() => (Array.isArray(context?.coordination?.tasks) ? context.coordination.tasks : []), [context]);
   const agents = useMemo(() => (Array.isArray(context?.agent_states) ? context.agent_states : []), [context]);
   const board = useMemo(() => buildBoard(tasks, context?.board), [context?.board, tasks]);
@@ -739,6 +513,37 @@ export function ContextModal({
     [taskDraft]
   );
   const selectedTaskScaffold = useMemo(() => getTaskWorkflowScaffold(taskScaffoldId), [taskScaffoldId]);
+
+  const tasksSummary = useMemo(() => {
+    const fallback = {
+      total: tasks.length,
+      planned: board.planned.length,
+      active: board.active.length,
+      done: board.done.length,
+      archived: board.archived.length,
+    };
+    return context?.tasks_summary || fallback;
+  }, [board.active.length, board.archived.length, board.done.length, board.planned.length, context?.tasks_summary, tasks.length]);
+
+  const attentionCounts = useMemo(() => {
+    const blockedFallback = tasks.filter((task) => taskStatus(task) === "active" && Array.isArray(task.blocked_by) && task.blocked_by.length > 0).length;
+    const waitingUserFallback = tasks.filter((task) => String(task.waiting_on || "none") === "user").length;
+    const handoffFallback = tasks.filter((task) => !!String(task.handoff_to || "").trim() && taskStatus(task) !== "archived").length;
+    return {
+      blocked: countLike(context?.attention?.blocked, blockedFallback),
+      waitingUser: countLike(context?.attention?.waiting_user, waitingUserFallback),
+      pendingHandoffs: countLike(context?.attention?.pending_handoffs, handoffFallback),
+    };
+  }, [context?.attention, tasks]);
+
+  const recentDecisions = useMemo(
+    () => (Array.isArray(context?.coordination?.recent_decisions) ? context.coordination.recent_decisions : []),
+    [context]
+  );
+  const recentHandoffs = useMemo(
+    () => (Array.isArray(context?.coordination?.recent_handoffs) ? context.coordination.recent_handoffs : []),
+    [context]
+  );
 
   const tasksSummary = useMemo(() => {
     const fallback = {
@@ -863,6 +668,7 @@ export function ContextModal({
     setHandoffDraft(emptyNoteDraft());
     setActivityBusyKind(null);
     setActivityError("");
+    setMobileViewMenuOpen(false);
   }, [groupId, isOpen]);
 
   useEffect(() => {
@@ -1187,8 +993,6 @@ export function ContextModal({
     return (
       <div ref={setNodeRef} style={style} className={classNames("group/task", isDragging && "z-20 opacity-80")}>
         <div
-          id={`context-task-${task.id}`}
-          data-task-id={task.id}
           {...attributes}
           onClick={() => selectTask(task)}
           className={classNames(
@@ -1303,30 +1107,6 @@ export function ContextModal({
     setActiveView("coordination");
   }, [confirmDiscardTaskChanges, selectedTaskId, taskEditorMode]);
 
-  useEffect(() => {
-    if (!isOpen) return;
-    if (pendingIntent?.kind !== "task") return;
-
-    const task = taskMap.get(pendingIntent.taskId);
-    if (task) {
-      setActiveView("coordination");
-      setTaskFilter("all");
-      setAssigneeFilter("__all__");
-      setTaskQuery("");
-      selectTask(task);
-    }
-
-    const rafId = window.requestAnimationFrame(() => {
-      document
-        .getElementById(`context-task-${pendingIntent.taskId}`)
-        ?.scrollIntoView({ behavior: "smooth", block: "center" });
-    });
-
-    setPendingIntent(null);
-
-    return () => window.cancelAnimationFrame(rafId);
-  }, [isOpen, pendingIntent, selectTask, setPendingIntent, taskMap]);
-
   const closeTaskEditor = () => {
     if (!confirmDiscardTaskChanges()) return;
     setTaskEditorMode("none");
@@ -1352,8 +1132,8 @@ export function ContextModal({
     }
   }, [confirmDiscardTaskChanges, loadProjectMd]);
 
-  const handleSwitchActiveView = useCallback((next: "coordination" | "agents" | "desktop_pet") => {
-    if (next !== "coordination") {
+  const handleSwitchActiveView = useCallback((next: "coordination" | "agents") => {
+    if (next === "agents") {
       if (!confirmDiscardTaskChanges()) return;
       setTaskEditorMode("none");
       setSelectedTaskId("");
@@ -1382,11 +1162,12 @@ export function ContextModal({
   const closeProjectExpanded = useCallback(() => setProjectExpanded(false), []);
   const { modalRef: projectExpandedRef } = useModalA11y(projectExpanded, closeProjectExpanded);
 
-  const handleToggleDesktopPet = useCallback(async (enabled: boolean) => {
+  const handleTogglePanorama = useCallback(async (enabled: boolean) => {
     if (!onUpdateSettings) return;
     setViewBusy(true);
     try {
-      await onUpdateSettings({ desktop_pet_enabled: enabled });
+      await onUpdateSettings({ panorama_enabled: enabled });
+      setMobileViewMenuOpen(false);
     } finally {
       setViewBusy(false);
     }
@@ -2197,68 +1978,57 @@ export function ContextModal({
             {agentsWithBlockers > 0 ? <span className={classNames("rounded-full px-2.5 py-1 text-xs", "bg-rose-500/15 text-rose-600 dark:text-rose-400")}>{tr("context.blockersCount", "{{count}} blockers", { count: agentsWithBlockers })}</span> : null}
           </div>
         </div>
-        <div className="mt-4 grid gap-3 2xl:grid-cols-2">
-          {agents.length > 0 ? agents.map((agent) => (
-            <AgentStateCard
-              key={agent.id}
-              agent={agent}
-              tr={tr}
-              mutedTextClass={mutedTextClass}
-              subtleTextClass={subtleTextClass}
-            />
-          )) : <div className={classNames("rounded-xl border border-dashed px-3 py-4 text-sm", "border-[var(--glass-border-subtle)] text-[var(--color-text-muted)]")}>{tr("context.noAgents", "No agent state")}</div>}
-        </div>
-      </section>
-    );
-  };
-
-  const renderDesktopPetView = () => {
-    if (!onUpdateSettings) {
-      return (
-        <section className={classNames(surfaceClass, "p-4")}>
-          <div className={classNames("text-sm", mutedTextClass)}>
-            {tr("context.desktopPetUnavailable", "Web Pet settings are unavailable in this context.")}
-          </div>
-        </section>
-      );
-    }
-
-    return (
-      <section className={classNames(surfaceClass, "p-4")}>
-        <div className="flex flex-col gap-4">
-          <div>
-            <div className={classNames("flex items-center gap-2 text-lg font-semibold", "text-[var(--color-text-primary)]")}>
-              {tr("context.desktopPetTitle", "Web Pet")}
-              <span className="rounded-md bg-cyan-500/15 px-2 py-0.5 text-xs font-semibold leading-none text-cyan-400">Beta</span>
-            </div>
-            <div className={classNames("mt-1 text-sm", subtleTextClass)}>
-              {tr("context.desktopPetHint", "Show a floating web pet in the corner that reflects this team's status.")}
-            </div>
-          </div>
-
-          <div className={classNames("flex flex-col gap-4 rounded-2xl border p-4", "glass-panel")}>
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <div className={classNames("text-sm font-medium", "text-[var(--color-text-primary)]")}>
-                  {tr("context.desktopPetSwitchLabel", "Enable Web Pet")}
+        <div className="mt-4 grid gap-3 xl:grid-cols-2">
+          {agents.length > 0 ? agents.map((agent) => {
+            const hot = agentHot(agent);
+            const warm = agentWarm(agent);
+            return (
+              <div key={agent.id} className={classNames("rounded-xl border p-4", "glass-card")}>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className={classNames("text-sm font-semibold", "text-[var(--color-text-primary)]")}>{agent.id}</div>
+                    <div className={classNames("mt-1 text-xs", mutedTextClass)}>{agent.updated_at ? `${tr("context.updated", "Updated {{time}}", { time: formatTime(agent.updated_at) })}` : tr("context.notUpdatedYet", "Not updated yet")}</div>
+                  </div>
+                  {hot.activeTaskId ? <span className={classNames("rounded-full px-2 py-0.5 text-[11px]", "bg-blue-500/15 text-blue-600 dark:text-blue-400")}>{hot.activeTaskId}</span> : null}
                 </div>
-                <div className={classNames("mt-1 text-xs", mutedTextClass)}>
-                  {tr("context.desktopPetTabHint", "Each enabled group shows its own Web Pet in the web UI.")}
+
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  <div className={classNames("rounded-lg border p-3", "glass-card")}>
+                    <div className={classNames("text-[11px] font-medium uppercase tracking-wide", mutedTextClass)}>{tr("context.focus", "Focus")}</div>
+                    <div className={classNames("mt-1 text-sm line-clamp-3", subtleTextClass)}>{hot.focus || tr("context.none", "None")}</div>
+                  </div>
+                  <div className={classNames("rounded-lg border p-3", "glass-card")}>
+                    <div className={classNames("text-[11px] font-medium uppercase tracking-wide", mutedTextClass)}>{tr("context.nextAction", "Next action")}</div>
+                    <div className={classNames("mt-1 text-sm line-clamp-3", subtleTextClass)}>{hot.nextAction || tr("context.none", "None")}</div>
+                  </div>
+                  <div className={classNames("rounded-lg border p-3 sm:col-span-2", "glass-card")}>
+                    <div className={classNames("text-[11px] font-medium uppercase tracking-wide", mutedTextClass)}>{tr("context.activeTask", "Active task")}</div>
+                    <div className={classNames("mt-1 text-sm", subtleTextClass)}>{hot.activeTaskId || tr("context.none", "None")}</div>
+                  </div>
+                  {hot.blockers.length > 0 ? (
+                    <div className={classNames("rounded-lg border px-3 py-3 text-sm sm:col-span-2", "border-rose-500/30 bg-rose-500/15 text-rose-600 dark:text-rose-400")}>
+                      <span className="font-medium">{tr("context.blockers", "Blockers")}: </span>{hot.blockers.join(" · ")}
+                    </div>
+                  ) : null}
                 </div>
+
+                {hasWarmState(agent) ? (
+                  <details className={classNames("mt-3 rounded-lg border px-3 py-2", "glass-card")} open={false}>
+                    <summary className={classNames("cursor-pointer text-xs font-medium", "text-[var(--color-text-secondary)]")}>{tr("context.warmState", "Warm state")}</summary>
+                    <div className="mt-2 space-y-2 text-xs">
+                      {warm.whatChanged ? <div className={subtleTextClass}><span className={mutedTextClass}>{tr("context.whatChanged", "What changed")}: </span>{warm.whatChanged}</div> : null}
+                      {warm.openLoops.length > 0 ? <div className={subtleTextClass}><span className={mutedTextClass}>{tr("context.openLoops", "Open loops")}: </span>{warm.openLoops.join(" · ")}</div> : null}
+                      {warm.commitments.length > 0 ? <div className={subtleTextClass}><span className={mutedTextClass}>{tr("context.commitments", "Commitments")}: </span>{warm.commitments.join(" · ")}</div> : null}
+                      {warm.environmentSummary ? <div className={subtleTextClass}><span className={mutedTextClass}>{tr("context.environmentSummary", "Environment")}: </span>{warm.environmentSummary}</div> : null}
+                      {warm.userModel ? <div className={subtleTextClass}><span className={mutedTextClass}>{tr("context.userModel", "User model")}: </span>{warm.userModel}</div> : null}
+                      {warm.personaNotes ? <div className={subtleTextClass}><span className={mutedTextClass}>{tr("context.personaNotes", "Persona notes")}: </span>{warm.personaNotes}</div> : null}
+                      {warm.resumeHint ? <div className={subtleTextClass}><span className={mutedTextClass}>{tr("context.resumeHint", "Resume hint")}: </span>{warm.resumeHint}</div> : null}
+                    </div>
+                  </details>
+                ) : null}
               </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={desktopPetEnabled}
-                aria-label={tr("context.desktopPetSwitchLabel", "Enable Web Pet")}
-                onClick={() => void handleToggleDesktopPet(!desktopPetEnabled)}
-                disabled={viewBusy}
-                className={switchTrackClass(desktopPetEnabled)}
-              >
-                <span className={switchThumbClass(desktopPetEnabled)} />
-              </button>
-            </div>
-          </div>
+            );
+          }) : <div className={classNames("rounded-xl border border-dashed px-3 py-4 text-sm", "border-[var(--glass-border-subtle)] text-[var(--color-text-muted)]")}>{tr("context.noAgents", "No agent state")}</div>}
         </div>
       </section>
     );
@@ -2407,6 +2177,55 @@ export function ContextModal({
                 <button type="button" onClick={() => handleSwitchActiveView("agents")} className={viewButtonClass(activeView === "agents")}>{tr("context.agents", "Agents")}</button>
                 <button type="button" onClick={() => handleSwitchActiveView("desktop_pet")} className={viewButtonClass(activeView === "desktop_pet")}>{tr("context.desktopPetTab", "Web Pet")}<span className="ml-1.5 rounded-md bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-cyan-400">Beta</span></button>
               </div>
+
+              {onUpdateSettings ? (
+                <>
+                  <div className="hidden sm:flex items-center gap-3">
+                    <div className="min-w-0 text-right">
+                      <div className={classNames("text-sm font-medium", isDark ? "text-slate-200" : "text-gray-800")}>{tr("context.panoramaToggle", "Panorama 3D")}</div>
+                      <div className={classNames("mt-1 text-xs", mutedTextClass)}>{tr("context.panoramaHint", "Show the Panorama tab for this group.")}</div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={panoramaEnabled}
+                      aria-label={tr("context.panoramaToggle", "Panorama 3D")}
+                      onClick={() => void handleTogglePanorama(!panoramaEnabled)}
+                      disabled={viewBusy}
+                      className={switchTrackClass(panoramaEnabled)}
+                    >
+                      <span className={switchThumbClass(panoramaEnabled)} />
+                    </button>
+                  </div>
+
+                  <div className="sm:hidden self-end relative">
+                    <button type="button" onClick={() => setMobileViewMenuOpen((open) => !open)} className={buttonSecondaryClass}>
+                      {tr("context.viewOptions", "View")}
+                    </button>
+                    {mobileViewMenuOpen ? (
+                      <div className={classNames("absolute right-0 z-20 mt-2 w-64 rounded-2xl border p-3 shadow-lg", isDark ? "border-slate-800 bg-slate-950 text-slate-200" : "border-gray-200 bg-white text-gray-900")}>
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <div className="text-sm font-medium">{tr("context.panoramaToggle", "Panorama 3D")}</div>
+                            <div className={classNames("mt-1 text-xs", mutedTextClass)}>{tr("context.panoramaHint", "Show the Panorama tab for this group.")}</div>
+                          </div>
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-checked={panoramaEnabled}
+                            aria-label={tr("context.panoramaToggle", "Panorama 3D")}
+                            onClick={() => void handleTogglePanorama(!panoramaEnabled)}
+                            disabled={viewBusy}
+                            className={switchTrackClass(panoramaEnabled)}
+                          >
+                            <span className={switchThumbClass(panoramaEnabled)} />
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                </>
+              ) : null}
             </div>
 
             {activeView === "coordination"
@@ -2414,7 +2233,6 @@ export function ContextModal({
               : activeView === "agents"
                 ? renderAgentsView()
                 : renderDesktopPetView()}
-          </div>
         </div>
       </ModalFrame>
 

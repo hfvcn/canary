@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 
 from ...kernel.group import load_group
+from ...kernel.settings import get_im_defaults
+from ...ports.im.config_schema import resolve_im_config
 from ...util.conv import coerce_bool
 from ...util.process import resolve_background_python_argv, supervised_process_popen_kwargs
 
@@ -38,10 +40,13 @@ def autostart_enabled_im_bridges(home: Path) -> None:
         if group is None:
             continue
 
-        im_cfg = group.doc.get("im") if isinstance(group.doc.get("im"), dict) else None
-        if not isinstance(im_cfg, dict) or not coerce_bool(im_cfg.get("enabled"), default=False):
+        raw_im_cfg = group.doc.get("im") if isinstance(group.doc.get("im"), dict) else None
+        if not isinstance(raw_im_cfg, dict) or not coerce_bool(raw_im_cfg.get("enabled"), default=False):
             continue
 
+        im_cfg = resolve_im_config(raw_im_cfg, get_im_defaults())
+        if not im_cfg:
+            continue
         platform = str(im_cfg.get("platform") or "telegram").strip() or "telegram"
         pid_path = group.path / "state" / "im_bridge.pid"
 

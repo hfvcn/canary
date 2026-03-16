@@ -348,7 +348,6 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                     "by": str(req.by or "user").strip() or "user",
                     "action": action,
                     "timeout_seconds": int(req.timeout_seconds or 900),
-                    "force_reauth": bool(req.force_reauth),
                 },
             }
         )

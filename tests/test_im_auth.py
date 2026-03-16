@@ -446,25 +446,8 @@ class TestImBridgeOutboundAuthGuard(unittest.TestCase):
                 super().__init__()
                 self.file_calls: list[tuple[str, str, str, str, int]] = []
 
-            def send_file(
-                self,
-                chat_id: str,
-                file_path: Path,
-                filename: str,
-                caption: str = "",
-                thread_id: int = 0,
-                mention_user_ids=None,
-            ) -> bool:
-                self.file_calls.append(
-                    (
-                        str(chat_id),
-                        str(file_path),
-                        str(filename),
-                        str(caption),
-                        int(thread_id or 0),
-                        tuple(mention_user_ids or []),
-                    )
-                )
+            def send_file(self, chat_id: str, file_path: Path, filename: str, caption: str = "", thread_id: int = 0) -> bool:
+                self.file_calls.append((str(chat_id), str(file_path), str(filename), str(caption), int(thread_id or 0)))
                 return True
 
         km = KeyManager(self.state_dir)

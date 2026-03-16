@@ -1,29 +1,11 @@
 from __future__ import annotations
 
-import json
 import os
-import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 
 class TestMcpHelpSkillsDigest(unittest.TestCase):
-    def _with_home(self):
-        old_home = os.environ.get("CCCC_HOME")
-        td_ctx = tempfile.TemporaryDirectory()
-        td = td_ctx.__enter__()
-        os.environ["CCCC_HOME"] = td
-
-        def cleanup() -> None:
-            td_ctx.__exit__(None, None, None)
-            if old_home is None:
-                os.environ.pop("CCCC_HOME", None)
-            else:
-                os.environ["CCCC_HOME"] = old_home
-
-        return td, cleanup
-
     def test_cccc_help_appends_runtime_skill_digest(self) -> None:
         from cccc.ports.mcp.server import handle_tool_call
 
@@ -53,27 +35,47 @@ class TestMcpHelpSkillsDigest(unittest.TestCase):
             out = handle_tool_call("cccc_help", {})
 
         markdown = str(out.get("markdown") or "")
-        self.assertIn("## Working Stance", markdown)
-        self.assertIn("## Communication Patterns", markdown)
-        self.assertIn("## Core Routes", markdown)
-        self.assertIn("## Control Plane", markdown)
-        self.assertIn("## Memory and Recall", markdown)
-        self.assertIn("## Capability", markdown)
-        self.assertIn("## Role Notes", markdown)
         self.assertIn("## Active Skills (Runtime)", markdown)
-        self.assertIn("Capsule skill is runtime capsule activation", markdown)
+        self.assertIn("## Capability Quick Use (Runtime)", markdown)
+        self.assertIn("## Gap Routing", markdown)
+        self.assertIn("cccc_capability_search(kind=\"mcp_toolpack\")", markdown)
+        self.assertIn("cccc_capability_use", markdown)
+        self.assertIn("capsule skill is runtime capsule activation", markdown)
         self.assertIn("$CODEX_HOME/skills", markdown)
-        self.assertIn("### Todo and Scope Discipline", markdown)
-        self.assertIn("Every concrete or implicit user ask becomes a runtime todo item.", markdown)
-        self.assertIn("Once implementation is approved, finish the agreed scope in one pass unless a real blocker stops progress.", markdown)
-        self.assertIn("### Planning and Scope Gates", markdown)
-        self.assertIn("For non-trivial plans, run a 6D check", markdown)
+        self.assertIn("### Todo (runtime-first)", markdown)
+        self.assertIn("Every concrete user ask/question (even simple) = one runtime todo item", markdown)
+        self.assertIn("Capture implicit asks too", markdown)
+        self.assertIn("If new evidence overturns prior assumptions, refactor todo immediately", markdown)
+        self.assertIn("Anti-drip delivery: once implementation is approved, finish the agreed scope in one pass", markdown)
+        self.assertIn("Include obvious low-risk in-scope polish in the same pass", markdown)
+        self.assertIn("For status replies, map current approved scope items to `done` / `pending` / `blocked(owner)`", markdown)
+        self.assertIn("## Intent and Scope Alignment", markdown)
+        self.assertIn("do not implement until explicit action intent", markdown)
+        self.assertIn("## Planning Balance (6D)", markdown)
+        self.assertIn("1. value / ROI", markdown)
+        self.assertIn("6. reversibility", markdown)
         self.assertIn("triage", markdown)
         self.assertIn("review", markdown)
         self.assertIn("working_rules:", markdown)
         self.assertIn("Restate the symptom first.", markdown)
         self.assertIn("Gather evidence before changing anything.", markdown)
         self.assertNotIn("### NotebookLM Artifact Runs", markdown)
+
+    def _with_home(self):
+        import tempfile
+        old_home = os.environ.get("CCCC_HOME")
+        td_ctx = tempfile.TemporaryDirectory()
+        td = td_ctx.__enter__()
+        os.environ["CCCC_HOME"] = td
+
+        def cleanup() -> None:
+            td_ctx.__exit__(None, None, None)
+            if old_home is None:
+                os.environ.pop("CCCC_HOME", None)
+            else:
+                os.environ["CCCC_HOME"] = old_home
+
+        return td, cleanup
 
     def test_cccc_help_appends_group_space_runtime_only_when_bound(self) -> None:
         from cccc.ports.mcp.server import handle_tool_call
@@ -292,76 +294,6 @@ class TestMcpHelpSkillsDigest(unittest.TestCase):
         self.assertEqual(str(hygiene.get("actor_id") or ""), "peer-1")
         self.assertEqual(bool(hygiene.get("present")), True)
         self.assertEqual(bool(hygiene.get("min_fields_ready")), True)
-        self.assertEqual(str((hygiene.get("execution_health") or {}).get("status") or ""), "stale")
-        self.assertEqual(str((hygiene.get("mind_context_health") or {}).get("status") or ""), "missing")
-
-    def test_cccc_help_marks_mind_context_stale_from_runtime_churn(self) -> None:
-        from cccc.kernel.group import create_group
-        from cccc.kernel.registry import load_registry
-        from cccc.ports.mcp.server import handle_tool_call
-
-        _, cleanup = self._with_home()
-        try:
-            now = datetime.now(timezone.utc)
-            touched_at = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
-            updated_at = now.isoformat().replace("+00:00", "Z")
-            group = create_group(load_registry(), title="help-hygiene")
-            state_path = group.path / "state" / "automation.json"
-            state_path.write_text(
-                json.dumps(
-                    {
-                        "v": 5,
-                        "actors": {
-                            "peer-1": {
-                                "mind_context_touched_at": touched_at,
-                                "hot_only_updates_since_mind_touch": 3,
-                            }
-                        },
-                        "rules": {},
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            with patch.dict(
-                os.environ,
-                {"CCCC_GROUP_ID": group.group_id, "CCCC_ACTOR_ID": "peer-1"},
-                clear=False,
-            ), patch(
-                "cccc.ports.mcp.handlers.cccc_core._call_daemon_or_raise",
-                return_value={},
-            ), patch(
-                "cccc.ports.mcp.server._call_daemon_or_raise",
-                return_value={
-                    "agent_states": [
-                        {
-                            "id": "peer-1",
-                            "hot": {
-                                "focus": "verify hygiene",
-                                "next_action": "read current status",
-                                "blockers": [],
-                            },
-                            "warm": {
-                                "what_changed": "recently updated execution state",
-                                "environment_summary": "single bugfix branch in progress",
-                                "user_model": "prefers direct evidence",
-                                "persona_notes": "do not overbuild the fix",
-                            },
-                            "updated_at": updated_at,
-                        }
-                    ]
-                },
-            ):
-                out = handle_tool_call("cccc_help", {})
-
-            hygiene = out.get("context_hygiene") if isinstance(out, dict) else None
-            self.assertIsInstance(hygiene, dict)
-            assert isinstance(hygiene, dict)
-            self.assertEqual(str((hygiene.get("execution_health") or {}).get("status") or ""), "ready")
-            self.assertEqual(str((hygiene.get("mind_context_health") or {}).get("status") or ""), "stale")
-            self.assertEqual(int((hygiene.get("mind_context_health") or {}).get("hot_only_updates_since_touch") or 0), 3)
-        finally:
-            cleanup()
 
 
 if __name__ == "__main__":

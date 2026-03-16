@@ -6,7 +6,63 @@ from typing import Any, Dict, List
 from ..util.conv import coerce_bool
 from .actors import get_effective_role, list_actors
 from .group import Group
+from .group_space import get_group_space_prompt_state
 from .prompt_files import DEFAULT_PREAMBLE_BODY, PREAMBLE_FILENAME, read_group_prompt_file
+
+
+def _memory_policy_lines(group_id: str) -> List[str]:
+    """Memory system guidance for agents."""
+    gid = str(group_id or "").strip()
+    if not gid:
+        return []
+    return [
+        "Memory:",
+        "- Split by horizon: Context agent state is short-term execution memory; long-term memory lives in state/memory/MEMORY.md + state/memory/daily/*.md.",
+        "- Keep transient execution status in Context; write only stable, reusable outcomes to memory files.",
+        "- Resume gate: use cccc_bootstrap.memory_recall_gate on start/resume; if empty, run cccc_memory(search/get) manually before implementation.",
+        "- Recall path: cccc_memory(action=search) -> cccc_memory(action=get) before planning or writing.",
+        '- Write path: cccc_memory(action="write", target="daily"|"memory", ...) with dedup intent.',
+        '- Compaction path (when context grows): cccc_memory_admin(action="context_check") -> cccc_memory_admin(action="compact"|"daily_flush").',
+    ]
+
+
+def _group_space_policy_lines(group_id: str) -> List[str]:
+    gid = str(group_id or "").strip()
+    if not gid:
+        return []
+    try:
+        state = get_group_space_prompt_state(gid, provider="notebooklm")
+        if not isinstance(state, dict):
+            return []
+        provider = str(state.get("provider") or "notebooklm")
+        mode = str(state.get("mode") or "disabled")
+        work_bound = bool(state.get("work_bound"))
+        memory_bound = bool(state.get("memory_bound"))
+        lines = [
+            "Group Space:",
+            f"- NotebookLM provider: {provider} ({mode}); work_bound={str(work_bound).lower()} memory_bound={str(memory_bound).lower()}.",
+        ]
+        if work_bound or memory_bound:
+            lines.append(
+                '- If cccc_space is hidden in this session, use cccc_capability_use(tool_name="cccc_space", tool_arguments={"action":"status"}) first to auto-enable pack:space.'
+            )
+        if work_bound:
+            lines.extend([
+                '- Use cccc_space(action=query) on lane="work" for long-horizon/shared/project knowledge lookup.',
+                '- Use cccc_space(action=ingest) on lane="work" only for stable findings/resources worth reusing.',
+                '- For resource_ingest payloads, use source_type + {url|content|file_id} depending on source kind.',
+                '- Use cccc_space(action=artifact) on lane="work" for NotebookLM outputs (save_to_space=true persists to repo/space/artifacts).',
+                "- If you see files matching '*.conflict.remote.*' under space/, report and ask user for resolution; do not auto-merge/delete.",
+            ])
+        if memory_bound:
+            lines.extend([
+                '- Memory recall order: local memory first (`cccc_bootstrap.memory_recall_gate` -> `cccc_memory(search/get)`), then `cccc_space(action=query, lane="memory")` only when deeper recall is needed.',
+                '- Never ingest or generate artifacts on lane="memory"; it is daemon-synced from finalized daily memory files.',
+            ])
+        lines.append("- If provider is degraded/disabled, continue with Context + ledger + local memory and report fallback explicitly.")
+        return lines
+    except Exception:
+        return []
 
 
 def render_system_prompt(*, group: Group, actor: Dict[str, Any]) -> str:
@@ -138,6 +194,13 @@ def render_system_prompt(*, group: Group, actor: Dict[str, Any]) -> str:
         "- Once scope is approved, finish it end-to-end; do not ask to continue on obvious next steps.",
         "- For strategy or scope discussion, align first; implement only after explicit action intent.",
     ]
+    memory_lines = _memory_policy_lines(group_id)
+    if memory_lines:
+        core_lines.extend(["", *memory_lines])
+
+    group_space_lines = _group_space_policy_lines(group_id)
+    if group_space_lines:
+        core_lines.extend(["", *group_space_lines])
 
     # Group override: CCCC_PREAMBLE.md under CCCC_HOME.
     pf = read_group_prompt_file(group, PREAMBLE_FILENAME)

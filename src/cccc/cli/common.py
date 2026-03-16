@@ -34,7 +34,6 @@ from ..kernel.ledger_retention import snapshot as snapshot_ledger
 from ..kernel.messaging import default_reply_recipients
 from ..kernel.permissions import require_actor_permission, require_group_permission, require_inbox_permission
 from ..kernel.registry import load_registry
-from ..kernel.settings import resolve_remote_access_web_binding
 from ..kernel.scope import detect_scope
 from ..kernel.system_prompt import render_system_prompt
 from ..paths import ensure_home
@@ -80,7 +79,8 @@ def _http_host_literal(host: str) -> str:
 
 
 def _resolve_web_server_binding() -> tuple[str, int]:
-    binding = resolve_remote_access_web_binding()
+    from ..kernel.settings import get_remote_access_settings
+    binding = get_remote_access_settings()
     host = str(binding.get("web_host") or "").strip() or "127.0.0.1"
     port = int(binding.get("web_port") or 8848)
     return host, port
@@ -350,9 +350,22 @@ def _ensure_daemon_running() -> bool:
             # Last resort: terminate the stale daemon by pid (best-effort).
             if call_daemon({"op": "ping"}, timeout_s=0.5).get("ok") and daemon_pid > 0:
                 try:
-                    killed = best_effort_signal_pid(daemon_pid, SOFT_TERMINATE_SIGNAL, include_group=True)
+                    import signal
+
+                    killed = False
+                    try:
+                        os.killpg(os.getpgid(daemon_pid), signal.SIGTERM)
+                        killed = True
+                    except Exception as e_pg:
+                        try:
+                            os.kill(daemon_pid, signal.SIGTERM)
+                            killed = True
+                        except Exception as e_kill:
+                            print(
+                                f"warn: failed to terminate stale daemon pid={daemon_pid}: killpg={e_pg}; kill={e_kill}",
+                                file=sys.stderr,
+                            )
                     if not killed:
-                        print(f"warn: failed to terminate stale daemon pid={daemon_pid}: signal not delivered", file=sys.stderr)
                         return True
                 except Exception as e:
                     print(f"warn: failed to terminate stale daemon pid={daemon_pid}: {e}", file=sys.stderr)
@@ -448,6 +461,7 @@ def _show_welcome() -> None:
 
 def _default_entry(*, web_host_override: str = "", web_port_override: Optional[int] = None) -> int:
     """Default entry: start daemon + web together, stop both on Ctrl+C."""
+    import signal
     import threading
     
     from ..paths import ensure_home
@@ -555,35 +569,44 @@ def _default_entry(*, web_host_override: str = "", web_port_override: Optional[i
 
         return False
     
-    # Lifecycle helper — real logic lives in daemon_lifecycle.py so tests
-    # can import and drive it directly with injectable deps.
-    from .daemon_lifecycle import DaemonLifecycle
-
-    def _read_log_tail(n: int) -> list[str]:
-        try:
-            return log_path.read_text().strip().split("\n")[-n:]
-        except Exception:
-            return []
-
-    def _start_daemon_for_lifecycle() -> bool:
-        """Wraps _start_daemon and syncs process ref to lifecycle."""
-        ok = _start_daemon()
-        # _start_daemon sets daemon_process via nonlocal; sync to lifecycle.
-        _lifecycle.process = daemon_process
-        return ok
-
-    _lifecycle = DaemonLifecycle(
-        call_daemon=lambda req, timeout: call_daemon(req, timeout_s=timeout),
-        start_daemon=_start_daemon_for_lifecycle,
-        is_shutdown_requested=lambda: shutdown_requested,
-        log=lambda msg: print(f"[cccc] {msg}", file=sys.stderr),
-        read_log_tail=_read_log_tail,
-    )
-
+    def _monitor_daemon() -> None:
+        """Background thread to monitor daemon and report crashes."""
+        nonlocal daemon_process, shutdown_requested
+        while not shutdown_requested and daemon_process is not None:
+            ret = daemon_process.poll()
+            if ret is not None and not shutdown_requested:
+                print(f"\n[cccc] Daemon crashed (exit code {ret})! Check log: {log_path}", file=sys.stderr)
+                try:
+                    lines = log_path.read_text().strip().split("\n")[-15:]
+                    for line in lines:
+                        print(f"  {line}", file=sys.stderr)
+                except Exception:
+                    pass
+                break
+            time.sleep(1.0)
+    
     def _stop_daemon() -> None:
         nonlocal daemon_process
-        _lifecycle.stop_daemon()
-        daemon_process = _lifecycle.process
+        # Send shutdown command (works even if we didn't start the daemon)
+        try:
+            call_daemon({"op": "shutdown"}, timeout_s=2.0)
+        except Exception:
+            pass
+
+        # Wait for our subprocess to exit (if we started it)
+        if daemon_process is not None:
+            try:
+                daemon_process.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    daemon_process.terminate()
+                    daemon_process.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        daemon_process.kill()
+                    except Exception:
+                        pass
+            daemon_process = None
     
     # Saved binding is the baseline, but top-level `cccc --host/--port`
     # must win for this invocation, including supervised child restarts.
@@ -608,12 +631,10 @@ def _default_entry(*, web_host_override: str = "", web_port_override: Optional[i
         if not _start_daemon():
             print("[cccc] Error: Could not start daemon", file=sys.stderr)
             return 1
-        # Sync initial process reference to lifecycle helper.
-        _lifecycle.process = daemon_process
         print("[cccc] Daemon started", file=sys.stderr)
 
         # Start daemon monitor thread
-        monitor_thread = threading.Thread(target=_lifecycle.monitor_daemon, daemon=True)
+        monitor_thread = threading.Thread(target=_monitor_daemon, daemon=True)
         monitor_thread.start()
 
         def _get_lan_ip() -> str:

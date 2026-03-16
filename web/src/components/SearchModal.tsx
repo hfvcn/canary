@@ -16,6 +16,7 @@ interface SearchModalProps {
   isDark: boolean;
   onReply: (ev: LedgerEvent) => void;
   onJumpToMessage?: (eventId: string) => void;
+  collapseHumanMessageBodiesByDefault?: boolean;
 }
 
 function formatEventText(ev: LedgerEvent): string {
@@ -83,7 +84,16 @@ async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
-export function SearchModal({ isOpen, onClose, groupId, actors, isDark, onReply, onJumpToMessage }: SearchModalProps) {
+export function SearchModal({
+  isOpen,
+  onClose,
+  groupId,
+  actors,
+  isDark,
+  onReply,
+  onJumpToMessage,
+  collapseHumanMessageBodiesByDefault,
+}: SearchModalProps) {
   const { modalRef } = useModalA11y(isOpen, onClose);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [query, setQuery] = useState("");
@@ -91,6 +101,7 @@ export function SearchModal({ isOpen, onClose, groupId, actors, isDark, onReply,
   const [by, setBy] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [expandedEventIds, setExpandedEventIds] = useState<Record<string, boolean>>({});
 
   const [results, setResults] = useState<LedgerEvent[]>([]);
   const [hasMore, setHasMore] = useState(false);
@@ -127,6 +138,7 @@ export function SearchModal({ isOpen, onClose, groupId, actors, isDark, onReply,
     setResults([]);
     setHasMore(false);
     setError("");
+    setExpandedEventIds({});
   }, [groupId, isOpen]);
 
   const doSearch = async (opts?: { before?: string; mode?: "replace" | "prepend" }) => {
@@ -327,6 +339,10 @@ export function SearchModal({ isOpen, onClose, groupId, actors, isDark, onReply,
             const text = formatEventText(ev);
             const evId = ev.id ? String(ev.id) : "";
             const isChat = ev.kind === "chat.message";
+            const bodyHiddenByServer = !!ev._message_body_hidden;
+            const showCollapsedHumanBody = Boolean(
+              collapseHumanMessageBodiesByDefault && ev.by === "user" && !bodyHiddenByServer && !expandedEventIds[evId]
+            );
             return (
               <div
                 key={evId || `r${idx}`}
@@ -361,7 +377,40 @@ export function SearchModal({ isOpen, onClose, groupId, actors, isDark, onReply,
                       )}
                     </div>
                     <div className={classNames("mt-2 text-sm whitespace-pre-wrap break-words", "text-[var(--color-text-primary)]")}>
-                      {highlightText(text, query, isDark)}
+                      {bodyHiddenByServer ? (
+                        <span className="text-[var(--color-text-secondary)]">{t('memberMessageHidden')}</span>
+                      ) : showCollapsedHumanBody ? (
+                        <button
+                          type="button"
+                          className={classNames(
+                            "rounded-lg border px-2 py-1 text-xs font-medium transition-colors",
+                            "glass-btn text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
+                          )}
+                          onClick={() => setExpandedEventIds((prev) => ({ ...prev, [evId]: true }))}
+                        >
+                          {t('showMemberMessage')}
+                        </button>
+                      ) : (
+                        <>
+                          {collapseHumanMessageBodiesByDefault && ev.by === "user" && evId ? (
+                            <button
+                              type="button"
+                              className={classNames(
+                                "mb-2 rounded-lg border px-2 py-1 text-[10px] font-medium transition-colors",
+                                "glass-btn text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
+                              )}
+                              onClick={() => setExpandedEventIds((prev) => {
+                                const next = { ...prev };
+                                delete next[evId];
+                                return next;
+                              })}
+                            >
+                              {t('hideMemberMessage')}
+                            </button>
+                          ) : null}
+                          <div>{highlightText(text, query, isDark)}</div>
+                        </>
+                      )}
                     </div>
                   </div>
 

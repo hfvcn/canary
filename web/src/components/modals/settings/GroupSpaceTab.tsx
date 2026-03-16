@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { CloseIcon, FolderIcon, GlobeIcon, PlusIcon, PowerIcon, RefreshIcon, TrashIcon } from "../../Icons";
 import type {
   GroupSpaceBinding,
   GroupSpaceProviderAuthStatus,
@@ -17,7 +16,6 @@ interface GroupSpaceTabProps {
 }
 
 type NotebookLane = "work" | "memory";
-type LaneVisualState = "unbound" | "active" | "saved";
 
 const NOTEBOOK_LANES: NotebookLane[] = ["work", "memory"];
 
@@ -65,37 +63,10 @@ function mergeNotebookOptions(
   return Array.from(byId.values());
 }
 
-function hasLaneTarget(binding: GroupSpaceBinding | null | undefined): boolean {
+function bindingStateText(binding: GroupSpaceBinding | null | undefined, t: (key: string) => string): string {
   const status = String(binding?.status || "").trim();
   const remoteId = String(binding?.remote_space_id || "").trim();
-  return status === "bound" && Boolean(remoteId);
-}
-
-function laneVisualState(
-  binding: GroupSpaceBinding | null | undefined,
-  { providerUsable }: { providerUsable: boolean }
-): LaneVisualState {
-  if (!hasLaneTarget(binding)) return "unbound";
-  return providerUsable ? "active" : "saved";
-}
-
-function laneStatusText(state: LaneVisualState, t: (key: string) => string): string {
-  if (state === "active") return t("groupSpace.bound");
-  if (state === "saved") return t("groupSpace.savedTarget");
-  return t("groupSpace.notBound");
-}
-
-function statusChipClass(tone: "neutral" | "good" | "warn" | "danger"): string {
-  if (tone === "good") {
-    return "border-emerald-500/30 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300";
-  }
-  if (tone === "warn") {
-    return "border-amber-500/30 bg-amber-500/15 text-amber-700 dark:text-amber-300";
-  }
-  if (tone === "danger") {
-    return "border-rose-500/30 bg-rose-500/15 text-rose-700 dark:text-rose-300";
-  }
-  return "border-[var(--glass-border-subtle)] bg-[var(--glass-tab-bg)] text-[var(--color-text-secondary)]";
+  return status === "bound" && remoteId ? t("groupSpace.bound") : t("groupSpace.notBound");
 }
 
 export function GroupSpaceTab({ isDark: _isDark, groupId, isActive = true }: GroupSpaceTabProps) {
@@ -119,11 +90,9 @@ export function GroupSpaceTab({ isDark: _isDark, groupId, isActive = true }: Gro
   const workBoundRemoteId = String(workBinding?.remote_space_id || "").trim();
   const memoryBoundRemoteId = String(memoryBinding?.remote_space_id || "").trim();
   const authConfigured = Boolean(providerState?.auth_configured);
-  const writeReady = Boolean(providerState?.write_ready);
   const connectionState = String(authFlow?.state || "idle").trim() || "idle";
   const connectionRunning = connectionState === "running";
   const connectionConnected = authConfigured;
-  const providerUsable = connectionConnected && writeReady;
   const connectionWarning =
     String(authFlow?.error?.message || "").trim() || String(providerState?.last_error || "").trim();
 
@@ -134,8 +103,6 @@ export function GroupSpaceTab({ isDark: _isDark, groupId, isActive = true }: Gro
 
   const workBoundNotebook = notebookOptions.find((item) => String(item.remote_space_id || "").trim() === workBoundRemoteId) || null;
   const memoryBoundNotebook = notebookOptions.find((item) => String(item.remote_space_id || "").trim() === memoryBoundRemoteId) || null;
-  const workLaneState = laneVisualState(workBinding, { providerUsable });
-  const memoryLaneState = laneVisualState(memoryBinding, { providerUsable });
 
   const connectionStatusText = useMemo(() => {
     if (connectionRunning) return t("groupSpace.accountConnecting");
@@ -150,16 +117,6 @@ export function GroupSpaceTab({ isDark: _isDark, groupId, isActive = true }: Gro
     if (connectionState === "failed") return "text-amber-600 dark:text-amber-400";
     return "text-[var(--color-text-secondary)]";
   }, [connectionConnected, connectionRunning, connectionState]);
-
-  const utilityButtonClass =
-    "glass-btn inline-flex items-center justify-center gap-2 rounded-xl border border-[var(--glass-border-subtle)] px-3.5 py-2.5 text-sm font-medium min-h-[44px] text-[var(--color-text-secondary)] disabled:opacity-50 disabled:cursor-not-allowed";
-  const primaryUtilityButtonClass =
-    "glass-btn-accent inline-flex items-center justify-center gap-2 rounded-xl px-3.5 py-2.5 text-sm font-medium min-h-[44px] text-[var(--color-text-primary)] disabled:opacity-50 disabled:cursor-not-allowed";
-  const dangerUtilityButtonClass =
-    "inline-flex items-center justify-center gap-2 rounded-xl border border-rose-500/25 bg-rose-500/10 px-3.5 py-2.5 text-sm font-medium min-h-[44px] text-rose-700 dark:text-rose-300 hover:bg-rose-500/16 disabled:opacity-50 disabled:cursor-not-allowed";
-  const compactDangerButtonClass =
-    "inline-flex items-center justify-center gap-1.5 rounded-lg border border-rose-500/25 bg-rose-500/10 px-3 py-2 text-xs font-medium text-rose-700 dark:text-rose-300 hover:bg-rose-500/16 disabled:opacity-50 disabled:cursor-not-allowed";
-  const showNotebookSection = connectionConnected;
 
   const setHintWithTimeout = (text: string) => {
     setHint(text);
@@ -192,7 +149,7 @@ export function GroupSpaceTab({ isDark: _isDark, groupId, isActive = true }: Gro
         setAuthFlow(null);
       }
 
-      const shouldLoadSpaces = Boolean(nextStatus?.provider?.write_ready);
+      const shouldLoadSpaces = Boolean(nextStatus?.provider?.auth_configured);
       if (shouldLoadSpaces) {
         setSpacesBusy(true);
         try {
@@ -261,27 +218,19 @@ export function GroupSpaceTab({ isDark: _isDark, groupId, isActive = true }: Gro
     // eslint-disable-next-line react-hooks/exhaustive-deps -- poll only while auth flow is running
   }, [isActive, groupId, connectionRunning]);
 
-  const handleStartConnect = async (forceReauth: boolean = false) => {
+  const handleConnectGoogle = async () => {
     setActionBusy(true);
     setErr("");
     try {
-      const resp = await api.controlGroupSpaceProviderAuth({
-        provider,
-        action: "start",
-        timeoutSeconds: 900,
-        forceReauth,
-      });
+      const resp = await api.controlGroupSpaceProviderAuth({ provider, action: "start", timeoutSeconds: 900 });
       if (!resp.ok) {
-        setErr(
-          resp.error?.message ||
-            t(forceReauth ? "groupSpace.switchStartFailed" : "groupSpace.connectStartFailed")
-        );
+        setErr(resp.error?.message || t("groupSpace.connectStartFailed"));
         return;
       }
       setAuthFlow(resp.result?.auth || null);
-      setHintWithTimeout(t(forceReauth ? "groupSpace.switchStarted" : "groupSpace.connectStarted"));
+      setHintWithTimeout(t("groupSpace.connectStarted"));
     } catch {
-      setErr(t(forceReauth ? "groupSpace.switchStartFailed" : "groupSpace.connectStartFailed"));
+      setErr(t("groupSpace.connectStartFailed"));
     } finally {
       setActionBusy(false);
     }
@@ -301,27 +250,6 @@ export function GroupSpaceTab({ isDark: _isDark, groupId, isActive = true }: Gro
       await loadAll();
     } catch {
       setErr(t("groupSpace.connectCancelFailed"));
-    } finally {
-      setActionBusy(false);
-    }
-  };
-
-  const handleDisconnect = async () => {
-    const confirmText = t("groupSpace.disconnectConfirm");
-    if (!window.confirm(confirmText)) return;
-    setActionBusy(true);
-    setErr("");
-    try {
-      const resp = await api.controlGroupSpaceProviderAuth({ provider, action: "disconnect" });
-      if (!resp.ok) {
-        setErr(resp.error?.message || t("groupSpace.disconnectFailed"));
-        return;
-      }
-      setAuthFlow(resp.result?.auth || null);
-      setHintWithTimeout(t("groupSpace.disconnectSuccess"));
-      await loadAll();
-    } catch {
-      setErr(t("groupSpace.disconnectFailed"));
     } finally {
       setActionBusy(false);
     }
@@ -409,61 +337,28 @@ export function GroupSpaceTab({ isDark: _isDark, groupId, isActive = true }: Gro
     const boundNotebook = isWork ? workBoundNotebook : memoryBoundNotebook;
     const titleKey = isWork ? "groupSpace.workNotebookTitle" : "groupSpace.memoryNotebookTitle";
     const hintKey = isWork ? "groupSpace.workNotebookHint" : "groupSpace.memoryNotebookHint";
-    const laneState = laneVisualState(binding, { providerUsable });
-    const notebookStateText = laneStatusText(laneState, t);
-    const canBind = providerUsable && !actionBusy;
-    const canUnbind = !actionBusy && Boolean(boundRemoteId);
-    const laneTitleLabel = laneState === "saved" ? t("groupSpace.savedNotebookTarget") : t("groupSpace.currentNotebook");
-    const boundNotebookTitle = String(boundNotebook?.title || "").trim();
-    const showRemoteIdLine = Boolean(boundRemoteId && boundNotebookTitle && boundNotebookTitle !== boundRemoteId);
-    const notebookActionsHint =
-      laneState === "saved"
-        ? t("groupSpace.savedTargetHint")
-        : !connectionConnected
-          ? t("groupSpace.connectGoogleFirst")
-          : !writeReady
-            ? (String(providerState?.last_error || "").trim() || t("groupSpace.adapterNotReady"))
-            : "";
-    const selectedNotebook =
-      notebookOptions.find((item) => String(item.remote_space_id || "").trim() === String(selectedRemoteId || "").trim()) || null;
-    const headerTone: "good" | "neutral" | "warn" = laneState === "active" ? "good" : laneState === "saved" ? "warn" : "neutral";
+    const notebookStateText = bindingStateText(binding, t);
+    const canManage = connectionConnected && !actionBusy;
 
     return (
       <div key={lane} className={cardClass()}>
-        <div>
-          <div className="text-sm font-semibold text-[var(--color-text-primary)]">{t(titleKey)}</div>
-          <div className="mt-1 text-xs text-[var(--color-text-tertiary)]">{t(hintKey)}</div>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-semibold text-[var(--color-text-primary)]">{t(titleKey)}</div>
+            <div className="mt-1 text-xs text-[var(--color-text-tertiary)]">{t(hintKey)}</div>
+          </div>
+          <div className="text-xs font-medium text-[var(--color-text-tertiary)]">{notebookStateText}</div>
         </div>
 
-        <div className="mt-3 rounded-xl border border-[var(--glass-border-subtle)] bg-[var(--glass-panel-bg)] px-3.5 py-3">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--color-text-muted)]">{laneTitleLabel}</div>
-              <div className="mt-1 text-sm font-semibold break-all text-[var(--color-text-primary)]">
-                {boundRemoteId
-                  ? (boundNotebookTitle || boundRemoteId)
-                  : t("groupSpace.notBound")}
-              </div>
-              {showRemoteIdLine ? (
-                <div className="mt-1 text-[11px] font-mono break-all text-[var(--color-text-muted)]">{boundRemoteId}</div>
-              ) : null}
-            </div>
-            <div className={`shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-medium ${statusChipClass(headerTone)}`}>
-              {notebookStateText}
-            </div>
+        <div className="mt-3 rounded-lg border border-[var(--glass-border-subtle)] bg-[var(--glass-panel-bg)] px-3 py-2">
+          <div className="text-[11px] uppercase tracking-wide text-[var(--color-text-muted)]">{t("groupSpace.currentNotebook")}</div>
+          <div className="mt-1 text-sm font-medium break-all text-[var(--color-text-primary)]">
+            {boundRemoteId
+              ? (String(boundNotebook?.title || "").trim() || boundRemoteId)
+              : t("groupSpace.notBound")}
           </div>
-          {canUnbind ? (
-            <div className="mt-3 flex justify-end">
-              <button
-                type="button"
-                onClick={() => void handleUnbind(lane)}
-                disabled={!canUnbind}
-                className={compactDangerButtonClass}
-              >
-                <TrashIcon size={14} />
-                {t("groupSpace.unbind")}
-              </button>
-            </div>
+          {boundRemoteId ? (
+            <div className="mt-1 text-[11px] font-mono break-all text-[var(--color-text-muted)]">{boundRemoteId}</div>
           ) : null}
         </div>
 
@@ -488,40 +383,36 @@ export function GroupSpaceTab({ isDark: _isDark, groupId, isActive = true }: Gro
               );
             })}
           </select>
-          {notebookActionsHint ? (
-            <div className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">{notebookActionsHint}</div>
+          {!connectionConnected ? (
+            <div className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">{t("groupSpace.connectGoogleFirst")}</div>
           ) : connectionConnected && !notebookOptions.length ? (
             <div className="mt-1 text-[11px] text-[var(--color-text-tertiary)]">{t("groupSpace.noNotebookOptionsHint")}</div>
           ) : null}
         </div>
 
-        <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+        <div className="mt-3 flex flex-wrap gap-2">
           <button
-            type="button"
             onClick={() => void handleBind(lane, selectedRemoteId)}
-            disabled={!canBind || !String(selectedRemoteId || "").trim()}
-            className={`${primaryUtilityButtonClass} w-full sm:flex-1`}
+            disabled={!canManage || !String(selectedRemoteId || "").trim()}
+            className="px-3 py-2 rounded-lg text-sm min-h-[44px] font-medium transition-colors bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 disabled:opacity-50"
           >
-            <FolderIcon size={16} />
             {t("groupSpace.bindSelected")}
           </button>
           <button
-            type="button"
             onClick={() => void handleCreateAndBind(lane)}
-            disabled={!canBind}
-            className={`${utilityButtonClass} w-full sm:w-auto sm:min-w-[132px]`}
+            disabled={!canManage}
+            className="glass-btn px-3 py-2 rounded-lg text-sm min-h-[44px] font-medium transition-colors text-[var(--color-text-primary)] disabled:opacity-50"
           >
-            <PlusIcon size={16} />
             {t("groupSpace.createAndBind")}
           </button>
+          <button
+            onClick={() => void handleUnbind(lane)}
+            disabled={!canManage || !boundRemoteId}
+            className="px-3 py-2 rounded-lg text-sm min-h-[44px] font-medium transition-colors bg-rose-500/15 hover:bg-rose-500/25 text-rose-600 dark:text-rose-400 border border-rose-500/30 disabled:opacity-50"
+          >
+            {t("groupSpace.unbind")}
+          </button>
         </div>
-        {selectedNotebook ? (
-          <div className="mt-2 text-[11px] text-[var(--color-text-tertiary)]">
-            {t("groupSpace.bindSelectedHintWithTarget", {
-              target: String(selectedNotebook.title || "").trim() || String(selectedNotebook.remote_space_id || "").trim(),
-            })}
-          </div>
-        ) : null}
       </div>
     );
   };
@@ -538,12 +429,10 @@ export function GroupSpaceTab({ isDark: _isDark, groupId, isActive = true }: Gro
           <p className="text-xs mt-1 max-w-3xl text-[var(--color-text-muted)]">{t("groupSpace.description")}</p>
         </div>
         <button
-          type="button"
           onClick={() => void loadAll()}
           disabled={actionBusy || loading}
-          className={utilityButtonClass}
+          className="glass-btn px-3 py-2 rounded-lg text-sm min-h-[44px] transition-colors text-[var(--color-text-primary)] disabled:opacity-50"
         >
-          <RefreshIcon size={16} />
           {loading ? t("common:loading") : t("groupSpace.refresh")}
         </button>
       </div>
@@ -558,55 +447,23 @@ export function GroupSpaceTab({ isDark: _isDark, groupId, isActive = true }: Gro
         </div>
 
         <div className="mt-3 flex flex-wrap gap-2">
+          <button
+            onClick={() => void handleConnectGoogle()}
+            disabled={actionBusy || connectionRunning}
+            className="px-3 py-2 rounded-lg text-sm min-h-[44px] font-medium transition-colors bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 disabled:opacity-50"
+          >
+            {connectionConnected ? t("groupSpace.reconnectGoogle") : t("groupSpace.connectGoogle")}
+          </button>
           {connectionRunning ? (
             <button
-              type="button"
               onClick={() => void handleCancelConnect()}
               disabled={actionBusy}
-              className={dangerUtilityButtonClass}
+              className="px-3 py-2 rounded-lg text-sm min-h-[44px] font-medium transition-colors bg-rose-500/15 hover:bg-rose-500/25 text-rose-600 dark:text-rose-400 border border-rose-500/30 disabled:opacity-50"
             >
-              <CloseIcon size={16} />
               {t("groupSpace.cancelConnect")}
             </button>
-          ) : !connectionConnected ? (
-            <button
-              type="button"
-              onClick={() => void handleStartConnect(false)}
-              disabled={actionBusy}
-              className={primaryUtilityButtonClass}
-            >
-              <GlobeIcon size={16} />
-              {t("groupSpace.connectGoogle")}
-            </button>
-          ) : (
-            <div className="grid w-full grid-cols-1 gap-2 sm:grid-cols-2">
-              <button
-                type="button"
-                onClick={() => void handleStartConnect(true)}
-                disabled={actionBusy}
-                className={utilityButtonClass}
-              >
-                <RefreshIcon size={16} />
-                {t("groupSpace.switchGoogle")}
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleDisconnect()}
-                disabled={actionBusy}
-                className={dangerUtilityButtonClass}
-              >
-                <PowerIcon size={16} />
-                {t("groupSpace.disconnectGoogle")}
-              </button>
-            </div>
-          )}
+          ) : null}
         </div>
-
-        {connectionConnected && !connectionRunning ? (
-          <div className="mt-3 text-xs text-[var(--color-text-tertiary)]">
-            {t("groupSpace.disconnectBehaviorHint")}
-          </div>
-        ) : null}
 
         {authFlow?.message ? (
           <div className="mt-3 text-xs text-[var(--color-text-tertiary)]">{String(authFlow.message)}</div>
@@ -616,49 +473,32 @@ export function GroupSpaceTab({ isDark: _isDark, groupId, isActive = true }: Gro
         ) : null}
       </div>
 
-      {showNotebookSection ? (
-        <>
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-            {NOTEBOOK_LANES.map((lane) => renderNotebookCard(lane))}
-          </div>
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+        {NOTEBOOK_LANES.map((lane) => renderNotebookCard(lane))}
+      </div>
 
-          <div className={cardClass()}>
-            <div className="text-sm font-semibold text-[var(--color-text-primary)]">{t("groupSpace.summaryTitle")}</div>
-            <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3">
-              <div className="rounded-lg border border-[var(--glass-border-subtle)] bg-[var(--glass-panel-bg)] px-3 py-2">
-                <div className="text-[11px] uppercase tracking-wide text-[var(--color-text-muted)]">{t("groupSpace.summaryGoogle")}</div>
-                <div className={`mt-1 text-sm font-medium ${connectionStatusTone}`}>{connectionStatusText}</div>
-              </div>
-              <div className="rounded-lg border border-[var(--glass-border-subtle)] bg-[var(--glass-panel-bg)] px-3 py-2">
-                <div className="text-[11px] uppercase tracking-wide text-[var(--color-text-muted)]">{t("groupSpace.summaryWork")}</div>
-                <div className={`mt-1 text-sm font-medium ${workLaneState === "active" ? "text-emerald-600 dark:text-emerald-400" : workLaneState === "saved" ? "text-amber-600 dark:text-amber-400" : "text-[var(--color-text-primary)]"}`}>
-                  {laneStatusText(workLaneState, t)}
-                </div>
-              </div>
-              <div className="rounded-lg border border-[var(--glass-border-subtle)] bg-[var(--glass-panel-bg)] px-3 py-2">
-                <div className="text-[11px] uppercase tracking-wide text-[var(--color-text-muted)]">{t("groupSpace.summaryMemory")}</div>
-                <div className={`mt-1 text-sm font-medium ${memoryLaneState === "active" ? "text-emerald-600 dark:text-emerald-400" : memoryLaneState === "saved" ? "text-amber-600 dark:text-amber-400" : "text-[var(--color-text-primary)]"}`}>
-                  {laneStatusText(memoryLaneState, t)}
-                </div>
-              </div>
-            </div>
-            {connectionWarning ? (
-              <div className="mt-3 text-xs text-amber-600 dark:text-amber-400">
-                {t("groupSpace.summaryWarning")}: {connectionWarning}
-              </div>
-            ) : null}
+      <div className={cardClass()}>
+        <div className="text-sm font-semibold text-[var(--color-text-primary)]">{t("groupSpace.summaryTitle")}</div>
+        <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div className="rounded-lg border border-[var(--glass-border-subtle)] bg-[var(--glass-panel-bg)] px-3 py-2">
+            <div className="text-[11px] uppercase tracking-wide text-[var(--color-text-muted)]">{t("groupSpace.summaryGoogle")}</div>
+            <div className={`mt-1 text-sm font-medium ${connectionStatusTone}`}>{connectionStatusText}</div>
           </div>
-        </>
-      ) : (
-        <div className={cardClass()}>
-          <div className="text-sm font-semibold text-[var(--color-text-primary)]">{t("groupSpace.notebookSectionLockedTitle")}</div>
-          <div className="mt-1 text-xs text-[var(--color-text-tertiary)]">
-            {connectionRunning
-              ? t("groupSpace.notebookSectionLockedConnecting")
-              : t("groupSpace.notebookSectionLockedDisconnected")}
+          <div className="rounded-lg border border-[var(--glass-border-subtle)] bg-[var(--glass-panel-bg)] px-3 py-2">
+            <div className="text-[11px] uppercase tracking-wide text-[var(--color-text-muted)]">{t("groupSpace.summaryWork")}</div>
+            <div className="mt-1 text-sm font-medium text-[var(--color-text-primary)]">{bindingStateText(workBinding, t)}</div>
+          </div>
+          <div className="rounded-lg border border-[var(--glass-border-subtle)] bg-[var(--glass-panel-bg)] px-3 py-2">
+            <div className="text-[11px] uppercase tracking-wide text-[var(--color-text-muted)]">{t("groupSpace.summaryMemory")}</div>
+            <div className="mt-1 text-sm font-medium text-[var(--color-text-primary)]">{bindingStateText(memoryBinding, t)}</div>
           </div>
         </div>
-      )}
+        {connectionWarning ? (
+          <div className="mt-3 text-xs text-amber-600 dark:text-amber-400">
+            {t("groupSpace.summaryWarning")}: {connectionWarning}
+          </div>
+        ) : null}
+      </div>
 
       {err ? <div className="text-xs text-rose-600 dark:text-rose-400">{err}</div> : null}
       {hint ? <div className="text-xs text-emerald-600 dark:text-emerald-400">{hint}</div> : null}

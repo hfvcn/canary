@@ -15,10 +15,10 @@ PROMPTS_DIRNAME = "prompts"
 
 _MAX_FILE_BYTES = 512 * 1024  # Safety limit for prompt markdown files.
 
-DEFAULT_PREAMBLE_BODY = """Startup routes:
-- Cold start or resume: run `cccc_bootstrap`, then `cccc_help`.
-- From bootstrap, inspect `context_hygiene`, `memory_recall_gate`, and inbox preview before planning.
-- Need colder group or project detail: use `cccc_context_get` / `cccc_project_info`.
+DEFAULT_PREAMBLE_BODY = """Quick start:
+- Call `cccc_bootstrap` first. It returns `session`, `recovery`, `inbox_preview`, `memory_recall_gate`, and `next_calls` for cold-start recovery.
+- If the coordination brief is missing or stale, align on objective/focus first and update it via `cccc_coordination(action=update_brief, ...)`.
+- Call `cccc_help` only when you need the detailed workflow or edge-case guidance; use `cccc_project_info` / `cccc_context_get` for cold detail on demand.
 
 Working stance:
 - Work like a sharp teammate, not a script.
@@ -26,6 +26,24 @@ Working stance:
 - Prefer silence over low-signal chatter; speak for real changes, not filler or routine `@all` updates.
 - For chat, be natural, brief, and direct.
 - Once scope is approved, finish it end-to-end; do not ask to continue on obvious next steps.
+
+Execution checklist:
+- Keep visible coordination in MCP chat (`cccc_message_send` / `cccc_message_reply`).
+- Update shared work through `cccc_task` and `cccc_coordination`, not private runtime todo.
+- Update your personal working memory via `cccc_agent_state(action=update, actor_id=<self>, ...)`.
+- Minimum hot-state payload each update: `focus` + `next_action` + `what_changed` (+ `active_task_id` when applicable).
+- Keep runtime todo current before implementation and before each status reply.
+
+Gap routing:
+- Info gap: inspect bootstrap / `cccc_context_get` / `cccc_project_info` / inbox / memory first; then web if allowed.
+- Capability gap: prefer `cccc_capability_use(...)`; if needed, run `cccc_capability_search(...)` then `cccc_capability_use(...)`.
+- If capability setup returns retry guidance (relist/reconnect/diagnostics), follow it before escalating.
+- Ask the user only for real env/permission blockers.
+
+Memory boundary:
+- `cccc_agent_state` is short-term working memory; long-term memory lives in `state/memory/MEMORY.md` + `state/memory/daily/*.md`.
+- On cold start, use `cccc_bootstrap`'s `memory_recall_gate` before planning or implementation.
+- Deep recall order: local memory first (`cccc_memory`), then `cccc_space(action=query, lane="memory")` only if the memory notebook is bound and local recall is insufficient.
 """
 
 

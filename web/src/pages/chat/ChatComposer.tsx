@@ -619,8 +619,10 @@ export function ChatComposer({
         {/* Attachment Button */}
         <button
           className={classNames(
-            composerToolButtonClass,
-            busy !== "send" && selectedGroupId && !isCrossGroup && "hover:text-[var(--color-text-primary)] active:scale-95"
+            "w-11 h-11 rounded-xl sm:rounded-2xl flex items-center justify-center transition-all duration-300 ease-out flex-shrink-0 border group",
+            isDark
+              ? "bg-slate-900 border-white/5 text-slate-400 hover:text-white hover:bg-slate-800 active:scale-95"
+              : "bg-white border-black/5 text-gray-500 hover:text-gray-900 hover:bg-gray-50 active:scale-95"
           )}
           onClick={() => fileInputRef.current?.click()}
           disabled={!selectedGroupId || busy === "send" || isCrossGroup}
@@ -656,7 +658,7 @@ export function ChatComposer({
             <button
               type="button"
               className={classNames(
-                composerInlineToolButtonClass,
+                "w-11 h-11 rounded-full transition-colors flex items-center justify-center",
                 busy === "send" || !selectedGroupId
                   ? "text-[var(--color-text-tertiary)]"
                   : messageMode === "task"

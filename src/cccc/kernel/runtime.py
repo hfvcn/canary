@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import shutil
-import sys
+import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from ..util.process import find_subprocess_executable
@@ -64,6 +64,7 @@ KNOWN_RUNTIMES: Dict[str, Dict[str, Any]] = {
     "gemini": {
         "display_name": "Gemini CLI",
         "command": "gemini",
+        "command_candidates": ["ge", "gemini"],
         "capabilities": "MCP; MCP setup: auto",
         "mcp_add_pattern": "gemini mcp add -s user {name} {cmd}",
     },
@@ -89,6 +90,54 @@ KNOWN_RUNTIMES: Dict[str, Dict[str, Any]] = {
 
 # First-class supported runtimes (CCCC manages startup defaults + MCP wiring)
 PRIMARY_RUNTIMES = ["claude", "codex", "droid", "amp", "auggie", "neovate", "gemini", "kimi"]
+
+
+def _normalize_command_list(raw: Any) -> List[str]:
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if isinstance(item, str) and str(item).strip()]
+
+
+def resolve_runtime_executable(name: str) -> str:
+    """Resolve the executable used for a runtime.
+
+    For runtimes with command candidates, pick the first command found in PATH.
+    """
+    config = KNOWN_RUNTIMES.get(name)
+    if not config:
+        return name
+    default_command = str(config.get("command") or name).strip() or name
+    candidates = _normalize_command_list(config.get("command_candidates")) or [default_command]
+    for candidate in candidates:
+        if shutil.which(candidate):
+            return candidate
+    return default_command
+
+
+@lru_cache(maxsize=8)
+def _has_zsh_alias(alias_name: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["zsh", "-lic", f"alias {alias_name}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return False
+    out = str(result.stdout or "").strip()
+    if result.returncode != 0:
+        return False
+    return out.startswith(f"{alias_name}=") or f"alias {alias_name}=" in out
+
+
+def _gemini_command_with_flags() -> List[str]:
+    if shutil.which("ge"):
+        return ["ge", "--yolo"]
+    if _has_zsh_alias("ge"):
+        # ge is often a zsh alias with proxy env exports; run through login shell so alias expands.
+        return ["zsh", "-lic", "ge --yolo"]
+    return [resolve_runtime_executable("gemini"), "--yolo"]
 
 
 def detect_runtime(name: str) -> RuntimeInfo:
@@ -118,7 +167,8 @@ def detect_runtime(name: str) -> RuntimeInfo:
         )
 
     command = config["command"]
-    path = find_subprocess_executable(command)
+    detected_command = resolve_runtime_executable(name)
+    path = find_subprocess_executable(detected_command)
     available = path is not None
     
     mcp_add_command = None
@@ -130,7 +180,7 @@ def detect_runtime(name: str) -> RuntimeInfo:
     return RuntimeInfo(
         name=name,
         display_name=config["display_name"],
-        command=command,
+        command=detected_command if available else command,
         available=available,
         path=path,
         capabilities=config["capabilities"],
@@ -167,7 +217,7 @@ def get_runtime_command(name: str) -> List[str]:
     config = KNOWN_RUNTIMES.get(name)
     if not config:
         return [name]
-    return [config["command"]]
+    return [resolve_runtime_executable(name)]
 
 
 def get_cccc_mcp_stdio_command() -> List[str]:
@@ -214,7 +264,7 @@ def get_runtime_command_with_flags(name: str) -> List[str]:
         # so MCP tools can resolve "self" context reliably.
         "codex": ["codex", "-c", "shell_environment_policy.inherit=all", "--dangerously-bypass-approvals-and-sandbox", "--search"],
         "droid": ["droid", "--auto", "high"],
-        "gemini": ["gemini", "--yolo"],
+        "gemini": _gemini_command_with_flags(),
         "kimi": ["kimi", "--yolo"],
         "neovate": ["neovate"],
         "custom": [],

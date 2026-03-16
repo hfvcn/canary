@@ -92,8 +92,6 @@ class ActorCreateRequest(BaseModel):
     # Values are never returned by the daemon; only keys can be listed via the dedicated endpoints.
     env_private: Optional[Dict[str, str]] = None
     profile_id: Optional[str] = None
-    profile_scope: Optional[Literal["global", "user"]] = None
-    profile_owner: Optional[str] = None
     default_scope_key: str = Field(default="")
     submit: ActorSubmit = Field(default="enter")
     by: str = Field(default="user")
@@ -112,8 +110,6 @@ class ActorUpdateRequest(BaseModel):
     runtime: Optional[AgentRuntime] = None
     enabled: Optional[bool] = None
     profile_id: Optional[str] = None
-    profile_scope: Optional[Literal["global", "user"]] = None
-    profile_owner: Optional[str] = None
     profile_action: Optional[Literal["convert_to_custom"]] = None
 
 
@@ -142,6 +138,20 @@ class RepoPromptUpdateRequest(BaseModel):
     by: str = Field(default="user")
     editor_mode: Optional[Literal["structured", "raw"]] = None
     changed_blocks: list[str] = Field(default_factory=list)
+
+
+class WorkspaceCreateRequest(BaseModel):
+    path: str
+    item_type: Literal["folder", "task", "file"] = "folder"
+    title: str = Field(default="")
+    initial_content: str = Field(default="")
+
+
+class WorkspaceTaskUpdateRequest(BaseModel):
+    path: str
+    title: Optional[str] = None
+    status: Optional[Literal["todo", "in_progress", "blocked", "done", "archived"]] = None
+    summary: Optional[str] = None
 
 
 class GroupUpdateRequest(BaseModel):
@@ -205,7 +215,6 @@ class GroupSettingsRequest(BaseModel):
 
     # Features
     panorama_enabled: Optional[bool] = None
-    desktop_pet_enabled: Optional[bool] = None
 
     by: str = Field(default="user")
 
@@ -363,9 +372,8 @@ class GroupSpaceProviderCredentialUpdateRequest(BaseModel):
 
 class GroupSpaceProviderAuthRequest(BaseModel):
     by: str = Field(default="user")
-    action: Literal["status", "start", "cancel", "disconnect"] = "status"
+    action: Literal["status", "start", "cancel"] = "status"
     timeout_seconds: int = 900
-    force_reauth: bool = False
 
 
 class IMSetRequest(BaseModel):
@@ -381,6 +389,9 @@ class IMSetRequest(BaseModel):
     feishu_domain: str = ""
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
+    feishu_message_style: str = "text"
+    feishu_card_title: str = ""
+    feishu_card_template_id: str = ""
     # DingTalk fields
     dingtalk_app_key: str = ""
     dingtalk_app_secret: str = ""
@@ -388,6 +399,23 @@ class IMSetRequest(BaseModel):
     # WeCom fields
     wecom_bot_id: str = ""
     wecom_secret: str = ""
+
+
+class GlobalIMSetRequest(BaseModel):
+    platform: Literal["telegram", "slack", "discord", "feishu", "dingtalk"]
+    token_env: str = ""
+    token: str = ""
+    bot_token_env: str = ""
+    app_token_env: str = ""
+    feishu_domain: str = ""
+    feishu_app_id: str = ""
+    feishu_app_secret: str = ""
+    feishu_message_style: str = "text"
+    feishu_card_title: str = ""
+    feishu_card_template_id: str = ""
+    dingtalk_app_key: str = ""
+    dingtalk_app_secret: str = ""
+    dingtalk_robot_code: str = ""
 
 
 class IMActionRequest(BaseModel):
@@ -491,6 +519,18 @@ def check_group(conn: Request | WebSocket, group_id: str) -> Any:
     raise HTTPException(status_code=403, detail={"code": "permission_denied", "message": "group access denied", "details": {"group_id": gid}})
 
 
+def check_group_admin(conn: Request | WebSocket, group_id: str) -> Any:
+    principal = check_group(conn, group_id)
+    if not _tokens_enabled():
+        return principal
+    if _principal_kind(principal) == "user" and _principal_is_admin(principal):
+        return principal
+    raise HTTPException(
+        status_code=403,
+        detail={"code": "permission_denied", "message": "group admin access required", "details": {"group_id": str(group_id or "").strip()}},
+    )
+
+
 def require_admin(request: Request) -> Any:
     return check_admin(request)
 
@@ -507,6 +547,10 @@ def require_user(request: Request) -> Any:
 
 def require_group(request: Request, group_id: str = FastApiPath(...)) -> Any:
     return check_group(request, group_id)
+
+
+def require_group_admin(request: Request, group_id: str = FastApiPath(...)) -> Any:
+    return check_group_admin(request, group_id)
 
 
 def filter_groups_for_principal(conn: Request | WebSocket, groups: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -85,7 +85,7 @@ class TestAutomationSilenceActivityFilter(unittest.TestCase):
                     context={"rule_id": "standup"},
                 ).model_dump(),
             )
-            append_event(
+            standup_reply = append_event(
                 group.ledger_path,
                 kind="chat.message",
                 group_id=group.group_id,
@@ -94,35 +94,8 @@ class TestAutomationSilenceActivityFilter(unittest.TestCase):
                 data=ChatMessageData(text="standup reply", reply_to=str(standup_notify.get("id") or "")).model_dump(),
             )
 
-            # Foreman's reply to standup should NOT count as activity (prevents auto-idle blocking).
             last_activity = _get_last_group_activity(group)
-            self.assertEqual(last_activity, parse_utc_iso(str(business.get("ts") or "")))
-
-            # But foreman's reply to a NON-standup automation rule SHOULD count as activity.
-            custom_notify = append_event(
-                group.ledger_path,
-                kind="system.notify",
-                group_id=group.group_id,
-                scope_key="",
-                by="system",
-                data=SystemNotifyData(
-                    kind="automation",
-                    title="Custom check",
-                    message="custom reminder",
-                    target_actor_id="foreman1",
-                    context={"rule_id": "my_custom_rule"},
-                ).model_dump(),
-            )
-            custom_reply = append_event(
-                group.ledger_path,
-                kind="chat.message",
-                group_id=group.group_id,
-                scope_key="",
-                by="foreman1",
-                data=ChatMessageData(text="custom reply", reply_to=str(custom_notify.get("id") or "")).model_dump(),
-            )
-            last_activity = _get_last_group_activity(group)
-            self.assertEqual(last_activity, parse_utc_iso(str(custom_reply.get("ts") or "")))
+            self.assertEqual(last_activity, parse_utc_iso(str(standup_reply.get("ts") or "")))
 
             peer_business = append_event(
                 group.ledger_path,

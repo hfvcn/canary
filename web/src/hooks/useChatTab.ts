@@ -94,7 +94,7 @@ export function useChatTab({
   const { setRecipientsModal, setRelayModal, openModal } = useModalStore();
   const { setNewActorRole } = useFormStore();
 
-  // Outbox (optimistic pending messages) — stable selector, no new array allocation.
+  // Outbox (optimistic pending messages) — stable selector, no new array allocation
   const outboxEntries = useChatOutboxStore(
     useCallback((s) => selectOutboxEntries(s, selectedGroupId), [selectedGroupId])
   );
@@ -175,10 +175,14 @@ export function useChatTab({
     return !!chatWindow && String(chatWindow.groupId || "") === String(selectedGroupId || "");
   }, [chatWindow, selectedGroupId]);
 
-  // Filtered live chat messages (canonical + optimistic pending merged)
+  // Filtered live chat messages (canonical + outbox pending merged)
   const liveChatMessages = useMemo(() => {
     const all = events.filter((ev) => ev.kind === "chat.message");
-    const pendingEvents = outboxEntries.map((entry) => entry.event);
+
+    // Merge outbox pending messages at the end (they are optimistic, not yet confirmed)
+    const pendingEvents = outboxEntries
+      .filter((e) => e.status === "pending")
+      .map((e) => e.event);
     const merged = pendingEvents.length > 0 ? [...all, ...pendingEvents] : all;
 
     if (chatFilter === "attention") {
@@ -375,7 +379,12 @@ export function useChatTab({
     };
 
     const applyImmediateComposerFeedback = () => {
-      clearComposer();
+      setComposerText("");
+      setComposerFiles([]);
+      setReplyTarget(null);
+      setPriority("normal");
+      setReplyRequired(false);
+      setToText("");
       if (chatAtBottomRef) chatAtBottomRef.current = true;
       if (selectedGroupId) {
         setShowScrollButton(selectedGroupId, false);
@@ -404,8 +413,7 @@ export function useChatTab({
       return;
     }
 
-    // Optimistic: enqueue to outbox immediately for same-group sends.
-    // If the request fails, we remove the pending entry and restore the composer.
+    // Optimistic: enqueue to outbox immediately for same-group sends
     if (!isCrossGroup) {
       const optimisticEvent: LedgerEvent = {
         id: localId,
@@ -418,13 +426,10 @@ export function useChatTab({
           to: toTokens,
           priority: prio,
           reply_required: replyRequired,
-          client_id: localId,
           reply_to: replyTargetSnapshot?.eventId || null,
           quote_text: replyTargetSnapshot?.text || undefined,
           refs: refsSnapshot,
           format: "plain",
-          // Keep optimistic events schema-compatible with real ledger events.
-          // Attachment previews should only render after the server returns blob paths.
           attachments: [],
           _optimistic: true,
         } as LedgerEvent["data"],
@@ -466,7 +471,7 @@ export function useChatTab({
         }
       }
       if (!resp.ok) {
-        // Pending-only outbox: failed sends roll back to the composer.
+        // Remove optimistic entry and restore composer
         removeOutbox(selectedGroupId, localId);
         restoreComposerState();
         showError(`${resp.error.code}: ${resp.error.message}`);
@@ -493,7 +498,6 @@ export function useChatTab({
       onMessageSent?.();
     } catch (error) {
       const message = error instanceof Error ? error.message : "send failed";
-      // Pending-only outbox: failed sends roll back to the composer.
       removeOutbox(selectedGroupId, localId);
       restoreComposerState();
       showError(message);
@@ -518,7 +522,6 @@ export function useChatTab({
     removeOutbox,
     setBusy,
     showError,
-    clearComposer,
     setComposerText,
     setComposerFiles,
     setReplyTarget,

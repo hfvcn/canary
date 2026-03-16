@@ -1,4 +1,6 @@
-import React, { lazy, Suspense, useMemo } from "react";
+import React, { lazy, Suspense, useEffect, useMemo, useRef } from "react";
+import { useTranslation } from "react-i18next";
+import { TabBar } from "./components/TabBar";
 import { DropOverlay } from "./components/DropOverlay";
 const AppModals = lazy(() => import("./components/AppModals").then((m) => ({ default: m.AppModals })));
 import { AppBackground } from "./components/app/AppBackground";
@@ -20,14 +22,25 @@ import { useAppTabState } from "./hooks/useAppTabState";
 import { WebPet } from "./features/webPet/WebPet";
 import { getEffectiveComposerDestGroupId } from "./stores/useComposerStore";
 import { getChatSession } from "./stores/useUIStore";
+import { classNames } from "./utils/classNames";
+import { ActorTab } from "./pages/ActorTab";
+import { BoardTab } from "./pages/BoardTab";
+import { ChatTab } from "./pages/chat";
+import { PanoramaTab } from "./pages/PanoramaTab";
+import { WorkspaceTab } from "./pages/WorkspaceTab";
 import {
   useGroupStore,
   useUIStore,
   useModalStore,
   useComposerStore,
   useFormStore,
+  useObservabilityStore,
+  useWorkspaceStore,
+  getWorkspaceGroupState,
 } from "./stores";
 import type { ChatMessageData, LedgerEvent } from "./types";
+
+const NON_ACTOR_TABS = ["chat", "board", "workspace", "panorama"];
 
 // ============ Main App Component ============
 
@@ -80,9 +93,7 @@ export default function App() {
   const setWebReadOnly = useUIStore((s) => s.setWebReadOnly);
   const sseStatus = useUIStore((s) => s.sseStatus);
 
-  const openModal = useModalStore((s) => s.openModal);
-  const modalFlags = useModalStore((s) => s.modals);
-  const editingActor = useModalStore((s) => s.editingActor);
+  const { openModal } = useModalStore();
 
   const {
     activeGroupId,
@@ -114,9 +125,31 @@ export default function App() {
   const chatUnreadCount = chatSession.chatUnreadCount;
   const chatSessionAtBottom = chatSession.scrollSnapshot?.atBottom;
 
+  // Hide Panorama tab when browser lacks GPU/3D support or feature is disabled
+  const canRender3D = useMemo(() => {
+    try {
+      const canvas = document.createElement("canvas");
+      return !!(navigator.gpu || canvas.getContext("webgl2"));
+    } catch { return false; }
+  }, []);
+  const showPanorama = canRender3D && !!groupSettings?.panorama_enabled;
+  const prevGroupIdRef = useRef<string | null>(null);
+
   const [showMentionMenu, setShowMentionMenu] = React.useState(false);
   const [_mentionFilter, setMentionFilter] = React.useState("");
   const [mentionSelectedIndex, setMentionSelectedIndex] = React.useState(0);
+  const [collapseHumanMessageBodiesByDefault, setCollapseHumanMessageBodiesByDefault] = React.useState(false);
+  const workspaceByGroup = useWorkspaceStore((state) => state.byGroup);
+  const ensureWorkspaceGroup = useWorkspaceStore((state) => state.ensureGroup);
+  const refreshWorkspaceGroup = useWorkspaceStore((state) => state.refreshGroup);
+  const openWorkspaceFolder = useWorkspaceStore((state) => state.openFolder);
+  const openWorkspaceFile = useWorkspaceStore((state) => state.openFile);
+  const createWorkspaceFolderAction = useWorkspaceStore((state) => state.createFolder);
+  const createWorkspaceFileAction = useWorkspaceStore((state) => state.createFile);
+  const workspaceState = useMemo(
+    () => getWorkspaceGroupState(selectedGroupId, workspaceByGroup),
+    [selectedGroupId, workspaceByGroup]
+  );
 
   const {
     composerRef,
@@ -223,11 +256,90 @@ export default function App() {
     editingActor,
   });
 
+  const refreshWebAccessSession = React.useCallback(async () => {
+    try {
+      const resp = await api.fetchWebAccessSession();
+      const session = resp.ok ? resp.result?.web_access_session ?? null : null;
+      const allowed = Boolean(session?.can_access_global_settings ?? !(session?.login_active ?? false));
+      setCanAccessGlobalSettings(allowed);
+      setCanManageActors(Boolean(session?.can_manage_actors ?? allowed));
+      setCanAccessTerminal(Boolean(session?.can_access_terminal ?? allowed));
+      setCollapseHumanMessageBodiesByDefault(Boolean(session?.login_active && session?.is_admin && session?.can_view_message_bodies));
+    } catch {
+      setCanAccessGlobalSettings(null);
+      setCanManageActors(null);
+      setCanAccessTerminal(null);
+      setCollapseHumanMessageBodiesByDefault(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshWebAccessSession();
+    const handleFocus = () => {
+      void refreshWebAccessSession();
+    };
+    window.addEventListener("focus", handleFocus);
+    return () => window.removeEventListener("focus", handleFocus);
+  }, [refreshWebAccessSession]);
+
+  // Tab list for swipe navigation
+  const canManageGroups = canAccessGlobalSettings === true;
+  const canManageActorsNow = canManageActors !== false;
+  const canAccessTerminalNow = canAccessTerminal !== false;
+  const canAccessSettings = canAccessGlobalSettings !== false;
+  const visibleActors = useMemo(
+    () => (canAccessTerminalNow ? actors : []),
+    [actors, canAccessTerminalNow]
+  );
+  const showBoardTab = Boolean(selectedGroupId);
+  const showWorkspaceTab = Boolean(selectedGroupId && workspaceState.openFilePath);
+
+  const allTabs = useMemo(() => {
+    const tabs = ["chat"];
+    if (showBoardTab) tabs.push("board");
+    if (showWorkspaceTab) tabs.push("workspace");
+    if (showPanorama) tabs.push("panorama");
+    return tabs.concat(visibleActors.map((a) => a.id));
+  }, [showBoardTab, showPanorama, showWorkspaceTab, visibleActors]);
+
+  const handleTabChange = React.useCallback((newTab: string) => {
+    if (!canAccessTerminalNow && !NON_ACTOR_TABS.includes(newTab)) {
+      return;
+    }
+    // Keep Chat mounted to preserve scroll position; no need to snapshot scrollTop.
+    if (!NON_ACTOR_TABS.includes(newTab)) {
+      setMountedActorIds((prev) => (prev.includes(newTab) ? prev : [...prev, newTab]));
+    }
+    setActiveTab(newTab);
+  }, [canAccessTerminalNow, setActiveTab]);
+
   const { handleTouchStart, handleTouchEnd } = useSwipeNavigation({
     tabs: allTabs,
     activeTab,
     onTabChange: handleTabChange,
   });
+
+  // Auto-fallback: switch away from panorama tab when feature is disabled
+  useEffect(() => {
+    if (!showPanorama && activeTab === "panorama") {
+      setActiveTab("chat");
+    }
+  }, [showPanorama, activeTab, setActiveTab]);
+
+  // BUG-1 + BUG-3: Refresh context on panorama tab activation + periodic polling fallback
+  useEffect(() => {
+    if (!showPanorama || activeTab !== "panorama" || !selectedGroupId) return;
+    // Immediate fetch on tab switch (skip if SSE debounce timer is already pending)
+    if (!contextRefreshTimerRef.current) {
+      void fetchContext(selectedGroupId);
+    }
+    // 12s polling fallback while panorama tab is active
+    const intervalId = window.setInterval(() => {
+      void fetchContext(selectedGroupId);
+    }, 12_000);
+    return () => window.clearInterval(intervalId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, selectedGroupId]);
 
   const hasForeman = useMemo(() => actors.some((a) => a.role === "foreman"), [actors]);
   // eslint-disable-next-line react-hooks/exhaustive-deps -- groups and groupOrder trigger recalculation
@@ -272,6 +384,50 @@ export default function App() {
     connectStream,
     cleanupSSE,
   });
+
+  // Ensure workspace group is loaded when switching groups
+  useEffect(() => {
+    if (!selectedGroupId) return;
+    ensureWorkspaceGroup(selectedGroupId);
+    void refreshWorkspaceGroup(selectedGroupId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedGroupId]);
+
+  // ============ Actions ============
+
+  async function handleOpenWorkspaceFile(path: string) {
+    if (!selectedGroupId) return;
+    await openWorkspaceFile(selectedGroupId, path);
+    setActiveTab("workspace");
+  }
+
+  async function handleOpenWorkspaceFolder(path: string) {
+    if (!selectedGroupId) return;
+    await openWorkspaceFolder(selectedGroupId, path);
+  }
+
+  async function handleCreateWorkspaceFolder(kind: "folder" | "task") {
+    if (!selectedGroupId) return;
+    const label = kind === "task" ? t("layout:newTaskPrompt") : t("layout:newFolderPrompt");
+    const name = window.prompt(label, "");
+    if (!name || !name.trim()) return;
+    try {
+      await createWorkspaceFolderAction(selectedGroupId, { name: name.trim(), kind });
+    } catch (error) {
+      showError(error instanceof Error ? error.message : t("layout:workspaceCreateFailed"));
+    }
+  }
+
+  async function handleCreateWorkspaceFile() {
+    if (!selectedGroupId) return;
+    const name = window.prompt(t("layout:newFilePrompt"), "");
+    if (!name || !name.trim()) return;
+    try {
+      await createWorkspaceFileAction(selectedGroupId, { name: name.trim() });
+    } catch (error) {
+      showError(error instanceof Error ? error.message : t("layout:workspaceCreateFailed"));
+    }
+  }
 
   return (
     <div
@@ -374,6 +530,16 @@ export default function App() {
         onRefreshActors={() => void refreshActors()}
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
+        collapseHumanMessageBodiesByDefault={collapseHumanMessageBodiesByDefault}
+        workspaceTree={workspaceState.tree}
+        workspaceSelectedFilePath={workspaceState.openFilePath}
+        workspaceLoading={workspaceState.loadingTree}
+        workspaceError={workspaceState.error}
+        onRefreshWorkspace={selectedGroupId ? () => void refreshWorkspaceGroup(selectedGroupId) : undefined}
+        onOpenWorkspaceFolder={selectedGroupId ? (path: string) => void handleOpenWorkspaceFolder(path) : undefined}
+        onOpenWorkspaceFile={selectedGroupId ? (path: string) => void handleOpenWorkspaceFile(path) : undefined}
+        onCreateWorkspaceFolder={selectedGroupId ? (kind: "folder" | "task") => void handleCreateWorkspaceFolder(kind) : undefined}
+        onCreateWorkspaceFile={selectedGroupId ? () => void handleCreateWorkspaceFile() : undefined}
       />
 
       <WebPet />

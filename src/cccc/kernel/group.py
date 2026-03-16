@@ -19,16 +19,25 @@ from ..util.time import utc_now_iso
 from .registry import Registry
 from .scope import ScopeIdentity
 
-_DEFAULT_AUTOMATION_STANDUP_SNIPPET = """{{interval_minutes}} minutes have passed. Stand-up reminder (foreman only).
+_DEFAULT_AUTOMATION_STANDUP_SNIPPET = """{{interval_minutes}} minutes have passed. Stand-up + memory consolidation reminder (foreman only).
 
-Use MCP chat for any visible update.
+Use MCP chat only (`cccc_message_send` / `cccc_message_reply`); terminal output is invisible to users.
 
-Checklist:
-1. Recall: check `cccc_bootstrap().memory_recall_gate`, then `cccc_memory(search/get)` if needed.
-2. Alignment: confirm objective, blockers, owners, and next actions.
-3. Gaps: close information gaps first; use `cccc_capability_use(...)` before declaring blocked.
-4. State: sync `cccc_coordination` / `cccc_task` and refresh `cccc_agent_state`.
-5. Consolidation: write durable memory only for stable outcomes; use `cccc_help` if you need the full playbook.
+Checklist (5-8 min):
+1. Recall: run `cccc_memory(action=search, query=<2-3 keywords from current Overview/tasks>, actor_id="")`.
+2. Alignment: confirm goals/constraints/DoD, top blockers, and next 1-3 actions with owners.
+3. Gap triage:
+   - info gap -> search Context/PROJECT.md/inbox/memory first (then web if allowed)
+   - capability gap -> `cccc_capability_use(...)`; if needed:
+     `cccc_capability_search(kind="mcp_toolpack"|"skill", query=...)` -> `cccc_capability_use(capability_id=..., scope="session")`
+     then handle `refresh_required=true`; if still failed, follow `diagnostics` + `resolution_plan`
+4. State upkeep: sync tasks/context and update your agent state (`focus/next_action/what_changed`).
+5. Consolidation (on milestone/done): write one durable daily note via
+   `cccc_memory(action="write", target="daily", content=...)`;
+   promote stable reusable know-how via
+   `cccc_memory(action="write", target="memory", content=...)`.
+
+Keep the report concise and evidence-based.
 """
 
 LOGGER = logging.getLogger(__name__)
@@ -49,7 +58,7 @@ def _default_automation_ruleset() -> Dict[str, Any]:
                     "kind": "notify",
                     "priority": "normal",
                     "requires_ack": False,
-                    "title": "Stand-up reminder",
+                    "title": "Stand-up + Memory Consolidation",
                     "snippet_ref": "standup",
                     "message": "",
                 },

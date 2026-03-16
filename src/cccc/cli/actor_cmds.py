@@ -115,7 +115,7 @@ def cmd_actor_add(args: argparse.Namespace) -> int:
         # Note: role is auto-determined by position (first enabled = foreman)
         if runner != "pty":
             raise ValueError("invalid runner (must be 'pty')")
-        if runtime not in ("amp", "auggie", "claude", "codex", "droid", "gemini", "kimi", "neovate", "custom"):
+        if runtime not in ("amp", "auggie", "claude", "codex", "cursor", "droid", "neovate", "gemini", "kilocode", "opencode", "copilot", "custom"):
             raise ValueError("invalid runtime")
         if runtime == "custom" and not command:
             raise ValueError("custom runtime requires a command (PTY runner)")

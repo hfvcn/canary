@@ -64,7 +64,7 @@ class TestSystemPromptGroupSpace(unittest.TestCase):
         finally:
             cleanup()
 
-    def test_prompt_excludes_group_space_block_even_when_work_lane_bound(self) -> None:
+    def test_prompt_includes_group_space_block_when_bound(self) -> None:
         from cccc.daemon.space.group_space_store import set_space_provider_state, upsert_space_binding
         from cccc.kernel.actors import find_actor
         from cccc.kernel.group import load_group
@@ -93,54 +93,13 @@ class TestSystemPromptGroupSpace(unittest.TestCase):
             actor = find_actor(group, aid)
             self.assertIsNotNone(actor)
             prompt = render_system_prompt(group=group, actor=actor or {})
-            self.assertNotIn("Group Space:", prompt)
-            self.assertNotIn("work_bound=true memory_bound=false", prompt)
-            self.assertNotIn('`cccc_space(action="query", lane="work")`', prompt)
-            self.assertNotIn("system.notify; do not poll", prompt)
-        finally:
-            cleanup()
-
-    def test_prompt_excludes_group_space_block_even_when_memory_lane_bound(self) -> None:
-        from cccc.daemon.space.group_space_store import set_space_provider_state, upsert_space_binding
-        from cccc.kernel.actors import find_actor
-        from cccc.kernel.group import load_group
-        from cccc.kernel.system_prompt import render_system_prompt
-
-        _, cleanup = self._with_home()
-        try:
-            gid, aid = self._create_group_with_actor(title="prompt-space-memory")
-            upsert_space_binding(
-                gid,
-                provider="notebooklm",
-                lane="work",
-                remote_space_id="nb_prompt_work",
-                by="user",
-                status="bound",
-            )
-            upsert_space_binding(
-                gid,
-                provider="notebooklm",
-                lane="memory",
-                remote_space_id="nb_prompt_memory",
-                by="user",
-                status="bound",
-            )
-            set_space_provider_state(
-                "notebooklm",
-                enabled=True,
-                mode="active",
-                last_error="",
-                touch_health=True,
-            )
-            group = load_group(gid)
-            self.assertIsNotNone(group)
-            assert group is not None
-            actor = find_actor(group, aid)
-            self.assertIsNotNone(actor)
-            prompt = render_system_prompt(group=group, actor=actor or {})
-            self.assertNotIn("Group Space:", prompt)
-            self.assertNotIn("work_bound=true memory_bound=true", prompt)
-            self.assertNotIn('`cccc_space(action="query", lane="memory")`', prompt)
+            self.assertIn("Group Space:", prompt)
+            self.assertIn('cccc_capability_use(tool_name="cccc_space", tool_arguments={"action":"status"})', prompt)
+            self.assertIn("cccc_space(action=query)", prompt)
+            self.assertIn("cccc_space(action=ingest)", prompt)
+            self.assertIn("cccc_space(action=artifact)", prompt)
+            self.assertIn("source_type", prompt)
+            self.assertIn("*.conflict.remote.*", prompt)
         finally:
             cleanup()
 

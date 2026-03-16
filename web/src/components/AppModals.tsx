@@ -50,6 +50,8 @@ interface AppModalsProps {
   onSetGroupState: (state: "active" | "idle" | "paused") => Promise<void>;
   fetchContext: (groupId: string, opts?: { fresh?: boolean; detail?: "summary" | "full" }) => Promise<void>;
   canManageGroups: boolean;
+  canAccessSettings: boolean;
+  collapseHumanMessageBodiesByDefault?: boolean;
 }
 
 function getErrorDetailGroupId(err: unknown): string {
@@ -79,6 +81,8 @@ export function AppModals({
   onSetGroupState,
   fetchContext,
   canManageGroups,
+  canAccessSettings,
+  collapseHumanMessageBodiesByDefault,
 }: AppModalsProps) {
   const { t } = useTranslation(['actors', 'chat']);
   // Stores
@@ -456,8 +460,8 @@ export function AppModals({
   }, [modals.addActor, editingActor]);
 
   // Handlers
-  const handleUpdateSettings = async (settings: Partial<GroupSettings>): Promise<boolean> => {
-    if (!selectedGroupId) return false;
+  const handleUpdateSettings = async (settings: Partial<GroupSettings>) => {
+    if (!selectedGroupId) return;
     setBusy("settings-update");
     try {
       const resp = await api.updateSettings(selectedGroupId, settings);
@@ -593,11 +597,7 @@ export function AppModals({
     const titleChanged = nextTitle !== currentTitle;
     const autoloadChanged =
       JSON.stringify(nextCapabilityAutoload) !== JSON.stringify(currentCapabilityAutoload);
-    const profileChanged = mode === "profile" && !actorProfileMatchesRef(selectedProfile || { id: "", scope: "global", owner_id: "" }, {
-      profileId: String(editingActor.profile_id || "").trim(),
-      profileScope: String(editingActor.profile_scope || "global").trim() || "global",
-      profileOwner: String(editingActor.profile_owner || "").trim(),
-    });
+    const profileChanged = mode === "profile" && profileId !== String(editingActor.profile_id || "").trim();
     const roleNotesChanged = nextRoleNotes !== currentRoleNotes;
     const hasActorMutation =
       convertToCustom || runtimeChanged || commandChanged || titleChanged || autoloadChanged || profileChanged;
@@ -651,8 +651,6 @@ export function AppModals({
             nextTitle,
             {
               profileId,
-              profileScope: (selectedProfile?.scope || "global") as api.ProfileScope,
-              profileOwner: String(selectedProfile?.owner_id || "").trim() || undefined,
               capabilityAutoload: nextCapabilityAutoload,
             }
           );
@@ -969,8 +967,6 @@ export function AppModals({
         newActorUseProfile
           ? {
               profileId: String(selectedProfile?.id || "").trim(),
-              profileScope: (selectedProfile?.scope || "global") as api.ProfileScope,
-              profileOwner: String(selectedProfile?.owner_id || "").trim() || undefined,
               capabilityAutoload,
             }
           : {
@@ -1351,7 +1347,7 @@ export function AppModals({
         onOpenContext={() => {
           openModal("context");
         }}
-        onOpenSettings={() => openModal("settings")}
+        onOpenSettings={canAccessSettings ? () => openModal("settings") : undefined}
         onOpenGroupEdit={canManageGroups ? () => {
           if (groupDoc) {
             setEditGroupTitle(groupDoc.title || "");
@@ -1402,6 +1398,7 @@ export function AppModals({
           window.history.replaceState({}, "", url.pathname + "?" + url.searchParams.toString());
           void openChatWindow(gid, eid);
         }}
+        collapseHumanMessageBodiesByDefault={collapseHumanMessageBodiesByDefault}
       />
 
       <PresentationPinModal
@@ -1467,7 +1464,7 @@ export function AppModals({
       />
 
       <SettingsModal
-        isOpen={modals.settings}
+        isOpen={canAccessSettings && modals.settings}
         onClose={() => closeModal("settings")}
         settings={groupSettings}
         onUpdateSettings={handleUpdateSettings}
@@ -1495,6 +1492,7 @@ export function AppModals({
         busy={busy}
         onClose={() => closeModal("inbox")}
         onMarkAllRead={handleMarkAllRead}
+        collapseHumanMessageBodiesByDefault={collapseHumanMessageBodiesByDefault}
       />
 
       <GroupEditModal

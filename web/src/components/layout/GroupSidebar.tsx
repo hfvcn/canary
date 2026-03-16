@@ -15,12 +15,13 @@ import {
   sortableKeyboardCoordinates,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
-import { GroupMeta } from "../../types";
+import { GroupMeta, WorkspaceTree } from "../../types";
 import { classNames } from "../../utils/classNames";
 import { CloseIcon, FolderIcon, ChevronLeftIcon, ChevronRightIcon, PlusIcon } from "../Icons";
 import { SortableGroupItem } from "./SortableGroupItem";
 import { SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH } from "../../stores/useUIStore";
 import { useBrandingStore } from "../../stores";
+import { WorkspaceSidebarSection } from "./WorkspaceSidebarSection";
 
 export interface GroupSidebarProps {
   orderedGroups: GroupMeta[];
@@ -38,6 +39,15 @@ export interface GroupSidebarProps {
   onToggleCollapse: () => void;
   onResizeWidth: (width: number) => void;
   onReorder: (fromIndex: number, toIndex: number) => void;
+  workspaceTree?: WorkspaceTree | null;
+  workspaceSelectedFilePath?: string;
+  workspaceLoading?: boolean;
+  workspaceError?: string;
+  onRefreshWorkspace?: () => void;
+  onOpenWorkspaceFolder?: (path: string) => void;
+  onOpenWorkspaceFile?: (path: string) => void;
+  onCreateWorkspaceFolder?: (kind: "folder" | "task") => void;
+  onCreateWorkspaceFile?: () => void;
 }
 
 export function GroupSidebar({
@@ -56,6 +66,15 @@ export function GroupSidebar({
   onToggleCollapse,
   onResizeWidth,
   onReorder,
+  workspaceTree,
+  workspaceSelectedFilePath = "",
+  workspaceLoading,
+  workspaceError = "",
+  onRefreshWorkspace,
+  onOpenWorkspaceFolder,
+  onOpenWorkspaceFile,
+  onCreateWorkspaceFolder,
+  onCreateWorkspaceFile,
 }: GroupSidebarProps) {
   const { t } = useTranslation('layout');
   const branding = useBrandingStore((s) => s.branding);
@@ -322,6 +341,22 @@ export function GroupSidebar({
               )}
             </div>
           )}
+
+          {!isCollapsed && onRefreshWorkspace && onOpenWorkspaceFolder && onOpenWorkspaceFile && onCreateWorkspaceFolder && onCreateWorkspaceFile ? (
+            <WorkspaceSidebarSection
+              isDark={isDark}
+              tree={workspaceTree || null}
+              selectedFilePath={workspaceSelectedFilePath}
+              loading={Boolean(workspaceLoading)}
+              error={workspaceError}
+              readOnly={readOnly}
+              onRefresh={onRefreshWorkspace}
+              onOpenFolder={onOpenWorkspaceFolder}
+              onOpenFile={onOpenWorkspaceFile}
+              onCreateFolder={onCreateWorkspaceFolder}
+              onCreateFile={onCreateWorkspaceFile}
+            />
+          ) : null}
         </div>
 
         {!isCollapsed && (

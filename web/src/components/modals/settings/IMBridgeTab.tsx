@@ -3,14 +3,17 @@ import { useState, useEffect, useCallback } from "react";
 import { useTranslation, Trans } from "react-i18next";
 import { IMStatus, IMPlatform } from "../../../types";
 import * as api from "../../../services/api";
-import { inputClass, labelClass, primaryButtonClass, cardClass } from "./types";
+import { inputClass, labelClass, primaryButtonClass, cardClass, SettingsScope } from "./types";
 
 const IM_PENDING_AUTO_REFRESH_MS = 12000;
 
 interface IMBridgeTabProps {
   isDark: boolean;
+  scope: SettingsScope;
   groupId?: string; // Reserved for future use.
   imStatus: IMStatus | null;
+  hasLocalOverride?: boolean;
+  usesGlobalDefaults?: boolean;
   imPlatform: IMPlatform;
   onPlatformChange: (v: IMPlatform) => void;
   imBotTokenEnv: string;
@@ -24,6 +27,12 @@ interface IMBridgeTabProps {
   setImFeishuAppId: (v: string) => void;
   imFeishuAppSecret: string;
   setImFeishuAppSecret: (v: string) => void;
+  imFeishuMessageStyle: "text" | "card";
+  setImFeishuMessageStyle: (v: "text" | "card") => void;
+  imFeishuCardTitle: string;
+  setImFeishuCardTitle: (v: string) => void;
+  imFeishuCardTemplateId: string;
+  setImFeishuCardTemplateId: (v: string) => void;
   // DingTalk fields
   imDingtalkAppKey: string;
   setImDingtalkAppKey: (v: string) => void;
@@ -46,8 +55,11 @@ interface IMBridgeTabProps {
 
 export function IMBridgeTab({
   isDark: _isDark,
+  scope,
   groupId,
   imStatus,
+  hasLocalOverride = false,
+  usesGlobalDefaults = false,
   imPlatform,
   onPlatformChange,
   imBotTokenEnv,
@@ -60,6 +72,12 @@ export function IMBridgeTab({
   setImFeishuAppId,
   imFeishuAppSecret,
   setImFeishuAppSecret,
+  imFeishuMessageStyle,
+  setImFeishuMessageStyle,
+  imFeishuCardTitle,
+  setImFeishuCardTitle,
+  imFeishuCardTemplateId,
+  setImFeishuCardTemplateId,
   imDingtalkAppKey,
   setImDingtalkAppKey,
   imDingtalkAppSecret,
@@ -77,6 +95,8 @@ export function IMBridgeTab({
   onStopBridge,
 }: IMBridgeTabProps) {
   const { t } = useTranslation("settings");
+  const isGlobalScope = scope === "global";
+  const showGroupControls = scope === "group";
   const getBotTokenLabel = () => {
     switch (imPlatform) {
       case "telegram": return t("imBridge.botTokenTelegram");
@@ -291,8 +311,24 @@ export function IMBridgeTab({
         </p>
       </div>
 
+      {isGlobalScope && (
+        <div className={cardClass()}>
+          <p className="text-xs text-[var(--color-text-muted)]">
+            {t("imBridge.globalDefaultsHint", "These values are the global IM defaults. Groups inherit them until a group-level override is saved. Authorized chats, pending approvals, and bridge start/stop remain group-specific.")}
+          </p>
+        </div>
+      )}
+
+      {showGroupControls && usesGlobalDefaults && !hasLocalOverride && (
+        <div className={cardClass()}>
+          <p className="text-xs text-[var(--color-text-muted)]">
+            {t("imBridge.inheritedDefaultsHint", "This group is currently inheriting the global IM defaults. Saving here creates a group-only override.")}
+          </p>
+        </div>
+      )}
+
       {/* Status */}
-      {imStatus && (
+      {showGroupControls && imStatus && (
         <div className={cardClass()}>
           <div className="flex items-center gap-2">
             <span className={`w-2 h-2 rounded-full ${imStatus.running ? "bg-emerald-500" : "bg-gray-400"}`} />
@@ -413,6 +449,50 @@ export function IMBridgeTab({
                 {t("imBridge.appSecretHint")}
               </p>
             </div>
+            <div>
+              <label className={labelClass()}>{t("imBridge.messageStyle", "Reply Style")}</label>
+              <select
+                value={imFeishuMessageStyle}
+                onChange={(e) => setImFeishuMessageStyle(e.target.value === "card" ? "card" : "text")}
+                className={inputClass()}
+              >
+                <option value="text">{t("imBridge.messageStyleText", "Plain text")}</option>
+                <option value="card">{t("imBridge.messageStyleCard", "Card")}</option>
+              </select>
+              <p className="text-xs mt-1 text-[var(--color-text-muted)]">
+                {t("imBridge.messageStyleHint", "Card mode sends Feishu interactive cards for outbound replies and command results.")}
+              </p>
+            </div>
+            {imFeishuMessageStyle === "card" && (
+              <>
+                <div>
+                  <label className={labelClass()}>{t("imBridge.cardTemplateId", "Template ID")}</label>
+                  <input
+                    type="text"
+                    value={imFeishuCardTemplateId}
+                    onChange={(e) => setImFeishuCardTemplateId(e.target.value)}
+                    placeholder={t("imBridge.cardTemplateIdPlaceholder", "AAqX09njntkHi")}
+                    className={`${inputClass()} placeholder-[var(--color-text-muted)]`}
+                  />
+                  <p className="text-xs mt-1 text-[var(--color-text-muted)]">
+                    {t("imBridge.cardTemplateIdHint", "Optional. If set, card replies use your configured Feishu template instead of the built-in fallback card.")}
+                  </p>
+                </div>
+                <div>
+                  <label className={labelClass()}>{t("imBridge.cardTitle", "Card Title")}</label>
+                  <input
+                    type="text"
+                    value={imFeishuCardTitle}
+                    onChange={(e) => setImFeishuCardTitle(e.target.value)}
+                    placeholder={t("imBridge.cardTitlePlaceholder", "CCCC")}
+                    className={`${inputClass()} placeholder-[var(--color-text-muted)]`}
+                  />
+                  <p className="text-xs mt-1 text-[var(--color-text-muted)]">
+                    {t("imBridge.cardTitleHint", "Optional. Leave empty to infer a short title from the sender label.")}
+                  </p>
+                </div>
+              </>
+            )}
           </>
         )}
 
@@ -507,7 +587,7 @@ export function IMBridgeTab({
           {imBusy ? t("common:saving") : t("imBridge.saveConfig")}
         </button>
 
-        {imStatus?.configured && (
+        {showGroupControls && imStatus?.configured && (
           <>
             {imStatus.running ? (
               <button
@@ -527,19 +607,31 @@ export function IMBridgeTab({
               </button>
             )}
 
-            <button
-              onClick={onRemoveConfig}
-              disabled={imBusy}
-              className="glass-btn px-4 py-2 text-sm rounded-lg min-h-[44px] transition-colors font-medium text-[var(--color-text-secondary)] disabled:opacity-50"
-            >
-              {t("imBridge.removeConfig")}
-            </button>
+            {hasLocalOverride && (
+              <button
+                onClick={onRemoveConfig}
+                disabled={imBusy}
+                className="glass-btn px-4 py-2 text-sm rounded-lg min-h-[44px] transition-colors font-medium text-[var(--color-text-secondary)] disabled:opacity-50"
+              >
+                {t("imBridge.clearOverride", "Clear Override")}
+              </button>
+            )}
           </>
+        )}
+
+        {isGlobalScope && (
+          <button
+            onClick={onRemoveConfig}
+            disabled={imBusy}
+            className="glass-btn px-4 py-2 text-sm rounded-lg min-h-[44px] transition-colors font-medium text-[var(--color-text-secondary)] disabled:opacity-50"
+          >
+            {t("imBridge.removeDefaults", "Remove Defaults")}
+          </button>
         )}
       </div>
 
       {/* Pending Requests */}
-      {imStatus?.configured && (
+      {showGroupControls && imStatus?.configured && (
         <div className="space-y-2">
           <div className="flex items-center justify-between">
             <h3 className="text-sm font-medium text-[var(--color-text-secondary)]">
@@ -612,7 +704,7 @@ export function IMBridgeTab({
       )}
 
       {/* Authorized Chats */}
-      {imStatus?.configured && (
+      {showGroupControls && imStatus?.configured && (
         <div className="space-y-2">
           <div className="flex items-center justify-between">
             <h3 className="text-sm font-medium text-[var(--color-text-secondary)]">

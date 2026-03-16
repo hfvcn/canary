@@ -42,13 +42,9 @@ class TestGroupAutomationBaseline(unittest.TestCase):
                 self.assertFalse(bool(standup_rule.get("enabled")), "default standup should be seeded but disabled")
                 self.assertIn("standup", snippets)
                 standup_snippet = str(snippets.get("standup") or "")
-                self.assertIn("Checklist:", standup_snippet)
-                self.assertIn("Recall:", standup_snippet)
-                self.assertIn("Alignment:", standup_snippet)
+                self.assertIn("Gap triage", standup_snippet)
                 self.assertIn("cccc_capability_use", standup_snippet)
-                self.assertIn("cccc_help", standup_snippet)
-                self.assertNotIn('cccc_capability_search(kind="mcp_toolpack"|"skill"', standup_snippet)
-                self.assertNotIn("diagnostics", standup_snippet)
+                self.assertIn('cccc_capability_search(kind="mcp_toolpack"|"skill"', standup_snippet)
 
                 clear_resp, _ = handle_request(
                     DaemonRequest.model_validate(

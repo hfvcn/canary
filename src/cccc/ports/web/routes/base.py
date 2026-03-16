@@ -7,6 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, Form, HT
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from ....kernel.access_tokens import list_access_tokens
+from ....kernel.settings import clear_im_defaults, get_im_defaults, set_im_defaults
 from ....kernel.scope import detect_scope
 from ....kernel.settings import get_web_branding_settings
 from ..branding import (
@@ -19,6 +20,7 @@ from ..branding import (
 from ..schemas import (
     BrandingUpdateRequest,
     DebugClearLogsRequest,
+    GlobalIMSetRequest,
     ObservabilityUpdateRequest,
     RegistryReconcileRequest,
     RemoteAccessConfigureRequest,
@@ -26,9 +28,47 @@ from ..schemas import (
     check_group,
     get_principal,
     require_admin,
+    require_group_admin,
     require_group,
     require_user,
 )
+
+
+def _build_global_im_config(req: GlobalIMSetRequest) -> Dict[str, Any]:
+    platform = str(req.platform or "").strip().lower()
+    config: Dict[str, Any] = {"platform": platform}
+    default_max_mb = 20 if platform in ("telegram", "slack") else 10
+    config["files"] = {"enabled": True, "max_mb": default_max_mb}
+    token_hint = str(req.bot_token_env or req.token_env or req.token or "").strip()
+    if platform in ("telegram", "discord", "slack"):
+        if token_hint:
+            config["bot_token_env"] = token_hint
+        app_hint = str(req.app_token_env or "").strip()
+        if platform == "slack" and app_hint:
+            config["app_token_env"] = app_hint
+        return config
+    if platform == "feishu":
+        config["feishu_domain"] = str(req.feishu_domain or "").strip()
+        config["feishu_message_style"] = str(req.feishu_message_style or "text").strip()
+        config["feishu_card_title"] = str(req.feishu_card_title or "").strip()
+        config["feishu_card_template_id"] = str(req.feishu_card_template_id or "").strip()
+        app_id = str(req.feishu_app_id or "").strip()
+        app_secret = str(req.feishu_app_secret or "").strip()
+        if app_id:
+            config["feishu_app_id"] = app_id
+        if app_secret:
+            config["feishu_app_secret"] = app_secret
+        return config
+    app_key = str(req.dingtalk_app_key or "").strip()
+    app_secret = str(req.dingtalk_app_secret or "").strip()
+    robot_code = str(req.dingtalk_robot_code or "").strip()
+    if app_key:
+        config["dingtalk_app_key"] = app_key
+    if app_secret:
+        config["dingtalk_app_secret"] = app_secret
+    if robot_code:
+        config["dingtalk_robot_code"] = robot_code
+    return config
 
 
 def create_routers(ctx: RouteContext) -> list[APIRouter]:
@@ -115,18 +155,16 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         return _branding_asset_file_response(normalized_kind)
 
     @global_router.get("/api/v1/ping")
-    async def ping(include_home: bool = False) -> Dict[str, Any]:
+    async def ping() -> Dict[str, Any]:
         resp = await ctx.daemon({"op": "ping"})
-        result: Dict[str, Any] = {
-            "daemon": resp.get("result", {}),
-            "version": ctx.version,
-            "web": {"mode": ctx.web_mode, "read_only": ctx.read_only},
-        }
-        if include_home:
-            result["home"] = str(ctx.home)
         return {
             "ok": True,
-            "result": result,
+            "result": {
+                "home": str(ctx.home),
+                "daemon": resp.get("result", {}),
+                "version": ctx.version,
+                "web": {"mode": ctx.web_mode, "read_only": ctx.read_only},
+            },
         }
 
     @global_router.get("/api/v1/health")
@@ -154,7 +192,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         login_active = access_token_count > 0
         principal_kind = str(getattr(principal, "kind", "anonymous") or "anonymous")
         is_admin = bool(getattr(principal, "is_admin", False))
-        can_access_global_settings = access_token_count == 0 or (principal_kind == "user" and is_admin)
+        can_administer = access_token_count == 0 or (principal_kind == "user" and is_admin)
         return {
             "ok": True,
             "result": {
@@ -166,7 +204,14 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                     "is_admin": is_admin,
                     "allowed_groups": groups,
                     "access_token_count": access_token_count,
-                    "can_access_global_settings": can_access_global_settings,
+                    "can_access_global_settings": can_administer,
+                    "can_manage_actors": can_administer,
+                    "can_manage_group_runtime": can_administer,
+                    "can_access_terminal": can_administer,
+                    "can_access_prompts": can_administer,
+                    "can_access_capabilities": can_administer,
+                    "can_access_group_settings": can_administer,
+                    "can_view_message_bodies": can_administer,
                 }
             },
         }
@@ -189,7 +234,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         check_group(request, group_id)
         return await ctx.daemon({"op": "debug_snapshot", "args": {"group_id": group_id, "by": "user"}})
 
-    @global_router.get("/api/v1/observability", dependencies=[Depends(require_admin)])
+    @global_router.get("/api/v1/observability", dependencies=[Depends(require_user)])
     async def observability_get() -> Dict[str, Any]:
         """Get global observability settings (developer mode, log level)."""
         return await ctx.daemon({"op": "observability_get"})
@@ -358,7 +403,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             )
         return await ctx.daemon({"op": "capability_allowlist_reset", "args": {"by": str(by or "user")}})
 
-    @global_router.get("/api/v1/capabilities/overview", dependencies=[Depends(require_user)])
+    @global_router.get("/api/v1/capabilities/overview", dependencies=[Depends(require_admin)])
     async def capability_overview(
         query: str = "",
         limit: int = 400,
@@ -439,6 +484,34 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
     async def remote_access_get() -> Dict[str, Any]:
         """Get global remote-access state."""
         return await ctx.daemon({"op": "remote_access_state", "args": {"by": "user"}})
+
+    @global_router.get("/api/v1/im/defaults", dependencies=[Depends(require_admin)])
+    async def im_defaults_get() -> Dict[str, Any]:
+        """Get global IM default configuration."""
+        im_defaults = get_im_defaults()
+        return {"ok": True, "result": {"im": im_defaults or None}}
+
+    @global_router.put("/api/v1/im/defaults", dependencies=[Depends(require_admin)])
+    async def im_defaults_set(req: GlobalIMSetRequest) -> Dict[str, Any]:
+        """Replace global IM default configuration."""
+        if ctx.read_only:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "read_only", "message": "Global IM settings are disabled in read-only mode."},
+            )
+        im_defaults = set_im_defaults(_build_global_im_config(req))
+        return {"ok": True, "result": {"im": im_defaults or None}}
+
+    @global_router.delete("/api/v1/im/defaults", dependencies=[Depends(require_admin)])
+    async def im_defaults_delete() -> Dict[str, Any]:
+        """Clear global IM default configuration."""
+        if ctx.read_only:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "read_only", "message": "Global IM settings are disabled in read-only mode."},
+            )
+        clear_im_defaults()
+        return {"ok": True, "result": {"im": None}}
 
     @global_router.put("/api/v1/remote_access", dependencies=[Depends(require_admin)])
     async def remote_access_configure(req: RemoteAccessConfigureRequest) -> Dict[str, Any]:
@@ -556,7 +629,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             }
         )
 
-    @global_router.get("/api/v1/runtimes", dependencies=[Depends(require_user)])
+    @global_router.get("/api/v1/runtimes", dependencies=[Depends(require_admin)])
     async def runtimes() -> Dict[str, Any]:
         """List available agent runtimes on the system."""
         if ctx.read_only:
@@ -578,8 +651,11 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                     {
                         "name": rt.name,
                         "display_name": rt.display_name,
+                        "command": rt.command,
                         "recommended_command": " ".join(get_runtime_command_with_flags(rt.name)),
                         "available": rt.available,
+                        "path": rt.path,
+                        "capabilities": rt.capabilities,
                     }
                     for rt in all_runtimes
                 ],
@@ -702,7 +778,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
     # Group-scoped routes
     # ------------------------------------------------------------------ #
 
-    @group_router.get("/terminal/tail")
+    @group_router.get("/terminal/tail", dependencies=[Depends(require_group_admin)])
     async def terminal_tail(
         group_id: str,
         actor_id: str,
@@ -725,7 +801,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             }
         )
 
-    @group_router.post("/terminal/clear")
+    @group_router.post("/terminal/clear", dependencies=[Depends(require_group_admin)])
     async def terminal_clear(group_id: str, actor_id: str) -> Dict[str, Any]:
         """Clear (truncate) an actor's in-memory terminal transcript ring buffer."""
         return await ctx.daemon(
@@ -739,7 +815,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             }
         )
 
-    @group_router.get("/capabilities/state")
+    @group_router.get("/capabilities/state", dependencies=[Depends(require_group_admin)])
     async def capability_state(group_id: str, actor_id: str = "user") -> Dict[str, Any]:
         """Get caller-effective capability state and visible/dynamic tools for a group."""
         return await ctx.daemon(
@@ -753,7 +829,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             }
         )
 
-    @group_router.post("/capabilities/enable")
+    @group_router.post("/capabilities/enable", dependencies=[Depends(require_group_admin)])
     async def capability_enable(group_id: str, request: Request) -> Dict[str, Any]:
         """Enable/disable a capability for a group (session/actor/group scope)."""
         if ctx.read_only:
@@ -790,7 +866,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             }
         )
 
-    @group_router.post("/capabilities/import")
+    @group_router.post("/capabilities/import", dependencies=[Depends(require_group_admin)])
     async def capability_import(group_id: str, request: Request) -> Dict[str, Any]:
         """Import (install) a capability into a group."""
         if ctx.read_only:

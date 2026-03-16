@@ -71,6 +71,8 @@ class ChatMessageData(BaseModel):
 
     # Metadata
     client_id: Optional[str] = None  # Client-generated idempotency key
+    sender_user_id: Optional[str] = None
+    sender_is_admin: bool = False
 
     model_config = ConfigDict(extra="forbid")
 

@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import yaml  # type: ignore
 
 from ..paths import ensure_home
+from ..ports.im.config_schema import canonicalize_im_defaults
 from ..util.fs import atomic_write_text
 from ..util.time import utc_now_iso
 
@@ -343,45 +344,31 @@ def get_web_branding_settings() -> Dict[str, Any]:
     return _merge_web_branding(settings.get("web_branding"))
 
 
-def resolve_remote_access_web_binding() -> Dict[str, Any]:
-    """Resolve effective Web binding with explicit settings/env/default precedence."""
+def get_im_defaults() -> Dict[str, Any]:
+    """Get canonical global IM defaults."""
     settings = load_settings()
-    raw = settings.get("remote_access") if isinstance(settings.get("remote_access"), dict) else {}
+    return canonicalize_im_defaults(settings.get("im_defaults"))
 
-    raw_host = str(raw.get("web_host") or "").strip()
-    env_host = str(os.environ.get("CCCC_WEB_HOST") or "").strip()
-    host_source = "settings" if raw_host else ("env" if env_host else "default")
-    host = raw_host or env_host or "127.0.0.1"
 
-    # Use raw persisted values here so we can still distinguish "unset" from the
-    # merged default and preserve env fallback behavior.
-    raw_port = raw.get("web_port")
-    raw_port_s = str(raw_port or "").strip()
-    env_port_raw = os.environ.get("CCCC_WEB_PORT")
-    env_port_s = str(env_port_raw or "").strip()
-    if raw_port_s:
-        port = _as_int(raw_port, int(DEFAULT_REMOTE_ACCESS["web_port"]), min_value=1, max_value=65535)
-        port_source = "settings"
-    elif env_port_s:
-        port = _as_int(env_port_raw, int(DEFAULT_REMOTE_ACCESS["web_port"]), min_value=1, max_value=65535)
-        port_source = "env"
+def set_im_defaults(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Replace global IM defaults with canonicalized values."""
+    settings = load_settings()
+    im_defaults = canonicalize_im_defaults(raw)
+    if im_defaults:
+        settings["im_defaults"] = im_defaults
     else:
-        port = int(DEFAULT_REMOTE_ACCESS["web_port"])
-        port_source = "default"
+        settings.pop("im_defaults", None)
+    save_settings(settings)
+    return dict(im_defaults)
 
-    raw_public_url = str(raw.get("web_public_url") or "").strip()
-    env_public_url = str(os.environ.get("CCCC_WEB_PUBLIC_URL") or "").strip()
-    public_url_source = "settings" if raw_public_url else ("env" if env_public_url else "none")
-    public_url = raw_public_url or env_public_url
 
-    return {
-        "web_host": host,
-        "web_host_source": host_source,
-        "web_port": int(port),
-        "web_port_source": port_source,
-        "web_public_url": (public_url or None),
-        "web_public_url_source": public_url_source,
-    }
+def clear_im_defaults() -> None:
+    """Remove global IM defaults from settings.yaml."""
+    settings = load_settings()
+    if "im_defaults" not in settings:
+        return
+    settings.pop("im_defaults", None)
+    save_settings(settings)
 
 
 def update_remote_access_settings(patch: Dict[str, Any]) -> Dict[str, Any]:
@@ -414,9 +401,9 @@ def update_remote_access_settings(patch: Dict[str, Any]) -> Dict[str, Any]:
         changed = True
 
     if "require_access_token" in patch:
-        raw["require_access_token"] = _as_bool(
+        merged["require_access_token"] = _as_bool(
             patch.get("require_access_token"),
-            bool(current["require_access_token"]),
+            bool(merged["require_access_token"]),
         )
         changed = True
 
@@ -435,6 +422,19 @@ def update_remote_access_settings(patch: Dict[str, Any]) -> Dict[str, Any]:
     if "web_public_url" in patch:
         raw["web_public_url"] = str(patch.get("web_public_url") or "").strip()
         changed = True
+
+    if "web_host" in patch:
+        merged["web_host"] = str(patch.get("web_host") or "").strip()
+        changed = True
+
+    if "web_port" in patch:
+        merged["web_port"] = _as_int(patch.get("web_port"), int(merged.get("web_port") or 8848), min_value=1, max_value=65535)
+        changed = True
+
+    if "web_public_url" in patch:
+        merged["web_public_url"] = str(patch.get("web_public_url") or "").strip()
+        changed = True
+
 
     if "updated_at" in patch:
         raw["updated_at"] = _as_str(patch.get("updated_at"), str(raw.get("updated_at") or ""))

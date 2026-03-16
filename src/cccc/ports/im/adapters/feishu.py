@@ -14,6 +14,8 @@ Features:
 from __future__ import annotations
 
 import json
+import os
+import ssl
 import threading
 import time
 import urllib.error
@@ -22,6 +24,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import certifi
 
 from .base import IMAdapter
 
@@ -35,6 +39,9 @@ DEFAULT_MAX_LINES = 1024
 # - Lark (Global): https://open.larkoffice.com
 FEISHU_DOMAIN = "https://open.feishu.cn"
 LARK_DOMAIN = "https://open.larkoffice.com"
+FEISHU_MESSAGE_STYLE_TEXT = "text"
+FEISHU_MESSAGE_STYLE_CARD = "card"
+DEFAULT_CARD_TITLE = "CCCC"
 
 
 def _normalize_domain(domain: str) -> str:
@@ -48,6 +55,22 @@ def _normalize_domain(domain: str) -> str:
     if not (d.startswith("http://") or d.startswith("https://")):
         d = "https://" + d
     return d
+
+
+def _normalize_message_style(style: str) -> str:
+    raw = str(style or "").strip().lower()
+    if raw == FEISHU_MESSAGE_STYLE_CARD:
+        return FEISHU_MESSAGE_STYLE_CARD
+    return FEISHU_MESSAGE_STYLE_TEXT
+
+
+def _escape_lark_md(text: str) -> str:
+    return (
+        str(text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
 
 
 class RateLimiter:
@@ -103,6 +126,10 @@ class FeishuAdapter(IMAdapter):
         log_path: Optional[Path] = None,
         max_chars: int = DEFAULT_MAX_CHARS,
         max_lines: int = DEFAULT_MAX_LINES,
+        message_style: str = FEISHU_MESSAGE_STYLE_TEXT,
+        card_title: str = "",
+        card_template_id: str = "",
+        card_context_path: str = "",
     ):
         self.app_id = app_id
         self.app_secret = app_secret
@@ -111,6 +138,14 @@ class FeishuAdapter(IMAdapter):
         self.log_path = log_path
         self.max_chars = max_chars
         self.max_lines = max_lines
+        self.message_style = _normalize_message_style(message_style)
+        self.card_title = str(card_title or "").strip()
+        self.card_template_id = str(card_template_id or "").strip()
+        self.card_context_path = str(card_context_path or "").strip()
+        self._ssl_context = ssl.create_default_context(cafile=certifi.where())
+        self._https_opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=self._ssl_context),
+        )
 
         # Token management
         self._token: str = ""
@@ -158,6 +193,16 @@ class FeishuAdapter(IMAdapter):
                 return self._token
             return ""
 
+    def _urlopen(self, req: urllib.request.Request, timeout: int):
+        return self._https_opener.open(req, timeout=timeout)
+
+    def _configure_ssl_environment(self) -> None:
+        bundle = certifi.where()
+        os.environ["SSL_CERT_FILE"] = bundle
+        os.environ["REQUESTS_CA_BUNDLE"] = bundle
+        os.environ["CURL_CA_BUNDLE"] = bundle
+        self._log(f"[ssl] Exported CA bundle env: {bundle}")
+
     def _refresh_token(self) -> bool:
         """
         Refresh tenant_access_token.
@@ -173,7 +218,7 @@ class FeishuAdapter(IMAdapter):
         req.add_header("Content-Type", "application/json; charset=utf-8")
 
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with self._urlopen(req, timeout=10) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
                 result = json.loads(body)
 
@@ -226,7 +271,7 @@ class FeishuAdapter(IMAdapter):
         req.add_header("Accept", "application/json")
 
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with self._urlopen(req, timeout=timeout) as resp:
                 result_body = resp.read().decode("utf-8", errors="replace")
                 return json.loads(result_body)
         except urllib.error.HTTPError as e:
@@ -255,6 +300,7 @@ class FeishuAdapter(IMAdapter):
 
         # Disable all proxies BEFORE importing lark SDK
         self._disable_proxies()
+        self._configure_ssl_environment()
 
         # Inbound requires the official SDK (lark-oapi) for long connection messaging.
         try:
@@ -273,6 +319,7 @@ class FeishuAdapter(IMAdapter):
         if not self._refresh_token():
             self._log("[connect] Failed to get token")
             return False
+        self._log(f"[ssl] Using certifi CA bundle: {certifi.where()}")
 
         # Start WebSocket listener for events
         self._ws_connect_error = None
@@ -639,26 +686,8 @@ class FeishuAdapter(IMAdapter):
         # Rate limit
         self._rate_limiter.wait_and_acquire(chat_id)
 
-        # Build message content
-        content = json.dumps({"text": safe_text}, ensure_ascii=False)
-
-        params: Dict[str, Any] = {
-            "receive_id_type": "chat_id",
-        }
-
-        body: Dict[str, Any] = {
-            "receive_id": chat_id,
-            "msg_type": "text",
-            "content": content,
-        }
-
-        # Thread support (reply to root message)
-        if thread_id:
-            body["root_id"] = str(thread_id)
-
-        # Build URL with query params
-        query = urllib.parse.urlencode(params)
-        endpoint = f"/im/v1/messages?{query}"
+        body = self._build_outbound_body(chat_id, safe_text, thread_id)
+        endpoint = "/im/v1/messages?receive_id_type=chat_id"
 
         resp = self._api("POST", endpoint, body)
 
@@ -676,6 +705,84 @@ class FeishuAdapter(IMAdapter):
             summarized = summarized[: FEISHU_MAX_MESSAGE_LENGTH - 1] + "..."
 
         return summarized
+
+    def _build_outbound_body(
+        self,
+        chat_id: str,
+        text: str,
+        thread_id: Optional[int],
+    ) -> Dict[str, Any]:
+        body = {
+            "receive_id": chat_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": text}, ensure_ascii=False),
+        }
+        if self.message_style == FEISHU_MESSAGE_STYLE_CARD:
+            body["msg_type"] = "interactive"
+            body["content"] = json.dumps(self._build_card_payload(text), ensure_ascii=False)
+        if thread_id:
+            body["root_id"] = str(thread_id)
+        return body
+
+    def _build_card_payload(self, text: str) -> Dict[str, Any]:
+        if self.card_template_id:
+            return self._build_template_card_payload(text)
+        title = self._card_header_title(text)
+        return {
+            "config": {
+                "wide_screen_mode": True,
+                "enable_forward": True,
+            },
+            "header": {
+                "template": "blue",
+                "title": {
+                    "tag": "plain_text",
+                    "content": title,
+                },
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": _escape_lark_md(text),
+                    },
+                },
+            ],
+        }
+
+    def _build_template_card_payload(self, text: str) -> Dict[str, Any]:
+        return {
+            "type": "template",
+            "data": {
+                "template_id": self.card_template_id,
+                "template_variable": {
+                    "session_title": self._template_session_title(text),
+                    "session_number": self._template_session_number(text),
+                    "cwd_path": self.card_context_path,
+                    "response": text,
+                },
+            },
+        }
+
+    def _card_header_title(self, text: str) -> str:
+        if self.card_title:
+            return self.card_title[:80]
+        first_line = str(text or "").splitlines()[0].strip() if text else ""
+        if first_line.startswith("[") and "]" in first_line:
+            return first_line[1:first_line.index("]")][:80] or DEFAULT_CARD_TITLE
+        return DEFAULT_CARD_TITLE
+
+    def _template_session_title(self, text: str) -> str:
+        if self.card_title:
+            return self.card_title[:80]
+        return self._card_header_title(text)
+
+    def _template_session_number(self, text: str) -> str:
+        first_line = str(text or "").splitlines()[0].strip() if text else ""
+        if first_line.startswith("[") and "]" in first_line:
+            return first_line[1:first_line.index("]")][:32] or "CCCC"
+        return "CCCC"
 
     def get_chat_title(self, chat_id: str) -> str:
         """Get chat title via API."""
@@ -714,7 +821,7 @@ class FeishuAdapter(IMAdapter):
         req.add_header("Authorization", f"Bearer {token}")
 
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with self._urlopen(req, timeout=30) as resp:
                 return resp.read()
         except Exception as e:
             raise ValueError(f"Download failed: {e}")
@@ -784,7 +891,7 @@ class FeishuAdapter(IMAdapter):
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
 
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with self._urlopen(req, timeout=60) as resp:
                 result = json.loads(resp.read().decode("utf-8", errors="replace"))
 
             if result.get("code") != 0:

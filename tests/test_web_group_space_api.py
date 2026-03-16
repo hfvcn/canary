@@ -213,9 +213,6 @@ class TestWebGroupSpaceApi(unittest.TestCase):
                 ), patch(
                     "cccc.daemon.space.group_space_ops.cancel_notebooklm_auth_flow",
                     return_value={"provider": "notebooklm", "state": "running", "phase": "canceling"},
-                ), patch(
-                    "cccc.daemon.space.group_space_ops.disconnect_notebooklm_auth_flow",
-                    return_value={"provider": "notebooklm", "state": "idle", "phase": "idle"},
                 ):
                     auth_start = client.post(
                         "/api/v1/space/providers/notebooklm/auth",
@@ -234,13 +231,6 @@ class TestWebGroupSpaceApi(unittest.TestCase):
                     )
                     self.assertEqual(auth_cancel.status_code, 200)
                     self.assertTrue(auth_cancel.json().get("ok"))
-
-                    auth_disconnect = client.post(
-                        "/api/v1/space/providers/notebooklm/auth",
-                        json={"by": "user", "action": "disconnect"},
-                    )
-                    self.assertEqual(auth_disconnect.status_code, 200)
-                    self.assertTrue(auth_disconnect.json().get("ok"))
         finally:
             cleanup_stub()
             cleanup()

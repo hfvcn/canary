@@ -13,7 +13,6 @@ __all__ = [
     "cmd_space_auth_status",
     "cmd_space_auth_start",
     "cmd_space_auth_cancel",
-    "cmd_space_auth_disconnect",
     "cmd_space_bind",
     "cmd_space_sync",
     "cmd_space_unbind",
@@ -189,7 +188,6 @@ def cmd_space_auth_start(args: argparse.Namespace) -> int:
                 "by": by,
                 "action": "start",
                 "timeout_seconds": timeout_seconds,
-                "force_reauth": bool(getattr(args, "force_reauth", False)),
             },
         }
     )
@@ -207,23 +205,6 @@ def cmd_space_auth_cancel(args: argparse.Namespace) -> int:
         {
             "op": "group_space_provider_auth",
             "args": {"provider": provider, "by": by, "action": "cancel"},
-        }
-    )
-    _print_json(resp)
-    return 0 if resp.get("ok") else 2
-
-
-def cmd_space_auth_disconnect(args: argparse.Namespace) -> int:
-    """Disconnect stored Group Space provider auth."""
-    provider = str(getattr(args, "provider", "") or "notebooklm").strip() or "notebooklm"
-    by = str(getattr(args, "by", "") or "user").strip() or "user"
-    if not _ensure_daemon_running():
-        _print_json({"ok": False, "error": {"code": "daemon_unavailable", "message": "daemon unavailable"}})
-        return 2
-    resp = call_daemon(
-        {
-            "op": "group_space_provider_auth",
-            "args": {"provider": provider, "by": by, "action": "disconnect"},
         }
     )
     _print_json(resp)

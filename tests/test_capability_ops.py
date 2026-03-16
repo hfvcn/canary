@@ -137,7 +137,6 @@ class TestCapabilityOps(unittest.TestCase):
             visible = result.get("visible_tools") if isinstance(result.get("visible_tools"), list) else []
             self.assertIn("cccc_help", visible)
             self.assertIn("cccc_capability_search", visible)
-            self.assertIn("cccc_file", visible)
             self.assertNotIn("cccc_space", visible)
         finally:
             cleanup()

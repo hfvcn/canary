@@ -6,16 +6,7 @@ import * as api from "../../../services/api";
 import { parsePrivateEnvSetText, parsePrivateEnvUnsetText } from "../../../utils/privateEnvInput";
 import { formatCapabilityIdInput, parseCapabilityIdInput } from "../../../utils/capabilityAutoload";
 import { useGroupStore } from "../../../stores";
-import {
-  cardClass,
-  inputClass,
-  labelClass,
-  primaryButtonClass,
-  secondaryButtonClass,
-  settingsDialogBodyClass,
-  settingsDialogFooterClass,
-  settingsDialogHeaderClass,
-} from "./types";
+import { cardClass, inputClass, labelClass, primaryButtonClass } from "./types";
 import { CapabilityPicker } from "../../CapabilityPicker";
 
 interface ActorProfilesTabProps {
@@ -616,12 +607,9 @@ export function ActorProfilesTab({ isDark, isActive, scope }: ActorProfilesTabPr
     setUsageBusyProfileId(profileId);
     setErr("");
     try {
-      const resp = await api.getProfile(profileId, {
-        scope: profileScope,
-        ownerId: isMyScope ? sessionUserId.trim() : "",
-      });
+      const resp = await api.getActorProfile(profileId);
       if (!resp.ok) {
-        setErr(scopeRequestError(resp.error?.code, resp.error?.message || t("actorProfiles.usageLoadFailed")));
+        setErr(resp.error?.message || t("actorProfiles.usageLoadFailed"));
         return;
       }
       const usage = Array.isArray(resp.result?.usage) ? resp.result.usage : [];
@@ -786,7 +774,7 @@ export function ActorProfilesTab({ isDark, isActive, scope }: ActorProfilesTabPr
           <div key={profile.id} className={cardClass()}>
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <div className="min-w-0">
-              <div className="text-sm font-semibold truncate text-[var(--color-text-primary)]">
+                <div className="text-sm font-semibold truncate text-[var(--color-text-primary)]">
                   {profile.name || profile.id}
                 </div>
                 <div className="mt-0.5 text-xs text-[var(--color-text-tertiary)]">
@@ -831,7 +819,231 @@ export function ActorProfilesTab({ isDark, isActive, scope }: ActorProfilesTabPr
         ) : null}
       </div>
 
-      {editorModal && typeof document !== "undefined" ? createPortal(editorModal, document.body) : editorModal}
+      {editorOpen ? (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-3 bg-black/50">
+          <div className="w-full max-w-xl max-h-[90vh] overflow-y-auto rounded-2xl border shadow-2xl border-[var(--glass-border-subtle)] bg-[var(--color-bg-primary)]">
+            <div className="sticky top-0 px-5 py-4 border-b border-[var(--glass-border-subtle)] bg-[var(--color-bg-primary)]">
+              <div className="text-base font-semibold text-[var(--color-text-primary)]">
+                {editor.id ? t("actorProfiles.editTitle") : t("actorProfiles.newTitle")}
+              </div>
+            </div>
+            <div className="p-5 space-y-4">
+              {editorErr ? (
+                <div className="rounded-lg border px-3 py-2 text-sm border-rose-500/30 bg-rose-500/10 text-rose-400">
+                  {editorErr}
+                </div>
+              ) : null}
+
+              <div>
+                <label className={labelClass()}>{t("actorProfiles.name")}</label>
+                <input
+                  value={editor.name}
+                  onChange={(e) => setEditor((prev) => ({ ...prev, name: e.target.value }))}
+                  className={inputClass()}
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className={labelClass()}>{t("actorProfiles.runtime")}</label>
+                  <select
+                    value={editor.runtime}
+                    onChange={(e) => {
+                      const nextRuntime = String(e.target.value || "");
+                      setEditor((prev) => {
+                        const supportsDefault = supportsRuntimeDefaultCommand(nextRuntime);
+                        return {
+                          ...prev,
+                          runtime: nextRuntime,
+                          useDefaultCommand: supportsDefault ? prev.useDefaultCommand : false,
+                          command: supportsDefault && prev.useDefaultCommand ? "" : prev.command,
+                        };
+                      });
+                    }}
+                    className={inputClass()}
+                  >
+                    {SUPPORTED_RUNTIMES.map((rt) => (
+                      <option key={rt} value={rt}>{RUNTIME_INFO[rt]?.label || rt}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className={labelClass()}>{t("actorProfiles.commandOverrideOptional")}</label>
+                {editorSupportsDefaultCommand ? (
+                  <label className="inline-flex items-center gap-2 text-xs mb-2 text-[var(--color-text-secondary)]">
+                    <input
+                      type="checkbox"
+                      checked={editor.useDefaultCommand}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setEditor((prev) => ({
+                          ...prev,
+                          useDefaultCommand: checked,
+                          command: checked ? "" : prev.command,
+                        }));
+                      }}
+                    />
+                    {t("actorProfiles.useRuntimeDefaultCommand")}
+                  </label>
+                ) : null}
+                {!editorSupportsDefaultCommand || !editor.useDefaultCommand ? (
+                  <input
+                    value={editor.command}
+                    onChange={(e) => setEditor((prev) => ({ ...prev, command: e.target.value }))}
+                    className={`${inputClass()} font-mono`}
+                    placeholder={editorDefaultCommand || "codex"}
+                  />
+                ) : null}
+                {editorSupportsDefaultCommand && editorDefaultCommand ? (
+                  <div className="text-[10px] mt-1 text-[var(--color-text-muted)]">
+                    {editor.useDefaultCommand ? t("actorProfiles.usingRuntimeDefaultCommand") : t("actorProfiles.default")}{" "}
+                    <code className="px-1 rounded bg-[var(--color-bg-secondary)]">{editorDefaultCommand}</code>
+                  </div>
+                ) : null}
+              </div>
+
+              <div>
+                <label className={labelClass()}>{t("actorProfiles.submit")}</label>
+                <select
+                  value={editor.submit}
+                  onChange={(e) => setEditor((prev) => ({ ...prev, submit: (e.target.value as "enter" | "newline" | "none") }))}
+                  className={inputClass()}
+                >
+                  <option value="enter">Enter</option>
+                  <option value="newline">Newline</option>
+                  <option value="none">None</option>
+                </select>
+              </div>
+
+              <div className={cardClass()}>
+                <div className="text-sm font-semibold text-[var(--color-text-primary)]">
+                  {t("actorProfiles.capabilityDefaults")}
+                </div>
+                <div className="text-xs mt-1 text-[var(--color-text-muted)]">
+                  {t("actorProfiles.capabilityDefaultsHint")}
+                </div>
+                <div className="mt-3">
+                  <CapabilityPicker
+                    isDark={isDark}
+                    value={parseCapabilityIdInput(editor.capabilityAutoloadText)}
+                    onChange={(next) =>
+                      setEditor((prev) => ({
+                        ...prev,
+                        capabilityAutoloadText: formatCapabilityIdInput(next),
+                      }))
+                    }
+                    disabled={editorBusy}
+                    label={t("actorProfiles.autoloadCapabilities")}
+                  />
+                </div>
+                <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className={labelClass()}>{t("actorProfiles.autoloadScope")}</label>
+                    <select
+                      value={editor.capabilityDefaultScope}
+                      onChange={(e) =>
+                        setEditor((prev) => ({
+                          ...prev,
+                          capabilityDefaultScope: e.target.value === "session" ? "session" : "actor",
+                        }))
+                      }
+                      className={inputClass()}
+                    >
+                      <option value="actor">{t("actorProfiles.autoloadScopeActor")}</option>
+                      <option value="session">{t("actorProfiles.autoloadScopeSession")}</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className={labelClass()}>{t("actorProfiles.sessionTtlSeconds")}</label>
+                    <input
+                      type="number"
+                      min={60}
+                      step={60}
+                      value={String(editor.capabilitySessionTtlSeconds || 3600)}
+                      onChange={(e) =>
+                        setEditor((prev) => ({
+                          ...prev,
+                          capabilitySessionTtlSeconds: Math.max(60, Number(e.target.value || 3600)),
+                        }))
+                      }
+                      className={inputClass()}
+                      disabled={editor.capabilityDefaultScope !== "session"}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className={cardClass()}>
+                <div className="text-sm font-semibold text-[var(--color-text-primary)]">{t("actorProfiles.env")}</div>
+                <div className="text-xs mt-1 text-[var(--color-text-muted)]">{t("actorProfiles.envHint")}</div>
+                {duplicateSourceProfileId ? (
+                  <div className="text-xs mt-1 text-[var(--color-text-tertiary)]">
+                    {t("actorProfiles.duplicateSecretsHint", { source: duplicateSourceLabel })}
+                  </div>
+                ) : null}
+                {secretKeys.length ? (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {secretKeys.map((key) => (
+                      <span
+                        key={key}
+                        title={secretMasks[key] ? `${key}=${secretMasks[key]}` : key}
+                        className="px-2 py-0.5 rounded text-[11px] bg-[var(--color-bg-secondary)] text-[var(--color-text-secondary)]"
+                      >
+                        {key}
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="mt-2 text-xs text-[var(--color-text-muted)]">{t("actorProfiles.noSecrets")}</div>
+                )}
+
+                <div className="mt-3">
+                  <label className={labelClass()}>{t("actorProfiles.setSecrets")}</label>
+                  <textarea
+                    value={secretSetText}
+                    onChange={(e) => setSecretSetText(e.target.value)}
+                    className={`${inputClass()} min-h-[90px] font-mono`}
+                    placeholder={t("actorProfiles.setSecretsPlaceholder")}
+                  />
+                </div>
+                <div className="mt-3">
+                  <label className={labelClass()}>{t("actorProfiles.unsetSecrets")}</label>
+                  <textarea
+                    value={secretUnsetText}
+                    onChange={(e) => setSecretUnsetText(e.target.value)}
+                    className={`${inputClass()} min-h-[70px] font-mono`}
+                    placeholder={t("actorProfiles.unsetSecretsPlaceholder")}
+                  />
+                </div>
+                <label className="mt-3 inline-flex items-center gap-2 text-sm text-[var(--color-text-secondary)]">
+                  <input type="checkbox" checked={secretClear} onChange={(e) => setSecretClear(e.target.checked)} />
+                  {t("actorProfiles.clearSecrets")}
+                </label>
+              </div>
+            </div>
+            <div className="sticky bottom-0 px-5 py-4 border-t flex justify-end gap-2 border-[var(--glass-border-subtle)] bg-[var(--color-bg-primary)]">
+              <button
+                onClick={() => {
+                  setDuplicateSourceProfileId("");
+                  setEditorOpen(false);
+                }}
+                className="glass-btn text-[var(--color-text-secondary)] px-3 py-2 rounded-lg text-sm min-h-[44px]"
+              >
+                {t("common:cancel")}
+              </button>
+              <button
+                onClick={() => void handleSave()}
+                disabled={editorBusy}
+                className={primaryButtonClass(editorBusy)}
+              >
+                {editorBusy ? t("common:saving") : t("common:save")}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

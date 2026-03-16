@@ -46,6 +46,7 @@ export interface ChatTabProps {
 
   // Group actions (from useGroupActions)
   onStartGroup: () => void;
+  collapseHumanMessageBodiesByDefault?: boolean;
 
   // Mention menu state (local state in App)
   showMentionMenu: boolean;
@@ -72,6 +73,7 @@ export function ChatTab({
   chatAtBottomRef,
   appendComposerFiles,
   onStartGroup,
+  collapseHumanMessageBodiesByDefault,
   showMentionMenu,
   setShowMentionMenu,
   mentionSelectedIndex,
@@ -486,6 +488,7 @@ export function ChatTab({
                 onRelay={relayMessage}
                 onOpenSource={openSourceMessage}
                 onOpenPresentationRef={openPresentationRef}
+                collapseHumanMessageBodiesByDefault={collapseHumanMessageBodiesByDefault}
                 showScrollButton={showScrollButton}
                 onScrollButtonClick={handleScrollButtonClick}
                   chatUnreadCount={chatUnreadCount}
