@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from ...util.time import utc_now_iso
 from .actor import ActorSubmit, AgentRuntime, RunnerKind
 
@@ -12,6 +13,14 @@ class CapabilityDefaults(BaseModel):
     session_ttl_seconds: int = 3600
 
     model_config = ConfigDict(extra="forbid")
+
+
+@dataclass(frozen=True)
+class ActorProfileRef:
+    profile_id: str
+    profile_scope: Literal["global", "user"] = "global"
+    profile_owner: str = ""
+
 
 class ActorProfile(BaseModel):
     """Reusable actor runtime configuration."""

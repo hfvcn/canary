@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import logging
 import mimetypes
@@ -34,6 +35,7 @@ from .schemas import RouteContext
 
 logger = logging.getLogger("cccc.web")
 _WEB_LOG_FH: Optional[Any] = None
+_WEB_LOG_PATH: Optional[Path] = None
 _SIGNED_OUT_COOKIE = "cccc_signed_out"
 
 
@@ -43,6 +45,17 @@ class Principal:
     user_id: str = ""
     allowed_groups: tuple[str, ...] = ()
     is_admin: bool = False
+
+
+def _close_web_logging() -> None:
+    global _WEB_LOG_FH, _WEB_LOG_PATH
+    try:
+        if _WEB_LOG_FH is not None:
+            _WEB_LOG_FH.close()
+    except Exception:
+        pass
+    _WEB_LOG_FH = None
+    _WEB_LOG_PATH = None
 
 
 def _apply_web_logging(*, home: Path, level: str) -> None:
@@ -406,8 +419,6 @@ def create_app() -> FastAPI:
     from .routes.groups import register_group_routes
     from .routes.messaging import create_routers as create_messaging_routers
     from .routes.actors import create_routers as create_actor_routers
-    from .routes.openai_compat import create_routers as create_openai_compat_routers
-    from .routes.workspace import create_routers as create_workspace_routers
     from .routes.im import register_im_routes
     from .routes.access_tokens import create_routers as create_access_token_routers
 
@@ -428,10 +439,6 @@ def create_app() -> FastAPI:
     for router in create_space_routers(route_ctx):
         app.include_router(router)
     register_group_routes(app, ctx=route_ctx)
-    for router in create_workspace_routers(route_ctx):
-        app.include_router(router)
-    for router in create_openai_compat_routers(route_ctx):
-        app.include_router(router)
     for router in create_messaging_routers(route_ctx):
         app.include_router(router)
     for router in create_actor_routers(route_ctx):

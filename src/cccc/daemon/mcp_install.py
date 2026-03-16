@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
-from ..kernel.runtime import resolve_runtime_executable
+from ..kernel.runtime import get_cccc_mcp_stdio_command
 from ..util.conv import coerce_bool
 from ..util.fs import read_json
 from ..util.process import resolve_subprocess_argv
