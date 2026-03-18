@@ -23,6 +23,7 @@ import { WebPet } from "./features/webPet/WebPet";
 import { getEffectiveComposerDestGroupId } from "./stores/useComposerStore";
 import { getChatSession } from "./stores/useUIStore";
 import { classNames } from "./utils/classNames";
+import { WebPet } from "./features/webPet/WebPet";
 import { ActorTab } from "./pages/ActorTab";
 import { BoardTab } from "./pages/BoardTab";
 import { ChatTab } from "./pages/chat";
@@ -572,6 +573,8 @@ export default function App() {
           collapseHumanMessageBodiesByDefault={collapseHumanMessageBodiesByDefault}
         />
       </Suspense>
+
+      <WebPet />
 
       <DropOverlay isOpen={dropOverlayOpen} isDark={isDark} maxFileMb={WEB_MAX_FILE_MB} />
     </div>
