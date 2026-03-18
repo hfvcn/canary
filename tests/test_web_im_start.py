@@ -38,6 +38,7 @@ class _FakeBridge:
         return None
 
 
+
 class TestWebImStart(unittest.TestCase):
     def _with_home(self):
         old_home = os.environ.get("CCCC_HOME")
@@ -177,6 +178,7 @@ class TestWebImStart(unittest.TestCase):
             self.assertTrue(lock_paths[0].endswith(f"im_bridge_wecom_{token_fingerprint}.lock"))
         finally:
             cleanup()
+
 
 
 if __name__ == "__main__":

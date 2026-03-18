@@ -53,6 +53,7 @@ class TestWebRuntimeControl(unittest.TestCase):
         self.assertEqual(mock_urlopen.call_count, 2)
         mock_sleep.assert_called_once_with(0.1)
 
+
     def test_wait_for_child_exit_interruptibly_returns_exit_code(self) -> None:
         from cccc.ports.web.runtime_control import wait_for_child_exit_interruptibly
 

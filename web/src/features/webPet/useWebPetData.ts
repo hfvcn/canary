@@ -156,6 +156,7 @@ export function useWebPetData() {
       dismissReminder,
     };
   }, [
+    t,
     activeReminder,
     dismissReminder,
     events,
