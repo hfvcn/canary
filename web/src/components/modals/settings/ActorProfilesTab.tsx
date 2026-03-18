@@ -6,7 +6,16 @@ import * as api from "../../../services/api";
 import { parsePrivateEnvSetText, parsePrivateEnvUnsetText } from "../../../utils/privateEnvInput";
 import { formatCapabilityIdInput, parseCapabilityIdInput } from "../../../utils/capabilityAutoload";
 import { useGroupStore } from "../../../stores";
-import { cardClass, inputClass, labelClass, primaryButtonClass } from "./types";
+import {
+  cardClass,
+  inputClass,
+  labelClass,
+  primaryButtonClass,
+  secondaryButtonClass,
+  settingsDialogBodyClass,
+  settingsDialogFooterClass,
+  settingsDialogHeaderClass,
+} from "./types";
 import { CapabilityPicker } from "../../CapabilityPicker";
 
 interface ActorProfilesTabProps {

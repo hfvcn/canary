@@ -41,7 +41,7 @@ interface ContextModalProps {
   onRefreshContext: () => Promise<void>;
   isDark: boolean;
   settings?: GroupSettings | null;
-  onUpdateSettings?: (settings: Partial<GroupSettings>) => Promise<void>;
+  onUpdateSettings?: (settings: Partial<GroupSettings>) => Promise<boolean | void>;
 }
 
 interface BriefDraft {
@@ -545,36 +545,6 @@ export function ContextModal({
     [context]
   );
 
-  const tasksSummary = useMemo(() => {
-    const fallback = {
-      total: tasks.length,
-      planned: board.planned.length,
-      active: board.active.length,
-      done: board.done.length,
-      archived: board.archived.length,
-    };
-    return context?.tasks_summary || fallback;
-  }, [board.active.length, board.archived.length, board.done.length, board.planned.length, context?.tasks_summary, tasks.length]);
-
-  const attentionCounts = useMemo(() => {
-    const blockedFallback = tasks.filter((task) => taskStatus(task) === "active" && Array.isArray(task.blocked_by) && task.blocked_by.length > 0).length;
-    const waitingUserFallback = tasks.filter((task) => String(task.waiting_on || "none") === "user").length;
-    const handoffFallback = tasks.filter((task) => !!String(task.handoff_to || "").trim() && taskStatus(task) !== "archived").length;
-    return {
-      blocked: countLike(context?.attention?.blocked, blockedFallback),
-      waitingUser: countLike(context?.attention?.waiting_user, waitingUserFallback),
-      pendingHandoffs: countLike(context?.attention?.pending_handoffs, handoffFallback),
-    };
-  }, [context?.attention, tasks]);
-
-  const recentDecisions = useMemo(
-    () => (Array.isArray(context?.coordination?.recent_decisions) ? context.coordination.recent_decisions : []),
-    [context]
-  );
-  const recentHandoffs = useMemo(
-    () => (Array.isArray(context?.coordination?.recent_handoffs) ? context.coordination.recent_handoffs : []),
-    [context]
-  );
   const projectPathLabel = useMemo(() => {
     const path = String(projectMd?.path || "").trim();
     return path || "PROJECT.md";

@@ -105,29 +105,27 @@ export const NumberInputRow = ({
   helperText?: React.ReactNode;
   formatValue?: boolean;
   onAutoSave?: () => void;
-}) => (
-  <div className="w-full">
-    <label className={labelClass(isDark)}>{label}</label>
-    <div className="relative">
-      <input
-        type="number"
-        min={min}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-        onBlur={() => onAutoSave?.()}
-        className={inputClass(isDark)}
-      />
-      {formatValue ? (
-        <div
-          className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-mono pointer-events-none transition-opacity duration-200 text-[var(--color-text-muted)]"
-        >
-          {formatDuration(value)}
-        </div>
-      ) : null}
-    </div>
-    {helperText && (
-      <div className="mt-1.5 text-[11px] leading-snug text-[var(--color-text-muted)]">
-        {helperText}
+}) => {
+  const { t } = useTranslation("settings");
+  return (
+    <div className="w-full">
+      <label className={labelClass(isDark)}>{label}</label>
+      <div className="relative">
+        <input
+          type="number"
+          min={min}
+          value={value}
+          onChange={(e) => onChange(Number(e.target.value))}
+          onBlur={() => onAutoSave?.()}
+          className={inputClass(isDark)}
+        />
+        {formatValue ? (
+          <div
+            className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-mono pointer-events-none transition-opacity duration-200 text-[var(--color-text-muted)]"
+          >
+            {formatDuration(value, t)}
+          </div>
+        ) : null}
       </div>
       {helperText && (
         <div className="mt-1.5 text-[11px] leading-snug text-[var(--color-text-muted)]">
@@ -146,23 +144,26 @@ export const Chip = ({
   label: string;
   onRemove?: () => void;
   isDark?: boolean;
-}) => (
-  <span
-    className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-[11px] border border-[var(--glass-border-subtle)] bg-[var(--glass-tab-bg)] text-[var(--color-text-secondary)]"
-  >
-    <span className="font-mono">{label}</span>
-    {onRemove ? (
-      <button
-        type="button"
-        onClick={onRemove}
-        className="ml-0.5 rounded-full w-4 h-4 flex items-center justify-center hover:bg-[var(--glass-tab-bg-hover)] text-[var(--color-text-tertiary)]"
-        aria-label={`Remove ${label}`}
-      >
-        ×
-      </button>
-    ) : null}
-  </span>
-);
+}) => {
+  const { t } = useTranslation();
+  return (
+    <span
+      className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-[11px] border border-[var(--glass-border-subtle)] bg-[var(--glass-tab-bg)] text-[var(--color-text-secondary)]"
+    >
+      <span className="font-mono">{label}</span>
+      {onRemove ? (
+        <button
+          type="button"
+          onClick={onRemove}
+          className="ml-0.5 rounded-full w-4 h-4 flex items-center justify-center hover:bg-[var(--glass-tab-bg-hover)] text-[var(--color-text-tertiary)]"
+          aria-label={`${t("common:remove")} ${label}`}
+        >
+          ×
+        </button>
+      ) : null}
+    </span>
+  );
+};
 
 export function clampInt(v: number, min: number, max: number) {
   const n = Number.isFinite(v) ? Math.trunc(v) : min;

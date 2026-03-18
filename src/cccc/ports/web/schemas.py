@@ -92,6 +92,8 @@ class ActorCreateRequest(BaseModel):
     # Values are never returned by the daemon; only keys can be listed via the dedicated endpoints.
     env_private: Optional[Dict[str, str]] = None
     profile_id: Optional[str] = None
+    profile_scope: Optional[Literal["global", "user"]] = None
+    profile_owner: Optional[str] = None
     default_scope_key: str = Field(default="")
     submit: ActorSubmit = Field(default="enter")
     by: str = Field(default="user")
@@ -110,6 +112,8 @@ class ActorUpdateRequest(BaseModel):
     runtime: Optional[AgentRuntime] = None
     enabled: Optional[bool] = None
     profile_id: Optional[str] = None
+    profile_scope: Optional[Literal["global", "user"]] = None
+    profile_owner: Optional[str] = None
     profile_action: Optional[Literal["convert_to_custom"]] = None
 
 
@@ -215,6 +219,7 @@ class GroupSettingsRequest(BaseModel):
 
     # Features
     panorama_enabled: Optional[bool] = None
+    desktop_pet_enabled: Optional[bool] = None
 
     by: str = Field(default="user")
 

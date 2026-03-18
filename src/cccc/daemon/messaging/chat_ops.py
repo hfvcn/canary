@@ -284,6 +284,15 @@ def handle_send(
     src_event_id = str(args.get("src_event_id") or "").strip()
     dst_group_id = str(args.get("dst_group_id") or "").strip()
     client_id = str(args.get("client_id") or "").strip()
+    source_platform = str(args.get("source_platform") or "").strip()
+    source_user_name = str(args.get("source_user_name") or "").strip()
+    source_user_id = str(args.get("source_user_id") or "").strip()
+    mention_user_ids_raw = args.get("mention_user_ids")
+    mention_user_ids = (
+        [str(item).strip() for item in mention_user_ids_raw if str(item).strip()]
+        if isinstance(mention_user_ids_raw, list)
+        else []
+    )
     sender_user_id = str(args.get("sender_user_id") or "").strip()
     sender_is_admin = bool(args.get("sender_is_admin", False))
     dst_to_raw = args.get("dst_to")

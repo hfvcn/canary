@@ -121,31 +121,16 @@ export function AutomationRuleEditorModal(props: AutomationRuleEditorModalProps)
   const scheduleTime = formatTimeInput(schedule.hour, schedule.minute);
   const atInput = isoToLocalDatetimeInput(atRaw);
 
-  return (
-    <div
-      className="fixed inset-0 z-[1000]"
-      role="dialog"
-      aria-modal="true"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onSetEditingRuleId(null);
-      }}
-    >
-      <div className="absolute inset-0 bg-black/50" />
-      <div
-        className="glass-modal absolute inset-2 sm:inset-auto sm:left-1/2 sm:top-1/2 sm:w-[min(840px,calc(100vw-20px))] sm:h-[min(78vh,760px)] sm:-translate-x-1/2 sm:-translate-y-1/2 rounded-xl sm:rounded-2xl shadow-2xl flex flex-col overflow-hidden"
-      >
-        <div className="px-4 py-3 border-b border-[var(--glass-border-subtle)] flex items-start gap-3">
+  const title = isNewRule ? t("automation.newRule") : t("ruleEditor.editRule");
+
+  const content = (
+    <div className="fixed inset-0 z-[1000]" role="dialog" aria-modal="true">
+      <div className="absolute inset-0 glass-overlay" onPointerDown={onClose} />
+      <div className={settingsDialogPanelClass("xl")}>
+        <div className={settingsDialogHeaderClass}>
           <div className="min-w-0">
             <div className="text-sm font-semibold text-[var(--color-text-primary)]">
-              {t("ruleEditor.editRule")} <span className="font-mono">{ruleId || t("ruleEditor.unnamed")}</span>
-            </div>
-            <div className="mt-1 text-[11px] text-[var(--color-text-tertiary)]">
-              {t("ruleEditor.last")} {ruleStatus.last_fired_at || "—"} • {t("ruleEditor.next")} {ruleStatus.next_fire_at || "—"}{" "}
-              {ruleStatus.completed ? `• ${t("ruleEditor.completed")} ${ruleStatus.completed_at || ruleStatus.last_fired_at || "—"}` : ""}{" "}
-              {ruleStatus.last_error ? `• ${t("ruleEditor.error")} ${ruleStatus.last_error_at || "—"}` : ""}
-            </div>
-            <div className="mt-1 text-[11px] text-[var(--color-text-muted)]">
-              {t("automation.draftHint")}
+              {title} <span className="font-mono">{ruleId || t("ruleEditor.unnamed")}</span>
             </div>
             {!isNewRule ? (
               <div className="mt-1 text-[11px] text-[var(--color-text-tertiary)]">
@@ -165,97 +150,79 @@ export function AutomationRuleEditorModal(props: AutomationRuleEditorModalProps)
               />
               {t("ruleList.on")}
             </label>
-            <button
-              type="button"
-              className="glass-btn px-3 py-2 rounded-lg text-sm min-h-[44px] transition-colors text-[var(--color-text-secondary)]"
-              onClick={() => {
-                onRuleRemove(ruleId);
-                onSetEditingRuleId(null);
-              }}
-            >
-              {t("common:delete")}
-            </button>
-            <button
-              type="button"
-              className="glass-btn px-3 py-2 rounded-lg text-sm min-h-[44px] transition-colors text-[var(--color-text-secondary)]"
-              onClick={() => onSetEditingRuleId(null)}
-            >
+            <button type="button" className={secondaryButtonClass("sm")} onClick={onClose}>
               {t("common:close")}
             </button>
           </div>
         </div>
 
-        {rulesErr ? <div className="px-4 pt-3 text-xs text-rose-600 dark:text-rose-300">{rulesErr}</div> : null}
-        {ruleStatus.last_error ? <div className="px-4 pt-1 text-xs text-rose-600 dark:text-rose-300">{ruleStatus.last_error}</div> : null}
+        {errorMessage ? <div className="px-4 pt-3 text-xs text-rose-600 dark:text-rose-300">{errorMessage}</div> : null}
+        {status.last_error && !isNewRule ? <div className="px-4 pt-1 text-xs text-rose-600 dark:text-rose-300">{status.last_error}</div> : null}
 
-        <div className="p-3 sm:p-4 flex-1 overflow-auto space-y-3">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className={labelClass(isDark)}>{t("ruleEditor.ruleName")}</label>
-              <input
-                value={ruleId}
-                onChange={(e) => {
-                  const nextId = e.target.value;
-                  onRulePatch(ruleId, { id: nextId });
-                  if (nextId.trim()) onSetEditingRuleId(nextId.trim());
-                }}
-                className={`${inputClass(isDark)} font-mono`}
-                placeholder="daily_checkin"
-                spellCheck={false}
-              />
-              <div className="mt-1 text-[11px] text-[var(--color-text-muted)]">
-                {t("ruleEditor.ruleNameHint")}
+        <div className={settingsDialogBodyClass}>
+          <div className="space-y-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className={labelClass(isDark)}>{t("ruleEditor.ruleName")}</label>
+                <input
+                  value={ruleId}
+                  onChange={(e) => patchRule({ id: e.target.value })}
+                  className={`${inputClass(isDark)} font-mono`}
+                  placeholder="daily_checkin"
+                  spellCheck={false}
+                />
+                <div className="mt-1 text-[11px] text-[var(--color-text-muted)]">
+                  {t("ruleEditor.ruleNameHint")}
+                </div>
+              </div>
+              <div>
+                <label className={labelClass(isDark)}>{t("ruleEditor.scheduleType")}</label>
+                <select
+                  value={scheduleSelectValue}
+                  disabled={scheduleLockedToOneTime}
+                  onChange={(e) => {
+                    const nextKind = String(e.target.value || "interval");
+                    if (nextKind === "cron") {
+                      const nextCron = buildCronFromPreset({
+                        preset: schedule.preset,
+                        hour: schedule.hour,
+                        minute: schedule.minute,
+                        weekday: schedule.weekday,
+                        dayOfMonth: schedule.dayOfMonth,
+                      });
+                      patchRule({
+                        trigger: {
+                          kind: "cron",
+                          cron: cronExpr || nextCron,
+                          timezone: localTz,
+                        },
+                      });
+                      return;
+                    }
+                    if (nextKind === "at") {
+                      onSetOneShotMode("after");
+                      patchRule({ trigger: { kind: "at", at: atRaw || new Date(Date.now() + 30 * 60 * 1000).toISOString() } });
+                      return;
+                    }
+                    patchRule({ trigger: { kind: "interval", every_seconds: everySeconds } });
+                  }}
+                  className={inputClass(isDark)}
+                >
+                  {kind === "notify" ? <option value="interval">{t("ruleEditor.intervalSchedule")}</option> : null}
+                  {kind === "notify" ? <option value="cron">{t("ruleEditor.recurringSchedule")}</option> : null}
+                  <option value="at">{t("ruleEditor.oneTimeSchedule")}</option>
+                </select>
+                <div className="mt-1 text-[11px] text-[var(--color-text-muted)]">
+                  {scheduleLockedToOneTime
+                    ? t("ruleEditor.oneTimeOnly")
+                    : activeTriggerKind === "interval"
+                      ? t("ruleEditor.intervalHint")
+                      : activeTriggerKind === "cron"
+                        ? t("ruleEditor.recurringHint")
+                        : t("ruleEditor.oneTimeHint")}
+                </div>
               </div>
             </div>
-            <div>
-              <label className={labelClass(isDark)}>{t("ruleEditor.scheduleType")}</label>
-              <select
-                value={scheduleSelectValue}
-                disabled={scheduleLockedToOneTime}
-                onChange={(e) => {
-                  const nextKind = String(e.target.value || "interval");
-                  if (nextKind === "cron") {
-                    const presetCron = buildCronFromPreset({
-                      preset: schedule.preset,
-                      hour: schedule.hour,
-                      minute: schedule.minute,
-                      weekday: schedule.weekday,
-                      dayOfMonth: schedule.dayOfMonth,
-                    });
-                    onRulePatch(ruleId, {
-                      trigger: {
-                        kind: "cron",
-                        cron: cronExpr || presetCron,
-                        timezone: localTz,
-                      },
-                    });
-                    return;
-                  }
-                  if (nextKind === "at") {
-                    onSetOneShotMode(ruleId, "after");
-                    const defaultAt = atRaw || new Date(Date.now() + 30 * 60 * 1000).toISOString();
-                    onRulePatch(ruleId, { trigger: { kind: "at", at: defaultAt } });
-                    return;
-                  }
-                  onRulePatch(ruleId, { trigger: { kind: "interval", every_seconds: everySeconds } });
-                }}
-                className={inputClass(isDark)}
-              >
-                {kind === "notify" ? <option value="interval">{t("ruleEditor.intervalSchedule")}</option> : null}
-                {kind === "notify" ? <option value="cron">{t("ruleEditor.recurringSchedule")}</option> : null}
-                <option value="at">{t("ruleEditor.oneTimeSchedule")}</option>
-              </select>
-              <div className="mt-1 text-[11px] text-[var(--color-text-muted)]">
-                {scheduleLockedToOneTime
-                  ? t("ruleEditor.oneTimeOnly")
-                  : activeTriggerKind === "interval"
-                    ? t("ruleEditor.intervalHint")
-                    : activeTriggerKind === "cron"
-                      ? t("ruleEditor.recurringHint")
-                      : t("ruleEditor.oneTimeHint")}
-              </div>
-            </div>
-          </div>
 
           {scope === "personal" ? (
             <div className="text-[11px] text-amber-700 dark:text-amber-300">
@@ -283,7 +250,7 @@ export function AutomationRuleEditorModal(props: AutomationRuleEditorModalProps)
                 />
               </div>
               <div className="self-end text-[11px] text-[var(--color-text-muted)]">
-                {t("ruleEditor.currentCadence", { duration: formatDuration(everySeconds) })}
+                {t("ruleEditor.currentCadence", { duration: formatDuration(everySeconds, t) })}
               </div>
             </div>
           ) : null}
@@ -426,8 +393,8 @@ export function AutomationRuleEditorModal(props: AutomationRuleEditorModalProps)
                       <button
                         key={minutes}
                         type="button"
-                        className="glass-btn px-2.5 py-1.5 rounded-lg text-xs transition-colors text-[var(--color-text-secondary)]"
-                        onClick={() => onSetOneShotAfterMinutes(ruleId, mins)}
+                        className={secondaryButtonClass("sm")}
+                        onClick={() => onSetOneShotAfterMinutes(minutes)}
                       >
                         {minutes >= 60 ? `${Math.round(minutes / 60)}h` : `${minutes}m`}
                       </button>
@@ -508,9 +475,7 @@ export function AutomationRuleEditorModal(props: AutomationRuleEditorModalProps)
               </option>
             </select>
             {!operationalActionsEnabled ? (
-              <div className="mt-1 text-[11px] text-[var(--color-text-muted)]">
-                {t("automation.operationalActionsOnly")}
-              </div>
+              <div className="mt-1 text-[11px] text-[var(--color-text-muted)]">{t("automation.operationalActionsOnly")}</div>
             ) : null}
           </div>
 
@@ -587,9 +552,7 @@ export function AutomationRuleEditorModal(props: AutomationRuleEditorModalProps)
                     ))}
                   </select>
                   {snippetIds.length === 0 ? (
-                    <div className={`mt-1 text-[11px] text-amber-700 dark:text-amber-300`}>
-                      {t("automation.noSnippetsYet")}
-                    </div>
+                    <div className="mt-1 text-[11px] text-amber-700 dark:text-amber-300">{t("automation.noSnippetsYet")}</div>
                   ) : null}
                 </div>
               ) : (
@@ -629,7 +592,7 @@ export function AutomationRuleEditorModal(props: AutomationRuleEditorModalProps)
                 <option value="stopped">{groupStateCopy.stopped.label}</option>
               </select>
               <div className="mt-1 text-[11px] text-[var(--color-text-muted)]">
-                {GROUP_STATE_COPY[(groupStateValue as "active" | "idle" | "paused" | "stopped") || "paused"].hint}
+                {groupStateCopy[(groupStateValue as "active" | "idle" | "paused" | "stopped") || "paused"].hint}
               </div>
             </div>
           ) : null}
@@ -656,7 +619,7 @@ export function AutomationRuleEditorModal(props: AutomationRuleEditorModalProps)
                   <option value="restart">{actorOperationCopy.restart.label}</option>
                 </select>
                 <div className="mt-1 text-[11px] text-[var(--color-text-muted)]">
-                  {ACTOR_OPERATION_COPY[(actorOperation as "start" | "stop" | "restart") || "restart"].hint}
+                  {actorOperationCopy[(actorOperation as "start" | "stop" | "restart") || "restart"].hint}
                 </div>
               </div>
 

@@ -71,7 +71,17 @@ def autostart_running_groups(
 
             if callable(resolve_linked_actor_before_start):
                 try:
-                    actor = resolve_linked_actor_before_start(group, actor_id)
+                    # Autostart is not an interactive user action, but explicit user-scoped
+                    # linked profiles must still resolve through their persisted owner ref.
+                    profile_scope = str(actor.get("profile_scope") or "").strip().lower()
+                    profile_owner = str(actor.get("profile_owner") or "").strip()
+                    caller_id = profile_owner if profile_scope == "user" and profile_owner else ""
+                    actor = resolve_linked_actor_before_start(
+                        group,
+                        actor_id,
+                        caller_id=caller_id,
+                        is_admin=False,
+                    )
                 except Exception as e:
                     logger.warning("Autostart skipped for %s/%s: %s", group_id, actor_id, e)
                     continue

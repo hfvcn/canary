@@ -478,16 +478,27 @@ class IMBridge:
             elif parsed.type == CommandType.SEND:
                 attachments = msg.get("attachments") if isinstance(msg.get("attachments"), list) else []
                 mention_user_ids = msg.get("mention_user_ids") if isinstance(msg.get("mention_user_ids"), list) else []
-                self._handle_message(
-                    chat_id,
-                    parsed,
-                    from_user,
-                    attachments=attachments,
-                    mention_user_ids=mention_user_ids,
-                    thread_id=thread_id,
-                    message_id=message_id,
-                    from_user_id=from_user_id,
-                )
+                if mention_user_ids:
+                    self._handle_message(
+                        chat_id,
+                        parsed,
+                        from_user,
+                        attachments=attachments,
+                        mention_user_ids=mention_user_ids,
+                        thread_id=thread_id,
+                        message_id=message_id,
+                        from_user_id=from_user_id,
+                    )
+                else:
+                    self._handle_message(
+                        chat_id,
+                        parsed,
+                        from_user,
+                        attachments=attachments,
+                        thread_id=thread_id,
+                        message_id=message_id,
+                        from_user_id=from_user_id,
+                    )
             elif parsed.type == CommandType.MESSAGE:
                 routed = coerce_bool(msg.get("routed"), default=False)
 
@@ -510,16 +521,27 @@ class IMBridge:
                         mentions=parsed.mentions,
                         args=implicit_args,
                     )
-                    self._handle_message(
-                        chat_id,
-                        implicit_send,
-                        from_user,
-                        attachments=attachments,
-                        mention_user_ids=mention_user_ids,
-                        thread_id=thread_id,
-                        message_id=message_id,
-                        from_user_id=from_user_id,
-                    )
+                    if mention_user_ids:
+                        self._handle_message(
+                            chat_id,
+                            implicit_send,
+                            from_user,
+                            attachments=attachments,
+                            mention_user_ids=mention_user_ids,
+                            thread_id=thread_id,
+                            message_id=message_id,
+                            from_user_id=from_user_id,
+                        )
+                    else:
+                        self._handle_message(
+                            chat_id,
+                            implicit_send,
+                            from_user,
+                            attachments=attachments,
+                            thread_id=thread_id,
+                            message_id=message_id,
+                            from_user_id=from_user_id,
+                        )
                     continue
 
                 # Non-routed messages are ignored.
@@ -850,16 +872,27 @@ class IMBridge:
                     cap = formatted if (i == 0 and formatted and not skip_text_due_to_stream) else ""
                     ok = False
                     try:
-                        ok = bool(
-                            self.adapter.send_file(
-                                sub.chat_id,
-                                file_path=abs_path,
-                                filename=title,
-                                caption=cap,
-                                thread_id=sub.thread_id,
-                                mention_user_ids=mention_user_ids,
+                        if mention_user_ids is None:
+                            ok = bool(
+                                self.adapter.send_file(
+                                    sub.chat_id,
+                                    file_path=abs_path,
+                                    filename=title,
+                                    caption=cap,
+                                    thread_id=sub.thread_id,
+                                )
                             )
-                        )
+                        else:
+                            ok = bool(
+                                self.adapter.send_file(
+                                    sub.chat_id,
+                                    file_path=abs_path,
+                                    filename=title,
+                                    caption=cap,
+                                    thread_id=sub.thread_id,
+                                    mention_user_ids=mention_user_ids,
+                                )
+                            )
                     except Exception:
                         ok = False
                     if ok:
@@ -868,8 +901,18 @@ class IMBridge:
                             delivered_user_facing = True
 
             # If we didn't send any files, or if there's text with no files, send message.
-            if formatted and not sent_any_file:
-                sent_msg = bool(self.adapter.send_message(sub.chat_id, formatted, thread_id=sub.thread_id))
+            if formatted and not sent_any_file and not skip_text_due_to_stream:
+                if mention_user_ids is None:
+                    sent_msg = bool(self.adapter.send_message(sub.chat_id, formatted, thread_id=sub.thread_id))
+                else:
+                    sent_msg = bool(
+                        self.adapter.send_message(
+                            sub.chat_id,
+                            formatted,
+                            thread_id=sub.thread_id,
+                            mention_user_ids=mention_user_ids,
+                        )
+                    )
                 if sent_msg and is_user_facing:
                     delivered_user_facing = True
 
@@ -962,6 +1005,8 @@ class IMBridge:
 
     def _handle_unsubscribe(self, chat_id: str, thread_id: int = 0) -> None:
         """Handle /unsubscribe command — also revokes authorization so re-subscribe requires key."""
+        # Reload auth state because daemon/web may have authorized this chat after bridge startup.
+        self.key_manager._load()
         was_subscribed = self.subscribers.unsubscribe(chat_id, thread_id=thread_id)
         self.key_manager.revoke(chat_id, thread_id)
         if was_subscribed:

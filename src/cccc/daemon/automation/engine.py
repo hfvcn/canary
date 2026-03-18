@@ -22,7 +22,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from ...contracts.v1 import AutomationRule, AutomationRuleSet, SystemNotifyData
+from ...kernel.agent_state_hygiene import (
+    evaluate_agent_state_hygiene,
+    sync_mind_context_runtime_state,
+)
 from ...kernel.actors import list_actors, find_foreman
+from ...kernel.context import ContextStorage
 from ...kernel.group import Group, load_group, get_group_state, set_group_state
 from ...kernel.inbox import iter_events, is_message_for_actor, get_cursor, get_obligation_status_batch
 from ...kernel.ledger import append_event
@@ -1951,11 +1956,8 @@ class AutomationManager:
             notify_data = SystemNotifyData(
                 kind="help_nudge",
                 priority="normal",
-                title="Refresh collaboration rules",
-                message=(
-                    "Run `cccc_help` now to refresh collaboration rules; then update your agent state "
-                    "(`cccc_agent_state`: focus/next_action/what_changed)."
-                ),
+                title="Refresh collaboration context",
+                message=message,
                 target_actor_id=aid,
                 requires_ack=False,
             )

@@ -143,8 +143,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     default_host = str(binding.get("web_host") or "").strip() or "127.0.0.1"
     default_port = int(binding.get("web_port") or 8848)
     parser = argparse.ArgumentParser(prog="cccc web", description="cccc web port (FastAPI)")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8848, help="Bind port (default: 8848)")
+    parser.add_argument("--host", default=default_host, help=f"Bind host (default: {default_host})")
+    parser.add_argument("--port", type=int, default=default_port, help=f"Bind port (default: {default_port})")
     parser.add_argument(
         "--mode",
         default=str(os.environ.get("CCCC_WEB_MODE") or "normal"),

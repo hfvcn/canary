@@ -1,9 +1,19 @@
+import { createPortal } from "react-dom";
 import { useEffect, useMemo, useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import * as api from "../../../services/api";
 import type { Actor } from "../../../types";
 import { buildHelpMarkdown, parseHelpMarkdown, type HelpChangedBlock, type ParsedHelpMarkdown } from "../../../utils/helpMarkdown";
-import { cardClass, inputClass, labelClass, primaryButtonClass, preClass } from "./types";
+import {
+  cardClass,
+  inputClass,
+  labelClass,
+  primaryButtonClass,
+  preClass,
+  secondaryButtonClass,
+  settingsDialogBodyClass,
+  settingsDialogPanelClass,
+} from "./types";
 
 type PromptKind = "preamble" | "help";
 type PromptInfo = api.GroupPromptInfo;
@@ -616,65 +626,6 @@ export function GuidanceTab({ isDark, groupId }: {
           {t("guidance.discardChanges")}
         </button>
       </div>
-    </div>
-  );
-
-  return (
-    <div className="space-y-4">
-      {err ? <div className={`text-sm ${isDark ? "text-rose-300" : "text-red-600"}`}>{err}</div> : null}
-
-      <div className={`text-[11px] ${isDark ? "text-slate-500" : "text-gray-500"}`}>
-        <Trans i18nKey="guidance.overridesHint" ns="settings" components={[<span className="font-mono" />]} />
-      </div>
-
-      {renderPreambleCard()}
-      {renderHelpCard()}
-
-      {expandedKind ? (
-        <div
-          className="fixed inset-0 z-[1000]"
-          role="dialog"
-          aria-modal="true"
-          onPointerDown={(e) => {
-            if (e.target === e.currentTarget) setExpandedKind(null);
-          }}
-        >
-          <div className="absolute inset-0 bg-black/50" />
-          <div
-            className={`absolute inset-0 sm:inset-4 md:inset-6 rounded-none sm:rounded-2xl border ${
-              isDark ? "border-slate-800 bg-slate-950" : "border-gray-200 bg-white"
-            } shadow-2xl overflow-hidden`}
-          >
-            <div className="absolute top-4 right-4 z-10">
-              <button
-                type="button"
-                className={`px-3 py-2 text-sm rounded-lg min-h-[44px] transition-colors ${
-                  isDark ? "bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800" : "bg-white hover:bg-gray-50 text-gray-700 border border-gray-200"
-                }`}
-                onClick={() => setExpandedKind(null)}
-              >
-                {t("common:close")}
-              </button>
-            </div>
-            <div className="h-full overflow-y-auto p-4 sm:p-6 md:p-8 pt-16">
-              {expandedKind === "help" ? renderHelpCard(true) : renderPreambleCard(true)}
-            </div>
-          </div>
-        ) : (
-          <div className={`mt-4 ${expanded ? "min-h-0 flex flex-1 flex-col" : ""}`}>
-            <label className={labelClass(isDark)}>{t("guidance.markdown")}</label>
-            <textarea
-              className={`${inputClass(isDark)} font-mono text-[12px] resize-y ${expanded ? "mt-1 min-h-[440px] flex-1" : ""}`}
-              style={expanded ? undefined : { minHeight: 320, maxHeight: "44vh" }}
-              value={help?.content || ""}
-              onChange={(e) => setHelpContentRaw(e.target.value)}
-              spellCheck={false}
-            />
-          </div>
-        )}
-      </div>
-
-      {renderPromptActions("help", expanded)}
     </div>
   );
 

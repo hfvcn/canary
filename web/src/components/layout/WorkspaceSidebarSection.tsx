@@ -141,7 +141,7 @@ export function WorkspaceSidebarSection({
       </div>
 
       <div className="mt-3 px-2">
-        <div className="glass-card rounded-xl p-2">
+        <div className="glass-card rounded-xl p-2 overflow-hidden">
           <div className="flex items-center gap-2">
             <button
               type="button"
@@ -163,7 +163,7 @@ export function WorkspaceSidebarSection({
           ) : null}
 
           {!loading && !error && tree ? (
-            <div className="mt-3 space-y-1">
+            <div className="mt-3 max-h-[min(38vh,24rem)] overflow-y-auto pr-1 space-y-1 overscroll-contain scrollbar-subtle">
               {tree.items.length === 0 ? (
                 <div className="text-xs text-[var(--color-text-muted)]">{t("workspaceNoFiles")}</div>
               ) : null}

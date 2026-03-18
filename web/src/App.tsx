@@ -93,7 +93,9 @@ export default function App() {
   const setWebReadOnly = useUIStore((s) => s.setWebReadOnly);
   const sseStatus = useUIStore((s) => s.sseStatus);
 
-  const { openModal } = useModalStore();
+  const openModal = useModalStore((state) => state.openModal);
+  const modalFlags = useModalStore((state) => state.modals);
+  const editingActor = useModalStore((state) => state.editingActor);
 
   const {
     activeGroupId,
@@ -566,6 +568,8 @@ export default function App() {
           onSetGroupState={handleSetGroupState}
           fetchContext={fetchContext}
           canManageGroups={canManageGroups}
+          canAccessSettings={canAccessSettings}
+          collapseHumanMessageBodiesByDefault={collapseHumanMessageBodiesByDefault}
         />
       </Suspense>
 

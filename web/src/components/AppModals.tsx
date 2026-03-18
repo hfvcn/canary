@@ -21,6 +21,7 @@ import { PresentationViewerModal } from "./presentation/PresentationViewerModal"
 import { RelayMessageModal } from "./modals/RelayMessageModal";
 import { RecipientsModal } from "./modals/RecipientsModal";
 import { parsePrivateEnvSetText } from "../utils/privateEnvInput";
+import { actorProfileIdentityKey } from "../utils/actorProfiles";
 import { parseHelpMarkdown, updateActorHelpNote } from "../utils/helpMarkdown";
 import { formatCapabilityIdInput, normalizeCapabilityIdList, parseCapabilityIdInput } from "../utils/capabilityAutoload";
 import { actorProfileIdentityKey, actorProfileMatchesRef } from "../utils/actorProfiles";
@@ -460,7 +461,7 @@ export function AppModals({
   }, [modals.addActor, editingActor]);
 
   // Handlers
-  const handleUpdateSettings = async (settings: Partial<GroupSettings>) => {
+  const handleUpdateSettings = async (settings: Partial<GroupSettings>): Promise<boolean | void> => {
     if (!selectedGroupId) return;
     setBusy("settings-update");
     try {

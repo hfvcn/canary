@@ -1,10 +1,15 @@
 import { ActorProfile, RuntimeInfo, SupportedRuntime, SUPPORTED_RUNTIMES, RUNTIME_INFO } from "../../types";
 import { useTranslation } from "react-i18next";
-import { BASIC_MCP_CONFIG_SNIPPET } from "../../utils/mcpConfigSnippets";
+import {
+  BASIC_MCP_CONFIG_SNIPPET,
+  COPILOT_MCP_CONFIG_SNIPPET,
+  OPENCODE_MCP_CONFIG_SNIPPET,
+} from "../../utils/mcpConfigSnippets";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../../services/api";
 import { useModalA11y } from "../../hooks/useModalA11y";
 import { parsePrivateEnvSetText, parsePrivateEnvUnsetText } from "../../utils/privateEnvInput";
+import { actorProfileIdentityKey, actorProfileMatchesRef } from "../../utils/actorProfiles";
 import { formatCapabilityIdInput, parseCapabilityIdInput } from "../../utils/capabilityAutoload";
 import { CapabilityPicker } from "../CapabilityPicker";
 import { RolePresetPicker } from "../RolePresetPicker";

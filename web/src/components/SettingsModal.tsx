@@ -1,7 +1,7 @@
 // SettingsModal renders the settings modal.
 import { useState, useEffect, useRef, useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { Actor, GroupDoc, GroupSettings, IMConfig, IMStatus, IMPlatform } from "../types";
+import { Actor, GroupDoc, GroupSettings, IMConfig, IMStatus, IMPlatform, WebAccessSession } from "../types";
 import * as api from "../services/api";
 import { useObservabilityStore } from "../stores";
 import {
@@ -56,6 +56,7 @@ export function SettingsModal({
   const [groupTab, setGroupTab] = useState<GroupTabId>("automation");
   const [globalTab, setGlobalTab] = useState<GlobalTabId>("capabilities");
   const [canAccessGlobalSettings, setCanAccessGlobalSettings] = useState<boolean | null>(null);
+  const [webAccessSession, setWebAccessSession] = useState<WebAccessSession | null>(null);
 
   // Automation + delivery settings state
   const [nudgeSeconds, setNudgeSeconds] = useState(300);
@@ -197,11 +198,15 @@ export function SettingsModal({
         const resp = await api.fetchWebAccessSession();
         if (cancelled) return;
         const session = resp.ok ? resp.result?.web_access_session ?? null : null;
+        setWebAccessSession(session);
         const allowed = Boolean(session?.can_access_global_settings ?? !(session?.login_active ?? false));
         setCanAccessGlobalSettings(allowed);
         if (!allowed && groupId) setScope("group");
       } catch {
-        if (!cancelled) setCanAccessGlobalSettings(true);
+        if (!cancelled) {
+          setWebAccessSession(null);
+          setCanAccessGlobalSettings(true);
+        }
       }
     };
     void loadWebAccessSession();
@@ -854,8 +859,6 @@ export function SettingsModal({
     return String((active || first)?.url || "").trim();
   })();
 
-  const globalSettingsEnabled = canAccessGlobalSettings !== false;
-
   const groupTabs: { id: GroupTabId; label: string }[] = [
     { id: "guidance", label: t("tabs.guidance") },
     { id: "automation", label: t("tabs.automation") },
@@ -866,14 +869,7 @@ export function SettingsModal({
     { id: "transcript", label: t("tabs.transcript") },
     { id: "blueprint", label: t("tabs.blueprint") },
   ];
-  const globalTabs: { id: GlobalTabId; label: string }[] = [
-    { id: "capabilities", label: t("tabs.capabilities") },
-    { id: "actorProfiles", label: t("tabs.actorProfiles") },
-    { id: "im", label: t("tabs.im") },
-    { id: "webAccess", label: t("tabs.webAccess") },
-    { id: "developer", label: t("tabs.developer") },
-  ];
-  const tabs = scope === "group" ? groupTabs : (globalSettingsEnabled ? globalTabs : []);
+  const tabs = scope === "group" ? groupTabs : (globalScopeEnabled ? globalTabs : []);
   const activeTab = scope === "group" ? groupTab : globalTab;
   const setActiveTab = (tab: GroupTabId | GlobalTabId) => {
     if (scope === "group") setGroupTab(tab as GroupTabId);

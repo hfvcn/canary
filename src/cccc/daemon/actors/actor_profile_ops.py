@@ -10,8 +10,9 @@ from ...kernel.actors import find_actor
 from ...kernel.group import load_group
 from ...kernel.registry import load_registry
 from ...util.conv import coerce_bool
-from .actor_profile_runtime import apply_profile_link_to_actor, clear_actor_link_metadata
+from .actor_profile_runtime import actor_profile_ref, apply_profile_link_to_actor, clear_actor_link_metadata
 from .actor_profile_store import (
+    ProfileResolver,
     ProfileRevisionMismatchError,
     delete_actor_profile_secrets,
     get_actor_profile,
@@ -221,8 +222,20 @@ def handle_actor_profile_upsert(args: Dict[str, Any]) -> DaemonResponse:
 
         # Unified model: runtime fields in profile + all variables in profile secrets.
         payload["env"] = {}
-        updated = upsert_actor_profile(payload, expected_revision=expected_revision)
-        return DaemonResponse(ok=True, result={"profile": updated})
+        resolver = ProfileResolver()
+        saved = resolver.save_profile(
+            payload,
+            caller_id=caller_id,
+            is_admin=is_admin,
+            expected_revision=expected_revision,
+        )
+        if not saved:
+            return _error("permission_denied", "profile write denied")
+        target_ref = normalize_actor_profile_ref(payload)
+        updated = resolver.resolve(target_ref, caller_id=caller_id, is_admin=True)
+        if updated is None:
+            return _error("actor_profile_upsert_failed", "saved profile could not be reloaded")
+        return DaemonResponse(ok=True, result={"profile": updated.model_dump(exclude_none=True)})
     except ProfileRevisionMismatchError as e:
         return _error("profile_revision_mismatch", str(e))
     except Exception as e:

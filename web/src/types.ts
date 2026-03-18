@@ -505,6 +505,7 @@ export type GroupSettings = {
   terminal_transcript_notify_lines: number;
 
   panorama_enabled: boolean;
+  desktop_pet_enabled?: boolean;
 };
 
 export type RemoteAccessState = {
@@ -938,9 +939,13 @@ export const SUPPORTED_RUNTIMES = [
   "droid",
   "amp",
   "auggie",
+  "cursor",
   "neovate",
   "gemini",
+  "kilocode",
   "kimi",
+  "opencode",
+  "copilot",
   "custom",
 ] as const;
 
@@ -950,11 +955,15 @@ export const RUNTIME_INFO: Record<string, { label: string; desc: string }> = {
   amp: { label: "Amp", desc: "" },
   auggie: { label: "Auggie (Augment)", desc: "" },
   claude: { label: "Claude Code", desc: "" },
+  copilot: { label: "GitHub Copilot", desc: "" },
   codex: { label: "Codex CLI", desc: "" },
+  cursor: { label: "Cursor", desc: "" },
   droid: { label: "Droid", desc: "" },
   gemini: { label: "Gemini CLI", desc: "" },
   kimi: { label: "Kimi CLI", desc: "" },
+  kilocode: { label: "Kilo Code", desc: "" },
   neovate: { label: "Neovate Code", desc: "" },
+  opencode: { label: "OpenCode", desc: "" },
   custom: { label: "Custom", desc: "Manual MCP installation needed" },
 };
 
