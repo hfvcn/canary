@@ -768,11 +768,24 @@ export function AgentTab({
           </>
         ) : (
           // Stopped agent
-          <div className={classNames("flex flex-col items-center justify-center h-full p-8", "text-[var(--color-text-tertiary)]")}>
-            <div className="mb-4"><TerminalIcon size={48} /></div>
-            <div className="text-lg font-medium mb-2">{t('agentNotRunning')}</div>
-            <div className="text-sm text-center max-w-md mb-4">
-              {t('agentStoppedDescription')}
+          <div className={classNames("flex flex-col items-center h-full p-8 overflow-y-auto", "text-[var(--color-text-tertiary)]")}>
+            <div className="flex flex-col items-center flex-shrink-0">
+              <div className="mb-4"><TerminalIcon size={48} /></div>
+              <div className="text-lg font-medium mb-2">{t('agentNotRunning')}</div>
+              <div className="text-sm text-center max-w-md mb-4">
+                {t('agentStoppedDescription')}
+              </div>
+              {canControl ? (
+                <button
+                  onClick={onLaunch}
+                  disabled={isBusy}
+                  className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium disabled:opacity-50 min-h-[44px] transition-colors"
+                  aria-label={t('launchAgentLabel')}
+                >
+                  <PlayIcon size={16} />
+                  {isBusy ? t('launching') : t('launchAgent')}
+                </button>
+              ) : null}
             </div>
             {stoppedTerminalTailLoading ? (
               <div className="mt-6 w-full max-w-xl flex-shrink-0 rounded-lg border border-dashed border-[var(--glass-border-subtle)] px-4 py-3 text-sm text-[var(--color-text-secondary)]">
