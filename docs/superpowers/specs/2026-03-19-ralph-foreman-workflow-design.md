@@ -3,31 +3,38 @@
 ## 概述
 
 将 CCCC 从通用 MCP 协作内核转型为角色驱动工作流系统：
-- Ralph Daemon（Rust）作为独立外层循环控制器
+- Ralph Daemon（Python-first 原型，后续可考虑 Rust 重写热点路径）作为观察/计算/建议层
 - Foreman 作为唯一对外协调者，可动态创建 Agent
-- Git 作为状态持久化层和通信媒介
+- Daemon IPC 为主通信通道，Git 仅做审计层
+- CCCC Daemon 保持 Actor 控制权威（Authority）
 - 移除 CCCC MCP 自动启用，改为按需 Prompt 引入
 
 ## 1. 整体架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Ralph Daemon (Rust)                         │
+│                     Ralph Daemon (Python)                       │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
 │  │ Git Watcher │→ │ Event Loop  │→ │ Protocol Validator      │  │
 │  │ (轮询提交)   │  │ (消息总线)   │  │ (验证标准 + ready-batch) │  │
 │  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
 │         ↑                                      ↓                │
-│         │              Git 仓库                │                │
-│         └──────── (状态 + 通信媒介) ───────────┘                │
+│         │              观察 + 计算              │                │
+│         └─────────── (只读分析层) ─────────────┘                │
 └─────────────────────────────────────────────────────────────────┘
-                              ↕ Git 事件
+                              ↕ IPC（建议/验证结果）
 ┌─────────────────────────────────────────────────────────────────┐
-│                     CCCC Daemon (Python)                        │
+│                  CCCC Daemon (Python) — Authority               │
 │  ┌──────────┐  ┌──────────┐  ┌────────────┐  ┌──────────────┐   │
 │  │ Web API  │  │ Messaging│  │ Automation │  │ Memory       │   │
 │  │ (HTTP)   │  │ (收件箱)  │  │ (定时任务)  │  │ (共享知识)    │   │
 │  └──────────┘  └──────────┘  └────────────┘  └──────────────┘   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ Actor Controller（实际控制 Actor 生命周期）               │   │
+│  │ - 接收 Ralph 建议，决定是否采纳                           │   │
+│  │ - 执行 Actor 启动/重启/终止                               │   │
+│  │ - 管理任务分配和状态同步                                   │   │
+│  └──────────────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │ Capability (Prompt 模板管理)                              │   │
 │  │ - Foreman: 完整工具集 + Feishu API                        │   │
@@ -45,6 +52,7 @@
 │         ↓                  ↓                  ↓                 │
 │     Git Commit         Git Commit         Git Commit            │
 │  (---METADATA---)    (---METADATA---)   (---METADATA---)        │
+│                    （审计层，非通信媒介）                         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -54,30 +62,36 @@
 
 ```
 ralph/
-├── src/
-│   ├── main.rs              # 入口，CLI 参数解析
-│   ├── git_watcher.rs       # Git 提交监控（复用 gitcortex）
-│   ├── message_bus.rs       # 事件总线（复用 gitcortex）
+├── ralph/
+│   ├── __init__.py
+│   ├── main.py              # 入口，CLI 参数解析
+│   ├── git_watcher.py       # Git 提交监控
+│   ├── message_bus.py       # 事件总线
 │   ├── validator/
-│   │   ├── mod.rs
-│   │   ├── build_test.rs    # 构建/测试验证器
-│   │   ├── task_file.rs     # 任务文件状态检查
-│   │   └── promise.rs       # Completion Promise 检查
+│   │   ├── __init__.py
+│   │   ├── build_test.py    # 构建/测试验证器
+│   │   ├── task_file.py     # 任务文件状态检查
+│   │   └── promise.py       # Completion Promise 检查
 │   ├── scheduler/
-│   │   ├── mod.rs
-│   │   ├── dep_graph.rs     # 任务依赖图分析
-│   │   └── ready_batch.rs   # 可执行批次计算
-│   ├── state/
-│   │   ├── mod.rs
-│   │   ├── actor_state.rs   # Actor 级别状态管理
-│   │   └── persistence.rs   # 状态持久化到 Git
-│   └── protocol/
-│       ├── mod.rs
-│       └── metadata.rs      # Git 提交元数据协议
-└── Cargo.toml
+│   │   ├── __init__.py
+│   │   ├── dep_graph.py     # 任务依赖图分析
+│   │   └── ready_batch.py   # 可执行批次计算
+│   ├── ipc/
+│   │   ├── __init__.py
+│   │   ├── client.py        # 与 CCCC Daemon 通信
+│   │   └── protocol.py      # IPC 消息协议
+│   └── state/
+│       ├── __init__.py
+│       └── observer.py      # 状态观察（只读）
+├── tests/
+│   └── ...
+├── pyproject.toml
+└── README.md
 ```
 
-### 2.2 Git 提交元数据协议
+### 2.2 Git 提交元数据协议（审计层）
+
+Git 提交用于审计追踪，不作为实时通信媒介：
 
 ```
 feat: implement user authentication
@@ -103,41 +117,43 @@ verification:
 2. **推荐**：任务文件状态检查（`.cccc/actors/{id}/state.json`）
 3. **可选**：Completion Promise（Actor 主动声明完成的信号）
 
-干预方式：通过 messaging 系统发送反馈消息。
+Ralph 验证后通过 IPC 将结果发送给 CCCC Daemon，由 Daemon 决定后续动作。
 
 ### 2.4 Ready-Batch 计算
 
-Ralph 计算可执行任务批次，输出为 proposal 供 Foreman 审核：
+Ralph 计算可执行任务批次，通过 IPC 发送建议给 CCCC Daemon：
 
-```json
-// .cccc/ralph/ready_batch_proposal.json
+```python
+# IPC 消息示例
 {
-  "proposal_id": "prop-20260319-103000",
-  "status": "pending_review",
-  "suggested_batch": [
-    {
-      "task_id": "T4",
-      "priority_score": 85,
-      "reason": "关键路径：被 T7 依赖",
-      "suggested_agent": "claude-backend-dev"
-    }
-  ],
-  "blocked_tasks": [...]
+    "type": "ready_batch_suggestion",
+    "proposal_id": "prop-20260319-103000",
+    "suggested_batch": [
+        {
+            "task_id": "T4",
+            "priority_score": 85,
+            "reason": "关键路径：被 T7 依赖",
+            "suggested_agent": "claude-backend-dev"
+        }
+    ],
+    "blocked_tasks": [...]
 }
 ```
 
-Foreman 审核后确认：
+CCCC Daemon 审核后决定是否采纳：
 
-```json
-// .cccc/ralph/ready_batch_confirmed.json
+```python
+# Daemon 内部处理
 {
-  "proposal_id": "prop-20260319-103000",
-  "decision": "accepted_with_changes",
-  "confirmed_batch": [
-    {"task_id": "T4", "assigned_to": "worker-1", "agent": "claude-backend-dev"}
-  ]
+    "proposal_id": "prop-20260319-103000",
+    "decision": "accepted_with_changes",
+    "confirmed_batch": [
+        {"task_id": "T4", "assigned_to": "worker-1", "agent": "claude-backend-dev"}
+    ]
 }
 ```
+
+**注意**：审核决策在 Daemon 内部处理，不再写入 Git 文件。Git 仅记录最终执行结果作为审计。
 
 ## 3. 动态角色系统
 
@@ -199,10 +215,8 @@ task_affinity: [backend, database, api]
 
 ```
 .cccc/
-├── ralph/                        # Ralph Daemon 状态
-│   ├── ready_batch_proposal.json
-│   ├── ready_batch_confirmed.json
-│   └── processed_commits.json
+├── ralph/                        # Ralph Daemon 状态（只读观察）
+│   └── processed_commits.json    # 已处理的提交记录
 ├── agents/                       # Agent 定义（Foreman 创建）
 ├── actors/                       # Actor 运行时状态
 │   ├── foreman/
@@ -222,33 +236,49 @@ task_affinity: [backend, database, api]
 
 ### 4.2 Context Rollover 机制
 
-当 Ralph 决定重启 Actor 会话时：
+当需要重启 Actor 会话时：
 1. Actor 提交带 `status=checkpoint` 的 commit，更新 `context.md`
-2. Ralph 写入 `.cccc/actors/{id}/inbox/restart.json`
-3. CCCC Daemon 检测到 inbox 变更，终止当前进程，启动新会话
+2. Ralph 通过 IPC 发送重启建议给 CCCC Daemon
+3. **CCCC Daemon（Authority）决定是否采纳，并执行实际的 Actor 控制**
 4. 新会话读取 `context.md` 恢复上下文，`iteration += 1`
 
 ## 5. 任务流程与通信协议
 
-### 5.1 Git 通信协议
+### 5.1 通信协议
 
-| 通信类型 | 文件路径 | 触发方 |
-|---------|---------|-------|
-| 任务分配 | `.cccc/actors/{id}/inbox/assignment.json` | Foreman |
-| 重启指令 | `.cccc/actors/{id}/inbox/restart.json` | Ralph |
-| 审查请求 | `.cccc/actors/{id}/inbox/handoff.json` | Worker |
-| 审查结果 | `.cccc/actors/{id}/inbox/review_result.json` | Reviewer |
-| Ready Batch | `.cccc/ralph/ready_batch_*.json` | Ralph/Foreman |
+#### 主通信通道：Daemon IPC
+
+| 消息类型 | 方向 | 说明 |
+|---------|------|------|
+| `ready_batch_suggestion` | Ralph → Daemon | 可执行批次建议 |
+| `verification_result` | Ralph → Daemon | 验证结果（build/test/lint） |
+| `restart_suggestion` | Ralph → Daemon | 建议重启某 Actor |
+| `batch_decision` | Daemon → Ralph | 批次采纳/拒绝决定 |
+| `actor_status` | Daemon → Ralph | Actor 状态同步 |
+
+#### 审计层：Git 提交
+
+Git 提交仅用于：
+- 记录代码变更历史
+- 记录任务完成状态（---METADATA---）
+- 提供可追溯的审计日志
+
+**不再用于**：
+- ~~任务分配（inbox/assignment.json）~~
+- ~~重启指令（inbox/restart.json）~~
+- ~~Ready Batch 协商（ready_batch_*.json）~~
 
 ### 5.2 完整任务生命周期
 
 1. **任务输入**：Feishu → Foreman → 解析为任务列表
 2. **任务规划**：Foreman 分析依赖 → 写入 tasks/index.json
-3. **Ready-Batch 计算**：Ralph 分析依赖图 → proposal
-4. **Foreman 审核**：审核/调整/确认 → confirmed
-5. **Worker 执行**：Ralph Loop（执行 → 验证 → 反馈）
-6. **Reviewer 审查**：审查 → approve/reject
-7. **任务完成**：更新状态 → 重新计算 → 循环继续
+3. **Ready-Batch 计算**：Ralph 分析依赖图 → IPC 发送建议
+4. **Daemon 决策**：CCCC Daemon 审核/调整/确认
+5. **Actor 控制**：CCCC Daemon 启动/分配 Worker
+6. **Worker 执行**：执行任务 → Git commit（审计）
+7. **验证反馈**：Ralph 验证 → IPC 发送结果 → Daemon 决定后续
+8. **Reviewer 审查**：审查 → approve/reject
+9. **任务完成**：更新状态 → 重新计算 → 循环继续
 
 ## 6. 现有模块改造
 
@@ -256,7 +286,8 @@ task_affinity: [backend, database, api]
 
 | 模块 | 职责 |
 |------|------|
-| Ralph | Git 事件驱动、任务依赖分析、协议验证、Context 刷新 |
+| Ralph | 观察 Git 事件、任务依赖分析、协议验证、**建议**（不直接控制） |
+| CCCC Daemon | **Authority**：Actor 生命周期控制、任务分配、状态管理 |
 | Automation | 时间触发的定时任务：standup、提醒、状态检查 |
 | Capability | Prompt 模板管理：按角色/需求组装 API 调用说明 |
 | Memory | 跨 Actor 共享知识：项目决策、技术约定、学习经验 |
@@ -283,20 +314,20 @@ prompt_fragments:
 ### 6.3 Automation 改造
 
 - 保留：`interval`/`cron`/`at` 触发器，`notify`/`group_state` 动作
-- 移除：`actor_control` 动作（转移给 Ralph）
-- 新增：`ralph_signal` 动作
+- 移除：`actor_control` 动作（由 Daemon 统一管理）
+- 新增：`ralph_query` 动作（查询 Ralph 状态）
 
 ## 7. 实现任务分解
 
 ### Phase 1: 基础设施（可并行）
-- T1: Ralph Daemon 骨架
-- T2: Git 通信协议
+- T1: Ralph Daemon 骨架（**Python 实现**）
+- T2: Daemon IPC 协议实现
 - T3: Capability 改造
 
 ### Phase 2: 核心能力（依赖 Phase 1）
 - T4: 动态 Agent 系统
-- T5: Ready-Batch 调度器
-- T6: Context Rollover
+- T5: Ready-Batch 调度器（Ralph 侧）
+- T6: Actor Controller（Daemon 侧）
 
 ### Phase 3: 集成与验证（依赖 Phase 2）
 - T7: Foreman 角色实现
@@ -318,11 +349,13 @@ Wave 5: T10
 
 ## 关键设计决策
 
-| 决策 | 选择 | 理由 |
-|------|------|------|
-| Ralph 定位 | 独立外层 Daemon | 解耦、可独立演进 |
-| 实现语言 | Rust | 复用 gitcortex 组件 |
-| 通信媒介 | Git | 状态可追溯、无额外依赖 |
-| 工具调用 | HTTP API | 简单、通用 |
-| 角色控制 | Prompt 层 | 轻量、灵活 |
-| 调度决策 | Ralph 建议 + Foreman 审核 | 平衡自动化与人工判断 |
+| 决策 | 选择 | 理由 | 变更说明 |
+|------|------|------|----------|
+| Ralph 定位 | 观察/计算/建议层 | 关注点分离，Daemon 保持 Authority | ⚠️ 原：直接控制 Actor |
+| 实现语言 | Python-first | 快速原型验证，与 CCCC Daemon 技术栈统一 | ⚠️ 原：Rust |
+| 通信媒介 | Daemon IPC 为主 | 实时性好，减少 Git 轮询开销 | ⚠️ 原：Git 文件 |
+| Git 角色 | 审计层 | 保留可追溯性，但不用于实时通信 | ⚠️ 原：状态 + 通信媒介 |
+| Actor 控制 | CCCC Daemon 独占 | 单一 Authority，避免竞争条件 | ⚠️ 新增决策 |
+| 工具调用 | HTTP API | 简单、通用 | — |
+| 角色控制 | Prompt 层 | 轻量、灵活 | — |
+| 调度决策 | Ralph 建议 + Daemon 决策 | 平衡自动化与控制权集中 | ⚠️ 原：Foreman 审核 |
