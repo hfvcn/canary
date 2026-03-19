@@ -3,6 +3,7 @@ from __future__ import annotations
 from .actor import Actor, ActorRole, ActorSubmit, AgentRuntime, HeadlessState, RunnerKind
 from .actor_profile import ActorProfile, ActorProfileRef
 from .automation import AutomationAction, AutomationRule, AutomationRuleSet, AutomationTrigger
+from .capability import APIEndpoint, Capability, CapabilitySet
 from .event import Event
 from .group_space import (
     SpaceBinding,
@@ -42,11 +43,14 @@ __all__ = [
     "ActorRole",
     "ActorSubmit",
     "AgentRuntime",
+    "APIEndpoint",
     "AutomationAction",
     "AutomationRule",
     "AutomationRuleSet",
     "AutomationTrigger",
     "Attachment",
+    "Capability",
+    "CapabilitySet",
     "ChatMessageData",
     "ChatReactionData",
     "ChatStreamData",

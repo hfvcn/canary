@@ -36,6 +36,7 @@ from .ops.capability_ops import try_handle_capability_op
 from .im.im_ops import try_handle_im_op
 from .actors.runner_ops import try_handle_headless_op
 from .memory.memory_ops import try_handle_memory_op
+from .ralph_ipc_handler import try_handle_ralph_op
 
 
 @dataclass(frozen=True)
@@ -372,6 +373,10 @@ def dispatch_request(
     im_resp = try_handle_im_op(op, args)
     if im_resp is not None:
         return im_resp, False
+
+    ralph_resp = try_handle_ralph_op(op, args)
+    if ralph_resp is not None:
+        return ralph_resp, False
 
     headless_resp = try_handle_headless_op(op, args)
     if headless_resp is not None:
