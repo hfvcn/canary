@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..util.process import find_subprocess_executable
@@ -226,6 +228,11 @@ def get_cccc_mcp_stdio_command() -> List[str]:
     Prefer an absolute path to the installed `cccc` entrypoint when available.
     On Windows this avoids relying on runtime-specific PATH inheritance for MCP
     child processes. Fall back to the current Python interpreter otherwise.
+    
+    Priority:
+    1. Check sibling directory of sys.executable for cccc/cccc.exe
+    2. Use shutil.which to find cccc in PATH
+    3. Fall back to python -m cccc.ports.mcp.main
     """
     candidates: List[Path] = []
     is_windows = sys.platform.startswith("win")

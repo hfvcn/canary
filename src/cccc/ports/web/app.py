@@ -422,6 +422,7 @@ def create_app() -> FastAPI:
     from .routes.workspace import create_routers as create_workspace_routers
     from .routes.im import register_im_routes
     from .routes.access_tokens import create_routers as create_access_token_routers
+    from .routes.openai_compat import create_routers as create_openai_compat_routers
 
     route_ctx = RouteContext(
         home=home,
@@ -448,6 +449,8 @@ def create_app() -> FastAPI:
         app.include_router(router)
     register_im_routes(app, ctx=route_ctx)
     for router in create_access_token_routers(route_ctx):
+        app.include_router(router)
+    for router in create_openai_compat_routers(route_ctx):
         app.include_router(router)
 
     return app

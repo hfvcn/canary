@@ -198,7 +198,9 @@ class TestProcessUtils(unittest.TestCase):
             ):
                 resolved = process_utils.resolve_subprocess_executable("kimi")
 
-        self.assertEqual(resolved, str(target))
+        # Compare resolved paths to handle macOS /var -> /private/var symlink
+        from pathlib import Path as _Path
+        self.assertEqual(_Path(resolved).resolve(), _Path(target).resolve())
 
 
 if __name__ == "__main__":

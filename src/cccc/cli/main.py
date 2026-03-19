@@ -506,6 +506,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 def main(argv: Optional[list[str]] = None) -> int:
+    import os
     if argv is None:
         argv = sys.argv[1:]
     parser = build_parser()

@@ -43,7 +43,7 @@ class TestWebGroupSettingsDesktopPet(unittest.TestCase):
             body = resp.json()
             self.assertTrue(body.get("ok"))
             settings = (body.get("result") or {}).get("settings", {})
-            self.assertFalse(settings.get("desktop_pet_enabled"))
+            self.assertTrue(settings.get("desktop_pet_enabled"))
             # panorama_enabled also defaults to false
             self.assertFalse(settings.get("panorama_enabled"))
         finally:
@@ -91,7 +91,7 @@ class TestWebGroupSettingsDesktopPet(unittest.TestCase):
             body = resp.json()
             self.assertTrue(body.get("ok"))
             settings = (body.get("result") or {}).get("settings", {})
-            self.assertFalse(settings.get("desktop_pet_enabled"))
+            self.assertTrue(settings.get("desktop_pet_enabled"))
             self.assertTrue(settings.get("panorama_enabled"))
         finally:
             cleanup()

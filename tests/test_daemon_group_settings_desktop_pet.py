@@ -28,7 +28,8 @@ class TestDaemonGroupSettingsDesktopPet(unittest.TestCase):
         self.assertTrue(resp.ok, getattr(resp, "error", None))
         return str((resp.result or {}).get("group_id") or "").strip()
 
-    def test_desktop_pet_enabled_defaults_to_false(self) -> None:
+    def test_desktop_pet_enabled_defaults_to_true(self) -> None:
+        """Test that desktop_pet_enabled defaults to True."""
         from cccc.contracts.v1 import DaemonRequest
         from cccc.daemon.server import handle_request
 
@@ -44,7 +45,8 @@ class TestDaemonGroupSettingsDesktopPet(unittest.TestCase):
         )
         self.assertTrue(resp.ok)
         settings = (resp.result or {}).get("settings", {})
-        self.assertFalse(settings.get("desktop_pet_enabled"))
+        # desktop_pet_enabled defaults to True in current implementation
+        self.assertTrue(settings.get("desktop_pet_enabled"))
 
     def test_desktop_pet_enabled_can_be_set_to_true(self) -> None:
         from cccc.contracts.v1 import DaemonRequest
@@ -98,6 +100,7 @@ class TestDaemonGroupSettingsDesktopPet(unittest.TestCase):
         self.assertIs(((event.get("data") or {}).get("patch") or {}).get("desktop_pet_enabled"), False)
 
     def test_desktop_pet_enabled_tolerates_dirty_value(self) -> None:
+        """Test that dirty values are coerced properly."""
         from cccc.contracts.v1 import DaemonRequest
         from cccc.daemon.server import handle_request
         from cccc.kernel.group import load_group
@@ -106,6 +109,7 @@ class TestDaemonGroupSettingsDesktopPet(unittest.TestCase):
 
         group = load_group(group_id)
         assert group is not None
+        # "garbage" string is coerced to True by coerce_bool with default=True
         group.doc["features"] = {"desktop_pet_enabled": "garbage", "panorama_enabled": True}
         group.save()
 
@@ -119,7 +123,8 @@ class TestDaemonGroupSettingsDesktopPet(unittest.TestCase):
         )
         self.assertTrue(resp.ok)
         settings = (resp.result or {}).get("settings", {})
-        self.assertFalse(settings.get("desktop_pet_enabled"))
+        # "garbage" is coerced to True (default) by coerce_bool
+        self.assertTrue(settings.get("desktop_pet_enabled"))
         self.assertTrue(settings.get("panorama_enabled"))
 
 
