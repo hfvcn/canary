@@ -56,7 +56,7 @@ class GroupTemplateSettings(BaseModel):
     terminal_transcript_notify_tail: bool = True
     terminal_transcript_notify_lines: int = 20
     panorama_enabled: bool = False
-    desktop_pet_enabled: bool = False
+    desktop_pet_enabled: bool = True
 
     model_config = ConfigDict(extra="ignore")
 

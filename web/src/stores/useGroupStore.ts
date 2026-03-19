@@ -947,6 +947,7 @@ export const useGroupStore = create<GroupState>((set, get) => ({
     const showPromise = api.fetchGroup(gid);
     const tailPromise = api.fetchLedgerTail(gid);
     const actorsPromise = api.fetchActors(gid, false);
+    const settingsPromise = api.fetchSettings(gid);
 
     void showPromise.then((show) => {
       if (show.ok) {
@@ -1006,7 +1007,15 @@ export const useGroupStore = create<GroupState>((set, get) => ({
       });
     });
 
-    // 首屏稳定后再补 context/settings/presentation，避免它们拖住切组体感。
+    // Settings 与其他请求并行加载，避免延迟导致的竞态覆盖。
+    void settingsPromise.then((settings) => {
+      if (!settings.ok || !settings.result.settings) return;
+      commitViewPatch({ groupSettings: settings.result.settings });
+    }).catch((error) => {
+      console.error(`Failed to load settings for group=${gid}:`, error);
+    });
+
+    // 首屏稳定后再补 context/presentation，避免它们拖住切组体感。
     void Promise.allSettled([showPromise, tailPromise, actorsPromise]).then(() => {
       const contextEpoch = beginContextRequest(gid);
       void api.fetchContext(gid, { detail: "summary" }).then((ctx) => {
@@ -1015,13 +1024,6 @@ export const useGroupStore = create<GroupState>((set, get) => ({
         commitViewPatch({ groupContext: ctx.result as GroupContext });
       }).catch((error) => {
         console.error(`Failed to load context for group=${gid}:`, error);
-      });
-
-      void api.fetchSettings(gid).then((settings) => {
-        if (!settings.ok || !settings.result.settings) return;
-        commitViewPatch({ groupSettings: settings.result.settings });
-      }).catch((error) => {
-        console.error(`Failed to load settings for group=${gid}:`, error);
       });
 
       void api.fetchPresentation(gid).then((presentationResp) => {

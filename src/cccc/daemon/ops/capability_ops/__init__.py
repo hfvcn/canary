@@ -272,3 +272,11 @@ def try_handle_capability_op(op: str, args: Dict[str, Any]) -> Optional[DaemonRe
     if op == "capability_tool_call":
         return handle_capability_tool_call(args)
     return None
+
+from ._prompt_builder import (  # noqa: F401
+    build_actor_prompt,
+    build_actor_prompt_from_ids,
+    get_capability_api_endpoints,
+    _load_capability_yaml,
+    _load_capabilities_from_dir,
+)

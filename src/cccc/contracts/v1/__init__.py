@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .actor import Actor, ActorRole, ActorSubmit, AgentRuntime, HeadlessState, RunnerKind
 from .actor_profile import ActorProfile, ActorProfileRef
+from .agent import Agent, AgentRoleType, AgentSet, ModelCapability, ModelRegistry
 from .automation import AutomationAction, AutomationRule, AutomationRuleSet, AutomationTrigger
 from .capability import APIEndpoint, Capability, CapabilitySet
 from .event import Event
@@ -42,7 +43,10 @@ __all__ = [
     "ActorProfileRef",
     "ActorRole",
     "ActorSubmit",
+    "Agent",
+    "AgentRoleType",
     "AgentRuntime",
+    "AgentSet",
     "APIEndpoint",
     "AutomationAction",
     "AutomationRule",
@@ -62,6 +66,14 @@ __all__ = [
     "GroupTemplateActor",
     "GroupTemplatePrompts",
     "GroupTemplateSettings",
+    "HeadlessState",
+    "ModelCapability",
+    "ModelRegistry",
+    "NotifyAckData",
+    "NotifyKind",
+    "NotifyPriority",
+    "Reference",
+    "RunnerKind",
     "SpaceBinding",
     "SpaceBindingStatus",
     "SpaceLane",
@@ -77,10 +89,6 @@ __all__ = [
     "SpaceProviderMode",
     "SpaceProviderState",
     "SpaceQueueSummary",
-    "HeadlessState",
-    "NotifyAckData",
-    "NotifyKind",
-    "NotifyPriority",
     "PresentationCard",
     "PresentationCardType",
     "PresentationContent",
@@ -88,7 +96,5 @@ __all__ = [
     "PresentationSlot",
     "PresentationSourceMode",
     "PresentationTableData",
-    "Reference",
-    "RunnerKind",
     "SystemNotifyData",
 ]

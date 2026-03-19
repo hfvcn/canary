@@ -296,7 +296,7 @@ def _apply_settings_replace(group: Group, settings: Dict[str, Any]) -> Dict[str,
     if "panorama_enabled" in settings:
         patch["panorama_enabled"] = coerce_bool(settings.get("panorama_enabled"), default=False)
     if "desktop_pet_enabled" in settings:
-        patch["desktop_pet_enabled"] = coerce_bool(settings.get("desktop_pet_enabled"), default=False)
+        patch["desktop_pet_enabled"] = coerce_bool(settings.get("desktop_pet_enabled"), default=True)
 
     delivery_keys = {"min_interval_seconds", "auto_mark_on_delivery"}
     automation_keys = {

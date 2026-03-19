@@ -34,7 +34,7 @@ class IPCMessage:
         timestamp: 消息时间戳
         payload: 消息载荷
     """
-    type: MessageType
+    type: MessageType = field(default=MessageType.READY_BATCH_SUGGESTION)
     timestamp: datetime = field(default_factory=datetime.now)
     payload: dict[str, Any] = field(default_factory=dict)
 

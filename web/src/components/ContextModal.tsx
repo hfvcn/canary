@@ -485,6 +485,7 @@ export function ContextModal({
 
   const brief = context?.coordination?.brief || null;
   const panoramaEnabled = Boolean(settings?.panorama_enabled);
+  const desktopPetEnabled = Boolean(settings?.desktop_pet_enabled);
   const tasks = useMemo(() => (Array.isArray(context?.coordination?.tasks) ? context.coordination.tasks : []), [context]);
   const agents = useMemo(() => (Array.isArray(context?.agent_states) ? context.agent_states : []), [context]);
   const board = useMemo(() => buildBoard(tasks, context?.board), [context?.board, tasks]);
@@ -1137,6 +1138,17 @@ export function ContextModal({
     setViewBusy(true);
     try {
       await onUpdateSettings({ panorama_enabled: enabled });
+      setMobileViewMenuOpen(false);
+    } finally {
+      setViewBusy(false);
+    }
+  }, [onUpdateSettings]);
+
+  const handleToggleDesktopPet = useCallback(async (enabled: boolean) => {
+    if (!onUpdateSettings) return;
+    setViewBusy(true);
+    try {
+      await onUpdateSettings({ desktop_pet_enabled: enabled });
       setMobileViewMenuOpen(false);
     } finally {
       setViewBusy(false);
@@ -2198,11 +2210,97 @@ export function ContextModal({
               ) : null}
             </div>
 
-            {activeView === "coordination"
-              ? renderCoordinationView()
-              : activeView === "agents"
-                ? renderAgentsView()
-                : renderDesktopPetView()}
+            {onUpdateSettings ? (
+              <>
+                <div className="hidden sm:flex items-center gap-6">
+                  <div className="flex items-center gap-3">
+                    <div className="min-w-0 text-right">
+                      <div className={classNames("text-sm font-medium", isDark ? "text-slate-200" : "text-gray-800")}>{tr("context.desktopPetToggle", "Web Pet")}</div>
+                      <div className={classNames("mt-1 text-xs", mutedTextClass)}>{tr("context.desktopPetHint", "Show the pet mascot on page.")}</div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={desktopPetEnabled}
+                      aria-label={tr("context.desktopPetToggle", "Web Pet")}
+                      onClick={() => void handleToggleDesktopPet(!desktopPetEnabled)}
+                      disabled={viewBusy}
+                      className={switchTrackClass(desktopPetEnabled)}
+                    >
+                      <span className={switchThumbClass(desktopPetEnabled)} />
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <div className="min-w-0 text-right">
+                      <div className={classNames("text-sm font-medium", isDark ? "text-slate-200" : "text-gray-800")}>{tr("context.panoramaToggle", "Panorama 3D")}</div>
+                      <div className={classNames("mt-1 text-xs", mutedTextClass)}>{tr("context.panoramaHint", "Show the Panorama tab for this group.")}</div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={panoramaEnabled}
+                      aria-label={tr("context.panoramaToggle", "Panorama 3D")}
+                      onClick={() => void handleTogglePanorama(!panoramaEnabled)}
+                      disabled={viewBusy}
+                      className={switchTrackClass(panoramaEnabled)}
+                    >
+                      <span className={switchThumbClass(panoramaEnabled)} />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="sm:hidden self-end relative">
+                  <button type="button" onClick={() => setMobileViewMenuOpen((open) => !open)} className={buttonSecondaryClass}>
+                    {tr("context.viewOptions", "View")}
+                  </button>
+                  {mobileViewMenuOpen ? (
+                    <div className={classNames("absolute right-0 z-20 mt-2 w-64 rounded-2xl border p-3 shadow-lg", isDark ? "border-slate-800 bg-slate-950 text-slate-200" : "border-gray-200 bg-white text-gray-900")}>
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-medium">{tr("context.desktopPetToggle", "Web Pet")}</div>
+                          <div className={classNames("mt-1 text-xs", mutedTextClass)}>{tr("context.desktopPetHint", "Show the pet mascot on page.")}</div>
+                        </div>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={desktopPetEnabled}
+                          aria-label={tr("context.desktopPetToggle", "Web Pet")}
+                          onClick={() => void handleToggleDesktopPet(!desktopPetEnabled)}
+                          disabled={viewBusy}
+                          className={switchTrackClass(desktopPetEnabled)}
+                        >
+                          <span className={switchThumbClass(desktopPetEnabled)} />
+                        </button>
+                      </div>
+                      <div className="mt-3 border-t pt-3 flex items-start justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-medium">{tr("context.panoramaToggle", "Panorama 3D")}</div>
+                          <div className={classNames("mt-1 text-xs", mutedTextClass)}>{tr("context.panoramaHint", "Show the Panorama tab for this group.")}</div>
+                        </div>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={panoramaEnabled}
+                          aria-label={tr("context.panoramaToggle", "Panorama 3D")}
+                          onClick={() => void handleTogglePanorama(!panoramaEnabled)}
+                          disabled={viewBusy}
+                          className={switchTrackClass(panoramaEnabled)}
+                        >
+                          <span className={switchThumbClass(panoramaEnabled)} />
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              </>
+            ) : null}
+          </div>
+
+          {activeView === "coordination"
+            ? renderCoordinationView()
+            : activeView === "agents"
+              ? renderAgentsView()
+              : renderDesktopPetView()}
         </div>
       </ModalFrame>
 

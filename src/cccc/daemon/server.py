@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import ntpath
 import os
 import socket
 import signal
@@ -235,7 +234,9 @@ SUPPORTED_RUNTIMES = (
     "custom",
 )
 
-AUTO_MCP_RUNTIMES = ("claude", "codex", "droid", "amp", "auggie", "neovate", "gemini", "kimi")
+# MCP Server 自动安装已禁用 - Capability 系统将管理 MCP 配置
+# AUTO_MCP_RUNTIMES = ("claude", "codex", "droid", "amp", "auggie", "neovate", "gemini", "kimi")
+AUTO_MCP_RUNTIMES: tuple[str, ...] = ()  # 禁用自动 MCP 安装
 
 
 def _normalize_runtime_command(runtime: str, command: list[str]) -> list[str]:
@@ -255,10 +256,16 @@ def _normalize_runtime_command(runtime: str, command: list[str]) -> list[str]:
 
     if rt == "codex":
         try:
-            exe = os.path.splitext(ntpath.basename(str(cmd[0] or "")))[0].lower()
+            # Try both path formats to handle cross-platform cases
+            from pathlib import PureWindowsPath, PurePosixPath
+            cmd0 = str(cmd[0] or "")
+            # Try Windows path first (handles C:\...), then POSIX
+            exe = PureWindowsPath(cmd0).name if "\\" in cmd0 or cmd0[1:2] == ":" else PurePosixPath(cmd0).name
         except Exception:
-            exe = str(cmd[0] or "").strip().lower()
-        if exe == "codex":
+            exe = str(cmd[0] or "")
+        # Match codex, codex.cmd, codex.exe, etc.
+        exe_lower = str(exe).lower()
+        if exe_lower == "codex" or exe_lower.startswith("codex."):
             # Ensure MCP servers inherit actor env (CCCC_* / ARENA_*).
             has_env_inherit = any("shell_environment_policy.inherit" in str(x) for x in cmd)
             if not has_env_inherit:

@@ -119,7 +119,7 @@ def handle_group_settings_update(args: Dict[str, Any]) -> DaemonResponse:
             if "panorama_enabled" in features_patch:
                 features["panorama_enabled"] = coerce_bool(features_patch["panorama_enabled"], default=False)
             if "desktop_pet_enabled" in features_patch:
-                features["desktop_pet_enabled"] = coerce_bool(features_patch["desktop_pet_enabled"], default=False)
+                features["desktop_pet_enabled"] = coerce_bool(features_patch["desktop_pet_enabled"], default=True)
             group.doc["features"] = features
 
         group.save()
@@ -184,7 +184,7 @@ def handle_group_settings_update(args: Dict[str, Any]) -> DaemonResponse:
             max_value=80,
         ),
         "panorama_enabled": coerce_bool(features.get("panorama_enabled"), default=False),
-        "desktop_pet_enabled": coerce_bool(features.get("desktop_pet_enabled"), default=False),
+        "desktop_pet_enabled": coerce_bool(features.get("desktop_pet_enabled"), default=True),
     }
 
     event = append_event(
