@@ -48,6 +48,7 @@ const NON_ACTOR_TABS = ["chat", "board", "workspace", "panorama", "workflow"];
 export default function App() {
   // Theme
   const { theme, setTheme, isDark } = useTheme();
+  const { t } = useTranslation("layout");
 
   // Virtual keyboard viewport adjustment for mobile
   useViewportHeight();
@@ -178,7 +179,7 @@ export default function App() {
   });
 
   // Custom hooks
-  const { connectStream, fetchContext, cleanup: cleanupSSE } = useSSE({
+  const { connectStream, fetchContext, cleanup: cleanupSSE, contextRefreshTimerRef } = useSSE({
     activeTabRef,
     chatAtBottomRef,
     actorsRef,
@@ -258,65 +259,6 @@ export default function App() {
     addActorOpen: modalFlags.addActor,
     editingActor,
   });
-
-  const refreshWebAccessSession = React.useCallback(async () => {
-    try {
-      const resp = await api.fetchWebAccessSession();
-      const session = resp.ok ? resp.result?.web_access_session ?? null : null;
-      const allowed = Boolean(session?.can_access_global_settings ?? !(session?.login_active ?? false));
-      setCanAccessGlobalSettings(allowed);
-      setCanManageActors(Boolean(session?.can_manage_actors ?? allowed));
-      setCanAccessTerminal(Boolean(session?.can_access_terminal ?? allowed));
-      setCollapseHumanMessageBodiesByDefault(Boolean(session?.login_active && session?.is_admin && session?.can_view_message_bodies));
-    } catch {
-      setCanAccessGlobalSettings(null);
-      setCanManageActors(null);
-      setCanAccessTerminal(null);
-      setCollapseHumanMessageBodiesByDefault(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void refreshWebAccessSession();
-    const handleFocus = () => {
-      void refreshWebAccessSession();
-    };
-    window.addEventListener("focus", handleFocus);
-    return () => window.removeEventListener("focus", handleFocus);
-  }, [refreshWebAccessSession]);
-
-  // Tab list for swipe navigation
-  const canManageGroups = canAccessGlobalSettings === true;
-  const canManageActorsNow = canManageActors !== false;
-  const canAccessTerminalNow = canAccessTerminal !== false;
-  const canAccessSettings = canAccessGlobalSettings !== false;
-  const visibleActors = useMemo(
-    () => (canAccessTerminalNow ? actors : []),
-    [actors, canAccessTerminalNow]
-  );
-  const showBoardTab = Boolean(selectedGroupId);
-  const showWorkspaceTab = Boolean(selectedGroupId && workspaceState.openFilePath);
-  const showWorkflowTab = Boolean(selectedGroupId);
-
-  const allTabs = useMemo(() => {
-    const tabs = ["chat"];
-    if (showBoardTab) tabs.push("board");
-    if (showWorkspaceTab) tabs.push("workspace");
-    if (showPanorama) tabs.push("panorama");
-    if (showWorkflowTab) tabs.push("workflow");
-    return tabs.concat(visibleActors.map((a) => a.id));
-  }, [showBoardTab, showPanorama, showWorkspaceTab, showWorkflowTab, visibleActors]);
-
-  const handleTabChange = React.useCallback((newTab: string) => {
-    if (!canAccessTerminalNow && !NON_ACTOR_TABS.includes(newTab)) {
-      return;
-    }
-    // Keep Chat mounted to preserve scroll position; no need to snapshot scrollTop.
-    if (!NON_ACTOR_TABS.includes(newTab)) {
-      setMountedActorIds((prev) => (prev.includes(newTab) ? prev : [...prev, newTab]));
-    }
-    setActiveTab(newTab);
-  }, [canAccessTerminalNow, setActiveTab]);
 
   const { handleTouchStart, handleTouchEnd } = useSwipeNavigation({
     tabs: allTabs,
@@ -535,16 +477,6 @@ export default function App() {
         onRefreshActors={() => void refreshActors()}
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
-        collapseHumanMessageBodiesByDefault={collapseHumanMessageBodiesByDefault}
-        workspaceTree={workspaceState.tree}
-        workspaceSelectedFilePath={workspaceState.openFilePath}
-        workspaceLoading={workspaceState.loadingTree}
-        workspaceError={workspaceState.error}
-        onRefreshWorkspace={selectedGroupId ? () => void refreshWorkspaceGroup(selectedGroupId) : undefined}
-        onOpenWorkspaceFolder={selectedGroupId ? (path: string) => void handleOpenWorkspaceFolder(path) : undefined}
-        onOpenWorkspaceFile={selectedGroupId ? (path: string) => void handleOpenWorkspaceFile(path) : undefined}
-        onCreateWorkspaceFolder={selectedGroupId ? (kind: "folder" | "task") => void handleCreateWorkspaceFolder(kind) : undefined}
-        onCreateWorkspaceFile={selectedGroupId ? () => void handleCreateWorkspaceFile() : undefined}
       />
 
       <WebPet />
@@ -571,7 +503,7 @@ export default function App() {
           onSetGroupState={handleSetGroupState}
           fetchContext={fetchContext}
           canManageGroups={canManageGroups}
-          canAccessSettings={canAccessSettings}
+          canAccessSettings={canManageGroups}
           collapseHumanMessageBodiesByDefault={collapseHumanMessageBodiesByDefault}
         />
       </Suspense>

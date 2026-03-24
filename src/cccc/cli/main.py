@@ -514,12 +514,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     previous_env, applied_env = _apply_invocation_web_overrides(args)
     try:
         if not getattr(args, "cmd", None):
-            return int(
-                _default_entry(
-                    web_host_override=str(getattr(args, "web_host", "") or ""),
-                    web_port_override=getattr(args, "web_port", None),
-                )
-            )
+            return int(_default_entry())
         return int(args.func(args))
     finally:
         _restore_invocation_web_overrides(previous_env, applied_env)

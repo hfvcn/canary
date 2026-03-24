@@ -450,7 +450,7 @@ export function ContextModal({
   const tr = useCallback((key: string, fallback: string, vars?: Record<string, unknown>) =>
     String(t(key as never, { defaultValue: fallback, ...(vars || {}) } as never)), [t]);
 
-  const [activeView, setActiveView] = useState<"coordination" | "agents">("coordination");
+  const [activeView, setActiveView] = useState<"coordination" | "agents" | "desktop_pet">("coordination");
   const [steeringTab, setSteeringTab] = useState<"summary" | "project" | "log">("summary");
   const [taskFilter, setTaskFilter] = useState<"all" | "blocked" | "waiting_user" | "handoff" | "unassigned">("all");
   const [assigneeFilter, setAssigneeFilter] = useState<string>("__all__");
@@ -1103,7 +1103,7 @@ export function ContextModal({
     }
   }, [confirmDiscardTaskChanges, loadProjectMd]);
 
-  const handleSwitchActiveView = useCallback((next: "coordination" | "agents") => {
+  const handleSwitchActiveView = useCallback((next: "coordination" | "agents" | "desktop_pet") => {
     if (next === "agents") {
       if (!confirmDiscardTaskChanges()) return;
       setTaskEditorMode("none");
@@ -2011,6 +2011,29 @@ export function ContextModal({
               </div>
             );
           }) : <div className={classNames("rounded-xl border border-dashed px-3 py-4 text-sm", "border-[var(--glass-border-subtle)] text-[var(--color-text-muted)]")}>{tr("context.noAgents", "No agent state")}</div>}
+        </div>
+      </section>
+    );
+  };
+
+  const renderDesktopPetView = () => {
+    return (
+      <section className={classNames(surfaceClass, "p-4")}>
+        <div className={classNames("text-lg font-semibold", "text-[var(--color-text-primary)]")}>{tr("context.desktopPetTab", "Web Pet")}</div>
+        <div className={classNames("mt-2 text-sm", subtleTextClass)}>{tr("context.desktopPetDescription", "Configure and interact with your Web Pet companion.")}</div>
+        <div className="mt-4 flex items-center gap-3">
+          <span className={classNames("text-sm", subtleTextClass)}>{tr("context.desktopPetToggle", "Web Pet")}</span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={desktopPetEnabled}
+            aria-label={tr("context.desktopPetToggle", "Web Pet")}
+            onClick={() => void handleToggleDesktopPet(!desktopPetEnabled)}
+            disabled={viewBusy}
+            className={switchTrackClass(desktopPetEnabled)}
+          >
+            <span className={switchThumbClass(desktopPetEnabled)} />
+          </button>
         </div>
       </section>
     );

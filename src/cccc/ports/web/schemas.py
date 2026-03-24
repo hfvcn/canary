@@ -194,6 +194,26 @@ class GroupPresentationBrowserSessionRequest(BaseModel):
     by: str = Field(default="user")
 
 
+class WorkspaceFolderCreateRequest(BaseModel):
+    parent_path: str = Field(default="")
+    name: str
+    kind: Literal["folder", "task"] = "folder"
+    by: str = Field(default="user")
+
+
+class WorkspaceFileCreateRequest(BaseModel):
+    parent_path: str = Field(default="")
+    name: str
+    content: str = Field(default="")
+    by: str = Field(default="user")
+
+
+class WorkspaceFileUpdateRequest(BaseModel):
+    path: str
+    content: str = Field(default="")
+    by: str = Field(default="user")
+
+
 class GroupSettingsRequest(BaseModel):
     default_send_to: Optional[Literal["foreman", "broadcast"]] = None
     nudge_after_seconds: Optional[int] = None

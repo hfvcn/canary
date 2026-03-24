@@ -254,12 +254,12 @@ export function WorkflowTab({ groupId, isDark }: WorkflowTabProps) {
                     )}>
                       {event.type}
                     </span>
-                    {event.task_id && (
+                    {String(event.task_id ?? "") && (
                       <span className="text-xs text-[var(--color-text-secondary)]">
                         Task: {String(event.task_id)}
                       </span>
                     )}
-                    {event.batch_id && (
+                    {String(event.batch_id ?? "") && (
                       <span className="text-xs text-[var(--color-text-muted)]">
                         Batch: {String(event.batch_id).slice(0, 8)}
                       </span>

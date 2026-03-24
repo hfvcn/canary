@@ -21,11 +21,10 @@ import { PresentationViewerModal } from "./presentation/PresentationViewerModal"
 import { RelayMessageModal } from "./modals/RelayMessageModal";
 import { RecipientsModal } from "./modals/RecipientsModal";
 import { parsePrivateEnvSetText } from "../utils/privateEnvInput";
-import { actorProfileIdentityKey } from "../utils/actorProfiles";
+import { actorProfileIdentityKey, actorProfileMatchesRef } from "../utils/actorProfiles";
 import { parseHelpMarkdown, updateActorHelpNote } from "../utils/helpMarkdown";
 import { buildActorCreateCommand } from "../utils/actorCommands";
 import { formatCapabilityIdInput, normalizeCapabilityIdList, parseCapabilityIdInput } from "../utils/capabilityAutoload";
-import { actorProfileIdentityKey, actorProfileMatchesRef } from "../utils/actorProfiles";
 import { findPresentationSlot } from "../utils/presentation";
 import { buildPresentationRefForSlot } from "../utils/presentationRefs";
 import {

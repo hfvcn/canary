@@ -135,6 +135,8 @@ export function SettingsModal({
     dingtalkAppKey: string;
     dingtalkAppSecret: string;
     dingtalkRobotCode: string;
+    wecomBotId: string;
+    wecomSecret: string;
   };
   const [imConfigDrafts, setImConfigDrafts] = useState<Partial<Record<IMPlatform, IMConfigDraft>>>({});
 
