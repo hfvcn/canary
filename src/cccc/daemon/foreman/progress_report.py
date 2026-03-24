@@ -63,6 +63,7 @@ class ProgressState:
     total_batches: int = 0
     completed_batches: int = 0
     tasks: Dict[str, TaskInfo] = field(default_factory=dict)
+    current_batch_task_ids: List[str] = field(default_factory=list)
 
     def get_batch_duration(self) -> int:
         """Get current batch duration in seconds."""
@@ -79,6 +80,18 @@ class ProgressState:
     def count_by_status(self, status: ProgressStatus) -> int:
         """Count tasks with given status."""
         return sum(1 for t in self.tasks.values() if t.status == status)
+
+    def get_current_batch_tasks(self) -> List[TaskInfo]:
+        """Return task infos that belong to the active batch."""
+        return [
+            self.tasks[task_id]
+            for task_id in self.current_batch_task_ids
+            if task_id in self.tasks
+        ]
+
+    def count_current_batch_by_status(self, status: ProgressStatus) -> int:
+        """Count tasks with a given status in the active batch only."""
+        return sum(1 for task in self.get_current_batch_tasks() if task.status == status)
 
 
 class ProgressReporter:
@@ -221,6 +234,7 @@ class ProgressReporter:
         self._state.current_batch_id = batch_id
         self._state.batch_start_time = time.time()
         self._state.total_batches += 1
+        self._state.current_batch_task_ids = []
 
         # Track tasks
         task_infos: List[TaskInfo] = []
@@ -232,6 +246,7 @@ class ProgressReporter:
                 status=ProgressStatus.PENDING,
             )
             self._state.tasks[task_info.id] = task_info
+            self._state.current_batch_task_ids.append(task_info.id)
             task_infos.append(task_info)
 
         # Record event
@@ -314,8 +329,8 @@ class ProgressReporter:
         batch_info = BatchInfo(
             batch_id=self._state.current_batch_id,
             workflow_id=self._state.workflow_id,
-            total_tasks=len(self._state.tasks),
-            completed_tasks=self._state.count_by_status(ProgressStatus.COMPLETED),
+            total_tasks=len(self._state.current_batch_task_ids),
+            completed_tasks=self._state.count_current_batch_by_status(ProgressStatus.COMPLETED),
         )
 
         card = build_task_completed_card(
@@ -376,8 +391,8 @@ class ProgressReporter:
         batch_info = BatchInfo(
             batch_id=self._state.current_batch_id,
             workflow_id=self._state.workflow_id,
-            total_tasks=len(self._state.tasks),
-            failed_tasks=self._state.count_by_status(ProgressStatus.FAILED),
+            total_tasks=len(self._state.current_batch_task_ids),
+            failed_tasks=self._state.count_current_batch_by_status(ProgressStatus.FAILED),
         )
 
         card = build_task_failed_card(
@@ -457,16 +472,16 @@ class ProgressReporter:
         batch_duration = self._state.get_batch_duration()
 
         # Collect task infos
-        task_infos = list(self._state.tasks.values())
+        task_infos = self._state.get_current_batch_tasks()
 
         # Build batch info
         batch_info = BatchInfo(
             batch_id=self._state.current_batch_id,
             workflow_id=self._state.workflow_id,
             total_tasks=len(task_infos),
-            completed_tasks=self._state.count_by_status(ProgressStatus.COMPLETED),
-            failed_tasks=self._state.count_by_status(ProgressStatus.FAILED),
-            skipped_tasks=self._state.count_by_status(ProgressStatus.SKIPPED),
+            completed_tasks=self._state.count_current_batch_by_status(ProgressStatus.COMPLETED),
+            failed_tasks=self._state.count_current_batch_by_status(ProgressStatus.FAILED),
+            skipped_tasks=self._state.count_current_batch_by_status(ProgressStatus.SKIPPED),
             duration_seconds=batch_duration,
             tasks=task_infos,
         )
@@ -505,7 +520,7 @@ class ProgressReporter:
             return False
 
         workflow_duration = self._state.get_workflow_duration()
-        total_tasks = self._state.count_by_status(ProgressStatus.COMPLETED)
+        total_tasks = len(self._state.tasks)
 
         # Record event
         self._record_event(EventType.WORKFLOW_COMPLETED, {

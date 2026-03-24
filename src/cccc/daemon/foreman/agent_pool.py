@@ -59,6 +59,8 @@ class TaskAssignment:
         agent_name: Display name of agent
         is_new_agent: Whether a new agent was created
         assignment_reason: Why this agent was chosen
+        model_runtime: Agent CLI runtime (e.g., "claude", "gemini")
+        model_id: Specific model identifier (e.g., "claude-sonnet-4")
     """
 
     task: TaskRef
@@ -66,6 +68,8 @@ class TaskAssignment:
     agent_name: str
     is_new_agent: bool = False
     assignment_reason: str = ""
+    model_runtime: str = ""
+    model_id: str = ""
 
 
 class AgentPoolManager:
@@ -279,7 +283,7 @@ class AgentPoolManager:
 
         # Generate agent ID and name
         if not agent_id:
-            agent_id = f"{model_runtime}-{task.type}-worker"
+            agent_id = self._generate_agent_id(model_runtime, task.type)
         if not agent_name:
             agent_name = f"{model_runtime.title()} {task.type.title()} Worker"
 
@@ -303,6 +307,18 @@ class AgentPoolManager:
         )
 
         return agent
+
+    def _generate_agent_id(self, model_runtime: str, task_type: str) -> str:
+        """Generate a unique agent ID for a task-scoped worker."""
+        base_id = f"{model_runtime}-{task_type}-worker"
+        candidate = base_id
+        suffix = 1
+
+        while (self.agents_dir / f"{candidate}.yaml").exists() or candidate in self._active_assignments:
+            candidate = f"{base_id}-{suffix}"
+            suffix += 1
+
+        return candidate
 
     def _generate_worker_prompt(self, task_type: str) -> str:
         """Generate a system prompt for a worker based on task type."""
@@ -421,8 +437,16 @@ class AgentPoolManager:
                 assignment_reason="Failed to find or create agent",
             )
 
-        # Mark agent as assigned
-        self.assign_agent(assigned_agent.id, task.id)
+        # Mark agent as assigned. If this fails, the chosen agent is not actually usable
+        # for this task, so surface a failed assignment instead of a misleading success.
+        if not self.assign_agent(assigned_agent.id, task.id):
+            return TaskAssignment(
+                task=task,
+                agent_id="",
+                agent_name="",
+                is_new_agent=False,
+                assignment_reason=f"Agent {assigned_agent.id} is already assigned",
+            )
 
         return TaskAssignment(
             task=task,
@@ -430,4 +454,6 @@ class AgentPoolManager:
             agent_name=assigned_agent.name,
             is_new_agent=is_new,
             assignment_reason=reason,
+            model_runtime=assigned_agent.model_runtime,
+            model_id=assigned_agent.model_id,
         )

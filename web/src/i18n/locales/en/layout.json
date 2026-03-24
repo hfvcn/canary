@@ -107,6 +107,7 @@
   "newFilePrompt": "Enter a new file name",
   "workspaceCreateFailed": "Failed to create workspace item",
   "panorama": "Panorama",
+  "workflow": "Workflow",
   "panoramaHudTitle": "Agent State",
   "panoramaHudHint": "Quick snapshot of who is active, blocked, or waiting in the panorama scene.",
   "panoramaHudActive": "Active",

@@ -512,15 +512,13 @@ def _default_entry() -> int:
                 ret = daemon_process.poll()
                 if ret is not None:
                     still_running = bool(call_daemon({"op": "ping"}, timeout_s=0.5).get("ok"))
-                    if attempt + 1 < max_attempts:
-                        if still_running and int(ret) == 0:
-                            print("[cccc] Another daemon remained active during startup; retrying clean restart...", file=sys.stderr)
-                        else:
-                            print("[cccc] Daemon exited during startup; retrying clean restart...", file=sys.stderr)
-                        break
                     if still_running and int(ret) == 0:
-                        print("[cccc] Another daemon is still active after clean restart attempts.", file=sys.stderr)
-                        return False
+                        daemon_process = None
+                        print("[cccc] Reusing existing daemon after clean restart attempt.", file=sys.stderr)
+                        return True
+                    if attempt + 1 < max_attempts:
+                        print("[cccc] Daemon exited during startup; retrying clean restart...", file=sys.stderr)
+                        break
                     print(f"[cccc] Daemon exited during startup (exit code {ret}). Check log: {log_path}", file=sys.stderr)
                     try:
                         lines = log_path.read_text(encoding="utf-8").strip().split("\n")[-20:]

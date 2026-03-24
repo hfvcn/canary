@@ -5,7 +5,7 @@ import { classNames } from "../utils/classNames";
 
 interface TabBarProps {
   actors: Actor[];
-  activeTab: string; // "chat" | "board" | "workspace" | "panorama" | actor id
+  activeTab: string; // "chat" | "board" | "workspace" | "panorama" | "workflow" | actor id
   onTabChange: (tab: string) => void;
   unreadChatCount: number;
   isDark: boolean;
@@ -14,6 +14,7 @@ interface TabBarProps {
   showPanorama?: boolean;
   showBoard?: boolean;
   showWorkspace?: boolean;
+  showWorkflow?: boolean;
 }
 
 export function TabBar({
@@ -27,6 +28,7 @@ export function TabBar({
   showPanorama = true,
   showBoard = true,
   showWorkspace = false,
+  showWorkflow = true,
 }: TabBarProps) {
   const { t } = useTranslation("layout");
   const rootRef = useRef<HTMLDivElement>(null);
@@ -222,6 +224,24 @@ export function TabBar({
               aria-selected={activeTab === "panorama"}
             >
               <span>{t("panorama")}</span>
+            </button>
+          )}
+
+          {/* Workflow Tab — Ralph-Foreman workflow dashboard */}
+          {showWorkflow && (
+            <button
+              ref={activeTab === "workflow" ? activeTabRef : null}
+              onClick={() => onTabChange("workflow")}
+              className={classNames(
+                "glass-tab relative flex items-center gap-2 px-3 py-2 text-sm font-medium whitespace-nowrap flex-shrink-0 focus:outline-none",
+                activeTab === "workflow"
+                  ? "glass-tab-active text-[var(--color-text-primary)]"
+                  : "text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)]"
+              )}
+              role="tab"
+              aria-selected={activeTab === "workflow"}
+            >
+              <span>{t("workflow")}</span>
             </button>
           )}
 

@@ -167,6 +167,24 @@ class TestWindowsSupportDiagnostics(unittest.TestCase):
         self.assertEqual(cmd[1:3], ["-c", "shell_environment_policy.inherit=all"])
         self.assertEqual(cmd[3:], ["--search"])
 
+    def test_flag_only_runtime_command_gets_default_executable_prepended(self) -> None:
+        from cccc.daemon import server as daemon_server
+
+        cmd = daemon_server._normalize_runtime_command("codex", ["--model", "gpt-5"])
+
+        self.assertEqual(
+            cmd,
+            [
+                "codex",
+                "-c",
+                "shell_environment_policy.inherit=all",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--search",
+                "--model",
+                "gpt-5",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

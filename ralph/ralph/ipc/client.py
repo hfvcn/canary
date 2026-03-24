@@ -1,268 +1,447 @@
 """
-IPC Client - Communication with CCCC Daemon.
+IPC client compatibility layer for talking to the CCCC daemon.
 
-Provides async client for sending messages to CCCC Daemon via Unix socket.
-Falls back to HTTP if socket is unavailable.
+The daemon already exposes a stable request/response protocol:
+- transport: Unix socket on POSIX, TCP fallback on Windows
+- framing: newline-delimited JSON
+- shape: {"op": "...", "args": {...}}
+
+Ralph historically produced legacy Ralph-specific payloads. This client keeps
+those call sites working by translating legacy messages into daemon requests.
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+import os
+import socket
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Coroutine
-import aiohttp
 
 from .protocol import IPCMessage, MessageType
 
 logger = logging.getLogger(__name__)
 
 
+def _cccc_home() -> Path:
+    env = str(os.environ.get("CCCC_HOME") or "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    return (Path.home() / ".cccc").resolve()
+
+
+def _default_socket_path() -> Path:
+    return _cccc_home() / "daemon" / "ccccd.sock"
+
+
+def _default_addr_path() -> Path:
+    return _cccc_home() / "daemon" / "ccccd.addr.json"
+
+
 @dataclass
 class IPCClientConfig:
-    """IPC 客户端配置"""
-    socket_path: Path = Path("/tmp/cccc-daemon.sock")
-    http_url: str = "http://localhost:8765"
+    """IPC client configuration."""
+
+    socket_path: Path = field(default_factory=_default_socket_path)
+    addr_path: Path = field(default_factory=_default_addr_path)
+    http_url: str = "http://localhost:8765"  # Deprecated, kept for compatibility.
     timeout: float = 30.0
     retry_count: int = 3
     retry_delay: float = 1.0
 
 
 class IPCClient:
-    """
-    IPC 客户端
-
-    与 CCCC Daemon 通信的客户端，支持 Unix socket 和 HTTP 两种方式。
-
-    示例:
-        client = IPCClient()
-        await client.connect()
-
-        # 发送消息
-        await client.send_message({
-            "type": "ready_batch_suggestion",
-            "proposal_id": "prop-123",
-            "suggested_batch": [...]
-        })
-
-        # 监听响应
-        client.on_message(MessageType.BATCH_DECISION, handle_decision)
-    """
+    """Compatibility client for sending Ralph workflow events to the daemon."""
 
     def __init__(self, config: IPCClientConfig | None = None):
         self.config = config or IPCClientConfig()
         self._connected = False
-        self._use_http = False
+        self._endpoint: dict[str, Any] | None = None
         self._handlers: dict[MessageType, list[Callable]] = {}
-        self._session: aiohttp.ClientSession | None = None
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
-        self._listen_task: asyncio.Task | None = None
 
     async def connect(self) -> bool:
-        """
-        连接到 CCCC Daemon
+        """Resolve the daemon endpoint without opening a long-lived connection."""
+        endpoint = self._resolve_endpoint()
+        if not endpoint:
+            logger.error("Failed to locate CCCC daemon endpoint")
+            self._connected = False
+            self._endpoint = None
+            return False
 
-        优先尝试 Unix socket，失败则回退到 HTTP。
-
-        Returns:
-            是否连接成功
-        """
-        # 尝试 Unix socket
-        if self.config.socket_path.exists():
-            try:
-                self._reader, self._writer = await asyncio.open_unix_connection(
-                    str(self.config.socket_path)
-                )
-                self._connected = True
-                self._use_http = False
-                logger.info(f"Connected via Unix socket: {self.config.socket_path}")
-
-                # 启动监听任务
-                self._listen_task = asyncio.create_task(self._listen_socket())
-                return True
-            except Exception as e:
-                logger.warning(f"Unix socket connection failed: {e}")
-
-        # 回退到 HTTP
-        try:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.config.timeout)
-            )
-            # 测试连接
-            async with self._session.get(f"{self.config.http_url}/health") as resp:
-                if resp.status == 200:
-                    self._connected = True
-                    self._use_http = True
-                    logger.info(f"Connected via HTTP: {self.config.http_url}")
-                    return True
-        except Exception as e:
-            logger.warning(f"HTTP connection failed: {e}")
-
-        logger.error("Failed to connect to CCCC Daemon")
-        return False
+        self._endpoint = endpoint
+        self._connected = True
+        logger.info("Resolved daemon endpoint via %s", endpoint.get("transport"))
+        return True
 
     async def disconnect(self) -> None:
-        """断开连接"""
+        """Forget the cached endpoint."""
         self._connected = False
-
-        if self._listen_task:
-            self._listen_task.cancel()
-            try:
-                await self._listen_task
-            except asyncio.CancelledError:
-                pass
-            self._listen_task = None
-
-        if self._writer:
-            self._writer.close()
-            await self._writer.wait_closed()
-            self._writer = None
-            self._reader = None
-
-        if self._session:
-            await self._session.close()
-            self._session = None
-
-        logger.info("Disconnected from CCCC Daemon")
+        self._endpoint = None
 
     async def send_message(self, message: dict[str, Any] | IPCMessage) -> bool:
-        """
-        发送消息到 CCCC Daemon
-
-        Args:
-            message: 消息内容（字典或 IPCMessage）
-
-        Returns:
-            是否发送成功
-        """
+        """Translate a Ralph message into a daemon request and send it."""
         if not self._connected:
-            logger.warning("Not connected, attempting to connect...")
+            logger.warning("Not connected, attempting to resolve daemon endpoint...")
             if not await self.connect():
                 return False
 
-        # 转换为 JSON
-        if isinstance(message, IPCMessage):
-            data = message.to_json()
-        else:
-            data = json.dumps(message)
+        request_payload = self._translate_to_daemon_request(message)
 
         for attempt in range(self.config.retry_count):
             try:
-                if self._use_http:
-                    return await self._send_http(data)
-                else:
-                    return await self._send_socket(data)
+                return await self._send_request(request_payload)
             except Exception as e:
-                logger.warning(f"Send failed (attempt {attempt + 1}): {e}")
+                logger.warning("Send failed (attempt %s): %s", attempt + 1, e)
                 if attempt < self.config.retry_count - 1:
                     await asyncio.sleep(self.config.retry_delay)
 
         return False
 
-    async def _send_http(self, data: str) -> bool:
-        """通过 HTTP 发送"""
-        if not self._session:
+    def _resolve_endpoint(self) -> dict[str, Any] | None:
+        """Resolve the daemon transport from explicit socket or addr descriptor."""
+        if self.config.socket_path.exists():
+            return {"transport": "unix", "path": str(self.config.socket_path)}
+
+        data = self._read_addr_descriptor()
+        if not isinstance(data, dict):
+            return None
+
+        transport = str(data.get("transport") or "").strip().lower()
+        if transport == "unix":
+            path = str(data.get("path") or "").strip()
+            if path:
+                return {"transport": "unix", "path": path}
+            return None
+
+        if transport == "tcp":
+            host = str(data.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+            try:
+                port = int(data.get("port") or 0)
+            except Exception:
+                port = 0
+            if port > 0:
+                return {"transport": "tcp", "host": host, "port": port}
+
+        return None
+
+    def _read_addr_descriptor(self) -> dict[str, Any] | None:
+        if not self.config.addr_path.exists():
+            return None
+
+        try:
+            raw = self.config.addr_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            logger.warning("Failed to read daemon addr descriptor %s: %s", self.config.addr_path, e)
+            return None
+
+    async def _send_request(self, request_payload: dict[str, Any]) -> bool:
+        """Send one daemon request over the resolved endpoint and parse its response."""
+        if not self._connected or not self._endpoint:
+            if not await self.connect():
+                return False
+
+        endpoint = self._endpoint or {}
+        transport = str(endpoint.get("transport") or "").strip().lower()
+
+        if transport == "tcp":
+            reader, writer = await asyncio.open_connection(
+                str(endpoint.get("host") or "127.0.0.1"),
+                int(endpoint.get("port") or 0),
+            )
+        elif transport == "unix":
+            if getattr(socket, "AF_UNIX", None) is None:
+                raise RuntimeError("AF_UNIX not supported on this platform")
+            reader, writer = await asyncio.open_unix_connection(str(endpoint.get("path") or self.config.socket_path))
+        else:
+            raise RuntimeError(f"unsupported daemon transport: {transport or 'unknown'}")
+
+        line = b""
+        try:
+            writer.write((json.dumps(request_payload, ensure_ascii=False) + "\n").encode("utf-8"))
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout=self.config.timeout)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+        if not line:
+            logger.warning("Daemon returned an empty response")
             return False
 
         try:
-            async with self._session.post(
-                f"{self.config.http_url}/api/ralph/message",
-                data=data,
-                headers={"Content-Type": "application/json"},
-            ) as resp:
-                return resp.status == 200
+            response = json.loads(line.decode("utf-8", errors="replace"))
         except Exception as e:
-            logger.error(f"HTTP send error: {e}")
+            logger.error("Failed to decode daemon response: %s", e)
             return False
 
-    async def _send_socket(self, data: str) -> bool:
-        """通过 Unix socket 发送"""
-        if not self._writer:
-            return False
+        return bool(response.get("ok"))
 
-        try:
-            # 消息格式：长度（4字节）+ JSON 数据
-            encoded = data.encode("utf-8")
-            length = len(encoded).to_bytes(4, "big")
-            self._writer.write(length + encoded)
-            await self._writer.drain()
-            return True
-        except Exception as e:
-            logger.error(f"Socket send error: {e}")
-            return False
+    def _translate_to_daemon_request(self, message: dict[str, Any] | IPCMessage) -> dict[str, Any]:
+        if isinstance(message, dict) and "op" in message:
+            return {
+                "op": str(message.get("op") or "").strip(),
+                "args": dict(message.get("args") or {}),
+            }
 
-    async def _listen_socket(self) -> None:
-        """监听 socket 消息"""
-        if not self._reader:
-            return
+        if isinstance(message, IPCMessage):
+            return self._translate_message_type(message.type, message.payload)
 
-        while self._connected:
-            try:
-                # 读取消息长度
-                length_bytes = await self._reader.readexactly(4)
-                length = int.from_bytes(length_bytes, "big")
+        if isinstance(message, dict):
+            msg_type = str(message.get("type") or message.get("message_type") or "").strip()
+            if not msg_type:
+                raise ValueError("legacy Ralph message missing type")
+            return self._translate_message_type(msg_type, message)
 
-                # 读取消息内容
-                data = await self._reader.readexactly(length)
-                message = IPCMessage.from_json(data.decode("utf-8"))
+        raise TypeError(f"unsupported message type: {type(message).__name__}")
 
-                # 调用处理器
-                await self._dispatch_message(message)
+    def _translate_message_type(
+        self,
+        msg_type: MessageType | str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        msg_value = msg_type.value if isinstance(msg_type, MessageType) else str(msg_type or "").strip()
 
-            except asyncio.IncompleteReadError:
-                logger.warning("Connection closed by peer")
-                break
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Listen error: {e}")
+        if msg_value == MessageType.READY_BATCH_SUGGESTION.value:
+            return self._translate_ready_batch(payload)
+        if msg_value == MessageType.VERIFICATION_RESULT.value:
+            return self._translate_verification_result(payload)
+        if msg_value == MessageType.RESTART_SUGGESTION.value:
+            return self._translate_restart_suggestion(payload)
+        if msg_value == MessageType.BATCH_DECISION.value:
+            return self._translate_batch_decision(payload)
+        if msg_value == MessageType.ACTOR_STATUS.value:
+            return self._translate_actor_status(payload)
 
-    async def _dispatch_message(self, message: IPCMessage) -> None:
-        """分发消息到处理器"""
-        handlers = self._handlers.get(message.type, [])
-        for handler in handlers:
-            try:
-                result = handler(message)
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception as e:
-                logger.error(f"Handler error: {e}")
+        raise ValueError(f"unsupported Ralph IPC message type: {msg_value}")
+
+    def _translate_ready_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        suggestion_id = str(payload.get("suggestion_id") or payload.get("proposal_id") or "").strip()
+        workflow_id = self._coerce_workflow_id(payload.get("workflow_id"), suggestion_id)
+
+        tasks: list[dict[str, Any]] = []
+        raw_tasks = payload.get("tasks")
+        if isinstance(raw_tasks, list) and raw_tasks:
+            for item in raw_tasks:
+                if not isinstance(item, dict):
+                    continue
+                task_id = str(item.get("id") or item.get("task_id") or "").strip()
+                if not task_id:
+                    continue
+                tasks.append(
+                    {
+                        "id": task_id,
+                        "title": str(item.get("title") or "").strip(),
+                        "type": str(item.get("type") or item.get("task_type") or "general").strip() or "general",
+                    }
+                )
+        else:
+            for item in payload.get("suggested_batch", []):
+                if not isinstance(item, dict):
+                    continue
+                task_id = str(item.get("task_id") or item.get("id") or "").strip()
+                if not task_id:
+                    continue
+                tasks.append(
+                    {
+                        "id": task_id,
+                        "title": str(item.get("title") or "").strip(),
+                        "type": str(item.get("task_type") or item.get("type") or "general").strip() or "general",
+                    }
+                )
+
+        return {
+            "op": "ralph_batch_suggest",
+            "args": {
+                "workflow_id": workflow_id,
+                "suggestion_id": suggestion_id,
+                "tasks": tasks,
+                "rationale": str(payload.get("rationale") or "").strip(),
+                "estimated_parallelism": int(payload.get("estimated_parallelism") or len(tasks)),
+            },
+        }
+
+    def _translate_verification_result(self, payload: dict[str, Any]) -> dict[str, Any]:
+        checks: list[dict[str, Any]] = []
+
+        raw_checks = payload.get("checks")
+        if isinstance(raw_checks, list) and raw_checks:
+            for item in raw_checks:
+                if not isinstance(item, dict):
+                    continue
+                checks.append(
+                    {
+                        "name": str(item.get("name") or "").strip(),
+                        "outcome": str(item.get("outcome") or "skipped").strip(),
+                        "duration_ms": int(item.get("duration_ms") or 0),
+                        "message": str(item.get("message") or "").strip(),
+                        "details": dict(item.get("details") or {}),
+                    }
+                )
+            overall_outcome = str(payload.get("overall_outcome") or "failed").strip()
+        else:
+            verification = payload.get("verification")
+            verification = verification if isinstance(verification, dict) else {}
+            for name in ("build", "test", "lint"):
+                checks.append(
+                    {
+                        "name": name,
+                        "outcome": "passed" if verification.get(name) == "pass" else "failed",
+                        "duration_ms": 0,
+                        "message": "",
+                        "details": {},
+                    }
+                )
+            overall_outcome = "passed" if checks and all(item["outcome"] == "passed" for item in checks) else "failed"
+
+        workflow_id = self._coerce_workflow_id(
+            payload.get("workflow_id"),
+            payload.get("task_id"),
+            payload.get("commit_hash"),
+        )
+
+        return {
+            "op": "ralph_verification_result",
+            "args": {
+                "workflow_id": workflow_id,
+                "task_id": str(payload.get("task_id") or "").strip() or None,
+                "overall_outcome": overall_outcome,
+                "checks": checks,
+                "summary": str(payload.get("summary") or "").strip(),
+            },
+        }
+
+    def _translate_restart_suggestion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        suggestion_id = str(payload.get("suggestion_id") or "").strip()
+        task_id = str(payload.get("task_id") or payload.get("actor_id") or "").strip()
+        workflow_id = self._coerce_workflow_id(payload.get("workflow_id"), suggestion_id, task_id)
+
+        files_to_adopt: list[str] = []
+        raw_files = payload.get("files_to_adopt")
+        if isinstance(raw_files, list):
+            files_to_adopt = [str(item).strip() for item in raw_files if str(item).strip()]
+        else:
+            context_path = str(payload.get("context_path") or "").strip()
+            if context_path:
+                files_to_adopt = [context_path]
+
+        return {
+            "op": "ralph_restart_suggest",
+            "args": {
+                "workflow_id": workflow_id,
+                "suggestion_id": suggestion_id,
+                "task_id": task_id,
+                "task_title": str(payload.get("task_title") or "").strip(),
+                "task_type": str(payload.get("task_type") or "general").strip() or "general",
+                "reason": str(payload.get("reason") or "").strip(),
+                "previous_attempts": int(payload.get("previous_attempts") or 0),
+                "files_to_adopt": files_to_adopt,
+            },
+        }
+
+    def _translate_batch_decision(self, payload: dict[str, Any]) -> dict[str, Any]:
+        approved_tasks = payload.get("approved_tasks")
+        if not isinstance(approved_tasks, list) or not approved_tasks:
+            approved_tasks = [
+                str(item.get("task_id") or "").strip()
+                for item in payload.get("confirmed_batch", [])
+                if isinstance(item, dict) and str(item.get("task_id") or "").strip()
+            ]
+
+        decision_map = {
+            "accepted": "approved",
+            "accepted_with_changes": "modified",
+            "approved": "approved",
+            "modified": "modified",
+            "rejected": "rejected",
+            "deferred": "deferred",
+        }
+        decision = decision_map.get(str(payload.get("decision") or "").strip(), "deferred")
+        suggestion_id = str(payload.get("suggestion_id") or payload.get("proposal_id") or "").strip()
+        workflow_id = self._coerce_workflow_id(payload.get("workflow_id"), suggestion_id)
+
+        return {
+            "op": "ralph_batch_decision",
+            "args": {
+                "decision_id": str(payload.get("decision_id") or suggestion_id or "decision").strip(),
+                "suggestion_id": suggestion_id,
+                "workflow_id": workflow_id,
+                "decision": decision,
+                "approved_tasks": [item for item in approved_tasks if item],
+                "rejected_tasks": list(payload.get("rejected_tasks") or []),
+                "reason": str(payload.get("reason") or "").strip(),
+            },
+        }
+
+    def _translate_actor_status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        status_map = {
+            "active": "executing",
+            "stopped": "completed",
+            "idle": "idle",
+            "analyzing": "analyzing",
+            "executing": "executing",
+            "waiting": "waiting",
+            "blocked": "blocked",
+            "completed": "completed",
+        }
+        raw_status = str(payload.get("status") or "").strip().lower()
+        status = status_map.get(raw_status, "idle")
+
+        args: dict[str, Any] = {
+            "actor_id": str(payload.get("actor_id") or "").strip(),
+            "actor_type": str(payload.get("actor_type") or "other").strip() or "other",
+            "status": status,
+            "current_task_id": payload.get("current_task_id") or payload.get("current_task"),
+            "message": str(payload.get("message") or "").strip(),
+        }
+
+        workflow_id = str(payload.get("workflow_id") or "").strip()
+        if workflow_id:
+            args["workflow_id"] = workflow_id
+
+        progress = payload.get("progress_pct")
+        if progress is not None:
+            args["progress_pct"] = progress
+
+        return {"op": "ralph_actor_status", "args": args}
+
+    @staticmethod
+    def _coerce_workflow_id(*values: Any) -> str:
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return "ralph-workflow"
 
     def on_message(
         self,
         message_type: MessageType,
         handler: Callable[[IPCMessage], Coroutine[Any, Any, None] | None],
     ) -> None:
-        """
-        注册消息处理器
-
-        Args:
-            message_type: 要处理的消息类型
-            handler: 处理函数
-        """
-        if message_type not in self._handlers:
-            self._handlers[message_type] = []
-        self._handlers[message_type].append(handler)
+        """Register a legacy callback for compatibility."""
+        self._handlers.setdefault(message_type, []).append(handler)
 
     def off_message(
         self,
         message_type: MessageType,
         handler: Callable,
     ) -> bool:
-        """
-        移除消息处理器
-
-        Returns:
-            是否成功移除
-        """
-        if message_type in self._handlers:
-            try:
-                self._handlers[message_type].remove(handler)
-                return True
-            except ValueError:
-                pass
-        return False
+        """Remove a registered legacy callback."""
+        handlers = self._handlers.get(message_type)
+        if not handlers:
+            return False
+        try:
+            handlers.remove(handler)
+            return True
+        except ValueError:
+            return False
 
     @property
     def is_connected(self) -> bool:
@@ -270,17 +449,16 @@ class IPCClient:
 
     @property
     def connection_type(self) -> str:
-        if not self._connected:
+        if not self._connected or not self._endpoint:
             return "disconnected"
-        return "http" if self._use_http else "socket"
+        return str(self._endpoint.get("transport") or "unknown")
 
 
-# 全局 IPC 客户端实例
 _default_client: IPCClient | None = None
 
 
 def get_ipc_client() -> IPCClient:
-    """获取全局 IPC 客户端实例"""
+    """Get a singleton IPC client."""
     global _default_client
     if _default_client is None:
         _default_client = IPCClient()

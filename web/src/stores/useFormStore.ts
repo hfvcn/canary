@@ -20,6 +20,7 @@ interface FormState {
   newActorRuntime: SupportedRuntime;
   newActorCommand: string;
   newActorUseDefaultCommand: boolean;
+  newActorModelId: string;
   newActorSecretsSetText: string;
   newActorCapabilityAutoloadText: string;
   newActorRoleNotes: string;
@@ -55,6 +56,7 @@ interface FormState {
   setNewActorRuntime: (v: SupportedRuntime) => void;
   setNewActorCommand: (v: string) => void;
   setNewActorUseDefaultCommand: (v: boolean) => void;
+  setNewActorModelId: (v: string) => void;
   setNewActorSecretsSetText: (v: string) => void;
   setNewActorCapabilityAutoloadText: (v: string) => void;
   setNewActorRoleNotes: (v: string) => void;
@@ -94,6 +96,7 @@ export const useFormStore = create<FormState>((set) => ({
   newActorRuntime: "codex",
   newActorCommand: "",
   newActorUseDefaultCommand: true,
+  newActorModelId: "",
   newActorSecretsSetText: "",
   newActorCapabilityAutoloadText: "",
   newActorRoleNotes: "",
@@ -129,6 +132,7 @@ export const useFormStore = create<FormState>((set) => ({
   setNewActorRuntime: (v) => set({ newActorRuntime: v }),
   setNewActorCommand: (v) => set({ newActorCommand: v }),
   setNewActorUseDefaultCommand: (v) => set({ newActorUseDefaultCommand: v }),
+  setNewActorModelId: (v) => set({ newActorModelId: v }),
   setNewActorSecretsSetText: (v) => set({ newActorSecretsSetText: v }),
   setNewActorCapabilityAutoloadText: (v) => set({ newActorCapabilityAutoloadText: v }),
   setNewActorRoleNotes: (v) => set({ newActorRoleNotes: v }),
@@ -141,6 +145,7 @@ export const useFormStore = create<FormState>((set) => ({
       newActorId: "",
       newActorCommand: "",
       newActorUseDefaultCommand: true,
+      newActorModelId: "",
       newActorSecretsSetText: "",
       newActorCapabilityAutoloadText: "",
       newActorRoleNotes: "",

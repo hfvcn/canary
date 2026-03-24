@@ -150,6 +150,39 @@ Run comparable multi-agent sessions with stable logging and replayability.
 - Uncontrolled environment differences.
 - Missing run metadata in messages.
 
+## Use Case 5: Headless CLI Smoke Validation
+
+### Goal
+
+Verify the daemon-driven control plane without relying on Web UI.
+
+### Minimal Setup
+
+```bash
+cd /path/to/repo
+bash scripts/smoke_headless_workflow.sh
+```
+
+### Execution Flow
+
+1. Start an isolated daemon under a temporary `CCCC_HOME`.
+2. Create a group and attach the current workspace.
+3. Add a headless actor and start the group.
+4. Send a directed message and verify inbox delivery.
+5. Read the ledger tail and confirm the event path end to end.
+
+### Success Criteria
+
+- Core lifecycle works without opening `/ui/`.
+- CLI stays aligned with daemon semantics.
+- Validation can run in local shells and CI runners.
+
+### Common Failure Points
+
+- Depending on Web-only flows for state changes.
+- Running against a polluted shared `CCCC_HOME`.
+- Forgetting to verify inbox and ledger, not just command exit codes.
+
 ## Recommended Next Reads
 
 - `docs/guide/operations.md`

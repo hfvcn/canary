@@ -277,6 +277,10 @@ class ObservabilityUpdateRequest(BaseModel):
     log_level: Optional[str] = None
     terminal_transcript_per_actor_bytes: Optional[int] = None
     terminal_ui_scrollback_lines: Optional[int] = None
+    terminal_ui_font_family: Optional[str] = None
+    terminal_ui_font_size: Optional[int] = None
+    terminal_ui_line_height: Optional[float] = None
+    terminal_ui_letter_spacing: Optional[int] = None
 
 
 class RegistryReconcileRequest(BaseModel):

@@ -29,6 +29,27 @@ class TestBootstrapActorOps(unittest.TestCase):
 
         return handle_request(DaemonRequest.model_validate({"op": op, "args": args}))
 
+    def test_server_autostart_passes_caller_context_to_profile_resolver(self) -> None:
+        from cccc.daemon import server as daemon_server
+
+        captured: dict[str, object] = {}
+
+        def _fake_autostart_running_groups(_home: Path, **kwargs):
+            resolver = kwargs["resolve_linked_actor_before_start"]
+            captured["resolved"] = resolver("group", "actor", caller_id="user-a", is_admin=False)
+
+        with patch.object(daemon_server, "autostart_running_groups", side_effect=_fake_autostart_running_groups), patch.object(
+            daemon_server,
+            "_resolve_linked_actor_before_start",
+            return_value={"id": "actor", "profile_owner": "user-a"},
+        ) as resolve_mock:
+            daemon_server._maybe_autostart_running_groups()
+
+        self.assertEqual(captured["resolved"], {"id": "actor", "profile_owner": "user-a"})
+        resolve_mock.assert_called_once()
+        self.assertEqual(resolve_mock.call_args.kwargs["caller_id"], "user-a")
+        self.assertFalse(bool(resolve_mock.call_args.kwargs["is_admin"]))
+
     def test_no_groups_is_noop(self) -> None:
         home, cleanup = self._with_home()
         try:

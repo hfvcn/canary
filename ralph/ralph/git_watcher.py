@@ -113,6 +113,15 @@ class GitWatcher:
         except TypeError:
             # detached HEAD
             return "HEAD"
+
+    def _get_monitored_ref(self) -> str:
+        """获取当前监控的 ref 名称。"""
+        return self.config.branch or self._get_current_branch()
+
+    def _get_ref_commit(self, ref_name: str) -> Commit:
+        """读取指定 ref 的提交对象。"""
+        assert self._repo is not None
+        return self._repo.commit(ref_name)
             
     def _get_latest_commit(self) -> ParsedCommit | None:
         """获取最新提交"""
@@ -120,8 +129,8 @@ class GitWatcher:
             return None
             
         try:
-            branch = self.config.branch or self._get_current_branch()
-            commit = self._repo.head.commit
+            branch = self._get_monitored_ref()
+            commit = self._get_ref_commit(branch)
             return ParsedCommit.from_git_commit(commit, branch)
         except Exception as e:
             logger.error(f"Failed to get latest commit: {e}")
@@ -133,16 +142,16 @@ class GitWatcher:
             return []
             
         try:
-            branch = self.config.branch or self._get_current_branch()
+            branch = self._get_monitored_ref()
             
             if last_hash is None:
                 # 首次运行，只返回最新提交
-                commit = self._repo.head.commit
+                commit = self._get_ref_commit(branch)
                 return [ParsedCommit.from_git_commit(commit, branch)]
                 
-            # 获取从 last_hash 到 HEAD 的所有提交
+            # 获取从 last_hash 到监控分支 tip 的所有提交
             commits = []
-            for commit in self._repo.iter_commits(f"{last_hash}..HEAD"):
+            for commit in self._repo.iter_commits(f"{last_hash}..{branch}"):
                 commits.append(ParsedCommit.from_git_commit(commit, branch))
                 
             # 反转以保持时间顺序（旧的在前）

@@ -58,7 +58,7 @@ def _validate_required(args: Dict[str, Any], *fields: str) -> Optional[DaemonRes
     return None
 
 
-def handle_ralph_batch_suggest(args: Dict[str, Any]) -> DaemonResponse:
+def handle_ralph_batch_suggest(args: Dict[str, Any], *, daemon_request_fn: Any = None) -> DaemonResponse:
     """
     Handle ralph_batch_suggest operation.
 
@@ -69,6 +69,9 @@ def handle_ralph_batch_suggest(args: Dict[str, Any]) -> DaemonResponse:
         tasks: List of task references [{id, title, type}]
         rationale: Why these tasks are suggested together
         estimated_parallelism: Expected parallelism degree
+        auto_process: If true, automatically trigger workflow processing
+        group_id: Required if auto_process is true
+        project_root: Required if auto_process is true
     """
     err = _validate_required(args, "workflow_id", "tasks")
     if err:
@@ -78,7 +81,7 @@ def handle_ralph_batch_suggest(args: Dict[str, Any]) -> DaemonResponse:
     if not isinstance(tasks, list) or len(tasks) == 0:
         return _error("invalid_tasks", "Tasks must be a non-empty list")
 
-    suggestion_id = str(uuid4())
+    suggestion_id = str(args.get("suggestion_id") or uuid4())
     suggestion = ReadyBatchSuggestion(
         suggestion_id=suggestion_id,
         workflow_id=str(args["workflow_id"]),
@@ -90,11 +93,67 @@ def handle_ralph_batch_suggest(args: Dict[str, Any]) -> DaemonResponse:
     _RALPH_STATE["pending_suggestions"][suggestion_id] = suggestion.model_dump()
     logger.info(f"Ralph batch suggestion created: {suggestion_id} with {len(tasks)} tasks")
 
-    return _success({
+    result: Dict[str, Any] = {
         "suggestion_id": suggestion_id,
         "task_count": len(tasks),
         "created_at": suggestion.created_at,
-    })
+    }
+
+    # Optionally trigger workflow processing
+    if args.get("auto_process"):
+        process_result = _try_process_batch(suggestion, args, daemon_request_fn=daemon_request_fn)
+        if process_result:
+            result["processing"] = process_result
+
+    return _success(result)
+
+
+def _try_process_batch(
+    suggestion: ReadyBatchSuggestion,
+    args: Dict[str, Any],
+    *,
+    daemon_request_fn: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Try to process batch through workflow orchestrator."""
+    from pathlib import Path
+
+    group_id = str(args.get("group_id") or "").strip()
+    project_root = str(args.get("project_root") or "").strip()
+
+    if not group_id or not project_root:
+        return {"status": "skipped", "reason": "missing group_id or project_root"}
+
+    try:
+        from .foreman.workflow_orchestrator import get_orchestrator
+
+        orchestrator = get_orchestrator(
+            group_id,
+            project_root=Path(project_root),
+            feishu_chat_id=args.get("feishu_chat_id"),
+            daemon_request_fn=daemon_request_fn,
+        )
+
+        if orchestrator is None:
+            return {"status": "skipped", "reason": "orchestrator not available"}
+
+        # Update daemon_request_fn on cached orchestrator (may have been created without it)
+        if daemon_request_fn and not orchestrator._daemon_request_fn:
+            orchestrator._daemon_request_fn = daemon_request_fn
+
+        result = orchestrator.process_batch_suggestion(
+            suggestion,
+            auto_start_agents=bool(args.get("auto_start_agents", True)),
+        )
+
+        return {
+            "status": "processed",
+            "decision": result.decision,
+            "approved_count": len(result.approved_tasks),
+            "rejected_count": len(result.rejected_tasks),
+        }
+    except Exception as e:
+        logger.warning(f"Failed to process batch: {e}")
+        return {"status": "error", "error": str(e)}
 
 
 def handle_ralph_verification_result(args: Dict[str, Any]) -> DaemonResponse:
@@ -118,7 +177,7 @@ def handle_ralph_verification_result(args: Dict[str, Any]) -> DaemonResponse:
     if outcome not in ("passed", "failed", "skipped", "timeout"):
         return _error("invalid_outcome", f"Invalid verification outcome: {outcome}")
 
-    verification_id = str(uuid4())
+    verification_id = str(args.get("verification_id") or uuid4())
     checks = args.get("checks", [])
 
     verification = VerificationResult(
@@ -166,7 +225,7 @@ def handle_ralph_restart_suggest(args: Dict[str, Any]) -> DaemonResponse:
     if err:
         return err
 
-    suggestion_id = str(uuid4())
+    suggestion_id = str(args.get("suggestion_id") or uuid4())
     suggestion = RestartSuggestion(
         suggestion_id=suggestion_id,
         workflow_id=str(args["workflow_id"]),
@@ -411,6 +470,122 @@ def handle_ralph_clear_workflow(args: Dict[str, Any]) -> DaemonResponse:
     return _success({"workflow_id": workflow_id, "cleared": cleared})
 
 
+def handle_ralph_process_pending(args: Dict[str, Any], *, daemon_request_fn: Any = None) -> DaemonResponse:
+    """
+    Handle ralph_process_pending operation.
+
+    Explicitly process a pending batch suggestion through the workflow.
+
+    Args:
+        suggestion_id: ID of pending suggestion to process
+        group_id: CCCC group ID
+        project_root: Project root directory
+        feishu_chat_id: Optional Feishu chat ID for notifications
+        auto_start_agents: Whether to auto-start assigned agents (default true)
+    """
+    from pathlib import Path
+
+    err = _validate_required(args, "suggestion_id", "group_id", "project_root")
+    if err:
+        return err
+
+    suggestion_id = str(args["suggestion_id"])
+    group_id = str(args["group_id"])
+    project_root = Path(str(args["project_root"]))
+
+    # Find pending suggestion
+    suggestion_data = _RALPH_STATE["pending_suggestions"].get(suggestion_id)
+    if not suggestion_data:
+        return _error("suggestion_not_found", f"Pending suggestion not found: {suggestion_id}")
+
+    # Reconstruct suggestion object
+    suggestion = ReadyBatchSuggestion(
+        suggestion_id=suggestion_data["suggestion_id"],
+        workflow_id=suggestion_data["workflow_id"],
+        tasks=suggestion_data["tasks"],
+        rationale=suggestion_data.get("rationale", ""),
+        estimated_parallelism=suggestion_data.get("estimated_parallelism", 1),
+    )
+
+    try:
+        from .foreman.workflow_orchestrator import get_orchestrator
+
+        orchestrator = get_orchestrator(
+            group_id,
+            project_root=project_root,
+            feishu_chat_id=args.get("feishu_chat_id"),
+            daemon_request_fn=daemon_request_fn,
+        )
+
+        if orchestrator is None:
+            return _error("orchestrator_unavailable", "Failed to initialize workflow orchestrator")
+
+        # Update daemon_request_fn on cached orchestrator
+        if daemon_request_fn and not orchestrator._daemon_request_fn:
+            orchestrator._daemon_request_fn = daemon_request_fn
+
+        result = orchestrator.process_batch_suggestion(
+            suggestion,
+            auto_start_agents=bool(args.get("auto_start_agents", True)),
+        )
+
+        # Generate batch decision
+        decision = orchestrator.get_batch_decision(result)
+
+        # Store decision
+        _RALPH_STATE["decisions"][decision.decision_id] = decision.model_dump()
+
+        # Remove from pending if approved or rejected
+        if result.decision in ("approved", "rejected"):
+            _RALPH_STATE["pending_suggestions"].pop(suggestion_id, None)
+
+        logger.info(f"Processed pending suggestion {suggestion_id}: {result.decision}")
+
+        return _success({
+            "suggestion_id": suggestion_id,
+            "decision_id": decision.decision_id,
+            "decision": result.decision,
+            "approved_tasks": [t.id for t in result.approved_tasks],
+            "rejected_tasks": [t.id for t in result.rejected_tasks],
+            "reason": result.reason,
+        })
+
+    except Exception as e:
+        logger.error(f"Failed to process pending suggestion {suggestion_id}: {e}")
+        return _error("processing_failed", f"Failed to process suggestion: {e}")
+
+
+def handle_ralph_workflow_progress(args: Dict[str, Any]) -> DaemonResponse:
+    """
+    Handle ralph_workflow_progress operation.
+
+    Get workflow progress from the orchestrator.
+
+    Args:
+        workflow_id: Workflow identifier
+        group_id: CCCC group ID
+    """
+    workflow_id = str(args.get("workflow_id") or "").strip()
+    group_id = str(args.get("group_id") or "").strip()
+
+    if not group_id:
+        return _error("missing_group_id", "Missing group_id")
+
+    try:
+        from .foreman.workflow_orchestrator import get_orchestrator
+
+        orchestrator = get_orchestrator(group_id)
+        if orchestrator is None:
+            return _error("orchestrator_not_found", "No active orchestrator for group")
+
+        state = orchestrator.get_workflow_state(workflow_id)
+        return _success(state)
+
+    except Exception as e:
+        logger.warning(f"Failed to get workflow progress: {e}")
+        return _error("progress_error", f"Failed to get progress: {e}")
+
+
 # Operation dispatcher
 _RALPH_OPS = {
     "ralph_batch_suggest": handle_ralph_batch_suggest,
@@ -421,17 +596,31 @@ _RALPH_OPS = {
     "ralph_get_pending": handle_ralph_get_pending,
     "ralph_get_actors": handle_ralph_get_actors,
     "ralph_clear_workflow": handle_ralph_clear_workflow,
+    "ralph_process_pending": handle_ralph_process_pending,
+    "ralph_workflow_progress": handle_ralph_workflow_progress,
 }
 
 
-def try_handle_ralph_op(op: str, args: Dict[str, Any]) -> Optional[DaemonResponse]:
+def try_handle_ralph_op(
+    op: str,
+    args: Dict[str, Any],
+    *,
+    daemon_request_fn: Any = None,
+) -> Optional[DaemonResponse]:
     """
     Try to handle a Ralph IPC operation.
 
     Returns None if the operation is not a Ralph operation.
     Returns DaemonResponse if handled.
+
+    Args:
+        daemon_request_fn: Optional callback to dispatch daemon requests
+            (used to register foreman agents as real group actors).
     """
     handler = _RALPH_OPS.get(op)
     if handler is None:
         return None
+    # Inject daemon_request_fn for handlers that need it
+    if op in ("ralph_batch_suggest", "ralph_process_pending"):
+        return handler(args, daemon_request_fn=daemon_request_fn)
     return handler(args)

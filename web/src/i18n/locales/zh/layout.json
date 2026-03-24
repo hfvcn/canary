@@ -107,6 +107,7 @@
   "newFilePrompt": "输入新文件名",
   "workspaceCreateFailed": "创建工作区内容失败",
   "panorama": "全景",
+  "workflow": "工作流",
   "panoramaHudTitle": "智能体状态",
   "panoramaHudHint": "在全景场景里快速查看谁在执行中、谁被阻塞、谁在待命。",
   "panoramaHudActive": "执行中",

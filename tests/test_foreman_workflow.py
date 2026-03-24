@@ -8,14 +8,14 @@ from typing import List
 
 import pytest
 
-from src.cccc.contracts.v1.agent import Agent, ModelCapability, ModelRegistry
-from src.cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef
-from src.cccc.daemon.foreman.agent_pool import (
+from cccc.contracts.v1.agent import Agent, ModelCapability, ModelRegistry
+from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef
+from cccc.daemon.foreman.agent_pool import (
     AgentPoolManager,
     AgentEvaluation,
     TaskAssignment,
 )
-from src.cccc.daemon.foreman.workflow import (
+from cccc.daemon.foreman.workflow import (
     receive_ready_batch,
     evaluate_agent_pool,
     assign_tasks,
@@ -23,7 +23,7 @@ from src.cccc.daemon.foreman.workflow import (
     ForemanWorkflow,
     BatchEvaluationResult,
 )
-from src.cccc.daemon.ops.agent_ops import (
+from cccc.daemon.ops.agent_ops import (
     create_agent,
     save_model_registry,
 )
@@ -268,6 +268,33 @@ class TestAgentPoolManager:
         assert not assignment.is_new_agent
         assert "Reused" in assignment.assignment_reason
 
+    def test_create_or_reuse_populates_model_info(self, pool_manager, temp_project_dir):
+        """TaskAssignment should carry model_runtime and model_id from the agent."""
+        create_agent(
+            agent_id="claude-worker",
+            name="Claude Worker",
+            agents_dir=temp_project_dir / ".cccc" / "agents",
+            model_runtime="claude",
+            model_id="claude-sonnet-4",
+            role_type="worker",
+            capabilities=["task_execution"],
+            task_affinity=["backend"],
+        )
+
+        task = TaskRef(id="T1", title="Backend task", type="backend")
+        assignment = pool_manager.create_or_reuse_agent(task, prefer_reuse=True)
+
+        assert assignment.model_runtime == "claude"
+        assert assignment.model_id == "claude-sonnet-4"
+
+    def test_create_agent_populates_model_info(self, pool_manager):
+        """Newly created agent assignment should carry model info from registry."""
+        task = TaskRef(id="T1", title="Backend task", type="backend")
+        assignment = pool_manager.create_or_reuse_agent(task, prefer_reuse=False)
+
+        assert assignment.agent_id != ""
+        assert assignment.model_runtime != ""  # Should be populated from registry
+
 
 class TestAssignTasks:
     """Tests for assign_tasks function."""
@@ -281,6 +308,19 @@ class TestAssignTasks:
         for assignment in assignments:
             assert assignment.agent_id != ""
             assert assignment.is_new_agent  # All new since no existing agents
+
+    def test_assign_same_type_tasks_create_unique_agents(self, pool_manager):
+        """Parallel tasks of the same type should not collide on a single agent ID."""
+        tasks = [
+            TaskRef(id="T1", title="Backend task 1", type="backend"),
+            TaskRef(id="T2", title="Backend task 2", type="backend"),
+        ]
+
+        assignments = assign_tasks(tasks, pool_manager, prefer_reuse=False)
+
+        assert len(assignments) == 2
+        assert len({assignment.agent_id for assignment in assignments}) == 2
+        assert set(pool_manager.get_active_assignments().values()) == {"T1", "T2"}
 
 
 class TestMakeBatchDecision:
@@ -342,6 +382,90 @@ class TestMakeBatchDecision:
         assert decision.decision == "rejected"
         assert len(decision.approved_tasks) == 0
         assert len(decision.rejected_tasks) == 3
+
+
+class TestWorkflowOrchestratorDaemonBridge:
+    """Tests for WorkflowOrchestrator registering agents as group actors."""
+
+    def test_add_actor_via_daemon_dispatches_actor_add(self, temp_project_dir, sample_suggestion):
+        """Should dispatch actor_add request through daemon_request_fn."""
+        from cccc.contracts.v1 import DaemonResponse
+        from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+
+        dispatched_requests = []
+
+        def fake_daemon_request(req):
+            dispatched_requests.append(req)
+            return DaemonResponse(ok=True, result={"actor": {"id": req.args["actor_id"]}}), False
+
+        orchestrator = WorkflowOrchestrator(
+            project_root=temp_project_dir,
+            group_id="test-group",
+            daemon_request_fn=fake_daemon_request,
+        )
+
+        assignment = TaskAssignment(
+            task=TaskRef(id="T1", title="Backend task", type="backend"),
+            agent_id="claude-backend-worker",
+            agent_name="Claude Backend Worker",
+            model_runtime="claude",
+            model_id="claude-sonnet-4",
+        )
+
+        result = orchestrator._add_actor_via_daemon(assignment)
+
+        assert result is True
+        assert len(dispatched_requests) == 1
+        req = dispatched_requests[0]
+        assert req.op == "actor_add"
+        assert req.args["group_id"] == "test-group"
+        assert req.args["actor_id"] == "claude-backend-worker"
+        assert req.args["runtime"] == "claude"
+        assert req.args["title"] == "Claude Backend Worker"
+        assert req.args["runner"] == "pty"
+
+    def test_add_actor_via_daemon_returns_false_without_fn(self, temp_project_dir):
+        """Should return False when daemon_request_fn is not set."""
+        from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+
+        orchestrator = WorkflowOrchestrator(
+            project_root=temp_project_dir,
+            group_id="test-group",
+        )
+
+        assignment = TaskAssignment(
+            task=TaskRef(id="T1", title="Task", type="backend"),
+            agent_id="test-agent",
+            agent_name="Test Agent",
+        )
+
+        assert orchestrator._add_actor_via_daemon(assignment) is False
+
+    def test_start_assigned_agents_registers_actors(self, temp_project_dir, sample_suggestion):
+        """Should register agents as group actors via daemon when processing batch."""
+        from cccc.contracts.v1 import DaemonResponse
+        from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+
+        added_actors = []
+
+        def fake_daemon_request(req):
+            if req.op == "actor_add":
+                added_actors.append(req.args["actor_id"])
+            return DaemonResponse(ok=True, result={"actor": {"id": req.args.get("actor_id", "")}}), False
+
+        orchestrator = WorkflowOrchestrator(
+            project_root=temp_project_dir,
+            group_id="test-group",
+            daemon_request_fn=fake_daemon_request,
+        )
+
+        result = orchestrator.process_batch_suggestion(
+            sample_suggestion,
+            auto_start_agents=True,
+        )
+
+        # Each approved task should have had actor_add dispatched
+        assert len(added_actors) == len(result.approved_tasks)
 
 
 class TestForemanWorkflow:

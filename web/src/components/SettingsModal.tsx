@@ -26,6 +26,11 @@ import { ModalFrame } from "./modals/ModalFrame";
 import { SettingsNavigation } from "./modals/settings/SettingsNavigation";
 import { IMConfigDraft, saveAndStartIMBridge, saveIMConfigDraft } from "./modals/settings/imBridgeConfig";
 import { useModalA11y } from "../hooks/useModalA11y";
+import {
+  TERMINAL_FONT_SIZE,
+  TERMINAL_LETTER_SPACING,
+  TERMINAL_LINE_HEIGHT,
+} from "./terminalRendering";
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -138,6 +143,10 @@ export function SettingsModal({
   const [logLevel, setLogLevel] = useState<"INFO" | "DEBUG">("INFO");
   const [terminalBacklogMiB, setTerminalBacklogMiB] = useState(10);
   const [terminalScrollbackLines, setTerminalScrollbackLines] = useState(8000);
+  const [terminalFontFamily, setTerminalFontFamily] = useState("");
+  const [terminalFontSize, setTerminalFontSize] = useState(TERMINAL_FONT_SIZE);
+  const [terminalLineHeight, setTerminalLineHeight] = useState(TERMINAL_LINE_HEIGHT);
+  const [terminalLetterSpacing, setTerminalLetterSpacing] = useState(TERMINAL_LETTER_SPACING);
   const [obsBusy, setObsBusy] = useState(false);
 
   // Developer-mode debug views
@@ -355,6 +364,26 @@ export function SettingsModal({
         if (Number.isFinite(scrollbackLines) && scrollbackLines > 0) {
           setTerminalScrollbackLines(Math.max(1000, Math.round(scrollbackLines)));
         }
+        const fontFamily = String(obs.terminal_ui?.font_family || "").trim();
+        setTerminalFontFamily(fontFamily);
+        const fontSize = Number(obs.terminal_ui?.font_size || 0);
+        setTerminalFontSize(
+          Number.isFinite(fontSize) && fontSize > 0
+            ? Math.max(8, Math.min(32, Math.round(fontSize)))
+            : TERMINAL_FONT_SIZE
+        );
+        const lineHeight = Number(obs.terminal_ui?.line_height || 0);
+        setTerminalLineHeight(
+          Number.isFinite(lineHeight) && lineHeight > 0
+            ? Math.max(0.8, Math.min(2, lineHeight))
+            : TERMINAL_LINE_HEIGHT
+        );
+        const letterSpacing = Number(obs.terminal_ui?.letter_spacing);
+        setTerminalLetterSpacing(
+          Number.isFinite(letterSpacing)
+            ? Math.max(-2, Math.min(5, Math.round(letterSpacing)))
+            : TERMINAL_LETTER_SPACING
+        );
       }
     } catch (e) {
       console.error("Failed to load observability settings:", e);
@@ -657,11 +686,19 @@ export function SettingsModal({
     try {
       const perActorBytes = Math.max(1, Math.min(50, Number(terminalBacklogMiB || 0))) * 1024 * 1024;
       const scrollbackLines = Math.max(1000, Math.min(200000, Number(terminalScrollbackLines || 0)));
+      const fontFamily = String(terminalFontFamily || "").trim();
+      const fontSize = Math.max(8, Math.min(32, Math.round(Number(terminalFontSize || 0) || TERMINAL_FONT_SIZE)));
+      const lineHeight = Math.max(0.8, Math.min(2, Number(terminalLineHeight || 0) || TERMINAL_LINE_HEIGHT));
+      const letterSpacing = Math.max(-2, Math.min(5, Math.round(Number(terminalLetterSpacing || 0))));
       const resp = await api.updateObservability({
         developerMode,
         logLevel,
         terminalTranscriptPerActorBytes: perActorBytes,
         terminalUiScrollbackLines: scrollbackLines,
+        terminalUiFontFamily: fontFamily,
+        terminalUiFontSize: fontSize,
+        terminalUiLineHeight: lineHeight,
+        terminalUiLetterSpacing: letterSpacing,
       });
       if (resp.ok && resp.result?.observability) {
         const obs = resp.result.observability;
@@ -677,6 +714,26 @@ export function SettingsModal({
         if (Number.isFinite(lines) && lines > 0) {
           setTerminalScrollbackLines(Math.max(1000, Math.round(lines)));
         }
+        const nextFontFamily = String(obs.terminal_ui?.font_family || "").trim();
+        setTerminalFontFamily(nextFontFamily);
+        const nextFontSize = Number(obs.terminal_ui?.font_size || 0);
+        setTerminalFontSize(
+          Number.isFinite(nextFontSize) && nextFontSize > 0
+            ? Math.max(8, Math.min(32, Math.round(nextFontSize)))
+            : TERMINAL_FONT_SIZE
+        );
+        const nextLineHeight = Number(obs.terminal_ui?.line_height || 0);
+        setTerminalLineHeight(
+          Number.isFinite(nextLineHeight) && nextLineHeight > 0
+            ? Math.max(0.8, Math.min(2, nextLineHeight))
+            : TERMINAL_LINE_HEIGHT
+        );
+        const nextLetterSpacing = Number(obs.terminal_ui?.letter_spacing);
+        setTerminalLetterSpacing(
+          Number.isFinite(nextLetterSpacing)
+            ? Math.max(-2, Math.min(5, Math.round(nextLetterSpacing)))
+            : TERMINAL_LETTER_SPACING
+        );
       } else if (resp.ok) {
         await loadObservability();
       }
@@ -1123,6 +1180,14 @@ export function SettingsModal({
                   setTerminalBacklogMiB={setTerminalBacklogMiB}
                   terminalScrollbackLines={terminalScrollbackLines}
                   setTerminalScrollbackLines={setTerminalScrollbackLines}
+                  terminalFontFamily={terminalFontFamily}
+                  setTerminalFontFamily={setTerminalFontFamily}
+                  terminalFontSize={terminalFontSize}
+                  setTerminalFontSize={setTerminalFontSize}
+                  terminalLineHeight={terminalLineHeight}
+                  setTerminalLineHeight={setTerminalLineHeight}
+                  terminalLetterSpacing={terminalLetterSpacing}
+                  setTerminalLetterSpacing={setTerminalLetterSpacing}
                   obsBusy={obsBusy}
                   onSaveObservability={handleSaveObservability}
                   debugSnapshot={debugSnapshot}

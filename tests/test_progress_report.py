@@ -487,6 +487,46 @@ class TestProgressReporter:
         state = reporter.get_state()
         assert state.completed_batches == 1
 
+    def test_batch_completed_uses_current_batch_tasks_only(
+        self,
+        reporter: ProgressReporter,
+        mock_sender: MagicMock,
+    ):
+        """Second-batch cards should not include tasks from earlier batches."""
+        reporter.init_workflow("wf-001")
+        reporter.on_batch_started(
+            "batch-001",
+            [
+                {"id": "T001", "title": "Task 1"},
+                {"id": "T002", "title": "Task 2"},
+            ],
+        )
+        reporter.on_task_completed("T001", "Agent A", 60, [], notify=False)
+        reporter.on_batch_completed()
+
+        mock_sender.reset_mock()
+
+        reporter.on_batch_started(
+            "batch-002",
+            [{"id": "T003", "title": "Task 3"}],
+        )
+        reporter.on_task_completed("T003", "Agent B", 30, [], notify=False)
+        reporter.on_batch_completed()
+
+        card = mock_sender.send_card.call_args_list[-1][0][1]
+        field_texts = [field["text"]["content"] for field in card["elements"][0]["fields"]]
+        task_texts = [
+            element["text"]["content"]
+            for element in card["elements"]
+            if isinstance(element, dict) and isinstance(element.get("text"), dict)
+        ]
+
+        assert "**总任务数**\n1" in field_texts
+        assert "**已完成**\n1" in field_texts
+        assert any("T003" in text for text in task_texts)
+        assert all("T001" not in text for text in task_texts)
+        assert all("T002" not in text for text in task_texts)
+
     def test_on_workflow_completed(
         self,
         reporter: ProgressReporter,
@@ -507,6 +547,31 @@ class TestProgressReporter:
         
         # State should be cleared
         assert reporter.get_state() is None
+
+    def test_workflow_completed_counts_all_tracked_tasks(
+        self,
+        reporter: ProgressReporter,
+        mock_sender: MagicMock,
+    ):
+        """Workflow summary should include failed tasks in the total count."""
+        reporter.init_workflow("wf-001")
+        reporter.on_batch_started(
+            "batch-001",
+            [
+                {"id": "T001", "title": "Task 1"},
+                {"id": "T002", "title": "Task 2"},
+            ],
+        )
+        reporter.on_task_completed("T001", "Agent A", 60, [], notify=False)
+        reporter.on_task_failed("T002", "boom", suggestion="", agent_name="Agent B")
+        mock_sender.reset_mock()
+
+        reporter.on_workflow_completed(summary="mixed outcome")
+
+        card = mock_sender.send_card.call_args[0][1]
+        field_texts = [field["text"]["content"] for field in card["elements"][0]["fields"]]
+
+        assert "**任务数**\n2" in field_texts
 
     def test_summarize_progress(
         self,

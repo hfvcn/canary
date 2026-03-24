@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +36,23 @@ def _spawn_daemon(paths: DaemonPaths) -> int:
             **supervised_process_popen_kwargs(),
         )
     return int(p.pid)
+
+
+def _clear_stale_daemon_state(paths: DaemonPaths) -> None:
+    paths.sock_path.unlink(missing_ok=True)
+    paths.addr_path.unlink(missing_ok=True)
+    paths.pid_path.unlink(missing_ok=True)
+
+
+def _wait_for_existing_daemon_state(paths: DaemonPaths, pid: int, *, timeout_s: float = 1.0, poll_s: float = 0.1) -> str:
+    deadline = time.time() + max(0.0, float(timeout_s))
+    while time.time() < deadline:
+        if call_daemon({"op": "ping"}, paths=paths).get("ok"):
+            return "reachable"
+        if not pid_is_alive(pid):
+            return "dead"
+        time.sleep(max(0.01, float(poll_s)))
+    return "reachable" if call_daemon({"op": "ping"}, paths=paths).get("ok") else ("dead" if not pid_is_alive(pid) else "busy")
 
 
 def _stop_supervised_web_runtime(paths: DaemonPaths) -> bool:
@@ -79,18 +97,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         pid = read_pid(paths)
         if pid > 0:
             if pid_is_alive(pid):
-                print(f"ccccd: pid file points to a live process (pid={pid}) but IPC is not responding; refusing to spawn duplicate daemon")
-                return 1
-            else:
-                # Process doesn't exist, clean up stale files
-                print("ccccd: cleaning up stale state from crashed daemon")
-                try:
-                    paths.sock_path.unlink(missing_ok=True)
-                    paths.addr_path.unlink(missing_ok=True)
-                    paths.pid_path.unlink(missing_ok=True)
-                except Exception as e:
-                    print(f"ccccd: failed to clean stale daemon state: {e}")
+                state = _wait_for_existing_daemon_state(paths, pid)
+                if state == "reachable":
+                    print("ccccd: already running")
+                    return 0
+                if state == "busy":
+                    print(f"ccccd: pid file points to a live process (pid={pid}) but IPC is not responding; refusing to spawn duplicate daemon")
                     return 1
+            # 进程不存在，清理陈旧状态文件。
+            print("ccccd: cleaning up stale state from crashed daemon")
+            try:
+                _clear_stale_daemon_state(paths)
+            except Exception as e:
+                print(f"ccccd: failed to clean stale daemon state: {e}")
+                return 1
         pid = _spawn_daemon(paths)
         print(f"ccccd: started pid={pid}")
         return 0

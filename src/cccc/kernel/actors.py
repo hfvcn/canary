@@ -107,12 +107,38 @@ def _ensure_actor_list(group: Group) -> List[Dict[str, Any]]:
     return actors
 
 
+def _repair_actor_command(item: Dict[str, Any]) -> bool:
+    runner_kind = str(item.get("runner") or "pty").strip() or "pty"
+    runtime_name = str(item.get("runtime") or "codex").strip() or "codex"
+    command = item.get("command")
+    if runner_kind == "headless" or runtime_name == "custom":
+        return False
+    if not isinstance(command, list) or not all(isinstance(x, str) for x in command):
+        return False
+
+    cmd = [str(x).strip() for x in command if str(x).strip()]
+    changed = cmd != command
+    if cmd and cmd[0].startswith("-"):
+        cmd = [*get_runtime_command_with_flags(runtime_name), *cmd]
+        changed = True
+    if not changed:
+        return False
+
+    item["command"] = cmd
+    item["updated_at"] = utc_now_iso()
+    return True
+
+
 def list_actors(group: Group) -> List[Dict[str, Any]]:
     actors = _ensure_actor_list(group)
+    changed = False
     out: List[Dict[str, Any]] = []
     for item in actors:
         if isinstance(item, dict) and isinstance(item.get("id"), str) and item.get("id"):
+            changed = _repair_actor_command(item) or changed
             out.append(item)
+    if changed:
+        group.save()
     return out
 
 

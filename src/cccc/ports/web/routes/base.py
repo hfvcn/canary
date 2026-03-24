@@ -464,6 +464,14 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             patch.setdefault("terminal_transcript", {})["per_actor_bytes"] = int(req.terminal_transcript_per_actor_bytes)
         if req.terminal_ui_scrollback_lines is not None:
             patch.setdefault("terminal_ui", {})["scrollback_lines"] = int(req.terminal_ui_scrollback_lines)
+        if req.terminal_ui_font_family is not None:
+            patch.setdefault("terminal_ui", {})["font_family"] = str(req.terminal_ui_font_family or "").strip()
+        if req.terminal_ui_font_size is not None:
+            patch.setdefault("terminal_ui", {})["font_size"] = int(req.terminal_ui_font_size)
+        if req.terminal_ui_line_height is not None:
+            patch.setdefault("terminal_ui", {})["line_height"] = float(req.terminal_ui_line_height)
+        if req.terminal_ui_letter_spacing is not None:
+            patch.setdefault("terminal_ui", {})["letter_spacing"] = int(req.terminal_ui_letter_spacing)
 
         resp = await ctx.daemon({"op": "observability_update", "args": {"by": req.by, "patch": patch}})
 

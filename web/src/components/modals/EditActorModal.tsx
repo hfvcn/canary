@@ -7,12 +7,14 @@ import {
 } from "../../utils/mcpConfigSnippets";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../../services/api";
+import type { ModelInfo } from "../../services/api";
 import { useModalA11y } from "../../hooks/useModalA11y";
 import { parsePrivateEnvSetText, parsePrivateEnvUnsetText } from "../../utils/privateEnvInput";
 import { actorProfileIdentityKey, actorProfileMatchesRef } from "../../utils/actorProfiles";
 import { formatCapabilityIdInput, parseCapabilityIdInput } from "../../utils/capabilityAutoload";
 import { CapabilityPicker } from "../CapabilityPicker";
 import { RolePresetPicker } from "../RolePresetPicker";
+import { ModelInfoCard } from "../ModelInfoCard";
 
 type EditMode = "custom" | "profile";
 
@@ -147,6 +149,14 @@ export function EditActorModal({
   const [localNotice, setLocalNotice] = useState("");
   const [secretSource, setSecretSource] = useState<SecretSource>("none");
   const secretFetchSeqRef = useRef(0);
+  // Model selection state
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [selectedModelKey, setSelectedModelKey] = useState<string>("");
+  const [modelsBusy, setModelsBusy] = useState(false);
+  const [showAddCustomModel, setShowAddCustomModel] = useState(false);
+  const [customModelId, setCustomModelId] = useState("");
+  const [addingCustomModel, setAddingCustomModel] = useState(false);
+  const [editingModelKey, setEditingModelKey] = useState<string | null>(null);
   const modalStateRef = useRef<{
     groupId: string;
     actorId: string;
@@ -342,11 +352,56 @@ export function EditActorModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editMode, effectiveLinked]);
 
+  // Load models when runtime changes
+  useEffect(() => {
+    if (!isOpen) return;
+    if (!runtime || runtime === "custom") {
+      setModels([]);
+      setSelectedModelKey("");
+      return;
+    }
+    // Only load for runtimes that support model selection
+    if (!["claude", "gemini", "codex"].includes(runtime)) {
+      setModels([]);
+      setSelectedModelKey("");
+      return;
+    }
+
+    setModelsBusy(true);
+    api.fetchModelsByRuntime(runtime)
+      .then((resp) => {
+        // Handle both { ok, result: { models } } and { ok, models } formats
+        const data = resp as unknown as { ok: boolean; models?: ModelInfo[]; result?: { models?: ModelInfo[] } };
+        const modelList = data.models || data.result?.models || [];
+        if (resp.ok && modelList.length > 0) {
+          setModels(modelList);
+        } else {
+          setModels([]);
+        }
+      })
+      .catch(() => {
+        setModels([]);
+      })
+      .finally(() => {
+        setModelsBusy(false);
+      });
+  }, [isOpen, runtime]);
+
   if (!isOpen) return null;
 
   const rtInfo = runtimes.find((r) => r.name === runtime);
   const available = rtInfo?.available ?? false;
   const defaultCommand = rtInfo?.recommended_command || "";
+  // Compute display command with model parameter when selected
+  const displayCommand = (() => {
+    if (!defaultCommand) return "";
+    if (!selectedModelKey) return defaultCommand;
+    // Extract model_id from model_key (e.g., "claude-claude-sonnet-4-6" -> "claude-sonnet-4-6")
+    const modelId = selectedModelKey.startsWith(`${runtime}-`)
+      ? selectedModelKey.slice(runtime.length + 1)
+      : selectedModelKey;
+    return `${defaultCommand} --model ${modelId}`;
+  })();
   const requireCommand = !effectiveLinked && editMode === "custom" && (runtime === "custom" || !available);
 
   const convertToCustomDraft = () => {
@@ -649,10 +704,246 @@ export function EditActorModal({
                       {isRunning ? <div className="text-[10px] mt-1.5 text-[var(--color-text-muted)]">{t("runtimeChangesNote")}</div> : null}
                       {defaultCommand.trim() ? (
                         <div className="text-[10px] mt-1.5 text-[var(--color-text-muted)]">
-                          {t("default")} <code className="px-1 rounded bg-[var(--glass-tab-bg)] text-[var(--color-text-secondary)]">{defaultCommand}</code>
+                          {t("default")} <code className="px-1 rounded bg-[var(--glass-tab-bg)] text-[var(--color-text-secondary)]">{displayCommand}</code>
                         </div>
                       ) : null}
                     </div>
+
+                    {/* Model Selection */}
+                    {["claude", "gemini", "codex"].includes(runtime || "") && (
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="block text-xs font-medium text-[var(--color-text-muted)]">
+                            {t("model", "Model")}
+                          </label>
+                          <button
+                            type="button"
+                            onClick={() => setShowAddCustomModel(!showAddCustomModel)}
+                            className="text-xs text-blue-500 hover:underline"
+                          >
+                            {showAddCustomModel ? t("cancel", "Cancel") : t("addCustomModel", "Add Model")}
+                          </button>
+                        </div>
+
+                        {/* Add Custom Model Form */}
+                        {showAddCustomModel && (
+                          <div className="mb-3 p-3 rounded-xl border border-[var(--glass-border-subtle)] bg-[var(--glass-bg)]">
+                            <div className="flex gap-2">
+                              <input
+                                type="text"
+                                value={customModelId}
+                                onChange={(e) => setCustomModelId(e.target.value)}
+                                placeholder={t("modelIdPlaceholder", "e.g., claude-sonnet-4-6")}
+                                className="flex-1 rounded-lg border px-3 py-2 text-sm glass-input text-[var(--color-text-primary)]"
+                              />
+                              <button
+                                type="button"
+                                disabled={!customModelId.trim() || addingCustomModel}
+                                onClick={async () => {
+                                  if (!runtime || !customModelId.trim()) return;
+                                  setAddingCustomModel(true);
+                                  try {
+                                    const resp = await api.addCustomModel({
+                                      runtime,
+                                      model_id: customModelId.trim(),
+                                    });
+                                    if (resp.ok) {
+                                      const refreshResp = await api.fetchModelsByRuntime(runtime);
+                                      const data = refreshResp as unknown as { ok: boolean; models?: ModelInfo[] };
+                                      if (data.ok && data.models) {
+                                        setModels(data.models);
+                                      }
+                                      setShowAddCustomModel(false);
+                                      setCustomModelId("");
+                                      if (resp.result?.model_key) {
+                                        setSelectedModelKey(resp.result.model_key);
+                                      }
+                                    }
+                                  } finally {
+                                    setAddingCustomModel(false);
+                                  }
+                                }}
+                                className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                              >
+                                {addingCustomModel ? "..." : t("addModel", "Add")}
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Model List */}
+                        {models.length > 0 ? (
+                          <div className="rounded-xl border border-[var(--glass-border-subtle)] overflow-hidden">
+                            {models.map((m) => (
+                              <div
+                                key={m.model_key}
+                                className={`flex items-center gap-3 px-3 py-2.5 border-b border-[var(--glass-border-subtle)] last:border-b-0 cursor-pointer hover:bg-[var(--glass-tab-bg-hover)] ${
+                                  m.enabled === false ? "opacity-50" : ""
+                                } ${selectedModelKey === m.model_key ? "bg-blue-500/10" : ""}`}
+                                onClick={() => setSelectedModelKey(selectedModelKey === m.model_key ? "" : m.model_key)}
+                              >
+                                {/* Radio button */}
+                                <input
+                                  type="radio"
+                                  name="model-select"
+                                  checked={selectedModelKey === m.model_key}
+                                  onChange={() => {}}
+                                  className="w-4 h-4 text-blue-600 pointer-events-none"
+                                />
+                                {/* Model name */}
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-sm text-[var(--color-text-primary)] truncate">
+                                    {m.display_name || m.model_id}
+                                  </div>
+                                  {m.description && (
+                                    <div className="text-xs text-[var(--color-text-muted)] truncate">
+                                      {m.description}
+                                    </div>
+                                  )}
+                                </div>
+                                {/* Edit button */}
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setEditingModelKey(m.model_key);
+                                  }}
+                                  title={t("editModelInfo", "Edit model info")}
+                                  className="p-1.5 rounded hover:bg-[var(--glass-tab-bg)] transition-colors"
+                                >
+                                  <svg className="w-4 h-4 text-[var(--color-text-muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                                  </svg>
+                                </button>
+                                {/* Visibility toggle */}
+                                <button
+                                  type="button"
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    await api.toggleModel(m.model_key, !m.enabled);
+                                    if (runtime && runtime !== "custom") {
+                                      const resp = await api.fetchModelsByRuntime(runtime);
+                                      const data = resp as unknown as { ok: boolean; models?: ModelInfo[] };
+                                      if (data.ok && data.models) {
+                                        setModels(data.models);
+                                      }
+                                    }
+                                  }}
+                                  title={m.enabled !== false ? t("hideFromForeman", "Hide from Foreman") : t("showToForeman", "Show to Foreman")}
+                                  className="p-1.5 rounded hover:bg-[var(--glass-tab-bg)] transition-colors"
+                                >
+                                  {m.enabled !== false ? (
+                                    <svg className="w-4 h-4 text-[var(--color-text-muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                                    </svg>
+                                  ) : (
+                                    <svg className="w-4 h-4 text-[var(--color-text-muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
+                                    </svg>
+                                  )}
+                                </button>
+                                {/* Delete button */}
+                                <button
+                                  type="button"
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    if (!confirm(t("deleteModelConfirm", "Delete this model?"))) return;
+                                    await api.deleteCustomModel(m.model_key);
+                                    if (selectedModelKey === m.model_key) setSelectedModelKey("");
+                                    if (runtime && runtime !== "custom") {
+                                      const resp = await api.fetchModelsByRuntime(runtime);
+                                      const data = resp as unknown as { ok: boolean; models?: ModelInfo[] };
+                                      if (data.ok && data.models) {
+                                        setModels(data.models);
+                                      }
+                                    }
+                                  }}
+                                  title={t("deleteModel", "Delete model")}
+                                  className="p-1.5 rounded hover:bg-red-500/10 transition-colors"
+                                >
+                                  <svg className="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                  </svg>
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="text-sm text-[var(--color-text-muted)] italic py-3">
+                            {t("noModelsYet", "No models added yet. Click 'Add Model' to add one.")}
+                          </div>
+                        )}
+
+                        {/* Model Edit Modal */}
+                        {editingModelKey && models.find((m) => m.model_key === editingModelKey) && (
+                          <div
+                            className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50"
+                            onClick={() => setEditingModelKey(null)}
+                          >
+                            <div
+                              className="bg-[var(--glass-panel-bg)] rounded-2xl p-4 max-w-md w-full mx-4 shadow-xl border border-[var(--glass-border-subtle)]"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <div className="flex items-center justify-between mb-3">
+                                <h3 className="text-sm font-semibold text-[var(--color-text-primary)]">
+                                  {models.find((m) => m.model_key === editingModelKey)?.display_name || editingModelKey}
+                                </h3>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingModelKey(null)}
+                                  className="p-1 rounded hover:bg-[var(--glass-tab-bg-hover)]"
+                                >
+                                  <svg className="w-5 h-5 text-[var(--color-text-muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                                  </svg>
+                                </button>
+                              </div>
+                              <ModelInfoCard
+                                model={models.find((m) => m.model_key === editingModelKey)!}
+                                onUpdateDescription={async (description, bestFor) => {
+                                  await api.updateModel(editingModelKey, { description, best_for: bestFor });
+                                  if (runtime && runtime !== "custom") {
+                                    const resp = await api.fetchModelsByRuntime(runtime);
+                                    const data = resp as unknown as { ok: boolean; models?: ModelInfo[] };
+                                    if (data.ok && data.models) {
+                                      setModels(data.models);
+                                    }
+                                  }
+                                }}
+                                onRequestRating={async () => {
+                                  if (!groupId) {
+                                    alert(t("noGroupId", "No group selected"));
+                                    return;
+                                  }
+                                  try {
+                                    const resp = await api.requestModelReview(editingModelKey, groupId);
+                                    if (resp.ok && resp.result) {
+                                      if (resp.result.status === "sent") {
+                                        alert(t("reviewRequestSent", "Evaluation request sent to Foreman"));
+                                      }
+                                      // Refresh models to show the new comment
+                                      if (runtime && runtime !== "custom") {
+                                        const modelResp = await api.fetchModelsByRuntime(runtime);
+                                        const data = modelResp as unknown as { ok: boolean; models?: ModelInfo[] };
+                                        if (data.ok && data.models) {
+                                          setModels(data.models);
+                                        }
+                                      }
+                                    } else {
+                                      const errMsg = resp.ok ? "" : (resp.error?.message || t("reviewFailed", "No usage history yet"));
+                                      alert(errMsg || t("reviewFailed", "No usage history yet"));
+                                    }
+                                  } catch {
+                                    alert(t("reviewFailed", "No usage history yet"));
+                                  }
+                                }}
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

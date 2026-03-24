@@ -356,6 +356,6 @@ def cleanup_after_stop(
     except Exception:
         pass
     try:
-        release_lockfile(lock_handle)
+        release_lockfile(lock_handle, remove=True)
     except Exception:
         pass

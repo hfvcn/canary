@@ -164,6 +164,7 @@ graph TB
 - **Daemon is the single writer** — all state changes go through one process, eliminating race conditions
 - **Ledger is append-only** — events are never mutated, making history reliable and debuggable
 - **Ports are thin** — Web, CLI, MCP, and IM bridges are stateless frontends; the daemon owns all truth
+- **Headless operation is first-class** — group, actor, messaging, and validation flows must remain operable without Web UI
 - **Runtime home is `CCCC_HOME`** (default `~/.cccc/`) — runtime state stays out of your repo
 
 ## Supported Runtimes

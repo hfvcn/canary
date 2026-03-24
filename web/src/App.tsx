@@ -23,12 +23,12 @@ import { WebPet } from "./features/webPet/WebPet";
 import { getEffectiveComposerDestGroupId } from "./stores/useComposerStore";
 import { getChatSession } from "./stores/useUIStore";
 import { classNames } from "./utils/classNames";
-import { WebPet } from "./features/webPet/WebPet";
 import { ActorTab } from "./pages/ActorTab";
 import { BoardTab } from "./pages/BoardTab";
 import { ChatTab } from "./pages/chat";
 import { PanoramaTab } from "./pages/PanoramaTab";
 import { WorkspaceTab } from "./pages/WorkspaceTab";
+import { WorkflowTab } from "./pages/WorkflowTab";
 import {
   useGroupStore,
   useUIStore,
@@ -41,7 +41,7 @@ import {
 } from "./stores";
 import type { ChatMessageData, LedgerEvent } from "./types";
 
-const NON_ACTOR_TABS = ["chat", "board", "workspace", "panorama"];
+const NON_ACTOR_TABS = ["chat", "board", "workspace", "panorama", "workflow"];
 
 // ============ Main App Component ============
 
@@ -296,14 +296,16 @@ export default function App() {
   );
   const showBoardTab = Boolean(selectedGroupId);
   const showWorkspaceTab = Boolean(selectedGroupId && workspaceState.openFilePath);
+  const showWorkflowTab = Boolean(selectedGroupId);
 
   const allTabs = useMemo(() => {
     const tabs = ["chat"];
     if (showBoardTab) tabs.push("board");
     if (showWorkspaceTab) tabs.push("workspace");
     if (showPanorama) tabs.push("panorama");
+    if (showWorkflowTab) tabs.push("workflow");
     return tabs.concat(visibleActors.map((a) => a.id));
-  }, [showBoardTab, showPanorama, showWorkspaceTab, visibleActors]);
+  }, [showBoardTab, showPanorama, showWorkspaceTab, showWorkflowTab, visibleActors]);
 
   const handleTabChange = React.useCallback((newTab: string) => {
     if (!canAccessTerminalNow && !NON_ACTOR_TABS.includes(newTab)) {

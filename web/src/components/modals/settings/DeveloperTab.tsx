@@ -16,6 +16,14 @@ interface DeveloperTabProps {
   setTerminalBacklogMiB: (v: number) => void;
   terminalScrollbackLines: number;
   setTerminalScrollbackLines: (v: number) => void;
+  terminalFontFamily: string;
+  setTerminalFontFamily: (v: string) => void;
+  terminalFontSize: number;
+  setTerminalFontSize: (v: number) => void;
+  terminalLineHeight: number;
+  setTerminalLineHeight: (v: number) => void;
+  terminalLetterSpacing: number;
+  setTerminalLetterSpacing: (v: number) => void;
   obsBusy: boolean;
   onSaveObservability: () => void;
   // Debug snapshot
@@ -63,6 +71,14 @@ export function DeveloperTab({
   setTerminalBacklogMiB,
   terminalScrollbackLines,
   setTerminalScrollbackLines,
+  terminalFontFamily,
+  setTerminalFontFamily,
+  terminalFontSize,
+  setTerminalFontSize,
+  terminalLineHeight,
+  setTerminalLineHeight,
+  terminalLetterSpacing,
+  setTerminalLetterSpacing,
   obsBusy,
   onSaveObservability,
   debugSnapshot,
@@ -227,6 +243,57 @@ export function DeveloperTab({
               <div className="mt-1 text-[11px] text-[var(--color-text-muted)]">
                 {t("developer.webScrollbackHint")}
               </div>
+            </div>
+          </div>
+
+          <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <div className="sm:col-span-2">
+              <label className={labelClass()}>{t("developer.webTerminalFontFamily")}</label>
+              <input
+                type="text"
+                value={terminalFontFamily}
+                placeholder={t("developer.webTerminalFontFamilyPlaceholder")}
+                onChange={(e) => setTerminalFontFamily(e.target.value)}
+                className={inputClass()}
+              />
+              <div className="mt-1 text-[11px] text-[var(--color-text-muted)]">
+                {t("developer.webTerminalFontFamilyHint")}
+              </div>
+            </div>
+            <div>
+              <label className={labelClass()}>{t("developer.webTerminalFontSize")}</label>
+              <input
+                type="number"
+                value={terminalFontSize}
+                min={8}
+                max={32}
+                onChange={(e) => setTerminalFontSize(Number(e.target.value || 13))}
+                className={inputClass()}
+              />
+            </div>
+            <div>
+              <label className={labelClass()}>{t("developer.webTerminalLineHeight")}</label>
+              <input
+                type="number"
+                value={terminalLineHeight}
+                min={0.8}
+                max={2}
+                step={0.05}
+                onChange={(e) => setTerminalLineHeight(Number(e.target.value || 1))}
+                className={inputClass()}
+              />
+            </div>
+            <div>
+              <label className={labelClass()}>{t("developer.webTerminalLetterSpacing")}</label>
+              <input
+                type="number"
+                value={terminalLetterSpacing}
+                min={-2}
+                max={5}
+                step={1}
+                onChange={(e) => setTerminalLetterSpacing(Number(e.target.value || 0))}
+                className={inputClass()}
+              />
             </div>
           </div>
         </div>

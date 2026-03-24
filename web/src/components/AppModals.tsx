@@ -23,6 +23,7 @@ import { RecipientsModal } from "./modals/RecipientsModal";
 import { parsePrivateEnvSetText } from "../utils/privateEnvInput";
 import { actorProfileIdentityKey } from "../utils/actorProfiles";
 import { parseHelpMarkdown, updateActorHelpNote } from "../utils/helpMarkdown";
+import { buildActorCreateCommand } from "../utils/actorCommands";
 import { formatCapabilityIdInput, normalizeCapabilityIdList, parseCapabilityIdInput } from "../utils/capabilityAutoload";
 import { actorProfileIdentityKey, actorProfileMatchesRef } from "../utils/actorProfiles";
 import { findPresentationSlot } from "../utils/presentation";
@@ -161,6 +162,7 @@ export function AppModals({
     newActorRuntime,
     newActorCommand,
     newActorUseDefaultCommand,
+    newActorModelId,
     newActorSecretsSetText,
     newActorCapabilityAutoloadText,
     newActorRoleNotes,
@@ -173,6 +175,7 @@ export function AppModals({
     setNewActorRuntime,
     setNewActorCommand,
     setNewActorUseDefaultCommand,
+    setNewActorModelId,
     setNewActorSecretsSetText,
     setNewActorCapabilityAutoloadText,
     setNewActorRoleNotes,
@@ -957,7 +960,16 @@ export function AppModals({
     setBusy("actor-add");
     setAddActorError("");
     try {
-      const commandToUse = newActorUseProfile ? "" : (newActorUseDefaultCommand ? "" : newActorCommand);
+      const defaultRuntimeCommand = runtimes.find((item) => item.name === newActorRuntime)?.recommended_command || "";
+      const commandToUse = newActorUseProfile
+        ? ""
+        : buildActorCreateCommand({
+            runtime: newActorRuntime,
+            defaultCommand: defaultRuntimeCommand,
+            command: newActorCommand,
+            useDefaultCommand: newActorUseDefaultCommand,
+            modelKey: newActorModelId,
+          });
       const resp = await api.addActor(
         selectedGroupId,
         actorId,
@@ -1586,6 +1598,7 @@ export function AppModals({
         busy={busy}
         hasForeman={hasForeman}
         runtimes={runtimes}
+        groupId={selectedGroupId}
         suggestedActorId={suggestedActorId}
         newActorId={newActorId}
         setNewActorId={setNewActorId}
@@ -1603,6 +1616,8 @@ export function AppModals({
         setNewActorCommand={setNewActorCommand}
         newActorUseDefaultCommand={newActorUseDefaultCommand}
         setNewActorUseDefaultCommand={setNewActorUseDefaultCommand}
+        newActorModelId={newActorModelId}
+        setNewActorModelId={setNewActorModelId}
         newActorSecretsSetText={newActorSecretsSetText}
         setNewActorSecretsSetText={setNewActorSecretsSetText}
         newActorCapabilityAutoloadText={newActorCapabilityAutoloadText}

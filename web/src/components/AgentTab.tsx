@@ -12,6 +12,13 @@ import { useObservabilityStore } from "../stores";
 import { withAuthToken, fetchTerminalTail } from "../services/api";
 import { StopIcon, RefreshIcon, InboxIcon, TrashIcon, PlayIcon, EditIcon, RocketIcon, TerminalIcon } from "./Icons";
 import { ScrollFade } from "./ScrollFade";
+import { DEFAULT_TERMINAL_FONT_FAMILY } from "./terminalFontFamily";
+import {
+  TERMINAL_FONT_SIZE,
+  TERMINAL_LETTER_SPACING,
+  TERMINAL_LINE_HEIGHT,
+  relayoutTerminalAfterFontsReady,
+} from "./terminalRendering";
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
 
@@ -68,6 +75,10 @@ export function AgentTab({
   const observabilityLoaded = useObservabilityStore((s) => s.loaded);
   const loadObservability = useObservabilityStore((s) => s.load);
   const terminalScrollbackLines = useObservabilityStore((s) => s.terminalScrollbackLines);
+  const terminalFontFamily = useObservabilityStore((s) => s.terminalFontFamily);
+  const terminalFontSize = useObservabilityStore((s) => s.terminalFontSize);
+  const terminalLineHeight = useObservabilityStore((s) => s.terminalLineHeight);
+  const terminalLetterSpacing = useObservabilityStore((s) => s.terminalLetterSpacing);
 
   const termRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -194,6 +205,30 @@ export function AgentTab({
     }
   }, [terminalScrollbackLines]);
 
+  useEffect(() => {
+    const term = terminalRef.current;
+    if (!term) return;
+    term.options.fontFamily = terminalFontFamily || DEFAULT_TERMINAL_FONT_FAMILY;
+    term.options.fontSize = terminalFontSize || TERMINAL_FONT_SIZE;
+    term.options.lineHeight = terminalLineHeight || TERMINAL_LINE_HEIGHT;
+    term.options.letterSpacing = Number.isFinite(terminalLetterSpacing)
+      ? terminalLetterSpacing
+      : TERMINAL_LETTER_SPACING;
+    try {
+      term.clearTextureAtlas();
+    } catch {
+      // ignore
+    }
+    if (fitAddonRef.current && termRef.current && termRef.current.clientWidth > 50) {
+      fitAddonRef.current.fit();
+    }
+  }, [
+    terminalFontFamily,
+    terminalFontSize,
+    terminalLineHeight,
+    terminalLetterSpacing,
+  ]);
+
   // Initialize terminal
   useEffect(() => {
     if (!termRef.current || isHeadless || !isRunning || !activated) return;
@@ -203,8 +238,12 @@ export function AgentTab({
       // Avoid an extra blinking "outline" cursor when the terminal isn't focused.
       // Some runtimes render their own cursor; xterm's inactive cursor can look like a second cursor.
       cursorInactiveStyle: "none",
-      fontSize: 13,
-      fontFamily: '"JetBrains Mono", "Fira Code", "SF Mono", Menlo, Monaco, monospace',
+      fontSize: terminalFontSize || TERMINAL_FONT_SIZE,
+      fontFamily: terminalFontFamily || DEFAULT_TERMINAL_FONT_FAMILY,
+      lineHeight: terminalLineHeight || TERMINAL_LINE_HEIGHT,
+      letterSpacing: Number.isFinite(terminalLetterSpacing)
+        ? terminalLetterSpacing
+        : TERMINAL_LETTER_SPACING,
       theme: getTerminalTheme(isDark),
       disableStdin: !canControl,
       // Bigger scrollback improves history browsing without going "infinite" and hurting perf.
@@ -298,7 +337,15 @@ export function AgentTab({
       }
     });
 
+    const cleanupFontRelayout = relayoutTerminalAfterFontsReady(
+      term.element?.ownerDocument,
+      term,
+      fitAddon,
+      () => Boolean(termRef.current && termRef.current.clientWidth > 50),
+    );
+
     return () => {
+      cleanupFontRelayout();
       term.element?.removeEventListener("contextmenu", onContextMenu);
       term.element?.removeEventListener("mousedown", onPointerDown);
       term.element?.removeEventListener("touchstart", onPointerDown);

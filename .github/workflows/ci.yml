@@ -38,6 +38,10 @@ jobs:
           python -m pip install -U pip build twine
           python -m pip install -e . pytest
 
+      - name: Run headless CLI smoke
+        run: |
+          bash scripts/smoke_headless_workflow.sh
+
       - name: Run test suite
         run: |
           python -m pytest -q

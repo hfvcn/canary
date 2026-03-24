@@ -165,6 +165,22 @@ class TestRalphIPCHandler(unittest.TestCase):
         self.assertIn("suggestion_id", resp.result)
         self.assertEqual(resp.result["task_count"], 2)
 
+    def test_ralph_batch_suggest_preserves_caller_suggestion_id(self) -> None:
+        from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op, _RALPH_STATE
+
+        _RALPH_STATE["pending_suggestions"].clear()
+
+        resp = try_handle_ralph_op("ralph_batch_suggest", {
+            "workflow_id": "wf-1",
+            "suggestion_id": "sug-external-1",
+            "tasks": [{"id": "t1", "title": "Task 1", "type": "backend"}],
+        })
+
+        self.assertIsNotNone(resp)
+        self.assertTrue(resp.ok)
+        self.assertEqual(resp.result["suggestion_id"], "sug-external-1")
+        self.assertIn("sug-external-1", _RALPH_STATE["pending_suggestions"])
+
     def test_ralph_batch_suggest_missing_workflow(self) -> None:
         from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op
 
@@ -233,6 +249,24 @@ class TestRalphIPCHandler(unittest.TestCase):
         self.assertTrue(resp.ok)
         self.assertIn("suggestion_id", resp.result)
         self.assertEqual(resp.result["task_id"], "t1")
+
+    def test_ralph_restart_suggest_preserves_caller_suggestion_id(self) -> None:
+        from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op, _RALPH_STATE
+
+        _RALPH_STATE["pending_restarts"].clear()
+
+        resp = try_handle_ralph_op("ralph_restart_suggest", {
+            "workflow_id": "wf-1",
+            "suggestion_id": "rst-external-1",
+            "task_id": "t1",
+            "task_title": "Failed Task",
+            "reason": "Build failed",
+        })
+
+        self.assertIsNotNone(resp)
+        self.assertTrue(resp.ok)
+        self.assertEqual(resp.result["suggestion_id"], "rst-external-1")
+        self.assertIn("rst-external-1", _RALPH_STATE["pending_restarts"])
 
     def test_ralph_batch_decision_flow(self) -> None:
         from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op

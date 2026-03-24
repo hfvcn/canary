@@ -35,7 +35,7 @@ from ..util.conv import coerce_bool
 from ..util.obslog import setup_root_json_logging
 from ..util.process import best_effort_signal_pid, pid_is_alive
 from ..util.fs import atomic_write_json, atomic_write_text, read_json
-from ..util.file_lock import acquire_lockfile, release_lockfile, LockUnavailableError
+from ..util.file_lock import acquire_lockfile, release_lockfile, write_pid_to_lockfile, LockUnavailableError
 from ..util.time import utc_now_iso
 from .automation import AutomationManager
 from .im.bootstrap_im_ops import autostart_enabled_im_bridges
@@ -253,6 +253,11 @@ def _normalize_runtime_command(runtime: str, command: list[str]) -> list[str]:
     cmd = [str(x) for x in (command or []) if str(x).strip()]
     if not cmd:
         return []
+
+    # Recover malformed stored commands like ["--model", "..."] by restoring the
+    # runtime launcher that should have preceded those flags.
+    if rt and rt != "custom" and str(cmd[0]).startswith("-"):
+        cmd = [*get_runtime_command_with_flags(rt), *cmd]
 
     if rt == "codex":
         try:
@@ -558,12 +563,14 @@ def _maybe_autostart_running_groups() -> None:
         throttle_reset_actor=lambda gid, aid: THROTTLE.reset_actor(gid, aid, keep_pending=True),
         automation_on_resume=AUTOMATION.on_resume,
         get_group_state=get_group_state,
-        resolve_linked_actor_before_start=lambda grp, aid: _resolve_linked_actor_before_start(
+        resolve_linked_actor_before_start=lambda grp, aid, caller_id="", is_admin=False: _resolve_linked_actor_before_start(
             grp,
             aid,
             get_actor_profile=_get_actor_profile,
             load_actor_profile_secrets=_load_actor_profile_secrets,
             update_actor_private_env=_update_actor_private_env,
+            caller_id=caller_id,
+            is_admin=is_admin,
         ),
     )
 
@@ -773,12 +780,15 @@ def serve_forever(paths: Optional[DaemonPaths] = None) -> int:
 
     # Acquire exclusive lock to prevent multiple daemon instances (race condition fix).
     # The lock is held for the lifetime of the daemon process.
+    # PID is written into the lock file so stale locks from crashed daemons
+    # can be detected and broken automatically on next startup.
     lock_path = p.daemon_dir / "ccccd.lock"
     try:
         lock_handle = acquire_lockfile(lock_path, blocking=False)
     except LockUnavailableError:
-        # Another daemon already holds the lock
+        # Another daemon already holds the lock (verified alive by acquire_lockfile)
         return 0
+    write_pid_to_lockfile(lock_handle)
 
     # Apply global observability settings early (logging + developer mode gating).
     try:
@@ -789,7 +799,7 @@ def serve_forever(paths: Optional[DaemonPaths] = None) -> int:
 
     _cleanup_stale_daemon_endpoints(p)
     if _is_daemon_alive(p):
-        release_lockfile(lock_handle)
+        release_lockfile(lock_handle, remove=True)
         return 0
 
     # Cleanup stale IM bridge state from previous runs/crashes.

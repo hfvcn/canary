@@ -138,6 +138,10 @@ DEFAULT_OBSERVABILITY: Dict[str, Any] = {
     # Web terminal UI preferences (global).
     "terminal_ui": {
         "scrollback_lines": 8000,
+        "font_family": "",
+        "font_size": 13,
+        "line_height": 1.0,
+        "letter_spacing": 0,
     },
 }
 
@@ -197,6 +201,18 @@ def _as_int(v: Any, default: int, *, min_value: int = 0, max_value: Optional[int
     return n
 
 
+def _as_float(v: Any, default: float, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
+    try:
+        n = float(v)
+    except Exception:
+        n = float(default)
+    if min_value is not None and n < min_value:
+        n = min_value
+    if max_value is not None and n > max_value:
+        n = max_value
+    return n
+
+
 def _as_str(v: Any, default: str) -> str:
     s = str(v).strip() if v is not None else ""
     return s or default
@@ -232,6 +248,25 @@ def _merge_observability(raw: Any) -> Dict[str, Any]:
             int(tui_base["scrollback_lines"]),
             min_value=1000,
             max_value=200_000,
+        )
+        tui_base["font_family"] = str(tui.get("font_family") or "").strip()
+        tui_base["font_size"] = _as_int(
+            tui.get("font_size"),
+            int(tui_base["font_size"]),
+            min_value=8,
+            max_value=32,
+        )
+        tui_base["line_height"] = _as_float(
+            tui.get("line_height"),
+            float(tui_base["line_height"]),
+            min_value=0.8,
+            max_value=2.0,
+        )
+        tui_base["letter_spacing"] = _as_int(
+            tui.get("letter_spacing"),
+            int(tui_base["letter_spacing"]),
+            min_value=-2,
+            max_value=5,
         )
     base["terminal_ui"] = tui_base
 
@@ -324,6 +359,29 @@ def update_observability_settings(patch: Dict[str, Any]) -> Dict[str, Any]:
                     int(tui.get("scrollback_lines", 8000)),
                     min_value=1000,
                     max_value=200_000,
+                )
+            if "font_family" in tui_patch:
+                tui["font_family"] = str(tui_patch.get("font_family") or "").strip()
+            if "font_size" in tui_patch:
+                tui["font_size"] = _as_int(
+                    tui_patch.get("font_size"),
+                    int(tui.get("font_size", 13)),
+                    min_value=8,
+                    max_value=32,
+                )
+            if "line_height" in tui_patch:
+                tui["line_height"] = _as_float(
+                    tui_patch.get("line_height"),
+                    float(tui.get("line_height", 1.0)),
+                    min_value=0.8,
+                    max_value=2.0,
+                )
+            if "letter_spacing" in tui_patch:
+                tui["letter_spacing"] = _as_int(
+                    tui_patch.get("letter_spacing"),
+                    int(tui.get("letter_spacing", 0)),
+                    min_value=-2,
+                    max_value=5,
                 )
             merged["terminal_ui"] = tui
 

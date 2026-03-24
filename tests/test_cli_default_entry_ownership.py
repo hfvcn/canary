@@ -335,6 +335,52 @@ class TestCliDefaultEntryOwnership(unittest.TestCase):
         finally:
             cleanup()
 
+    def test_default_entry_reuses_existing_daemon_when_spawn_exits_zero_but_ping_works(self) -> None:
+        from cccc.cli import common
+
+        home, cleanup = self._with_home()
+        try:
+            daemon_proc = _DaemonProc()
+            daemon_proc.poll = lambda: 0
+            web_proc = unittest.mock.Mock(pid=4321)
+            requests: list[dict] = []
+
+            class _DummyThread:
+                def __init__(self, *args, **kwargs) -> None:
+                    _ = args, kwargs
+
+                def start(self) -> None:
+                    return None
+
+            def _fake_call_daemon(req: dict, timeout_s: float = 0, **kwargs):
+                _ = timeout_s, kwargs
+                requests.append(dict(req))
+                if req.get("op") == "ping":
+                    return {"ok": True, "result": {"pid": 9999}}
+                return {"ok": True}
+
+            with patch.object(common, "_is_first_run", return_value=False), patch(
+                "cccc.paths.ensure_home", return_value=home
+            ), patch.object(common, "_acquire_default_entry_lock", return_value=("lock", None)), patch.object(
+                common, "_stop_existing_web_runtime", return_value=True
+            ), patch.object(common, "_stop_existing_daemon", return_value=True), patch.object(
+                common, "_resolve_web_server_binding", return_value=("127.0.0.1", 8848)
+            ), patch.object(common, "call_daemon", side_effect=_fake_call_daemon), patch.object(
+                common, "supervised_process_popen_kwargs", return_value={}
+            ), patch.object(common.subprocess, "Popen", return_value=daemon_proc), patch.object(
+                common, "start_supervised_web_child", return_value=(web_proc, None)
+            ), patch.object(common, "wait_for_child_exit_interruptibly", side_effect=KeyboardInterrupt()), patch.object(
+                common, "stop_web_child", return_value=True
+            ), patch.object(common, "clear_web_runtime_state"), patch.object(
+                common, "release_lockfile"
+            ), patch.object(common.time, "sleep", return_value=None), patch("threading.Thread", _DummyThread):
+                ret = common._default_entry()
+
+            self.assertEqual(ret, 0)
+            self.assertFalse(any(req.get("op") == "shutdown" for req in requests))
+        finally:
+            cleanup()
+
 
 
 if __name__ == "__main__":

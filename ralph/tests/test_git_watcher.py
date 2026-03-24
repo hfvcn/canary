@@ -173,6 +173,27 @@ class TestGitWatcher:
         assert commit_event.payload["hash"] == new_commit.hexsha
         assert "Add test file" in commit_event.payload["message"]
 
+    def test_get_latest_commit_respects_configured_branch(self, temp_repo):
+        """监控指定分支时，应读取该分支而不是当前 HEAD。"""
+        repo_path, repo = temp_repo
+        default_branch = repo.active_branch.name
+
+        repo.git.checkout("-b", "feature")
+        feature_file = repo_path / "feature.txt"
+        feature_file.write_text("feature content")
+        repo.index.add(["feature.txt"])
+        feature_commit = repo.index.commit("Feature commit")
+        repo.git.checkout(default_branch)
+
+        watcher = GitWatcher(GitWatcherConfig(repo_path=repo_path, branch="feature"))
+        watcher._repo = repo
+
+        latest = watcher._get_latest_commit()
+
+        assert latest is not None
+        assert latest.branch == "feature"
+        assert latest.hash == feature_commit.hexsha
+
 
 class TestMessageBusIntegration:
     """MessageBus 集成测试"""

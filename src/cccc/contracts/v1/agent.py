@@ -30,6 +30,12 @@ class ModelCapability(BaseModel):
         weaknesses: List of task types this model struggles with
         context_window: Maximum context window size (e.g., "200k", "1m")
         tags: Additional categorization tags
+        description: User-provided description of the model
+        best_for: Best use cases for this model
+        foreman_rating: Foreman's rating (1-5) based on workflow performance
+        foreman_notes: Notes from Foreman about the model's performance
+        foreman_sample_count: Number of workflows the rating is based on
+        last_rated_at: Timestamp of last Foreman rating
 
     Example:
         ModelCapability(
@@ -37,7 +43,9 @@ class ModelCapability(BaseModel):
             model_id="claude-sonnet-4",
             strengths=["complex_logic", "long_context", "code_refactoring"],
             weaknesses=["realtime_info"],
-            context_window="200k"
+            context_window="200k",
+            description="擅长复杂后端逻辑和代码重构",
+            best_for="后端开发、架构设计"
         )
     """
 
@@ -48,6 +56,20 @@ class ModelCapability(BaseModel):
     weaknesses: List[str] = Field(default_factory=list)
     context_window: str = "128k"
     tags: List[str] = Field(default_factory=list)
+
+    # User-editable description fields
+    description: str = ""  # User-provided model description
+    best_for: str = ""  # Best use cases
+
+    # Visibility control
+    enabled: bool = True  # Whether to show in model picker (for hiding unused models)
+    is_custom: bool = False  # Whether this is a user-added custom model
+
+    # Foreman rating fields (only populated when user requests evaluation)
+    foreman_rating: Optional[float] = None  # Rating from 1-5
+    foreman_notes: str = ""  # Rating explanation
+    foreman_sample_count: int = 0  # Number of workflows rated
+    last_rated_at: Optional[str] = None  # Last rating timestamp
 
     model_config = ConfigDict(extra="ignore")
 

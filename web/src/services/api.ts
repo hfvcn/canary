@@ -2172,6 +2172,136 @@ export async function fetchRuntimes() {
   return apiJson<{ runtimes: RuntimeInfo[]; available: string[] }>("/api/v1/runtimes");
 }
 
+// ============ Models ============
+
+export type ModelInfo = {
+  model_key: string;
+  model_id: string;
+  runtime: string;
+  display_name: string;
+  context_window?: string;
+  description?: string;
+  best_for?: string;
+  strengths?: string[];
+  weaknesses?: string[];
+  enabled?: boolean;
+  is_custom?: boolean;
+  foreman_rating?: number;
+  foreman_notes?: string;
+  foreman_sample_count?: number;
+  last_rated_at?: string;
+};
+
+export type ModelsListResponse = {
+  ok: boolean;
+  models: ModelInfo[];
+  runtimes: string[];
+  runtime_availability: Record<string, boolean>;
+};
+
+export async function fetchModels(runtime?: string) {
+  const url = runtime
+    ? `/api/v1/models?runtime=${encodeURIComponent(runtime)}`
+    : "/api/v1/models";
+  return apiJson<ModelsListResponse>(url);
+}
+
+export async function fetchModelsByRuntime(runtime: string, includeDisabled: boolean = true) {
+  return apiJson<{ ok: boolean; runtime: string; models: ModelInfo[] }>(
+    `/api/v1/runtimes/models?runtime=${encodeURIComponent(runtime)}&include_disabled=${includeDisabled}`
+  );
+}
+
+export async function fetchModel(modelKey: string) {
+  return apiJson<ModelInfo>(`/api/v1/models/${encodeURIComponent(modelKey)}`);
+}
+
+export async function updateModel(
+  modelKey: string,
+  data: {
+    description?: string;
+    best_for?: string;
+    strengths?: string[];
+    weaknesses?: string[];
+  }
+) {
+  return apiJson<{ ok: boolean; model_key: string; error?: string }>(
+    `/api/v1/models/${encodeURIComponent(modelKey)}`,
+    {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }
+  );
+}
+
+export async function rateModel(modelKey: string, rating: number, notes: string = "") {
+  return apiJson<{
+    ok: boolean;
+    model_key: string;
+    new_rating?: number;
+    sample_count?: number;
+    error?: string;
+  }>(`/api/v1/models/${encodeURIComponent(modelKey)}/rate`, {
+    method: "POST",
+    body: JSON.stringify({ rating, notes }),
+  });
+}
+
+export async function requestModelReview(modelKey: string, groupId: string) {
+  return apiJson<{
+    ok: boolean;
+    model_key: string;
+    comment?: string;
+    status?: string;
+    error?: string;
+  }>(`/api/v1/models/${encodeURIComponent(modelKey)}/review`, {
+    method: "POST",
+    body: JSON.stringify({ group_id: groupId }),
+  });
+}
+
+export async function fetchRuntimeAvailability() {
+  return apiJson<{
+    ok: boolean;
+    runtimes: string[];
+    availability: Record<string, boolean>;
+  }>("/api/v1/runtimes/availability");
+}
+
+export async function toggleModel(modelKey: string, enabled: boolean) {
+  return apiJson<{ ok: boolean; model_key: string; error?: string }>(
+    `/api/v1/models/${encodeURIComponent(modelKey)}/toggle`,
+    {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    }
+  );
+}
+
+export async function addCustomModel(data: {
+  runtime: string;
+  model_id: string;
+  display_name?: string;
+  description?: string;
+  context_window?: string;
+  strengths?: string[];
+}) {
+  return apiJson<{ ok: boolean; model_key: string; error?: string }>(
+    "/api/v1/models/custom",
+    {
+      method: "POST",
+      body: JSON.stringify(data),
+    }
+  );
+}
+
+export async function deleteCustomModel(modelKey: string) {
+  return apiJson<{ ok: boolean; model_key: string; error?: string }>(
+    `/api/v1/models/${encodeURIComponent(modelKey)}`,
+    { method: "DELETE" }
+  );
+}
+
 // ============ File System ============
 
 export async function fetchDirSuggestions() {
@@ -2409,6 +2539,10 @@ export interface Observability {
   };
   terminal_ui?: {
     scrollback_lines?: number;
+    font_family?: string;
+    font_size?: number;
+    line_height?: number;
+    letter_spacing?: number;
   };
 }
 
@@ -2421,6 +2555,10 @@ export async function updateObservability(args: {
   logLevel: "INFO" | "DEBUG";
   terminalTranscriptPerActorBytes?: number;
   terminalUiScrollbackLines?: number;
+  terminalUiFontFamily?: string;
+  terminalUiFontSize?: number;
+  terminalUiLineHeight?: number;
+  terminalUiLetterSpacing?: number;
 }) {
   return apiJson<{ observability: Observability }>("/api/v1/observability", {
     method: "PUT",
@@ -2430,6 +2568,10 @@ export async function updateObservability(args: {
       log_level: args.logLevel,
       terminal_transcript_per_actor_bytes: args.terminalTranscriptPerActorBytes,
       terminal_ui_scrollback_lines: args.terminalUiScrollbackLines,
+      terminal_ui_font_family: args.terminalUiFontFamily,
+      terminal_ui_font_size: args.terminalUiFontSize,
+      terminal_ui_line_height: args.terminalUiLineHeight,
+      terminal_ui_letter_spacing: args.terminalUiLetterSpacing,
     }),
   });
 }
@@ -3015,5 +3157,171 @@ export async function clearLogs(component: "daemon" | "web" | "im", groupId: str
   return apiJson("/api/v1/debug/clear_logs", {
     method: "POST",
     body: JSON.stringify({ component, group_id: groupId, by: "user" }),
+  });
+}
+
+// ============ Workflow (Ralph-Foreman) ============
+
+export interface WorkflowTask {
+  id: string;
+  title: string;
+  type: "frontend" | "backend" | "general";
+}
+
+export interface BatchSuggestion {
+  suggestion_id: string;
+  workflow_id: string;
+  tasks: WorkflowTask[];
+  rationale: string;
+  estimated_parallelism: number;
+  created_at: string;
+}
+
+export interface BatchDecision {
+  decision_id: string;
+  suggestion_id: string;
+  workflow_id: string;
+  decision: "approved" | "modified" | "rejected" | "deferred";
+  approved_tasks: string[];
+  rejected_tasks: string[];
+  reason: string;
+  created_at: string;
+}
+
+export interface WorkflowProgress {
+  status: "idle" | "running";
+  workflow_id?: string;
+  current_batch?: string;
+  batches?: { total: number; completed: number };
+  tasks?: {
+    total: number;
+    completed: number;
+    failed: number;
+    running: number;
+    pending: number;
+  };
+  duration?: {
+    workflow_seconds: number;
+    batch_seconds: number;
+  };
+  recent_events?: Array<{
+    type: string;
+    timestamp: number;
+    [key: string]: unknown;
+  }>;
+}
+
+export interface WorkflowPendingState {
+  pending_suggestions: BatchSuggestion[];
+  pending_restarts: unknown[];
+  decisions?: BatchDecision[];
+}
+
+export async function fetchWorkflowPending(workflowId = "", includeDecisions = false) {
+  const params = new URLSearchParams();
+  if (workflowId) params.set("workflow_id", workflowId);
+  if (includeDecisions) params.set("include_decisions", "true");
+  return apiJson<WorkflowPendingState>(`/api/v1/workflow/pending?${params.toString()}`);
+}
+
+export async function fetchWorkflowActors(workflowId = "", actorType = "") {
+  const params = new URLSearchParams();
+  if (workflowId) params.set("workflow_id", workflowId);
+  if (actorType) params.set("actor_type", actorType);
+  return apiJson<{ actors: unknown[] }>(`/api/v1/workflow/actors?${params.toString()}`);
+}
+
+export async function clearWorkflow(workflowId: string) {
+  return apiJson(`/api/v1/workflow/clear?workflow_id=${encodeURIComponent(workflowId)}`, {
+    method: "POST",
+  });
+}
+
+export async function submitBatchSuggestion(
+  groupId: string,
+  workflowId: string,
+  tasks: WorkflowTask[],
+  options?: {
+    rationale?: string;
+    estimatedParallelism?: number;
+    autoProcess?: boolean;
+    feishuChatId?: string;
+    autoStartAgents?: boolean;
+  }
+) {
+  return apiJson(`/api/v1/groups/${encodeURIComponent(groupId)}/workflow/batch/suggest`, {
+    method: "POST",
+    body: JSON.stringify({
+      workflow_id: workflowId,
+      tasks,
+      rationale: options?.rationale || "",
+      estimated_parallelism: options?.estimatedParallelism || tasks.length,
+      auto_process: options?.autoProcess ?? false,
+      feishu_chat_id: options?.feishuChatId || null,
+      auto_start_agents: options?.autoStartAgents ?? true,
+    }),
+  });
+}
+
+export async function processPendingBatch(
+  groupId: string,
+  suggestionId: string,
+  options?: {
+    feishuChatId?: string;
+    autoStartAgents?: boolean;
+  }
+) {
+  return apiJson(`/api/v1/groups/${encodeURIComponent(groupId)}/workflow/batch/process`, {
+    method: "POST",
+    body: JSON.stringify({
+      suggestion_id: suggestionId,
+      feishu_chat_id: options?.feishuChatId || null,
+      auto_start_agents: options?.autoStartAgents ?? true,
+    }),
+  });
+}
+
+export async function fetchWorkflowProgress(groupId: string, workflowId = "") {
+  const params = workflowId ? `?workflow_id=${encodeURIComponent(workflowId)}` : "";
+  return apiJson<WorkflowProgress>(
+    `/api/v1/groups/${encodeURIComponent(groupId)}/workflow/progress${params}`
+  );
+}
+
+export async function reportTaskCompleted(
+  groupId: string,
+  taskId: string,
+  agentId: string,
+  durationSeconds: number,
+  changedFiles: string[],
+  workflowId?: string
+) {
+  return apiJson(`/api/v1/groups/${encodeURIComponent(groupId)}/workflow/task/completed`, {
+    method: "POST",
+    body: JSON.stringify({
+      task_id: taskId,
+      agent_id: agentId,
+      duration_seconds: durationSeconds,
+      changed_files: changedFiles,
+      workflow_id: workflowId || null,
+    }),
+  });
+}
+
+export async function reportTaskFailed(
+  groupId: string,
+  taskId: string,
+  errorMessage: string,
+  suggestion = "",
+  agentName = ""
+) {
+  return apiJson(`/api/v1/groups/${encodeURIComponent(groupId)}/workflow/task/failed`, {
+    method: "POST",
+    body: JSON.stringify({
+      task_id: taskId,
+      error_message: errorMessage,
+      suggestion,
+      agent_name: agentName,
+    }),
   });
 }

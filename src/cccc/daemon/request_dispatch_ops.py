@@ -375,7 +375,7 @@ def dispatch_request(
     if im_resp is not None:
         return im_resp, False
 
-    ralph_resp = try_handle_ralph_op(op, args)
+    ralph_resp = try_handle_ralph_op(op, args, daemon_request_fn=recurse)
     if ralph_resp is not None:
         return ralph_resp, False
 

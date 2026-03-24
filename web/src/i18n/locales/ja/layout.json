@@ -107,6 +107,7 @@
   "newFilePrompt": "新しいファイル名を入力してください",
   "workspaceCreateFailed": "ワークスペース項目の作成に失敗しました",
   "panorama": "パノラマ",
+  "workflow": "ワークフロー",
   "panoramaHudTitle": "Agent State",
   "panoramaHudHint": "パノラマ上で、誰が作業中・受阻・待機中かを素早く確認できます。",
   "panoramaHudActive": "実行中",
