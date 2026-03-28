@@ -9,7 +9,7 @@ from typing import List
 import pytest
 
 from cccc.contracts.v1.agent import Agent, ModelCapability, ModelRegistry
-from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef
+from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, RestartSuggestion, TaskRef
 from cccc.daemon.foreman.agent_pool import (
     AgentPoolManager,
     AgentEvaluation,
@@ -101,6 +101,36 @@ def sample_suggestion(sample_tasks) -> ReadyBatchSuggestion:
     )
 
 
+def _create_group_with_foreman(foreman_id: str = "lead") -> str:
+    from cccc.contracts.v1 import DaemonRequest
+    from cccc.daemon.server import handle_request
+
+    create, _ = handle_request(
+        DaemonRequest.model_validate({"op": "group_create", "args": {"title": "workflow-test", "topic": "", "by": "user"}})
+    )
+    assert create.ok, getattr(create, "error", None)
+    group_id = str((create.result or {}).get("group_id") or "").strip()
+    assert group_id
+
+    add_foreman, _ = handle_request(
+        DaemonRequest.model_validate(
+            {
+                "op": "actor_add",
+                "args": {
+                    "group_id": group_id,
+                    "actor_id": foreman_id,
+                    "title": "Lead",
+                    "runner": "pty",
+                    "runtime": "claude",
+                    "by": "user",
+                },
+            }
+        )
+    )
+    assert add_foreman.ok, getattr(add_foreman, "error", None)
+    return group_id
+
+
 class TestReceiveReadyBatch:
     """Tests for receive_ready_batch function."""
 
@@ -169,6 +199,9 @@ class TestAgentPoolManager:
         assert "backend" in agent.task_affinity
         assert agent.role_type == "worker"
         assert agent.created_by == "foreman"
+        assert "assigned by Foreman" in agent.prompt
+        assert "Do not renegotiate user scope" in agent.prompt
+        assert "Report concrete evidence, changed files, and blockers" in agent.prompt
 
     def test_find_best_agent_no_agents(self, pool_manager):
         """Should return None when no agents exist."""
@@ -387,12 +420,27 @@ class TestMakeBatchDecision:
 class TestWorkflowOrchestratorDaemonBridge:
     """Tests for WorkflowOrchestrator registering agents as group actors."""
 
-    def test_add_actor_via_daemon_dispatches_actor_add(self, temp_project_dir, sample_suggestion):
+    def test_add_actor_via_daemon_dispatches_actor_add(self, temp_project_dir, monkeypatch):
         """Should dispatch actor_add request through daemon_request_fn."""
         from cccc.contracts.v1 import DaemonResponse
         from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+        from cccc.daemon.ops.agent_ops import create_agent
 
+        monkeypatch.setenv("CCCC_HOME", tempfile.mkdtemp())
+        group_id = _create_group_with_foreman("lead")
         dispatched_requests = []
+        worker_prompt = "# Worker Contract\n\nBackend only."
+
+        agent = create_agent(
+            agent_id="claude-backend-worker",
+            name="Claude Backend Worker",
+            agents_dir=temp_project_dir / ".cccc" / "agents",
+            model_runtime="claude",
+            model_id="claude-sonnet-4",
+            role_type="worker",
+            prompt=worker_prompt,
+        )
+        assert agent is not None
 
         def fake_daemon_request(req):
             dispatched_requests.append(req)
@@ -400,7 +448,7 @@ class TestWorkflowOrchestratorDaemonBridge:
 
         orchestrator = WorkflowOrchestrator(
             project_root=temp_project_dir,
-            group_id="test-group",
+            group_id=group_id,
             daemon_request_fn=fake_daemon_request,
         )
 
@@ -418,11 +466,14 @@ class TestWorkflowOrchestratorDaemonBridge:
         assert len(dispatched_requests) == 1
         req = dispatched_requests[0]
         assert req.op == "actor_add"
-        assert req.args["group_id"] == "test-group"
+        assert req.args["group_id"] == group_id
         assert req.args["actor_id"] == "claude-backend-worker"
         assert req.args["runtime"] == "claude"
         assert req.args["title"] == "Claude Backend Worker"
         assert req.args["runner"] == "pty"
+        assert req.args["capability_autoload"] == ["pack:group-runtime"]
+        assert req.args["worker_prompt"] == worker_prompt
+        assert req.args["by"] == "service:workflow_orchestrator"
 
     def test_add_actor_via_daemon_returns_false_without_fn(self, temp_project_dir):
         """Should return False when daemon_request_fn is not set."""
@@ -441,11 +492,13 @@ class TestWorkflowOrchestratorDaemonBridge:
 
         assert orchestrator._add_actor_via_daemon(assignment) is False
 
-    def test_start_assigned_agents_registers_actors(self, temp_project_dir, sample_suggestion):
+    def test_start_assigned_agents_registers_actors(self, temp_project_dir, sample_suggestion, monkeypatch):
         """Should register agents as group actors via daemon when processing batch."""
         from cccc.contracts.v1 import DaemonResponse
         from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
 
+        monkeypatch.setenv("CCCC_HOME", tempfile.mkdtemp())
+        group_id = _create_group_with_foreman("lead")
         added_actors = []
 
         def fake_daemon_request(req):
@@ -455,7 +508,7 @@ class TestWorkflowOrchestratorDaemonBridge:
 
         orchestrator = WorkflowOrchestrator(
             project_root=temp_project_dir,
-            group_id="test-group",
+            group_id=group_id,
             daemon_request_fn=fake_daemon_request,
         )
 
@@ -466,6 +519,100 @@ class TestWorkflowOrchestratorDaemonBridge:
 
         # Each approved task should have had actor_add dispatched
         assert len(added_actors) == len(result.approved_tasks)
+
+    def test_build_task_prompt_uses_ralph_worker_contract(self, temp_project_dir):
+        """Worker assignment prompt should reflect the foreman/worker contract."""
+        from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+
+        orchestrator = WorkflowOrchestrator(
+            project_root=temp_project_dir,
+            group_id="test-group",
+        )
+
+        prompt = orchestrator._build_task_prompt(
+            TaskRef(id="T9", title="Fix bug", type="backend"),
+            worker_prompt="# Worker Contract\n\nBackend only.",
+        )
+
+        assert "[Foreman Assignment]" in prompt
+        assert "Assigned by Foreman inside the Ralph workflow." in prompt
+        assert "Do not contact the user to renegotiate scope." in prompt
+        assert "Worker Assignment:" in prompt
+        assert "Backend only." in prompt
+        assert "Report back to Foreman with:" in prompt
+        assert "changed files or evidence" in prompt
+        assert 'cccc_message_send(to="@foreman", text=...)' in prompt
+
+    def test_process_batch_suggestion_syncs_control_plane(self, temp_project_dir, sample_suggestion):
+        """Ralph batch processing should mirror tasks/decision into shared context."""
+        from cccc.contracts.v1 import DaemonResponse
+        from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+
+        dispatched_requests = []
+
+        def fake_daemon_request(req):
+            dispatched_requests.append(req)
+            return DaemonResponse(ok=True, result={"ok": True}), False
+
+        orchestrator = WorkflowOrchestrator(
+            project_root=temp_project_dir,
+            group_id="test-group",
+            daemon_request_fn=fake_daemon_request,
+        )
+
+        orchestrator.process_batch_suggestion(
+            sample_suggestion,
+            auto_start_agents=True,
+        )
+
+        context_sync_reqs = [req for req in dispatched_requests if req.op == "context_sync"]
+        assert len(context_sync_reqs) == 1
+        sync_args = context_sync_reqs[0].args
+        assert sync_args["group_id"] == "test-group"
+        assert sync_args["by"] == "service:workflow_orchestrator"
+        ops = sync_args["ops"]
+        task_create_ops = [op for op in ops if op["op"] == "task.create"]
+        note_ops = [op for op in ops if op["op"] == "coordination.note.add"]
+        assert len(task_create_ops) == len(sample_suggestion.tasks)
+        assert len(note_ops) == 1
+        assert task_create_ops[0]["status"] in {"active", "blocked"}
+        assert "ralph_batch=sug-test-001" in task_create_ops[0]["notes"]
+
+    def test_handle_restart_wraps_restart_as_single_task_batch(self, temp_project_dir, monkeypatch):
+        """Restart suggestions should be reprocessed through the batch workflow."""
+        from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+
+        orchestrator = WorkflowOrchestrator(
+            project_root=temp_project_dir,
+            group_id="test-group",
+        )
+        restart = RestartSuggestion(
+            suggestion_id="rst-001",
+            workflow_id="wf-test-001",
+            task=TaskRef(id="T9", title="Retry backend task", type="backend"),
+            reason="Retry after transient failure",
+            previous_attempts=1,
+            files_to_adopt=["src/service.py"],
+        )
+
+        captured = {}
+
+        def fake_process_batch_suggestion(suggestion, *, auto_start_agents=True):
+            captured["suggestion"] = suggestion
+            captured["auto_start_agents"] = auto_start_agents
+            return BatchEvaluationResult(suggestion=suggestion, approved_tasks=list(suggestion.tasks))
+
+        monkeypatch.setattr(orchestrator, "process_batch_suggestion", fake_process_batch_suggestion)
+
+        result = orchestrator.handle_restart(restart, auto_start_agents=False)
+
+        assert result.suggestion.suggestion_id == "rst-001"
+        assert captured["suggestion"].workflow_id == "wf-test-001"
+        assert len(captured["suggestion"].tasks) == 1
+        assert captured["suggestion"].tasks[0].id == "T9"
+        assert captured["suggestion"].rationale == "Restart suggested: Retry after transient failure"
+        assert captured["suggestion"].estimated_parallelism == 1
+        assert captured["auto_start_agents"] is False
 
 
 class TestForemanWorkflow:

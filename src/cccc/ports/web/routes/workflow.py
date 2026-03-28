@@ -10,6 +10,19 @@ from pydantic import BaseModel
 from ..schemas import RouteContext, require_group, require_user
 
 
+async def resolve_group_runtime_context(ctx: RouteContext, group_id: str) -> Dict[str, Any]:
+    """Unified helper to extract group scope / project_root for workflow ops."""
+    group_resp = await ctx.daemon({"op": "group_show", "args": {"group_id": group_id}})
+    group_data = (group_resp or {}).get("result", {})
+    active_scope = str(group_data.get("active_scope_key") or "").strip()
+    project_root = ""
+    for scope in group_data.get("scopes", []):
+        if isinstance(scope, dict) and scope.get("scope_key") == active_scope:
+            project_root = scope.get("url", "")
+            break
+    return {"group_id": group_id, "project_root": project_root, "active_scope": active_scope}
+
+
 class BatchSuggestRequest(BaseModel):
     workflow_id: str
     tasks: List[Dict[str, Any]]
@@ -173,11 +186,13 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         workflow_id: str = "",
     ) -> Dict[str, Any]:
         """Get current workflow progress."""
+        runtime_ctx = await resolve_group_runtime_context(ctx, group_id)
         return await ctx.daemon({
             "op": "ralph_workflow_progress",
             "args": {
                 "workflow_id": workflow_id,
                 "group_id": group_id,
+                "project_root": runtime_ctx["project_root"],
             },
         })
 
@@ -186,16 +201,23 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         group_id: str,
         req: TaskCompletedRequest,
     ) -> Dict[str, Any]:
-        """Report a task as completed."""
+        """Report a task as completed via unified task event."""
+        runtime_ctx = await resolve_group_runtime_context(ctx, group_id)
         return await ctx.daemon({
-            "op": "ralph_actor_status",
+            "op": "ralph_task_event",
             "args": {
-                "actor_id": req.agent_id,
-                "actor_type": "worker",
-                "workflow_id": req.workflow_id,
-                "status": "completed",
-                "current_task_id": req.task_id,
-                "message": f"Task {req.task_id} completed in {req.duration_seconds}s",
+                "group_id": group_id,
+                "project_root": runtime_ctx["project_root"],
+                "event_type": "completed",
+                "task_id": req.task_id,
+                "assignment_id": getattr(req, "assignment_id", ""),
+                "actor_run_id": getattr(req, "actor_run_id", ""),
+                "payload": {
+                    "agent_id": req.agent_id,
+                    "workflow_id": req.workflow_id,
+                    "duration_seconds": req.duration_seconds,
+                    "changed_files": req.changed_files or [],
+                },
             },
         })
 
@@ -204,14 +226,22 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         group_id: str,
         req: TaskFailedRequest,
     ) -> Dict[str, Any]:
-        """Report a task as failed."""
+        """Report a task as failed via unified task event."""
+        runtime_ctx = await resolve_group_runtime_context(ctx, group_id)
         return await ctx.daemon({
-            "op": "ralph_verification_result",
+            "op": "ralph_task_event",
             "args": {
-                "workflow_id": "",
+                "group_id": group_id,
+                "project_root": runtime_ctx["project_root"],
+                "event_type": "failed",
                 "task_id": req.task_id,
-                "overall_outcome": "failed",
-                "summary": req.error_message,
+                "assignment_id": getattr(req, "assignment_id", ""),
+                "actor_run_id": getattr(req, "actor_run_id", ""),
+                "payload": {
+                    "error_message": req.error_message,
+                    "suggestion": req.suggestion,
+                    "agent_name": req.agent_name,
+                },
             },
         })
 

@@ -675,6 +675,14 @@ export function AgentTab({
           <div className="min-w-0">
             <div className="flex items-center gap-2 min-w-0">
               <span className={classNames("font-semibold truncate min-w-0", color.text)}>{actor.title || actor.id}</span>
+              {actor.admin_hold && actor.admin_hold !== "none" && (
+                <span
+                  className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-900/30 dark:text-amber-300"
+                  title={`Held: ${actor.admin_hold}`}
+                >
+                  HOLD
+                </span>
+              )}
               {actor.role === "foreman" && (
                 <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-900/50 text-amber-300 font-medium">
                   {t('foreman')}
@@ -684,6 +692,9 @@ export function AgentTab({
             <div className={classNames("mt-0.5 text-xs truncate", "text-[var(--color-text-tertiary)]")}>
               {rtInfo?.label || t('custom')} • {isRunning ? t('running') : t('stopped')}
               {isHeadless && ` • ${t('headless')}`}
+              {actor.role === "peer" && (
+                <span className="ml-1 opacity-70">• peer</span>
+              )}
             </div>
             {/* Mobile-only: condensed single-line agent state */}
             <div

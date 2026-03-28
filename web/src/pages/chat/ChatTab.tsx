@@ -13,6 +13,7 @@ import { useChatTab } from "../../hooks/useChatTab";
 import { useTranslation } from 'react-i18next';
 import { useGroupStore, useModalStore, useUIStore } from "../../stores";
 import { getChatSession } from "../../stores/useUIStore";
+import { WorkflowActivityBar } from "../../components/WorkflowActivityBar";
 
 const EMPTY_PRESENTATION_ATTENTION: Record<string, boolean> = {};
 
@@ -286,6 +287,14 @@ export function ChatTab({
           </div>
         )}
       </header>
+
+      {/* Workflow Activity Bar — shows active agent dispatch inline */}
+      <WorkflowActivityBar
+        groupId={selectedGroupId}
+        isDark={isDark}
+        onNavigateToAgent={(actorId) => useUIStore.getState().setActiveTab(actorId)}
+        onNavigateToWorkflow={() => useUIStore.getState().setActiveTab("workflow")}
+      />
 
       {/* 2. Body Area: messages stay primary; presentation is a secondary surface */}
       <main className="flex flex-1 min-h-0 flex-col">

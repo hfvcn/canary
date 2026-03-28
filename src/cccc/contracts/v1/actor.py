@@ -43,9 +43,14 @@ class Actor(BaseModel):
     default_scope_key: str = ""
     submit: ActorSubmit = "enter"
     capability_autoload: List[str] = Field(default_factory=list)
-    enabled: bool = True
+    enabled: bool = True  # Deprecated: use desired_state instead
+    desired_state: Literal["running", "stopped"] = "running"
+    runtime_state: Literal["starting", "running", "stopping", "stopped", "crashed"] = "stopped"
+    admin_hold: Literal["none", "manual", "policy"] = "none"
+    run_id: int = 0
     runner: RunnerKind = "pty"  # "pty" for interactive, "headless" for MCP-driven
     runtime: AgentRuntime = "codex"  # Agent CLI runtime
+    worker_prompt: str = ""
     profile_id: str = ""
     profile_scope: Literal["global", "user"] = "global"
     profile_owner: str = ""

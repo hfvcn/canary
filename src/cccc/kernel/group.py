@@ -25,13 +25,9 @@ Use MCP chat only (`cccc_message_send` / `cccc_message_reply`); terminal output 
 
 Checklist (5-8 min):
 1. Recall: run `cccc_memory(action=search, query=<2-3 keywords from current Overview/tasks>, actor_id="")`.
-2. Alignment: confirm goals/constraints/DoD, top blockers, and next 1-3 actions with owners.
-3. Gap triage:
-   - info gap -> search Context/PROJECT.md/inbox/memory first (then web if allowed)
-   - capability gap -> `cccc_capability_use(...)`; if needed:
-     `cccc_capability_search(kind="mcp_toolpack"|"skill", query=...)` -> `cccc_capability_use(capability_id=..., scope="session")`
-     then handle `refresh_required=true`; if still failed, follow `diagnostics` + `resolution_plan`
-4. State upkeep: sync tasks/context and update your agent state (`focus/next_action/what_changed`).
+2. Ralph + user reality: confirm the latest user ask, current success criteria, ready/pending Ralph batches, and active blockers.
+3. Agent routing: reuse/start existing workers first; if the pool is wrong, inspect `cccc_runtime_list` + `cccc_model(action="list"|"get")` before `cccc_actor(action="add", ...)`.
+4. Delivery view: map each active ask to `done` / `pending` / `blocked(owner)` and send only meaningful deltas outward.
 5. Consolidation (on milestone/done): write one durable daily note via
    `cccc_memory(action="write", target="daily", content=...)`;
    promote stable reusable know-how via

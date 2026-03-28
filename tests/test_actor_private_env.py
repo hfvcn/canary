@@ -263,6 +263,164 @@ class TestActorPrivateEnv(unittest.TestCase):
             else:
                 os.environ["CCCC_HOME"] = old_home
 
+    def test_foreman_add_same_runtime_inherits_command_env_and_private_env(self) -> None:
+        from cccc.contracts.v1 import DaemonRequest
+        from cccc.daemon.server import handle_request
+        from cccc.kernel.actors import find_actor
+        from cccc.kernel.group import load_group
+
+        old_home = os.environ.get("CCCC_HOME")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                os.environ["CCCC_HOME"] = td
+
+                create, _ = handle_request(
+                    DaemonRequest.model_validate({"op": "group_create", "args": {"title": "t", "topic": "", "by": "user"}})
+                )
+                self.assertTrue(create.ok, getattr(create, "error", None))
+                group_id = str((create.result or {}).get("group_id") or "").strip()
+                self.assertTrue(group_id)
+
+                add_foreman, _ = handle_request(
+                    DaemonRequest.model_validate(
+                        {
+                            "op": "actor_add",
+                            "args": {
+                                "group_id": group_id,
+                                "actor_id": "lead",
+                                "title": "Lead",
+                                "runner": "pty",
+                                "runtime": "claude",
+                                "env": {"FOREMAN_ONLY": "1"},
+                                "env_private": {"OPENAI_API_KEY": "secret"},
+                                "by": "user",
+                            },
+                        }
+                    )
+                )
+                self.assertTrue(add_foreman.ok, getattr(add_foreman, "error", None))
+
+                add_peer, _ = handle_request(
+                    DaemonRequest.model_validate(
+                        {
+                            "op": "actor_add",
+                            "args": {
+                                "group_id": group_id,
+                                "actor_id": "peer1",
+                                "title": "Peer One",
+                                "runner": "pty",
+                                "runtime": "claude",
+                                "by": "lead",
+                            },
+                        }
+                    )
+                )
+                self.assertTrue(add_peer.ok, getattr(add_peer, "error", None))
+
+                group = load_group(group_id)
+                self.assertIsNotNone(group)
+                assert group is not None
+                foreman = find_actor(group, "lead")
+                peer = find_actor(group, "peer1")
+                self.assertIsInstance(foreman, dict)
+                self.assertIsInstance(peer, dict)
+                assert isinstance(foreman, dict)
+                assert isinstance(peer, dict)
+                self.assertEqual(peer.get("command"), foreman.get("command"))
+                self.assertEqual(peer.get("env"), foreman.get("env"))
+
+                keys, _ = handle_request(
+                    DaemonRequest.model_validate(
+                        {"op": "actor_env_private_keys", "args": {"group_id": group_id, "actor_id": "peer1", "by": "user"}}
+                    )
+                )
+                self.assertTrue(keys.ok, getattr(keys, "error", None))
+                self.assertEqual(set(keys.result.get("keys") or []), {"OPENAI_API_KEY"})
+        finally:
+            if old_home is None:
+                os.environ.pop("CCCC_HOME", None)
+            else:
+                os.environ["CCCC_HOME"] = old_home
+
+    def test_foreman_add_cross_runtime_uses_runtime_default_command_and_no_env_inheritance(self) -> None:
+        from cccc.contracts.v1 import DaemonRequest
+        from cccc.daemon.server import handle_request
+        from cccc.kernel.actors import find_actor
+        from cccc.kernel.group import load_group
+        from cccc.kernel.runtime import get_runtime_command_with_flags
+
+        old_home = os.environ.get("CCCC_HOME")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                os.environ["CCCC_HOME"] = td
+
+                create, _ = handle_request(
+                    DaemonRequest.model_validate({"op": "group_create", "args": {"title": "t", "topic": "", "by": "user"}})
+                )
+                self.assertTrue(create.ok, getattr(create, "error", None))
+                group_id = str((create.result or {}).get("group_id") or "").strip()
+                self.assertTrue(group_id)
+
+                add_foreman, _ = handle_request(
+                    DaemonRequest.model_validate(
+                        {
+                            "op": "actor_add",
+                            "args": {
+                                "group_id": group_id,
+                                "actor_id": "lead",
+                                "title": "Lead",
+                                "runner": "pty",
+                                "runtime": "claude",
+                                "env": {"RUNTIME_SPECIFIC": "claude"},
+                                "env_private": {"OPENAI_API_KEY": "secret"},
+                                "by": "user",
+                            },
+                        }
+                    )
+                )
+                self.assertTrue(add_foreman.ok, getattr(add_foreman, "error", None))
+
+                add_peer, _ = handle_request(
+                    DaemonRequest.model_validate(
+                        {
+                            "op": "actor_add",
+                            "args": {
+                                "group_id": group_id,
+                                "actor_id": "peer1",
+                                "title": "Peer One",
+                                "runner": "headless",
+                                "runtime": "gemini",
+                                "by": "lead",
+                            },
+                        }
+                    )
+                )
+                self.assertTrue(add_peer.ok, getattr(add_peer, "error", None))
+
+                group = load_group(group_id)
+                self.assertIsNotNone(group)
+                assert group is not None
+                peer = find_actor(group, "peer1")
+                self.assertIsInstance(peer, dict)
+                assert isinstance(peer, dict)
+                self.assertEqual(peer.get("runtime"), "gemini")
+                self.assertEqual(peer.get("runner"), "headless")
+                self.assertEqual(peer.get("command"), get_runtime_command_with_flags("gemini"))
+                self.assertEqual(peer.get("env"), {})
+
+                keys, _ = handle_request(
+                    DaemonRequest.model_validate(
+                        {"op": "actor_env_private_keys", "args": {"group_id": group_id, "actor_id": "peer1", "by": "user"}}
+                    )
+                )
+                self.assertTrue(keys.ok, getattr(keys, "error", None))
+                self.assertEqual(keys.result.get("keys") or [], [])
+        finally:
+            if old_home is None:
+                os.environ.pop("CCCC_HOME", None)
+            else:
+                os.environ["CCCC_HOME"] = old_home
+
 
 if __name__ == "__main__":
     unittest.main()

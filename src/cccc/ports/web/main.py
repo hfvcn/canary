@@ -11,6 +11,7 @@ import uvicorn
 from ...daemon.server import call_daemon
 from ...kernel.settings import resolve_remote_access_web_binding
 from ...paths import ensure_home
+from .access_log import build_web_log_config
 from .runtime_control import (
     WEB_RUNTIME_RESTART_EXIT_CODE,
     clear_web_runtime_state,
@@ -74,6 +75,7 @@ def _run_web_child(*, host: str, port: int, mode: str, reload: bool, log_level: 
         host=str(host),
         port=int(port),
         log_level=str(log_level),
+        log_config=build_web_log_config(),
         reload=bool(reload),
         timeout_graceful_shutdown=0.2,
     )

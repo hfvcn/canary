@@ -85,6 +85,7 @@ class GroupSetActiveScopeData(BaseModel):
 
 class GroupStartData(BaseModel):
     started: List[str] = Field(default_factory=list)
+    skipped_held: List[str] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="forbid")
 

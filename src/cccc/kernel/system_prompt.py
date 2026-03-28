@@ -65,6 +65,30 @@ def _group_space_policy_lines(group_id: str) -> List[str]:
         return []
 
 
+def _role_policy_lines(role: str) -> List[str]:
+    role_norm = str(role or "").strip().casefold()
+    if role_norm == "foreman":
+        return [
+            "Role Focus:",
+            "- You MUST NOT execute implementation tasks. Your job is orchestration ONLY.",
+            "- When you receive a task from the user, your response should be to evaluate the agent pool and assign workers, NOT to start coding.",
+            "- Reuse or create workers as needed. Inspect actors with `cccc_actor`, runtimes with `cccc_runtime_list`, and models with `cccc_model` before assignment.",
+            '- If those tools are hidden, enable `pack:group-runtime` first with `cccc_capability_use(capability_id="pack:group-runtime", scope="session")`.',
+            "- Track progress/blockers across agents, keep shared state current, and send outward status through MCP/Feishu.",
+            "- Treat `done`, `idle`, and silence as signals to evaluate, not closure truth.",
+            "- If criteria are unmet, choose one clear next control action: continue, request evidence, hand off, or block.",
+        ]
+    if role_norm == "peer":
+        return [
+            "Role Focus:",
+            "- Execute the task assigned by foreman; do not renegotiate user scope on your own.",
+            "- Deliver concrete evidence, changed files, and blockers; avoid vague status.",
+            "- Raise risks or a better route early, with a specific recommendation.",
+            "- Do not spawn extra workers or re-plan the workflow unless foreman asks.",
+        ]
+    return []
+
+
 def render_system_prompt(*, group: Group, actor: Dict[str, Any]) -> str:
     """Render SYSTEM prompt for an actor.
     
@@ -176,7 +200,16 @@ def render_system_prompt(*, group: Group, actor: Dict[str, Any]) -> str:
         lines.append("")
         lines.append("scopes (* = active):")
         lines.extend(scope_lines)
-    
+
+    if str(role or "").strip().casefold() == "foreman":
+        lines.extend([
+            "",
+            "--- ROLE MANDATE ---",
+            "You are the Foreman (orchestrator). Your ONLY job is to coordinate, delegate, and track.",
+            "NEVER execute implementation tasks yourself. ALWAYS create or reuse worker agents.",
+            "If you catch yourself writing code, editing files, or implementing features - STOP and delegate to a worker instead.",
+        ])
+
     # Keep this stable and short. Long-lived playbook details belong in cccc_help.
     core_lines = [
         "Working Style:",
@@ -194,6 +227,12 @@ def render_system_prompt(*, group: Group, actor: Dict[str, Any]) -> str:
         "- Once scope is approved, finish it end-to-end; do not ask to continue on obvious next steps.",
         "- For strategy or scope discussion, align first; implement only after explicit action intent.",
     ]
+    role_lines = _role_policy_lines(role)
+    if role_lines:
+        core_lines.extend(["", *role_lines])
+    worker_prompt = str(actor.get("worker_prompt") or "").strip()
+    if worker_prompt:
+        core_lines.extend(["", "Worker Assignment:", worker_prompt])
     memory_lines = _memory_policy_lines(group_id)
     if memory_lines:
         core_lines.extend(["", *memory_lines])

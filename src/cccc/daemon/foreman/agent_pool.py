@@ -6,6 +6,7 @@ and decide whether to create new agents or reuse existing ones.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
@@ -26,6 +27,7 @@ from ..ops.agent_ops import (
 # Default capability sets for different task types
 DEFAULT_WORKER_CAPABILITIES = ["task_execution", "code_modification", "memory_access"]
 DEFAULT_REVIEWER_CAPABILITIES = ["code_review", "memory_access"]
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -100,6 +102,7 @@ class AgentPoolManager:
 
         # Track active assignments (agent_id -> task_id)
         self._active_assignments: Dict[str, str] = {}
+        self._last_assignment_warning: str = ""
 
     def get_model_registry(self) -> ModelRegistry:
         """Load the current model registry."""
@@ -197,7 +200,7 @@ class AgentPoolManager:
 
         # Model suitability (0-10 points)
         registry = self.get_model_registry()
-        model = registry.get_model(agent.model_runtime)
+        _, model = self._resolve_registry_model(registry, agent.model_id)
         if model:
             if task.type in model.strengths:
                 score += 10
@@ -267,19 +270,23 @@ class AgentPoolManager:
             Created agent, or None if creation failed
         """
         registry = self.get_model_registry()
+        self._last_assignment_warning = ""
 
         # Select best model for task type
         model_key = select_model_for_task(task.type, registry)
         if not model_key:
-            # Fall back to first available model
-            if registry.models:
-                model_key = next(iter(registry.models))
-            else:
-                model_key = "claude"  # Ultimate fallback
+            self._last_assignment_warning = f"Warning: no registry model available for task type '{task.type}'"
+            logger.warning(self._last_assignment_warning)
+            return None
 
         model = registry.get_model(model_key)
-        model_runtime = model.runtime if model else "claude"
-        model_id = model.model_id if model else ""
+        if model is None:
+            self._last_assignment_warning = f"Warning: registry key '{model_key}' not found for task type '{task.type}'"
+            logger.warning(self._last_assignment_warning)
+            return None
+
+        model_runtime = model.runtime
+        model_id = model.model_id or model_key
 
         # Generate agent ID and name
         if not agent_id:
@@ -322,36 +329,19 @@ class AgentPoolManager:
 
     def _generate_worker_prompt(self, task_type: str) -> str:
         """Generate a system prompt for a worker based on task type."""
-        prompts = {
-            "frontend": """# Role: Frontend Developer
+        return f"""# Worker Contract
 
-你是一个专注于前端开发的 Worker。你的职责是：
-- 实现 UI 组件和页面
-- 处理用户交互逻辑
-- 优化前端性能
-- 确保跨浏览器兼容性
+You are a {task_type} worker assigned by Foreman inside the Ralph workflow.
 
-遵循项目的代码规范和设计系统。""",
-            "backend": """# Role: Backend Developer
-
-你是一个专注于后端开发的 Worker。你的职责是：
-- 实现 API 端点和业务逻辑
-- 设计和优化数据库查询
-- 处理认证和授权
-- 确保代码安全性
-
-遵循项目的架构模式和编码规范。""",
-            "general": """# Role: General Developer
-
-你是一个通用开发者 Worker。你的职责是：
-- 执行分配的开发任务
-- 编写文档和配置
-- 修复 bug 和改进代码
-- 协助其他专业任务
-
-灵活适应各种开发需求。""",
-        }
-        return prompts.get(task_type, prompts["general"])
+Rules:
+- Execute the assigned scope.
+- Do not renegotiate user scope or re-plan the workflow on your own.
+- Work through the repo/task evidence first, then implement the smallest correct change.
+- Report concrete evidence, changed files, and blockers back to Foreman.
+- Report via `cccc_message_send(to="@foreman", text=...)` when handing off progress or completion.
+- Raise risks or a better route early, with a specific recommendation.
+- Do not spawn extra workers unless Foreman explicitly asks.
+"""
 
     def assign_agent(self, agent_id: str, task_id: str) -> bool:
         """Mark an agent as assigned to a task.
@@ -425,7 +415,7 @@ class AgentPoolManager:
             # Create new agent
             assigned_agent = self.create_agent_for_task(task)
             is_new = True
-            reason = f"Created new agent for {task.type} task"
+            reason = self._last_assignment_warning or f"Created new agent for {task.type} task"
 
         if not assigned_agent:
             # Fallback: return a generic assignment
@@ -434,7 +424,7 @@ class AgentPoolManager:
                 agent_id="",
                 agent_name="",
                 is_new_agent=False,
-                assignment_reason="Failed to find or create agent",
+                assignment_reason=self._last_assignment_warning or "Failed to find or create agent",
             )
 
         # Mark agent as assigned. If this fails, the chosen agent is not actually usable
@@ -457,3 +447,16 @@ class AgentPoolManager:
             model_runtime=assigned_agent.model_runtime,
             model_id=assigned_agent.model_id,
         )
+
+    def _resolve_registry_model(
+        self,
+        registry: ModelRegistry,
+        model_id: str,
+    ) -> tuple[Optional[str], Optional[ModelCapability]]:
+        wanted = str(model_id or "").strip()
+        if not wanted:
+            return None, None
+        for model_key, model in registry.models.items():
+            if model_key == wanted or model.model_id == wanted:
+                return model_key, model
+        return None, None

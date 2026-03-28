@@ -249,6 +249,18 @@ MCP_TOOLS = [
         "inputSchema": _obj({}),
     },
     {
+        "name": "cccc_model",
+        "description": "Inspect the local model registry: action=list|get, optionally filter by runtime, include ratings/notes/history fields when present.",
+        "inputSchema": _obj(
+            {
+                "action": {"type": "string", "enum": ["list", "get"], "default": "list"},
+                "runtime": {"type": "string", "description": "Optional runtime filter for action=list"},
+                "include_disabled": {"type": "boolean", "default": False},
+                "model_key": {"type": "string", "description": "Required when action=get"},
+            }
+        ),
+    },
+    {
         "name": "cccc_capability_search",
         "description": "Search capability registry (built-in + external sources).",
         "inputSchema": _obj(

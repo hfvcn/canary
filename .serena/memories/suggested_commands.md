@@ -1,0 +1,1 @@
+Key commands: `cccc` to start local app; `cccc attach .`; `cccc setup --runtime claude|codex`; `cccc actor add <id> --runtime <runtime>`; `cccc group start`; `cccc send "..." --to @all`; `cccc inbox`; `cccc inbox --mark-read`. Development commands: `python3 -m pytest` for tests when pytest is installed. Entry points are `cccc` and `ccccd` from pyproject.

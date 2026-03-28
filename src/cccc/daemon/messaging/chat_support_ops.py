@@ -39,6 +39,12 @@ def auto_wake_recipients(
                 auto_wake_in_progress.discard(key)
             continue
         try:
+            # Three-layer state check: only wake if desired_state=running and admin_hold=none
+            admin_hold = str(actor.get("admin_hold", "none") or "none") if isinstance(actor, dict) else str(getattr(actor, "admin_hold", "none") or "none")
+            desired_state = str(actor.get("desired_state", "running") or "running") if isinstance(actor, dict) else str(getattr(actor, "desired_state", "running") or "running")
+            if admin_hold != "none" or desired_state != "running":
+                logger.info("Skipping auto-wake for %s: admin_hold=%s desired_state=%s", actor_id, admin_hold, desired_state)
+                continue
             if coerce_bool(actor.get("enabled"), default=True):
                 continue
             cmd = actor.get("command") if isinstance(actor.get("command"), list) else []

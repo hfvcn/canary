@@ -186,6 +186,51 @@ class TestMcpBootstrapMemoryRecallGate(unittest.TestCase):
         self.assertIn("workspace has multiple parallel edits", query)
         self.assertIn("cares about ROI and low noise", query)
 
+    def test_foreman_bootstrap_next_calls_include_runtime_pack_hint(self) -> None:
+        from cccc.ports.mcp import server as mcp_server
+        from cccc.ports.mcp.handlers import cccc_core, cccc_group_actor
+        from cccc.ports.mcp.handlers import context as cccc_context
+
+        with patch.dict(os.environ, {"CCCC_GROUP_ID": "g_test", "CCCC_ACTOR_ID": "foreman1"}, clear=False), patch.object(
+            cccc_group_actor,
+            "group_info",
+            return_value={
+                "group": {
+                    "group_id": "g_test",
+                    "title": "temp_task",
+                    "active_scope_key": "s1",
+                    "scopes": [{"scope_key": "s1", "url": "/tmp/workspace"}],
+                }
+            },
+        ), patch.object(
+            cccc_group_actor,
+            "actor_list",
+            return_value={"actors": [{"id": "foreman1", "role": "foreman", "runner": "pty"}]},
+        ), patch.object(
+            cccc_core,
+            "project_info",
+            return_value={"found": True, "path": "/tmp/workspace/PROJECT.md"},
+        ), patch.object(
+            cccc_context,
+            "context_get",
+            return_value={"coordination": {"brief": {}, "tasks": [], "recent_decisions": [], "recent_handoffs": []}, "agent_states": []},
+        ), patch.object(
+            cccc_core,
+            "inbox_list",
+            return_value={"messages": []},
+        ), patch.object(
+            cccc_core,
+            "_call_daemon_or_raise",
+            return_value={"hits": []},
+        ):
+            out = mcp_server.bootstrap(group_id="g_test", actor_id="foreman1")
+
+        next_calls = out["next_calls"]
+        self.assertEqual(
+            next_calls["enable_runtime_pack"],
+            'cccc_capability_use(capability_id="pack:group-runtime", scope="session")',
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

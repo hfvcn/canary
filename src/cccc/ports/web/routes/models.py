@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+_NO_MODEL_NS = ConfigDict(protected_namespaces=())
 
 from ....daemon.ops.model_ops import (
     list_models_for_runtime,
@@ -36,6 +38,7 @@ from ..schemas import RouteContext, require_user
 
 class ModelInfoResponse(BaseModel):
     """Model information response."""
+    model_config = _NO_MODEL_NS
 
     model_key: str
     model_id: str
@@ -71,6 +74,7 @@ class ToggleModelRequest(BaseModel):
 
 class AddCustomModelRequest(BaseModel):
     """Request to add a custom model."""
+    model_config = _NO_MODEL_NS
 
     runtime: str
     model_id: str
@@ -99,6 +103,7 @@ class ModelsListResponse(BaseModel):
 
 class ModelUpdateResponse(BaseModel):
     """Response for model update."""
+    model_config = _NO_MODEL_NS
 
     ok: bool
     model_key: str = ""
@@ -107,6 +112,7 @@ class ModelUpdateResponse(BaseModel):
 
 class ModelRateResponse(BaseModel):
     """Response for model rating."""
+    model_config = _NO_MODEL_NS
 
     ok: bool
     model_key: str = ""
@@ -117,6 +123,7 @@ class ModelRateResponse(BaseModel):
 
 class ModelReviewResponse(BaseModel):
     """Response for model review (Foreman comment)."""
+    model_config = _NO_MODEL_NS
 
     ok: bool
     model_key: str = ""
@@ -133,6 +140,7 @@ class ModelReviewRequest(BaseModel):
 
 class AddCustomModelResponse(BaseModel):
     """Response for adding custom model."""
+    model_config = _NO_MODEL_NS
 
     ok: bool
     model_key: str = ""

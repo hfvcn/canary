@@ -14,6 +14,7 @@ Uses existing daemon IPC infrastructure (Unix socket + JSON line protocol).
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
@@ -85,7 +86,13 @@ def handle_ralph_batch_suggest(args: Dict[str, Any], *, daemon_request_fn: Any =
     suggestion = ReadyBatchSuggestion(
         suggestion_id=suggestion_id,
         workflow_id=str(args["workflow_id"]),
-        tasks=[{"id": t.get("id", ""), "title": t.get("title", ""), "type": t.get("type", "general")} for t in tasks],
+        tasks=[{
+            "id": t.get("id", ""),
+            "title": t.get("title", ""),
+            "type": t.get("type", "general"),
+            "depends_on": t.get("depends_on", []),
+            "claimed_paths": t.get("claimed_paths", []),
+        } for t in tasks],
         rationale=str(args.get("rationale", "")),
         estimated_parallelism=int(args.get("estimated_parallelism", len(tasks))),
     )
@@ -156,7 +163,80 @@ def _try_process_batch(
         return {"status": "error", "error": str(e)}
 
 
-def handle_ralph_verification_result(args: Dict[str, Any]) -> DaemonResponse:
+def _try_forward_verification(
+    verification: VerificationResult,
+    args: Dict[str, Any],
+    *,
+    daemon_request_fn: Any = None,
+) -> None:
+    """Forward verification results to an active orchestrator when available."""
+    group_id = str(args.get("group_id") or "").strip()
+    if not group_id:
+        return
+
+    try:
+        from .foreman.workflow_orchestrator import get_orchestrator
+
+        orchestrator = get_orchestrator(group_id)
+        if orchestrator is None:
+            logger.info(f"Skipping verification forwarding for {verification.workflow_id}: orchestrator not available")
+            return
+
+        if daemon_request_fn and not orchestrator._daemon_request_fn:
+            orchestrator._daemon_request_fn = daemon_request_fn
+
+        orchestrator.on_verification_result(verification)
+    except Exception as e:
+        logger.warning(f"Failed to forward verification result {verification.verification_id}: {e}")
+
+
+def _try_process_restart(
+    suggestion: RestartSuggestion,
+    args: Dict[str, Any],
+    *,
+    daemon_request_fn: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Try to process a restart suggestion through the workflow orchestrator."""
+    from pathlib import Path
+
+    group_id = str(args.get("group_id") or "").strip()
+    project_root = str(args.get("project_root") or "").strip()
+
+    if not group_id or not project_root:
+        return {"status": "skipped", "reason": "missing group_id or project_root"}
+
+    try:
+        from .foreman.workflow_orchestrator import get_orchestrator
+
+        orchestrator = get_orchestrator(
+            group_id,
+            project_root=Path(project_root),
+            feishu_chat_id=args.get("feishu_chat_id"),
+            daemon_request_fn=daemon_request_fn,
+        )
+
+        if orchestrator is None:
+            return {"status": "skipped", "reason": "orchestrator not available"}
+
+        if daemon_request_fn and not orchestrator._daemon_request_fn:
+            orchestrator._daemon_request_fn = daemon_request_fn
+
+        result = orchestrator.handle_restart(
+            suggestion,
+            auto_start_agents=bool(args.get("auto_start_agents", True)),
+        )
+        return {
+            "status": "processed",
+            "decision": result.decision,
+            "approved_count": len(result.approved_tasks),
+            "rejected_count": len(result.rejected_tasks),
+        }
+    except Exception as e:
+        logger.warning(f"Failed to process restart suggestion {suggestion.suggestion_id}: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+def handle_ralph_verification_result(args: Dict[str, Any], *, daemon_request_fn: Any = None) -> DaemonResponse:
     """
     Handle ralph_verification_result operation.
 
@@ -168,6 +248,7 @@ def handle_ralph_verification_result(args: Dict[str, Any]) -> DaemonResponse:
         overall_outcome: passed/failed/skipped/timeout
         checks: List of individual check results
         summary: Human-readable summary
+        group_id: Optional group ID for forwarding to an active orchestrator
     """
     err = _validate_required(args, "workflow_id", "overall_outcome")
     if err:
@@ -197,6 +278,7 @@ def handle_ralph_verification_result(args: Dict[str, Any]) -> DaemonResponse:
 
     _RALPH_STATE["verifications"][verification_id] = verification.model_dump()
     logger.info(f"Ralph verification result: {verification_id} - {outcome}")
+    _try_forward_verification(verification, args, daemon_request_fn=daemon_request_fn)
 
     return _success({
         "verification_id": verification_id,
@@ -206,7 +288,7 @@ def handle_ralph_verification_result(args: Dict[str, Any]) -> DaemonResponse:
     })
 
 
-def handle_ralph_restart_suggest(args: Dict[str, Any]) -> DaemonResponse:
+def handle_ralph_restart_suggest(args: Dict[str, Any], *, daemon_request_fn: Any = None) -> DaemonResponse:
     """
     Handle ralph_restart_suggest operation.
 
@@ -220,6 +302,9 @@ def handle_ralph_restart_suggest(args: Dict[str, Any]) -> DaemonResponse:
         reason: Why restart is suggested
         previous_attempts: Number of previous attempts
         files_to_adopt: Files from previous attempt to adopt
+        auto_process: If true, process immediately through the orchestrator
+        group_id: Required if auto_process is true
+        project_root: Required if auto_process is true
     """
     err = _validate_required(args, "workflow_id", "task_id")
     if err:
@@ -242,11 +327,18 @@ def handle_ralph_restart_suggest(args: Dict[str, Any]) -> DaemonResponse:
     _RALPH_STATE["pending_restarts"][suggestion_id] = suggestion.model_dump()
     logger.info(f"Ralph restart suggestion: {suggestion_id} for task {args['task_id']}")
 
-    return _success({
+    result: Dict[str, Any] = {
         "suggestion_id": suggestion_id,
         "task_id": str(args["task_id"]),
         "created_at": suggestion.created_at,
-    })
+    }
+
+    if args.get("auto_process"):
+        process_result = _try_process_restart(suggestion, args, daemon_request_fn=daemon_request_fn)
+        if process_result:
+            result["processing"] = process_result
+
+    return _success(result)
 
 
 def handle_ralph_batch_decision(args: Dict[str, Any]) -> DaemonResponse:
@@ -576,7 +668,19 @@ def handle_ralph_workflow_progress(args: Dict[str, Any]) -> DaemonResponse:
 
         orchestrator = get_orchestrator(group_id)
         if orchestrator is None:
-            return _error("orchestrator_not_found", "No active orchestrator for group")
+            return _success({
+                "kind": "unavailable",
+                "reason_code": "no_active_orchestrator",
+                "snapshot": {
+                    "batches": {"total": 0, "completed": 0},
+                    "tasks": {"total": 0, "completed": 0, "failed": 0, "running": 0, "pending": 0},
+                    "duration": {"workflow_seconds": 0, "batch_seconds": 0},
+                    "recent_events": [],
+                    "assignments": [],
+                },
+                "workflow_id": workflow_id,
+                "active": False,
+            })
 
         state = orchestrator.get_workflow_state(workflow_id)
         return _success(state)
@@ -584,6 +688,47 @@ def handle_ralph_workflow_progress(args: Dict[str, Any]) -> DaemonResponse:
     except Exception as e:
         logger.warning(f"Failed to get workflow progress: {e}")
         return _error("progress_error", f"Failed to get progress: {e}")
+
+
+def handle_ralph_task_event(args: Dict[str, Any]) -> DaemonResponse:
+    """Handle ralph_task_event operation — unified task lifecycle event."""
+    from ..contracts.v1.ralph_ipc import TaskEvent
+
+    try:
+        event = TaskEvent(
+            event_type=str(args.get("event_type") or "").strip(),
+            task_id=str(args.get("task_id") or "").strip(),
+            assignment_id=str(args.get("assignment_id") or "").strip(),
+            actor_run_id=str(args.get("actor_run_id") or "").strip(),
+            idempotency_key=str(args.get("idempotency_key") or "").strip(),
+            occurred_at=str(args.get("occurred_at") or "").strip(),
+            payload=args.get("payload") or {},
+        )
+    except Exception as e:
+        return _error("invalid_task_event", f"Invalid task event: {e}")
+
+    group_id = str(args.get("group_id") or "").strip()
+    project_root = str(args.get("project_root") or "").strip() or None
+
+    if not group_id:
+        return _error("missing_group_id", "Missing group_id")
+
+    try:
+        from .foreman.workflow_orchestrator import get_orchestrator
+
+        orchestrator = get_orchestrator(group_id, project_root=Path(project_root) if project_root else None)
+        if orchestrator is None:
+            return _error("orchestrator_not_found", "No active orchestrator for group")
+
+        if hasattr(orchestrator, "ralph") and orchestrator.ralph is not None:
+            result = orchestrator.ralph.apply_task_event(event)
+        else:
+            result = {"accepted": False, "reason": "ralph_service_not_wired"}
+
+        return _success(result)
+    except Exception as e:
+        logger.warning(f"Failed to process task event: {e}")
+        return _error("task_event_error", f"Failed to process task event: {e}")
 
 
 # Operation dispatcher
@@ -598,6 +743,7 @@ _RALPH_OPS = {
     "ralph_clear_workflow": handle_ralph_clear_workflow,
     "ralph_process_pending": handle_ralph_process_pending,
     "ralph_workflow_progress": handle_ralph_workflow_progress,
+    "ralph_task_event": handle_ralph_task_event,
 }
 
 
@@ -621,6 +767,11 @@ def try_handle_ralph_op(
     if handler is None:
         return None
     # Inject daemon_request_fn for handlers that need it
-    if op in ("ralph_batch_suggest", "ralph_process_pending"):
+    if op in (
+        "ralph_batch_suggest",
+        "ralph_verification_result",
+        "ralph_restart_suggest",
+        "ralph_process_pending",
+    ):
         return handler(args, daemon_request_fn=daemon_request_fn)
     return handler(args)

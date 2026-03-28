@@ -180,6 +180,16 @@ class GroupPresentationPublishWorkspaceRequest(BaseModel):
     by: str = Field(default="user")
 
 
+class GroupPresentationPublishContentRequest(BaseModel):
+    slot: str = Field(default="auto")
+    card_type: str = Field(default="markdown")
+    title: str = Field(default="")
+    summary: str = Field(default="")
+    content: str = Field(default="")
+    table: Optional[Dict[str, Any]] = None
+    by: str = Field(default="user")
+
+
 class GroupPresentationClearRequest(BaseModel):
     slot: str = Field(default="")
     all: bool = False

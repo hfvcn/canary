@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ....kernel.group import load_group
+from ....kernel.group_space import get_group_space_prompt_state
 from ....kernel.prompt_files import load_builtin_help_markdown as _load_builtin_help_markdown
 from ....util.time import parse_utc_iso
 from ..common import MCPError, _call_daemon_or_raise
@@ -22,6 +24,12 @@ _PACK_QUICK_USE_EXAMPLES: Dict[str, str] = {
     "pack:file-im": 'cccc_capability_use(tool_name="cccc_file", tool_arguments={"action":"blob_path","rel_path":"state/blobs/..."})',
     "pack:automation": 'cccc_capability_use(tool_name="cccc_automation", tool_arguments={"action":"state"})',
     "pack:context-advanced": 'cccc_capability_use(tool_name="cccc_memory_admin", tool_arguments={"action":"index_sync","mode":"scan"})',
+}
+
+_RUNTIME_HELP_HEADERS = {
+    "## Group Space (Runtime)",
+    "## Active Skills (Runtime)",
+    "## Capability Quick Use (Runtime)",
 }
 
 
@@ -457,23 +465,63 @@ def _build_bootstrap_inbox_preview(*, inbox: Dict[str, Any], limit: int) -> Dict
     }
 
 
-def _append_runtime_skill_digest(markdown: str, *, group_id: str, actor_id: str) -> str:
-    base = str(markdown or "")
-    if not base.strip():
-        return base
-    if "## Active Skills (Runtime)" in base or "## Capability Quick Use (Runtime)" in base:
-        return base
+def _strip_runtime_help_sections(markdown: str) -> str:
+    raw = str(markdown or "")
+    if not raw.strip():
+        return raw
+    out: List[str] = []
+    skip = False
+    for line in raw.splitlines():
+        if line in _RUNTIME_HELP_HEADERS:
+            skip = True
+            continue
+        if skip and re.match(r"^##(?!#)\s+", line):
+            skip = False
+        if not skip:
+            out.append(line)
+    text = "\n".join(out).strip()
+    return text + "\n" if text else ""
+
+
+def _build_group_space_runtime_section(*, group_id: str) -> str:
+    gid = str(group_id or "").strip()
+    if not gid:
+        return ""
+    state = get_group_space_prompt_state(gid, provider="notebooklm")
+    if not isinstance(state, dict):
+        return ""
+    provider = str(state.get("provider") or "notebooklm")
+    mode = str(state.get("mode") or "disabled")
+    work_bound = bool(state.get("work_bound"))
+    memory_bound = bool(state.get("memory_bound"))
+    if not work_bound and not memory_bound:
+        return ""
+
+    lines = [
+        "## Group Space (Runtime)",
+        f"- NotebookLM provider: {provider} ({mode}); work_bound={str(work_bound).lower()} memory_bound={str(memory_bound).lower()}.",
+        '- If `cccc_space` is hidden in this session, use `cccc_capability_use(tool_name="cccc_space", tool_arguments={"action":"status"})` first.',
+        "- Artifact/job runs are async: do not poll. Wait for the later `system.notify` one-shot reminder, then continue other work or standby.",
+    ]
+    if work_bound:
+        lines.append('Use `cccc_space(action="query", lane="work")` for shared/project knowledge lookup.')
+    if memory_bound:
+        lines.append('use `cccc_space(action="query", lane="memory")` only as a deeper recall fallback.')
+    return "\n".join(lines).rstrip()
+
+
+def _build_runtime_skill_sections(*, group_id: str, actor_id: str) -> List[str]:
     gid = str(group_id or "").strip()
     aid = str(actor_id or "").strip()
     if not gid or not aid:
-        return base
+        return []
     try:
         state = _call_daemon_or_raise(
             {"op": "capability_state", "args": {"group_id": gid, "actor_id": aid, "by": aid}},
             timeout_s=3.0,
         )
     except Exception:
-        return base
+        return []
     enabled_caps = state.get("enabled_capabilities") if isinstance(state, dict) else []
     hidden_caps = state.get("hidden_capabilities") if isinstance(state, dict) else []
     active = state.get("active_capsule_skills") if isinstance(state, dict) else []
@@ -583,9 +631,32 @@ def _append_runtime_skill_digest(markdown: str, *, group_id: str, actor_id: str)
                     )
         sections.append("\n".join(lines_cap).rstrip())
 
+    return sections
+
+
+def _append_runtime_help_addenda(markdown: str, *, group_id: str, actor_id: str) -> str:
+    base = _strip_runtime_help_sections(markdown)
+    sections: List[str] = []
+
+    group_space = _build_group_space_runtime_section(group_id=group_id)
+    if group_space:
+        sections.append(group_space)
+    sections.extend(_build_runtime_skill_sections(group_id=group_id, actor_id=actor_id))
+
     if not sections:
         return base
+
+    insert_before = "## Role Notes"
+    if insert_before in base:
+        head, tail = base.split(insert_before, 1)
+        merged = head.rstrip() + "\n\n" + "\n\n".join(sections).rstrip() + "\n\n" + insert_before + tail
+        return merged.rstrip() + "\n"
     return base.rstrip() + "\n\n" + "\n\n".join(sections).rstrip() + "\n"
+
+
+def _append_runtime_skill_digest(markdown: str, *, group_id: str, actor_id: str) -> str:
+    """Backward-compatible alias for runtime help addenda."""
+    return _append_runtime_help_addenda(markdown, group_id=group_id, actor_id=actor_id)
 
 
 def inbox_list(*, group_id: str, actor_id: str, limit: int = 50, kind_filter: str = "all") -> Dict[str, Any]:
@@ -650,25 +721,30 @@ def bootstrap(
         context=recovery_pack if isinstance(recovery_pack, dict) else {},
     )
 
+    session = _build_bootstrap_session(
+        group=group if isinstance(group, dict) else {},
+        actors=[item for item in actors if isinstance(item, dict)],
+        actor_id=actor_id,
+        project=project,
+    )
+    next_calls = {
+        "help": "cccc_help()",
+        "project_info": "cccc_project_info()",
+        "context_get": "cccc_context_get()",
+        "memory_search": 'cccc_memory(action="search", query=...)',
+    }
+    if str(session.get("role") or "").strip().lower() == "foreman":
+        next_calls["enable_runtime_pack"] = 'cccc_capability_use(capability_id="pack:group-runtime", scope="session")'
+
     return {
-        "session": _build_bootstrap_session(
-            group=group if isinstance(group, dict) else {},
-            actors=[item for item in actors if isinstance(item, dict)],
-            actor_id=actor_id,
-            project=project,
-        ),
+        "session": session,
         "recovery": _build_bootstrap_recovery(pack=recovery_pack if isinstance(recovery_pack, dict) else {}),
         "inbox_preview": _build_bootstrap_inbox_preview(
             inbox=inbox if isinstance(inbox, dict) else {},
             limit=int(inbox_limit or 50),
         ),
         "memory_recall_gate": memory_recall_gate,
-        "next_calls": {
-            "help": "cccc_help()",
-            "project_info": "cccc_project_info()",
-            "context_get": "cccc_context_get()",
-            "memory_search": 'cccc_memory(action="search", query=...)',
-        },
+        "next_calls": next_calls,
     }
 
 

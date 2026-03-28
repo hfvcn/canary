@@ -45,13 +45,14 @@ CORE_TOOL_NAMES: Tuple[str, ...] = CORE_BASIC_TOOLS + CORE_ADMIN_TOOLS
 BUILTIN_CAPABILITY_PACKS: Dict[str, Dict[str, object]] = {
     "pack:group-runtime": {
         "title": "Group + Runtime Operations",
-        "description": "Group state operations and actor/runtime lifecycle controls.",
+        "description": "Group state, actor/runtime lifecycle controls, and model registry inspection.",
         "tool_names": (
             "cccc_group",
             "cccc_actor",
             "cccc_runtime_list",
+            "cccc_model",
         ),
-        "tags": ("group", "actor", "runtime"),
+        "tags": ("group", "actor", "runtime", "model"),
     },
     "pack:file-im": {
         "title": "File + IM",

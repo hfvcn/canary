@@ -1,0 +1,1 @@
+After code changes, run relevant tests with pytest if the environment has it installed, and validate behavior through daemon-facing flows when touching messaging, context, automation, or ports. For coordination features, verify task/context sync, inbox read/ack semantics, and any automation rule affected. If pytest is unavailable locally, note that verification gap explicitly.

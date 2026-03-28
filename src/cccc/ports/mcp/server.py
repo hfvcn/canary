@@ -5,7 +5,7 @@ Static MCP surface:
 - cccc_help / cccc_bootstrap / cccc_project_info
 - cccc_inbox_list / cccc_inbox_mark_read
 - cccc_message_send / cccc_message_reply
-- cccc_file / cccc_group / cccc_actor / cccc_runtime_list
+- cccc_file / cccc_group / cccc_actor / cccc_runtime_list / cccc_model
 - cccc_capability_search / cccc_capability_enable / cccc_capability_block / cccc_capability_state / cccc_capability_import / cccc_capability_uninstall / cccc_capability_use
 - cccc_space / cccc_automation
 - cccc_context_get / cccc_coordination / cccc_task / cccc_agent_state
@@ -49,6 +49,7 @@ from .toolspecs import MCP_TOOLS
 from .handlers.cccc_core import (  # noqa: F401
     _CCCC_HELP_BUILTIN,
     _build_context_hygiene_hint,
+    _append_runtime_help_addenda,
     _append_runtime_skill_digest,
     bootstrap,
     inbox_list,
@@ -81,6 +82,10 @@ from .handlers.cccc_group_actor import (  # noqa: F401
     group_list,
     group_set_state,
     runtime_list,
+)
+from .handlers.cccc_model import (  # noqa: F401
+    model_get,
+    model_list,
 )
 from .handlers.cccc_capability import (  # noqa: F401
     capability_block,
@@ -128,9 +133,6 @@ from .handlers.context import (  # noqa: F401
     coordination_get,
     coordination_update_brief,
     task_delete,
-    role_notes_clear,
-    role_notes_get,
-    role_notes_set,
     task_create,
     task_list,
     task_move,
@@ -184,7 +186,7 @@ def _handle_cccc_namespace(name: str, arguments: Dict[str, Any]) -> Optional[Dic
                 pf = read_group_prompt_file(g, HELP_FILENAME)
                 if pf.found and isinstance(pf.content, str) and pf.content.strip():
                     help_result = {
-                        "markdown": _append_runtime_skill_digest(
+                        "markdown": _append_runtime_help_addenda(
                             _select_help_markdown(pf.content, role=role, actor_id=aid),
                             group_id=gid,
                             actor_id=aid,
@@ -193,7 +195,7 @@ def _handle_cccc_namespace(name: str, arguments: Dict[str, Any]) -> Optional[Dic
                     }
                 else:
                     help_result = {
-                        "markdown": _append_runtime_skill_digest(
+                        "markdown": _append_runtime_help_addenda(
                             _select_help_markdown(_CCCC_HELP_BUILTIN, role=role, actor_id=aid),
                             group_id=gid,
                             actor_id=aid,
@@ -202,7 +204,7 @@ def _handle_cccc_namespace(name: str, arguments: Dict[str, Any]) -> Optional[Dic
                     }
             else:
                 help_result = {
-                    "markdown": _append_runtime_skill_digest(
+                    "markdown": _append_runtime_help_addenda(
                         _select_help_markdown(_CCCC_HELP_BUILTIN, role=role, actor_id=aid),
                         group_id=gid,
                         actor_id=aid,
@@ -211,7 +213,7 @@ def _handle_cccc_namespace(name: str, arguments: Dict[str, Any]) -> Optional[Dic
                 }
         else:
             help_result = {
-                "markdown": _append_runtime_skill_digest(
+                "markdown": _append_runtime_help_addenda(
                     _select_help_markdown(_CCCC_HELP_BUILTIN, role=role, actor_id=aid),
                     group_id=gid,
                     actor_id=aid,
@@ -449,6 +451,17 @@ def _handle_cccc_namespace(name: str, arguments: Dict[str, Any]) -> Optional[Dic
 
     if name == "cccc_runtime_list":
         return runtime_list()
+
+    if name == "cccc_model":
+        action = str(arguments.get("action") or "list").strip().lower()
+        if action == "list":
+            return model_list(
+                runtime=str(arguments.get("runtime") or ""),
+                include_disabled=coerce_bool(arguments.get("include_disabled"), default=False),
+            )
+        if action == "get":
+            return model_get(model_key=str(arguments.get("model_key") or ""))
+        raise MCPError(code="invalid_request", message="cccc_model action must be one of: list/get")
 
     # --- Capability ---
     if name == "cccc_capability_search":

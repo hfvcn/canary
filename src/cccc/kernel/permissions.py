@@ -67,6 +67,21 @@ def require_actor_permission(
     if not who or who == "user":
         return
 
+    # Service principal handling
+    if who.startswith("service:"):
+        service_name = who[len("service:"):]
+        # Define allowed actions per service principal
+        _SERVICE_ALLOWED_ACTIONS = {
+            "workflow_orchestrator": {
+                "actor.add", "actor.start", "actor.stop", "actor.restart",
+                "actor.remove", "actor.list",
+            },
+        }
+        allowed = _SERVICE_ALLOWED_ACTIONS.get(service_name, set())
+        if action in allowed:
+            return  # Service principal authorized
+        raise ValueError(f"permission denied: service:{service_name} cannot {action}")
+
     role = actor_role(group, who)
     
     if role == "foreman":

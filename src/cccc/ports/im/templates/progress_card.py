@@ -27,6 +27,8 @@ class EventType(str, Enum):
     TASK_COMPLETED = "task_completed"
     BATCH_COMPLETED = "batch_completed"
     TASK_FAILED = "task_failed"
+    TASK_STALLED = "task_stalled"
+    TASK_OFFLINE = "task_offline"
     INTERVENTION_NEEDED = "intervention_needed"
     WORKFLOW_COMPLETED = "workflow_completed"
 
@@ -38,6 +40,8 @@ class ProgressStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    STALLED = "stalled"
+    OFFLINE = "offline"
     BLOCKED = "blocked"
     SKIPPED = "skipped"
 
@@ -240,6 +244,8 @@ class ProgressCardBuilder:
                 ProgressStatus.RUNNING: "🔄",
                 ProgressStatus.COMPLETED: "✅",
                 ProgressStatus.FAILED: "❌",
+                ProgressStatus.STALLED: "⏸️",
+                ProgressStatus.OFFLINE: "📴",
                 ProgressStatus.BLOCKED: "🚫",
                 ProgressStatus.SKIPPED: "⏭️",
             }

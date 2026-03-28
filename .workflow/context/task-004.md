@@ -1,0 +1,3 @@
+# task-004: 动态 Agent 系统
+
+实现动态 Agent 系统：Agent 合约定义 (ModelCapability, Agent, ModelRegistry, AgentSet)、Agent CRUD 操作 (create/get/list/update/delete)、Prompt 动态组装 (build_agent_prompt 复用 capability_ops)、模型选择 (select_model_for_task)。[REMEMBER] Agent 由 Foreman 动态创建，定义存储为 YAML 在 .cccc/agents/；ModelRegistry 在 .cccc/models/registry.yaml 定义模型能力；Agent role_type (worker/reviewer/specialist) 映射到 capability prompt 的 peer 角色 [DECISION] Agent 定义存储为 YAML 文件在 .cccc/agents/，便于版本控制和复用；model 字段使用嵌套结构 {runtime, model_id} 保持 YAML 可读性 [ARCHITECTURE] Agent -> Capability -> Prompt 组装链：Agent.capabilities 列表 → 加载 Capability YAML → build_agent_prompt 调用 cap.get_prompt_for_role() 组装完整 Prompt

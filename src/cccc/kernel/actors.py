@@ -203,6 +203,21 @@ def find_foreman(group: Group) -> Optional[Dict[str, Any]]:
     return None
 
 
+def should_auto_start(actor: Dict[str, Any]) -> bool:
+    """Check if an actor should be auto-started based on three-layer state model.
+
+    Only start when desired_state=running AND admin_hold=none.
+    Falls back to enabled field for backward compat.
+    """
+    desired = str(actor.get("desired_state", "running")).strip()
+    hold = str(actor.get("admin_hold", "none")).strip()
+    if desired != "running":
+        return False
+    if hold != "none":
+        return False
+    return True
+
+
 def add_actor(
     group: Group,
     *,
@@ -216,6 +231,7 @@ def add_actor(
     enabled: bool = True,
     runner: RunnerKind = "pty",
     runtime: AgentRuntime = "codex",
+    worker_prompt: str = "",
 ) -> Dict[str, Any]:
     """Add a new actor to the group.
     
@@ -241,8 +257,11 @@ def add_actor(
         submit=submit,
         capability_autoload=_normalize_capability_id_list(capability_autoload or []),
         enabled=coerce_bool(enabled, default=True),
+        admin_hold="none",
+        run_id=0,
         runner=runner,
         runtime=runtime,
+        worker_prompt=str(worker_prompt or "").strip(),
         created_at=now,
         updated_at=now,
     )
@@ -266,6 +285,28 @@ def remove_actor(group: Group, actor_id: str) -> None:
     if len(actors) == before:
         raise ValueError(f"actor not found: {aid}")
     group.save()
+
+
+def retire_actor(group: Group, actor_id: str) -> Dict[str, Any]:
+    aid = actor_id.strip()
+    if not aid:
+        raise ValueError("missing actor id")
+
+    item = find_actor(group, aid)
+    if item is None:
+        raise ValueError(f"actor not found: {aid}")
+
+    now = utc_now_iso()
+    item["enabled"] = False
+    item["desired_state"] = "stopped"
+    item["admin_hold"] = "policy"
+    item["retired_at"] = now
+    item["updated_at"] = now
+    group.save()
+
+    result = dict(item)
+    result["role"] = get_effective_role(group, aid)
+    return result
 
 
 def reorder_actors(group: Group, actor_ids: List[str]) -> List[Dict[str, Any]]:
@@ -361,6 +402,22 @@ def update_actor(group: Group, actor_id: str, patch: Dict[str, Any]) -> Dict[str
 
     if "enabled" in patch:
         item["enabled"] = coerce_bool(patch.get("enabled"), default=False)
+
+    if "desired_state" in patch:
+        ds = patch["desired_state"]
+        if ds in ("running", "stopped"):
+            item["desired_state"] = ds
+
+    if "runtime_state" in patch:
+        rs = patch["runtime_state"]
+        if rs in ("starting", "running", "stopping", "stopped", "crashed"):
+            item["runtime_state"] = rs
+
+    if "admin_hold" in patch:
+        item["admin_hold"] = patch["admin_hold"]
+
+    if "run_id" in patch:
+        item["run_id"] = patch["run_id"]
 
     if "runner" in patch:
         runner = patch.get("runner")

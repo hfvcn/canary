@@ -796,6 +796,38 @@ export async function publishPresentationUrl(
   return { ok: true, result: normalizePresentationMutationResult(groupId, resp.result) };
 }
 
+export async function publishPresentationContent(
+  groupId: string,
+  payload: {
+    slotId: string;
+    cardType?: string;
+    title?: string;
+    summary?: string;
+    content?: string;
+    table?: { columns: string[]; rows: string[][] };
+  },
+): Promise<ApiResponse<PresentationMutationResult>> {
+  const resp = await apiJson<{
+    group_id?: unknown;
+    slot_id?: unknown;
+    card?: unknown;
+    presentation?: unknown;
+  }>(`/api/v1/groups/${encodeURIComponent(groupId)}/presentation/publish_content`, {
+    method: "POST",
+    body: JSON.stringify({
+      by: "user",
+      slot: String(payload.slotId || "").trim() || "auto",
+      card_type: String(payload.cardType || "markdown").trim(),
+      title: String(payload.title || "").trim(),
+      summary: String(payload.summary || "").trim(),
+      content: String(payload.content || "").trim() || undefined,
+      table: payload.table || undefined,
+    }),
+  });
+  if (!resp.ok) return resp as ApiResponse<PresentationMutationResult>;
+  return { ok: true, result: normalizePresentationMutationResult(groupId, resp.result) };
+}
+
 export async function publishPresentationUpload(
   groupId: string,
   payload: { slotId: string; file: File; title?: string; summary?: string },
@@ -3166,6 +3198,23 @@ export interface WorkflowTask {
   id: string;
   title: string;
   type: "frontend" | "backend" | "general";
+  depends_on?: string[];
+  claimed_paths?: string[];
+}
+
+export interface WorkflowAgentAssignment {
+  task_id: string;
+  task_title: string;
+  task_type: "frontend" | "backend" | "general";
+  agent_id: string;
+  agent_name: string;
+  is_new_agent: boolean;
+  model_runtime: string;
+  model_id: string;
+  status?: "pending" | "running" | "completed" | "failed" | "deferred" | "stalled" | "offline" | "blocked";
+  duration_seconds?: number;
+  changed_files?: string[];
+  error_message?: string;
 }
 
 export interface BatchSuggestion {
@@ -3188,6 +3237,42 @@ export interface BatchDecision {
   created_at: string;
 }
 
+export interface WorkflowSnapshot {
+  batches: { total: number; completed: number };
+  tasks: {
+    total: number;
+    completed: number;
+    failed: number;
+    running: number;
+    pending: number;
+    deferred: number;
+  };
+  duration: {
+    workflow_seconds: number;
+    batch_seconds: number;
+  };
+  recent_events: Array<{
+    type: string;
+    timestamp: number;
+    task_id?: string;
+    batch_id?: string;
+    agent_name?: string;
+    [key: string]: unknown;
+  }>;
+  assignments: WorkflowAgentAssignment[];
+}
+
+export interface WorkflowProgressResponse {
+  kind: "idle" | "running" | "stalled" | "unavailable" | "error";
+  reason_code: string;
+  snapshot: WorkflowSnapshot;
+  workflow_id: string;
+  active: boolean;
+}
+
+/**
+ * @deprecated Use WorkflowProgressResponse instead.
+ */
 export interface WorkflowProgress {
   status: "idle" | "running";
   workflow_id?: string;
@@ -3199,6 +3284,7 @@ export interface WorkflowProgress {
     failed: number;
     running: number;
     pending: number;
+    deferred: number;
   };
   duration?: {
     workflow_seconds: number;
@@ -3207,8 +3293,12 @@ export interface WorkflowProgress {
   recent_events?: Array<{
     type: string;
     timestamp: number;
+    task_id?: string;
+    batch_id?: string;
+    agent_name?: string;
     [key: string]: unknown;
   }>;
+  assignments?: WorkflowAgentAssignment[];
 }
 
 export interface WorkflowPendingState {
@@ -3283,7 +3373,7 @@ export async function processPendingBatch(
 
 export async function fetchWorkflowProgress(groupId: string, workflowId = "") {
   const params = workflowId ? `?workflow_id=${encodeURIComponent(workflowId)}` : "";
-  return apiJson<WorkflowProgress>(
+  return apiJson<WorkflowProgressResponse>(
     `/api/v1/groups/${encodeURIComponent(groupId)}/workflow/progress${params}`
   );
 }

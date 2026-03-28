@@ -72,6 +72,13 @@ class TestSystemPromptMemory(unittest.TestCase):
             self.assertIn("At key transitions, sync shared control-plane state and your cccc_agent_state.", prompt)
             self.assertIn("Once scope is approved, finish it end-to-end; do not ask to continue on obvious next steps.", prompt)
             self.assertIn("For strategy or scope discussion, align first; implement only after explicit action intent.", prompt)
+            self.assertIn("Ralph workflow:", prompt)
+            self.assertIn("Foreman owns user alignment, planning, agent routing, model choice", prompt)
+            self.assertIn('`cccc_model(action="list"|"get")`', prompt)
+            self.assertIn('`cccc_capability_use(capability_id="pack:group-runtime", scope="session")`', prompt)
+            self.assertIn("--- ROLE MANDATE ---", prompt)
+            self.assertIn("NEVER execute implementation tasks yourself. ALWAYS create or reuse worker agents.", prompt)
+            self.assertIn("You MUST NOT execute implementation tasks. Your job is orchestration ONLY.", prompt)
 
             # Memory header
             self.assertIn("Memory:", prompt)
@@ -85,14 +92,6 @@ class TestSystemPromptMemory(unittest.TestCase):
             self.assertIn("cccc_memory(action=get)", prompt)
             self.assertIn('cccc_memory(action="write", target="daily"|"memory", ...)', prompt)
             self.assertIn('cccc_memory_admin(action="context_check")', prompt)
-            self.assertIn("Fact-Goal gate: strategy/scope discussion first; implement only after explicit action intent", prompt)
-            self.assertIn("Planning gate (6D) for non-trivial changes: value/ROI", prompt)
-            self.assertIn("Todo discipline: track every concrete or implicit user ask as a runtime todo", prompt)
-            self.assertIn("Reconcile the full current approved scope before implementation", prompt)
-            self.assertIn("Delivery rule: once implementation is approved, complete the agreed scope in one pass", prompt)
-            self.assertIn("Completion rule (current approved scope): report each in-scope ask as done/pending/blocked(owner)", prompt)
-            self.assertIn("Gap policy: info gap -> search evidence first", prompt)
-            self.assertIn("Prefer simplification/removal over stacking fallback patches", prompt)
         finally:
             cleanup()
 

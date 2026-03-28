@@ -113,8 +113,10 @@ export type Actor = {
   id: string;
   role?: string;
   title?: string;
+  admin_hold?: "none" | "manual" | "policy";
   enabled?: boolean;
   running?: boolean;  // Actual process running status
+  run_id?: number;
   idle_seconds?: number | null;  // Seconds since last PTY output (null if not running/headless)
   command?: string[];
   env?: Record<string, string>;

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
 
 from ...contracts.v1 import DaemonError, DaemonResponse
-from ...kernel.actors import list_actors, update_actor
+from ...kernel.actors import list_actors, should_auto_start, update_actor
 from ...kernel.group import load_group
 from ...kernel.ledger import append_event
 from ...kernel.permissions import require_group_permission
@@ -14,6 +15,8 @@ from ...runners import headless as headless_runner
 from ...runners import pty as pty_runner
 from ...util.conv import coerce_bool
 from ..actors.actor_profile_runtime import resolve_linked_actor_before_start
+
+logger = logging.getLogger(__name__)
 
 
 def _error(code: str, message: str, *, details: Optional[Dict[str, Any]] = None) -> DaemonResponse:
@@ -59,12 +62,22 @@ def handle_group_start(
         require_group_permission(group, by=by, action="group.start")
         actors = list_actors(group)
         start_specs: list[tuple[str, Path, list[str], dict[str, str], Dict[str, Any], str]] = []
+        skipped_held: list[str] = []
         for actor in actors:
             if not isinstance(actor, dict):
                 continue
             aid = str(actor.get("id") or "").strip()
             if not aid:
                 continue
+            # group_start expresses user intent: set desired_state=running for non-held actors
+            admin_hold = str(actor.get("admin_hold", "none") or "none")
+            if admin_hold != "none":
+                skipped_held.append(aid)
+                logger.info("Skipping actor %s: admin_hold=%s", aid, admin_hold)
+                continue
+            # Restore desired_state for actors that were stopped by group_stop
+            if str(actor.get("desired_state", "running")) != "running":
+                update_actor(group, aid, {"enabled": True, "desired_state": "running"})
 
             scope_key = str(actor.get("default_scope_key") or group_scope_key).strip()
             url = find_scope_url(group, scope_key)
@@ -190,9 +203,9 @@ def handle_group_start(
             pass
         reset_automation_timers_if_active(group)
 
-    data: Dict[str, Any] = {"started": started}
+    data: Dict[str, Any] = {"started": started, "skipped_held": skipped_held}
     event = append_event(group.ledger_path, kind="group.start", group_id=group.group_id, scope_key="", by=by, data=data)
-    result: Dict[str, Any] = {"group_id": group.group_id, "started": started, "event": event}
+    result: Dict[str, Any] = {"group_id": group.group_id, "started": started, "skipped_held": skipped_held, "event": event}
     return DaemonResponse(ok=True, result=result)
 
 
@@ -220,7 +233,7 @@ def handle_group_stop(
             if not aid:
                 continue
             try:
-                update_actor(group, aid, {"enabled": False})
+                update_actor(group, aid, {"enabled": False, "desired_state": "stopped", "runtime_state": "stopped"})
                 stopped.append(aid)
             except Exception:
                 pass

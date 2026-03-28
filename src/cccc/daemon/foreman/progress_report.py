@@ -180,7 +180,15 @@ class ProgressReporter:
             - events (recent history)
         """
         if not self._state:
-            return {"status": "idle", "message": "No active workflow"}
+            return {
+                "status": "idle",
+                "workflow_id": "",
+                "current_batch": "",
+                "batches": {"total": 0, "completed": 0},
+                "tasks": {"total": 0, "completed": 0, "failed": 0, "running": 0, "pending": 0},
+                "duration": {"workflow_seconds": 0, "batch_seconds": 0},
+                "recent_events": [],
+            }
 
         return {
             "status": "running",
@@ -317,7 +325,7 @@ class ProgressReporter:
         # Record event
         self._record_event(EventType.TASK_COMPLETED, {
             "task_id": task_id,
-            "agent": agent_name,
+            "agent_name": agent_name,
             "duration": duration_seconds,
             "files_changed": len(changed_files),
         })
@@ -385,6 +393,7 @@ class ProgressReporter:
         self._record_event(EventType.TASK_FAILED, {
             "task_id": task_id,
             "error": error_message[:200],
+            "agent_name": agent_name or task_info.agent_name,
         })
 
         # Build batch context
@@ -403,6 +412,52 @@ class ProgressReporter:
         )
 
         return self._send_card(card)
+
+    def on_task_stalled(
+        self,
+        task_id: str,
+        agent_name: str = "",
+        last_progress_at: str = "",
+    ) -> None:
+        """Handle task stalled event (worker alive but no progress)."""
+        event_data: Dict[str, Any] = {
+            "task_id": task_id,
+            "agent_name": agent_name,
+        }
+        if last_progress_at:
+            event_data["last_progress_at"] = last_progress_at
+        self._record_event(EventType.TASK_STALLED, event_data)
+
+        if not self._state or task_id not in self._state.tasks:
+            return
+
+        task_info = self._state.tasks[task_id]
+        task_info.status = ProgressStatus.STALLED
+        if agent_name:
+            task_info.agent_name = agent_name
+
+    def on_task_offline(
+        self,
+        task_id: str,
+        agent_name: str = "",
+        last_seen_at: str = "",
+    ) -> None:
+        """Handle task offline event (worker heartbeat lost)."""
+        event_data: Dict[str, Any] = {
+            "task_id": task_id,
+            "agent_name": agent_name,
+        }
+        if last_seen_at:
+            event_data["last_seen_at"] = last_seen_at
+        self._record_event(EventType.TASK_OFFLINE, event_data)
+
+        if not self._state or task_id not in self._state.tasks:
+            return
+
+        task_info = self._state.tasks[task_id]
+        task_info.status = ProgressStatus.OFFLINE
+        if agent_name:
+            task_info.agent_name = agent_name
 
     def on_intervention_needed(
         self,

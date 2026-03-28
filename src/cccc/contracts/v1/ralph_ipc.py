@@ -53,6 +53,8 @@ class TaskRef(BaseModel):
     id: str
     title: str = ""
     type: Literal["frontend", "backend", "general"] = "general"
+    depends_on: List[str] = Field(default_factory=list)
+    claimed_paths: List[str] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="ignore")
 
@@ -163,6 +165,17 @@ class ActorStatus(BaseModel):
     updated_at: str = Field(default_factory=utc_now_iso)
 
     model_config = ConfigDict(extra="forbid")
+
+
+class TaskEvent(BaseModel):
+    """Unified task lifecycle event for the ralph_task_event daemon op."""
+    event_type: Literal["completed", "failed"]
+    task_id: str
+    assignment_id: str = ""
+    actor_run_id: str = ""
+    idempotency_key: str = ""
+    occurred_at: str = Field(default_factory=utc_now_iso)
+    payload: Dict[str, Any] = Field(default_factory=dict)
 
 
 # Union type for all Ralph IPC messages

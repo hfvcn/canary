@@ -40,6 +40,7 @@ from ..schemas import (
     GroupAutomationResetBaselineRequest,
     GroupPresentationBrowserSessionRequest,
     GroupPresentationClearRequest,
+    GroupPresentationPublishContentRequest,
     GroupPresentationPublishRequest,
     GroupPresentationPublishWorkspaceRequest,
     GroupSettingsRequest,
@@ -472,6 +473,31 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                 },
             }
         )
+
+    @group_router.post("/presentation/publish_content")
+    async def group_presentation_publish_content(
+        group_id: str, req: GroupPresentationPublishContentRequest
+    ) -> Dict[str, Any]:
+        content = str(req.content or "").strip()
+        table = req.table
+        if not content and not table:
+            raise HTTPException(status_code=400, detail={"code": "missing_content", "message": "content or table is required"})
+        slot = _normalize_presentation_slot(req.slot)
+        args: Dict[str, Any] = {
+            "group_id": group_id,
+            "by": req.by,
+            "slot": slot,
+            "card_type": str(req.card_type or "markdown").strip() or "markdown",
+            "title": str(req.title or "").strip(),
+            "summary": str(req.summary or "").strip(),
+        }
+        if table and isinstance(table, dict):
+            args["table"] = table
+            if not args["card_type"] or args["card_type"] == "markdown":
+                args["card_type"] = "table"
+        else:
+            args["content"] = content
+        return await ctx.daemon({"op": "presentation_publish", "args": args})
 
     @group_router.get("/presentation/workspace/list")
     async def group_presentation_workspace_list(group_id: str, path: str = "") -> Dict[str, Any]:

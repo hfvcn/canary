@@ -7,6 +7,8 @@ Tests the message models and daemon operations for Ralph-Foreman communication.
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import uuid4
 
 
@@ -221,6 +223,40 @@ class TestRalphIPCHandler(unittest.TestCase):
         self.assertIn("verification_id", resp.result)
         self.assertEqual(resp.result["overall_outcome"], "passed")
 
+    def test_ralph_verification_result_forwards_to_orchestrator(self) -> None:
+        from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op
+
+        forwarded = []
+        fake_orchestrator = SimpleNamespace(
+            _daemon_request_fn=None,
+            on_verification_result=lambda verification: forwarded.append(verification),
+        )
+
+        with patch(
+            "cccc.daemon.foreman.workflow_orchestrator.get_orchestrator",
+            return_value=fake_orchestrator,
+        ) as get_orchestrator:
+            daemon_request_fn = object()
+            resp = try_handle_ralph_op(
+                "ralph_verification_result",
+                {
+                    "workflow_id": "wf-1",
+                    "group_id": "group-1",
+                    "task_id": "t1",
+                    "overall_outcome": "failed",
+                    "summary": "tests failed",
+                },
+                daemon_request_fn=daemon_request_fn,
+            )
+
+        self.assertIsNotNone(resp)
+        self.assertTrue(resp.ok)
+        self.assertEqual(len(forwarded), 1)
+        self.assertEqual(forwarded[0].workflow_id, "wf-1")
+        self.assertEqual(forwarded[0].task_id, "t1")
+        self.assertIs(fake_orchestrator._daemon_request_fn, daemon_request_fn)
+        get_orchestrator.assert_called_once_with("group-1")
+
     def test_ralph_verification_result_invalid_outcome(self) -> None:
         from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op
 
@@ -249,6 +285,52 @@ class TestRalphIPCHandler(unittest.TestCase):
         self.assertTrue(resp.ok)
         self.assertIn("suggestion_id", resp.result)
         self.assertEqual(resp.result["task_id"], "t1")
+
+    def test_ralph_restart_suggest_auto_processes_with_orchestrator(self) -> None:
+        from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op
+
+        processed = []
+        fake_result = SimpleNamespace(
+            decision="approved",
+            approved_tasks=[SimpleNamespace(id="t1")],
+            rejected_tasks=[],
+        )
+        fake_orchestrator = SimpleNamespace(
+            _daemon_request_fn=None,
+            handle_restart=lambda suggestion, auto_start_agents=True: (
+                processed.append((suggestion, auto_start_agents)) or fake_result
+            ),
+        )
+
+        with patch(
+            "cccc.daemon.foreman.workflow_orchestrator.get_orchestrator",
+            return_value=fake_orchestrator,
+        ) as get_orchestrator:
+            daemon_request_fn = object()
+            resp = try_handle_ralph_op(
+                "ralph_restart_suggest",
+                {
+                    "workflow_id": "wf-1",
+                    "task_id": "t1",
+                    "task_title": "Failed Task",
+                    "task_type": "backend",
+                    "reason": "Build failed",
+                    "group_id": "group-1",
+                    "project_root": "/tmp/project",
+                    "auto_process": True,
+                },
+                daemon_request_fn=daemon_request_fn,
+            )
+
+        self.assertIsNotNone(resp)
+        self.assertTrue(resp.ok)
+        self.assertEqual(len(processed), 1)
+        self.assertEqual(processed[0][0].task.id, "t1")
+        self.assertTrue(processed[0][1])
+        self.assertEqual(resp.result["processing"]["status"], "processed")
+        self.assertEqual(resp.result["processing"]["approved_count"], 1)
+        self.assertIs(fake_orchestrator._daemon_request_fn, daemon_request_fn)
+        get_orchestrator.assert_called_once()
 
     def test_ralph_restart_suggest_preserves_caller_suggestion_id(self) -> None:
         from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op, _RALPH_STATE

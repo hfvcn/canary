@@ -1,13 +1,24 @@
 // Workflow state store (Ralph-Foreman workflow management).
 import { create } from "zustand";
 import * as api from "../services/api";
+import type {
+  WorkflowAgentAssignment,
+  WorkflowProgressResponse,
+  WorkflowSnapshot,
+} from "../services/api";
+
+export type { WorkflowAgentAssignment } from "../services/api";
 
 export interface WorkflowTask {
   id: string;
   title: string;
   type: "frontend" | "backend" | "general";
-  status?: "pending" | "running" | "completed" | "failed";
+  depends_on?: string[];
+  claimed_paths?: string[];
+  status?: "pending" | "running" | "completed" | "failed" | "deferred";
   agent_name?: string;
+  model_runtime?: string;
+  model_id?: string;
   duration_seconds?: number;
   changed_files?: string[];
   error_message?: string;
@@ -34,26 +45,44 @@ export interface BatchDecision {
 }
 
 export interface WorkflowProgress {
+  kind: WorkflowProgressResponse["kind"];
+  reason_code: string;
+  snapshot: WorkflowSnapshot;
+  workflow_id: string;
+  active: boolean;
+  /** @deprecated Use kind instead. */
   status: "idle" | "running";
-  workflow_id?: string;
+  /** @deprecated Use snapshot.batches instead. */
+  batches: WorkflowSnapshot["batches"];
+  /** @deprecated Use snapshot.tasks instead. */
+  tasks: WorkflowSnapshot["tasks"];
+  /** @deprecated Use snapshot.duration instead. */
+  duration: WorkflowSnapshot["duration"];
+  /** @deprecated Use snapshot.recent_events instead. */
+  recent_events: WorkflowSnapshot["recent_events"];
+  /** @deprecated Use snapshot.assignments instead. */
+  assignments: WorkflowSnapshot["assignments"];
+  /** @deprecated No longer returned by the progress API. */
   current_batch?: string;
-  batches?: { total: number; completed: number };
-  tasks?: {
-    total: number;
-    completed: number;
-    failed: number;
-    running: number;
-    pending: number;
+}
+
+function normalizeWorkflowProgress(response: WorkflowProgressResponse): WorkflowProgress {
+  const snapshot = {
+    ...response.snapshot,
+    tasks: {
+      ...response.snapshot.tasks,
+      deferred: response.snapshot.tasks.deferred ?? 0,
+    },
   };
-  duration?: {
-    workflow_seconds: number;
-    batch_seconds: number;
+  return {
+    ...response,
+    status: response.kind === "running" ? "running" : "idle",
+    batches: snapshot.batches,
+    tasks: snapshot.tasks,
+    duration: snapshot.duration,
+    recent_events: snapshot.recent_events,
+    assignments: snapshot.assignments,
   };
-  recent_events?: Array<{
-    type: string;
-    timestamp: number;
-    [key: string]: unknown;
-  }>;
 }
 
 interface WorkflowState {
@@ -61,6 +90,7 @@ interface WorkflowState {
   pendingSuggestions: BatchSuggestion[];
   decisions: BatchDecision[];
   progress: WorkflowProgress | null;
+  assignments: WorkflowAgentAssignment[];
   isLoading: boolean;
   error: string | null;
 
@@ -106,6 +136,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   pendingSuggestions: [],
   decisions: [],
   progress: null,
+  assignments: [],
   isLoading: false,
   error: null,
   selectedWorkflowId: "",
@@ -114,7 +145,10 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   // Setters
   setPendingSuggestions: (suggestions) => set({ pendingSuggestions: suggestions }),
   setDecisions: (decisions) => set({ decisions }),
-  setProgress: (progress) => set({ progress }),
+  setProgress: (progress) => {
+    const assignments = progress?.snapshot.assignments || [];
+    set({ progress, assignments });
+  },
   setIsLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ error }),
   setSelectedWorkflowId: (id) => set({ selectedWorkflowId: id }),
@@ -142,13 +176,22 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   },
 
   refreshProgress: async (groupId, workflowId = "") => {
+    set({ isLoading: true, error: null });
     try {
       const resp = await api.fetchWorkflowProgress(groupId, workflowId);
       if (resp.ok && resp.result) {
-        set({ progress: resp.result as api.WorkflowProgress });
+        const data = resp.result as WorkflowProgressResponse;
+        const progress = normalizeWorkflowProgress(data);
+        set({
+          progress,
+          assignments: progress.snapshot.assignments,
+          isLoading: false,
+        });
+      } else {
+        set({ error: resp.error?.message || null, isLoading: false });
       }
     } catch (e) {
-      console.warn("Failed to fetch workflow progress:", e);
+      set({ error: String(e), isLoading: false });
     }
   },
 
@@ -200,7 +243,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       const resp = await api.clearWorkflow(workflowId);
       if (resp.ok) {
         await get().refreshPending();
-        set({ progress: null });
+        set({ progress: null, assignments: [] });
         return true;
       }
       return false;

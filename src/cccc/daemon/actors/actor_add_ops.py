@@ -48,6 +48,7 @@ def handle_actor_add(
     env_raw = args.get("env")
     capability_autoload_raw = args.get("capability_autoload")
     env_private_raw = args.get("env_private")
+    worker_prompt = str(args.get("worker_prompt") or "").strip()
     default_scope_key = str(args.get("default_scope_key") or "").strip()
     profile_id = str(args.get("profile_id") or "").strip()
     profile_scope_raw = str(args.get("profile_scope") or "").strip().lower()
@@ -159,9 +160,6 @@ def handle_actor_add(
         inherit_foreman_private_env = False
         if isinstance(foreman_cfg, dict) and foreman_cfg.get("id") == by and not linked_profile_id:
             foreman_runtime = str(foreman_cfg.get("runtime") or "").strip()
-            foreman_runner = str(foreman_cfg.get("runner") or "pty").strip() or "pty"
-            foreman_runner_effective = effective_runner_kind(foreman_runner)
-            runner_effective = effective_runner_kind(runner)
             foreman_command_raw = foreman_cfg.get("command") if isinstance(foreman_cfg.get("command"), list) else []
             foreman_command = [str(item) for item in foreman_command_raw if isinstance(item, str) and str(item).strip()]
             foreman_env_raw = foreman_cfg.get("env") if isinstance(foreman_cfg.get("env"), dict) else {}
@@ -173,27 +171,25 @@ def handle_actor_add(
 
             if not foreman_runtime:
                 raise ValueError("foreman config missing runtime")
-            if runtime != foreman_runtime:
-                raise ValueError(f"foreman can only add actors with the same runtime as itself (expected: {foreman_runtime})")
-            if runner_effective != foreman_runner_effective:
-                raise ValueError(
-                    f"foreman can only add actors with the same runner as itself (expected: {foreman_runner_effective})"
-                )
+            same_runtime_as_foreman = runtime == foreman_runtime
 
             if not command:
-                command = list(foreman_command) if foreman_command else get_runtime_command_with_flags(runtime)
-            elif command != foreman_command:
+                if same_runtime_as_foreman:
+                    command = list(foreman_command) if foreman_command else get_runtime_command_with_flags(runtime)
+                else:
+                    command = get_runtime_command_with_flags(runtime)
+            elif same_runtime_as_foreman and command != foreman_command:
                 raise ValueError(
                     "foreman can only add actors by strict-cloning command (runtime/runner/command/env must match foreman)"
                 )
 
             if not env:
-                env = dict(foreman_env)
-            if env != foreman_env:
+                env = dict(foreman_env) if same_runtime_as_foreman else {}
+            if same_runtime_as_foreman and env != foreman_env:
                 raise ValueError("foreman can only add actors by strict-cloning env (runtime/runner/command/env must match foreman)")
 
-            # Mark for inheriting foreman's private env (secrets) to the new peer.
-            inherit_foreman_private_env = True
+            # Cross-runtime actors must not inherit runtime-specific secrets/config from the foreman.
+            inherit_foreman_private_env = same_runtime_as_foreman
         else:
             if not command:
                 command = get_runtime_command_with_flags(runtime)
@@ -212,6 +208,7 @@ def handle_actor_add(
             capability_autoload=list(capability_autoload_raw) if isinstance(capability_autoload_raw, list) else None,
             runner=runner,  # type: ignore
             runtime=runtime,  # type: ignore
+            worker_prompt=worker_prompt,
         )
 
         effective_actor_id = str(actor.get("id") or actor_id).strip() or actor_id

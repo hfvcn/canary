@@ -71,7 +71,7 @@ class ModelCapability(BaseModel):
     foreman_sample_count: int = 0  # Number of workflows rated
     last_rated_at: Optional[str] = None  # Last rating timestamp
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
 
 
 class Agent(BaseModel):
@@ -121,7 +121,7 @@ class Agent(BaseModel):
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
 
 
 class ModelRegistry(BaseModel):

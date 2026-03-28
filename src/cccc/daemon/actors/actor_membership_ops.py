@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Optional
 
 from ...contracts.v1 import DaemonError, DaemonResponse
-from ...kernel.actors import list_actors, remove_actor
+from ...kernel.actors import list_actors, remove_actor, retire_actor
 from ...kernel.group import load_group
 from ...kernel.ledger import append_event
 from ...kernel.permissions import require_actor_permission
@@ -39,7 +39,10 @@ def handle_actor_remove(
     before_foreman = foreman_id(group)
     try:
         require_actor_permission(group, by=by, action="actor.remove", target_actor_id=actor_id)
-        remove_actor(group, actor_id)
+        if by.startswith("service:"):
+            retire_actor(group, actor_id)
+        else:
+            remove_actor(group, actor_id)
         pty_runner.SUPERVISOR.stop_actor(group_id=group.group_id, actor_id=actor_id)
         remove_pty_state_if_pid(group.group_id, actor_id, pid=0)
         headless_runner.SUPERVISOR.stop_actor(group_id=group.group_id, actor_id=actor_id)

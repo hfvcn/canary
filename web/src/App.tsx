@@ -1,6 +1,4 @@
-import React, { lazy, Suspense, useEffect, useMemo, useRef } from "react";
-import { useTranslation } from "react-i18next";
-import { TabBar } from "./components/TabBar";
+import React, { lazy, Suspense, useEffect, useMemo } from "react";
 import { DropOverlay } from "./components/DropOverlay";
 const AppModals = lazy(() => import("./components/AppModals").then((m) => ({ default: m.AppModals })));
 import { AppBackground } from "./components/app/AppBackground";
@@ -22,33 +20,21 @@ import { useAppTabState } from "./hooks/useAppTabState";
 import { WebPet } from "./features/webPet/WebPet";
 import { getEffectiveComposerDestGroupId } from "./stores/useComposerStore";
 import { getChatSession } from "./stores/useUIStore";
-import { classNames } from "./utils/classNames";
-import { ActorTab } from "./pages/ActorTab";
-import { BoardTab } from "./pages/BoardTab";
-import { ChatTab } from "./pages/chat";
-import { PanoramaTab } from "./pages/PanoramaTab";
-import { WorkspaceTab } from "./pages/WorkspaceTab";
-import { WorkflowTab } from "./pages/WorkflowTab";
 import {
   useGroupStore,
   useUIStore,
   useModalStore,
   useComposerStore,
   useFormStore,
-  useObservabilityStore,
   useWorkspaceStore,
-  getWorkspaceGroupState,
 } from "./stores";
 import type { ChatMessageData, LedgerEvent } from "./types";
-
-const NON_ACTOR_TABS = ["chat", "board", "workspace", "panorama", "workflow"];
 
 // ============ Main App Component ============
 
 export default function App() {
   // Theme
   const { theme, setTheme, isDark } = useTheme();
-  const { t } = useTranslation("layout");
 
   // Virtual keyboard viewport adjustment for mobile
   useViewportHeight();
@@ -137,23 +123,12 @@ export default function App() {
     } catch { return false; }
   }, []);
   const showPanorama = canRender3D && !!groupSettings?.panorama_enabled;
-  const prevGroupIdRef = useRef<string | null>(null);
-
   const [showMentionMenu, setShowMentionMenu] = React.useState(false);
   const [_mentionFilter, setMentionFilter] = React.useState("");
   const [mentionSelectedIndex, setMentionSelectedIndex] = React.useState(0);
-  const [collapseHumanMessageBodiesByDefault, setCollapseHumanMessageBodiesByDefault] = React.useState(false);
-  const workspaceByGroup = useWorkspaceStore((state) => state.byGroup);
+  const [collapseHumanMessageBodiesByDefault] = React.useState(false);
   const ensureWorkspaceGroup = useWorkspaceStore((state) => state.ensureGroup);
   const refreshWorkspaceGroup = useWorkspaceStore((state) => state.refreshGroup);
-  const openWorkspaceFolder = useWorkspaceStore((state) => state.openFolder);
-  const openWorkspaceFile = useWorkspaceStore((state) => state.openFile);
-  const createWorkspaceFolderAction = useWorkspaceStore((state) => state.createFolder);
-  const createWorkspaceFileAction = useWorkspaceStore((state) => state.createFile);
-  const workspaceState = useMemo(
-    () => getWorkspaceGroupState(selectedGroupId, workspaceByGroup),
-    [selectedGroupId, workspaceByGroup]
-  );
 
   const {
     composerRef,
@@ -341,40 +316,6 @@ export default function App() {
   }, [selectedGroupId]);
 
   // ============ Actions ============
-
-  async function handleOpenWorkspaceFile(path: string) {
-    if (!selectedGroupId) return;
-    await openWorkspaceFile(selectedGroupId, path);
-    setActiveTab("workspace");
-  }
-
-  async function handleOpenWorkspaceFolder(path: string) {
-    if (!selectedGroupId) return;
-    await openWorkspaceFolder(selectedGroupId, path);
-  }
-
-  async function handleCreateWorkspaceFolder(kind: "folder" | "task") {
-    if (!selectedGroupId) return;
-    const label = kind === "task" ? t("layout:newTaskPrompt") : t("layout:newFolderPrompt");
-    const name = window.prompt(label, "");
-    if (!name || !name.trim()) return;
-    try {
-      await createWorkspaceFolderAction(selectedGroupId, { name: name.trim(), kind });
-    } catch (error) {
-      showError(error instanceof Error ? error.message : t("layout:workspaceCreateFailed"));
-    }
-  }
-
-  async function handleCreateWorkspaceFile() {
-    if (!selectedGroupId) return;
-    const name = window.prompt(t("layout:newFilePrompt"), "");
-    if (!name || !name.trim()) return;
-    try {
-      await createWorkspaceFileAction(selectedGroupId, { name: name.trim() });
-    } catch (error) {
-      showError(error instanceof Error ? error.message : t("layout:workspaceCreateFailed"));
-    }
-  }
 
   return (
     <div

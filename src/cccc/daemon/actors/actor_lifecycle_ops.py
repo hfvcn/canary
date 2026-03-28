@@ -20,6 +20,13 @@ def _error(code: str, message: str, *, details: Optional[Dict[str, Any]] = None)
     return DaemonResponse(ok=False, error=DaemonError(code=code, message=message, details=(details or {})))
 
 
+def _find_actor(group: Any, actor_id: str) -> Optional[Dict[str, Any]]:
+    for item in list_actors(group):
+        if isinstance(item, dict) and str(item.get("id") or "").strip() == actor_id:
+            return item
+    return None
+
+
 def handle_actor_start(
     args: Dict[str, Any],
     *,
@@ -45,7 +52,9 @@ def handle_actor_start(
     is_admin = coerce_bool(args.get("is_admin"), default=not caller_context_explicit)
     try:
         require_actor_permission(group, by=by, action="actor.start", target_actor_id=actor_id)
-        actor = update_actor(group, actor_id, {"enabled": True})
+        actor = _find_actor(group, actor_id)
+        current_run_id = actor.get("run_id", 0) if isinstance(actor, dict) else getattr(actor, "run_id", 0)
+        actor = update_actor(group, actor_id, {"enabled": True, "admin_hold": "none", "run_id": current_run_id + 1, "desired_state": "running", "runtime_state": "starting"})
         actor = resolve_linked_actor_before_start(
             group,
             actor_id,
@@ -79,7 +88,17 @@ def handle_actor_start(
         is_admin=is_admin,
     )
     if not start_result["success"]:
+        try:
+            update_actor(group, actor_id, {"runtime_state": "crashed"})
+        except Exception:
+            pass
         return _error("actor_start_failed", start_result.get("error") or "unknown error")
+
+    # Mark runtime_state as running on successful start
+    try:
+        actor = update_actor(group, actor_id, {"runtime_state": "running"})
+    except Exception:
+        pass
 
     maybe_reset_automation_on_foreman_change(group, before_foreman_id=before_foreman)
     result: Dict[str, Any] = {"actor": actor, "event": start_result["event"]}
@@ -108,7 +127,7 @@ def handle_actor_stop(
     before_foreman = foreman_id(group)
     try:
         require_actor_permission(group, by=by, action="actor.stop", target_actor_id=actor_id)
-        actor = update_actor(group, actor_id, {"enabled": False})
+        actor = update_actor(group, actor_id, {"enabled": False, "admin_hold": "manual", "desired_state": "stopped", "runtime_state": "stopped"})
         runner_kind = str(actor.get("runner") or "pty").strip()
         runner_effective = effective_runner_kind(runner_kind)
         if runner_effective == "headless":
@@ -188,7 +207,9 @@ def handle_actor_restart(
     is_admin = coerce_bool(args.get("is_admin"), default=not caller_context_explicit)
     try:
         require_actor_permission(group, by=by, action="actor.restart", target_actor_id=actor_id)
-        actor = update_actor(group, actor_id, {"enabled": True})
+        actor = _find_actor(group, actor_id)
+        current_run_id = actor.get("run_id", 0) if isinstance(actor, dict) else getattr(actor, "run_id", 0)
+        actor = update_actor(group, actor_id, {"enabled": True, "admin_hold": "none", "run_id": current_run_id + 1, "desired_state": "running", "runtime_state": "starting"})
         actor = resolve_linked_actor_before_start(
             group,
             actor_id,
@@ -314,6 +335,12 @@ def handle_actor_restart(
                 write_pty_state(group.group_id, actor_id, pid=session.pid)
             except Exception:
                 pass
+
+    # Mark runtime_state as running after successful restart
+    try:
+        actor = update_actor(group, actor_id, {"runtime_state": "running"})
+    except Exception:
+        pass
 
     maybe_reset_automation_on_foreman_change(group, before_foreman_id=before_foreman)
     event = append_event(

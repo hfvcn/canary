@@ -1,4 +1,6 @@
-import type { CSSProperties } from "react";
+import type { ComponentType, CSSProperties } from "react";
+import { lazy, Suspense } from "react";
+import { useTranslation } from "react-i18next";
 import { ErrorBoundary } from "../ErrorBoundary";
 import { TabBar } from "../TabBar";
 import { AppHeader } from "../layout/AppHeader";
@@ -6,7 +8,19 @@ import { GroupSidebar } from "../layout/GroupSidebar";
 import { ActorTab } from "../../pages/ActorTab";
 import { ChatTab } from "../../pages/chat";
 import type { Actor, GroupContext, GroupDoc, GroupMeta } from "../../types";
-import { SIDEBAR_COLLAPSED_WIDTH } from "../../stores/useUIStore";
+import { getWorkspaceGroupState, useWorkspaceStore } from "../../stores/useWorkspaceStore";
+import { SIDEBAR_COLLAPSED_WIDTH, useUIStore } from "../../stores/useUIStore";
+
+const LazyWorkflowTab = lazy(() => import("../../pages/WorkflowTab").then((m) => ({ default: m.WorkflowTab })));
+const LazyBoardTab = lazy<ComponentType<{ isDark: boolean }>>(() =>
+  import("./BoardTabContainer").then((m) => ({ default: m.BoardTabContainer }))
+);
+const LazyWorkspaceTab = lazy(() =>
+  import("./WorkspaceTabContainer").then((m) => ({ default: m.WorkspaceTabContainer }))
+);
+const LazyPanoramaTab = lazy(() =>
+  import("./PanoramaTabContainer").then((m) => ({ default: m.PanoramaTabContainer }))
+);
 
 type AppShellProps = {
   orderedGroups: GroupMeta[];
@@ -141,9 +155,53 @@ export function AppShell({
   onTouchStart,
   onTouchEnd,
 }: AppShellProps) {
+  const { t } = useTranslation("layout");
+  const showError = useUIStore((state) => state.showError);
+  const workspaceState = useWorkspaceStore((state) =>
+    getWorkspaceGroupState(selectedGroupId, state.byGroup)
+  );
+  const refreshWorkspaceGroup = useWorkspaceStore((state) => state.refreshGroup);
+  const openWorkspaceFolder = useWorkspaceStore((state) => state.openFolder);
+  const openWorkspaceFile = useWorkspaceStore((state) => state.openFile);
+  const createWorkspaceFolderAction = useWorkspaceStore((state) => state.createFolder);
+  const createWorkspaceFileAction = useWorkspaceStore((state) => state.createFile);
   const shellStyle = {
     "--sidebar-width": `${sidebarCollapsed ? SIDEBAR_COLLAPSED_WIDTH : sidebarWidth}px`,
   } as CSSProperties;
+
+  async function handleOpenWorkspaceFile(path: string) {
+    if (!selectedGroupId) return;
+    await openWorkspaceFile(selectedGroupId, path);
+    onTabChange("workspace");
+  }
+
+  async function handleOpenWorkspaceFolder(path: string) {
+    if (!selectedGroupId) return;
+    await openWorkspaceFolder(selectedGroupId, path);
+  }
+
+  async function handleCreateWorkspaceFolder(kind: "folder" | "task") {
+    if (!selectedGroupId) return;
+    const label = kind === "task" ? t("newTaskPrompt") : t("newFolderPrompt");
+    const name = window.prompt(label, "");
+    if (!name || !name.trim()) return;
+    try {
+      await createWorkspaceFolderAction(selectedGroupId, { name: name.trim(), kind });
+    } catch (error) {
+      showError(error instanceof Error ? error.message : t("workspaceCreateFailed"));
+    }
+  }
+
+  async function handleCreateWorkspaceFile() {
+    if (!selectedGroupId) return;
+    const name = window.prompt(t("newFilePrompt"), "");
+    if (!name || !name.trim()) return;
+    try {
+      await createWorkspaceFileAction(selectedGroupId, { name: name.trim() });
+    } catch (error) {
+      showError(error instanceof Error ? error.message : t("workspaceCreateFailed"));
+    }
+  }
 
   return (
     <div
@@ -166,6 +224,15 @@ export function AppShell({
         onToggleCollapse={onToggleSidebar}
         onResizeWidth={onResizeSidebar}
         onReorder={onReorderGroups}
+        workspaceTree={workspaceState.tree}
+        workspaceSelectedFilePath={workspaceState.openFilePath}
+        workspaceLoading={workspaceState.loadingTree}
+        workspaceError={workspaceState.error}
+        onRefreshWorkspace={() => void refreshWorkspaceGroup(selectedGroupId)}
+        onOpenWorkspaceFolder={handleOpenWorkspaceFolder}
+        onOpenWorkspaceFile={handleOpenWorkspaceFile}
+        onCreateWorkspaceFolder={handleCreateWorkspaceFolder}
+        onCreateWorkspaceFile={handleCreateWorkspaceFile}
       />
 
       <main
@@ -284,6 +351,46 @@ export function AppShell({
                 </div>
               );
             })}
+
+            {/* Workflow Tab */}
+            <div className={activeTab === "workflow" ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
+              <ErrorBoundary>
+                <Suspense fallback={null}>
+                  <LazyWorkflowTab
+                    groupId={selectedGroupId}
+                    isDark={isDark}
+                    onNavigateToActor={(actorId) => onTabChange(actorId)}
+                  />
+                </Suspense>
+              </ErrorBoundary>
+            </div>
+
+            {/* Board Tab */}
+            <div className={activeTab === "board" ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
+              <ErrorBoundary>
+                <Suspense fallback={null}>
+                  <LazyBoardTab isDark={isDark} />
+                </Suspense>
+              </ErrorBoundary>
+            </div>
+
+            {/* Workspace Tab */}
+            <div className={activeTab === "workspace" ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
+              <ErrorBoundary>
+                <Suspense fallback={null}>
+                  <LazyWorkspaceTab />
+                </Suspense>
+              </ErrorBoundary>
+            </div>
+
+            {/* Panorama Tab */}
+            <div className={activeTab === "panorama" ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
+              <ErrorBoundary>
+                <Suspense fallback={null}>
+                  <LazyPanoramaTab />
+                </Suspense>
+              </ErrorBoundary>
+            </div>
           </div>
         </div>
       </main>

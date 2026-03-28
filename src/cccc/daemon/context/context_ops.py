@@ -384,6 +384,15 @@ def _check_permission(
 ) -> Optional[str]:
     if by == "system":
         return None
+    # Service principal: limited bypass for workflow scheduling
+    if by and by.startswith("service:"):
+        _SERVICE_CONTEXT_ALLOWED = {
+            "task.create", "task.update", "task.move",
+            "coordination.note.add", "coordination.brief.update",
+        }
+        if op_name in _SERVICE_CONTEXT_ALLOWED:
+            return None
+        return f"Permission denied: {by} cannot {op_name} in context"
 
     group = load_group(group_id)
     if group is None:

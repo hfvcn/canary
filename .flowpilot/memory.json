@@ -1,0 +1,86 @@
+[
+  {
+    "content": "复用现有 daemon Unix socket + JSON line 协议架构，通过 try_handle_ralph_op 模式集成到 request_dispatch_ops [DECISION] 使用 Pydantic 模型定义消息格式（ReadyBatchSuggestion, VerificationResult, RestartSuggestion, BatchDecision, ActorStatus），内存存储 IPC 状态",
+    "source": "task-002",
+    "timestamp": "2026-03-19T10:03:08.920Z",
+    "refs": 6,
+    "archived": false
+  },
+  {
+    "content": "Capability 使用 prompt_fragments 字典按角色(foreman/peer/common)存储 Prompt 片段，build_actor_prompt() 函数根据角色自动组装完整系统提示 [DECISION] prompt_fragments 采用角色分组设计（common+role-specific），保持向后兼容，新字段可选 [ARCHITECTURE] Capability 契约位于 contracts/v1/capability.py，Prompt 组装逻辑在 capability_ops/_prompt_builder.py",
+    "source": "task-003",
+    "timestamp": "2026-03-19T10:03:30.385Z",
+    "refs": 6,
+    "archived": false
+  },
+  {
+    "content": "使用 asyncio 事件循环 + gitpython 实现 Git 轮询监控 [DECISION] 采用 typer CLI 框架，事件通过 MessageBus pub/sub 模式分发 [ARCHITECTURE] GitWatcher 轮询检测新提交 -> MessageBus 发布 GitCommitEvent -> 订阅者异步处理",
+    "source": "task-001",
+    "timestamp": "2026-03-19T10:03:43.002Z",
+    "refs": 8,
+    "archived": false
+  },
+  {
+    "content": "Agent 由 Foreman 动态创建，定义存储为 YAML 在 .cccc/agents/；ModelRegistry 在 .cccc/models/registry.yaml 定义模型能力；Agent role_type (worker/reviewer/specialist) 映射到 capability prompt 的 peer 角色 [DECISION] Agent 定义存储为 YAML 文件在 .cccc/agents/，便于版本控制和复用；model 字段使用嵌套结构 {runtime, model_id} 保持 YAML 可读性 [ARCHITECTURE] Agent -> Capability -> Prompt 组装链：Agent.capabilities 列表 → 加载 Capability YAML → build_agent_prompt 调用 cap.get_prompt_for_role() 组装完整 Prompt",
+    "source": "task-004",
+    "timestamp": "2026-03-19T10:08:08.413Z",
+    "refs": 4,
+    "archived": false
+  },
+  {
+    "content": "Daemon 保持 Authority，可拒绝 Ralph 建议（如资源不足、超过重启次数）[DECISION] 采用建议-决策模式，非强制执行；ActorController 通过依赖注入集成现有 Actor 生命周期管理 [ARCHITECTURE] Ralph 发送建议 -> ActorController 评估（检查重启次数、系统资源、并行度限制）-> 决定是否执行 -> 返回状态",
+    "source": "task-006",
+    "timestamp": "2026-03-19T10:10:42.485Z",
+    "refs": 4,
+    "archived": false
+  },
+  {
+    "content": "拓扑排序+DFS 检测环路，防止死锁；使用 set 收集下游任务避免重复计数 [DECISION] 支持 critical_path/shortest_first/fifo 三种优先级策略，默认 critical_path [ARCHITECTURE] DependencyGraph 管理任务依赖 -> compute_ready_batch 计算优先级排序的批次 -> IPC 发送建议给 Daemon；IPC 支持 Unix socket 和 HTTP 双通道",
+    "source": "task-005",
+    "timestamp": "2026-03-19T10:11:33.114Z",
+    "refs": 4,
+    "archived": false
+  },
+  {
+    "content": "验证分三层：构建/测试（必选）、任务状态（推荐）、反馈生成（辅助）。BuildTestValidator 并行执行 build/test/lint 命令，TaskStateChecker 检查 .cccc/actors/{id}/state.json，FeedbackGenerator 跟踪重试次数并生成 retry/escalation 消息 [DECISION] 使用 asyncio.create_subprocess_shell 执行命令支持 shell 语法；验证结果通过现有的 VerificationResult IPC 消息发送给 CCCC Daemon [ARCHITECTURE] GitCommit -> parse METADATA -> BuildTestValidator.validate() -> TaskStateChecker.check() -> FeedbackGenerator.generate() -> send VerificationResult via IPC",
+    "source": "task-008",
+    "timestamp": "2026-03-19T10:17:35.241Z",
+    "refs": 4,
+    "archived": false
+  },
+  {
+    "content": "Foreman 是唯一对外协调者，可动态创建 Agent，使用 receive_batch -> evaluate_pool -> assign_tasks 工作流 [DECISION] 采用 Prompt 层控制 Feishu 访问权，通过 ForemanWorkflow 类统一管理批次处理 [ARCHITECTURE] AgentPoolManager 负责 Agent 评估/创建/复用，workflow.py 实现完整批次处理流程包含 Feishu 通知",
+    "source": "task-007",
+    "timestamp": "2026-03-19T10:17:44.642Z",
+    "refs": 0,
+    "archived": false
+  },
+  {
+    "content": "ProgressReporter 支持 6 种关键事件类型：batch_started、task_completed、batch_completed、task_failed、intervention_needed、workflow_completed；卡片模板支持丰富的 UI 元素（进度条、字段网格、任务列表、操作按钮） [DECISION] 分离模板(progress_card.py)和发送逻辑(progress_report.py)，模板与平台解耦便于扩展其他 IM；使用 Protocol 定义 FeishuSender 接口实现依赖反转 [ARCHITECTURE] ProgressReporter 收集状态 -> build_*_card 模板函数构建卡片 -> Feishu adapter 发送；ProgressState 跟踪 workflow/batch/task 三级状态",
+    "source": "task-009",
+    "timestamp": "2026-03-19T10:24:49.131Z",
+    "refs": 1,
+    "archived": false
+  },
+  {
+    "content": "E2E 测试覆盖完整工作流周期，包含 6 个测试类、30+ 测试用例 [DECISION] 操作手册采用渐进式结构，从架构概述到故障排查逐步深入",
+    "source": "task-010",
+    "timestamp": "2026-03-19T10:35:09.090Z",
+    "refs": 1,
+    "archived": false
+  },
+  {
+    "content": "这些文件在工作流执行期间被间接修改以兼容新架构",
+    "source": "task-011",
+    "timestamp": "2026-03-19T12:26:18.431Z",
+    "refs": 1,
+    "archived": false
+  },
+  {
+    "content": "角色定义文件需要版本控制",
+    "source": "task-012",
+    "timestamp": "2026-03-19T12:28:37.662Z",
+    "refs": 0,
+    "archived": false
+  }
+]

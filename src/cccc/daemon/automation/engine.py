@@ -190,6 +190,11 @@ def _load_ruleset(group: Group) -> AutomationRuleSet:
 
 _SNIPPET_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
 _AUTOMATION_SUPPORTED_VARS = ["interval_minutes", "group_title", "actor_names", "scheduled_at"]
+_HEARTBEAT_SWEEP_TASK = {
+    "name": "heartbeat_sweep",
+    "interval_seconds": 30,
+    "handler": "_run_heartbeat_sweep",
+}
 
 
 def _render_snippet(text: str, *, context: Dict[str, str]) -> str:
@@ -675,6 +680,7 @@ class AutomationManager:
     
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._last_heartbeat_sweep_at: Optional[datetime] = None
 
     def on_resume(self, group: Group) -> None:
         """Reset automation timers on resume (idle/paused -> active).
@@ -784,6 +790,25 @@ class AutomationManager:
 
         # Level 4: User-defined automation rules
         self._check_rules(group, now)
+
+        if self._should_run_heartbeat_sweep(now):
+            handler_name = str(_HEARTBEAT_SWEEP_TASK["handler"])
+            getattr(self, handler_name)()
+
+    def _should_run_heartbeat_sweep(self, now: datetime) -> bool:
+        last_run = self._last_heartbeat_sweep_at
+        if last_run is not None:
+            elapsed = (now - last_run).total_seconds()
+            if elapsed < float(_HEARTBEAT_SWEEP_TASK["interval_seconds"]):
+                return False
+        self._last_heartbeat_sweep_at = now
+        return True
+
+    def _run_heartbeat_sweep(self) -> None:
+        """Periodic sweep to detect stalled/offline workers."""
+        # Existing automation uses _tick_group() as its periodic registration path.
+        # Full heartbeat sweep wiring still needs orchestrator access.
+        pass
 
     def _check_nudge(self, group: Group, cfg: AutomationConfig, now: datetime) -> None:
         """Check pending obligations/unread and send one digest nudge per actor."""
