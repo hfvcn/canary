@@ -81,7 +81,7 @@ def cmd_workflow_submit(args: argparse.Namespace) -> int:
             "tasks": tasks,
             "rationale": str(getattr(args, "rationale", "") or "").strip(),
             "estimated_parallelism": int(getattr(args, "parallelism", 1) or 1),
-            "auto_process": bool(getattr(args, "auto_process", False)),
+            "auto_process": bool(getattr(args, "auto_process", True)),
             "group_id": group_id,
             "project_root": project_root,
             "auto_start_agents": bool(getattr(args, "auto_start_agents", True)),
