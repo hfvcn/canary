@@ -136,24 +136,27 @@ Wave 3 联合审查发现了 7 个代码级问题（handler 调用路径错误�
 - `auto_process` 默认为 `False`，导致 batch 被注册但永远不进入分配流程（已修复为 `True`）
 - 即使 Foreman 走了 workflow submit，orchestrator batch → agent assignment → worker prompt 链条仍有缝隙
 
-### 结论
+### 结论（已修正）
 
-**外部审查 (gp-4, gpp-4) 的核心判断被验证为正确：**
+> **重要修正**：初版 findings 将 E2E 结果解读为"旧路径有安全漏洞需要堵"。
+> 实际情况是：Ralph 基础建好了，但 MCP → CLI 的迁移还没做完。
+> AI 用旧路径是因为**新路径还没完全接上**，不是因为旧路径有需要修补的漏洞。
 
-> "仅靠 prompt 把 AI 引到正确路径是不够的。必须让错误路径在系统层面失效或无法改变状态。"
+正确的解读：
+1. Prompt 改动只完成了**引导层**的工作（让 AI 知道新路径存在）
+2. 但 MCP 工具仍然注册/暴露在 AI 可见的上下文中，AI 自然会继续使用它们
+3. 这不是需要给旧路径打补丁（guardrail、canonical entry、降级），而是需要**完成迁移**
 
-具体表现为：
-1. Prompt 修改是**必要的**（让 AI 知道新路径存在），但**不充分**（无法阻止 AI 使用旧路径）
-2. AI 在上下文压力下（历史消息、长对话）会回退到训练数据中更常见的模式
-3. 41 个 pytest 全通过 ≠ 真实场景中 AI 会走新路径
+### 下一步方向：完成 MCP → CLI 迁移
 
-### 下一步方向
+不是"加固旧路径"，而是"完成迁移"：
 
-这验证了架构层面修复的必要性（原标记为"后续方向"，现需提前）：
+1. **从 AI 可见上下文中移除 MCP 工作流工具** — 不注册/不暴露 `cccc_task` 等用于状态变更的 MCP 工具
+2. **CLI 成为 AI 唯一可用的操作接口** — `cccc workflow submit/status` + `cccc task complete` 是仅有的路径
+3. **Prompt 只引导 CLI 用法** — 不再提及 MCP 工具作为备选
+4. **Ralph 校验 AI 是否正确使用了 CLI** — 验收时检查 AI 的操作路径
 
-1. **Completion guardrail** — `cccc_message_send` 发送类完成消息时，系统应拒绝状态推进或自动转换
-2. **Canonical backend entry** — 无论 CLI/MCP/消息，任务完成都必须走同一个 `complete_task()` 入口
-3. **MCP 降级** — `cccc_task` 的状态变更能力应被限制为只读/委托
+这直接改变了下一阶段计划的出发点——从"在旧架构上打补丁"变成"完成已规划好的迁移"。问题清单 v3 中的其他待修内容（MCP 工具移除、事件触发链完善等）仍需完成。
 
 ---
 

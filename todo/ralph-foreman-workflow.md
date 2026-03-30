@@ -10,13 +10,13 @@
 | 层 | 设计目标 | 实际状态 |
 |----|---------|---------|
 | **Ralph（独立工具）** | 计划校验 + 任务调度 + 执行时验收 | ✅ CLI 可用，validate/suggest/verify/explain 四命令 |
-| **Ralph（daemon 内）** | 观察层，verify gate | ⚠️ 代码存在但运行时未被触发（Worker 不走 task complete） |
-| **Foreman prompt** | 引导使用 workflow submit | ⚠️ 新 session 有效，有历史上下文时回退到旧路径 |
-| **Worker prompt** | 引导使用 task complete | ❌ Worker 始终使用 message_send + context.sync |
-| **Verify gate** | task complete → verifying → done/failed | ❌ 链路代码可达但从未在真实场景触发 |
-| **系统约束层** | 旧路径不能改变工作流状态 | ❌ 不存在，旧路径和新路径并存 |
+| **Ralph（daemon 内）** | 观察层，verify gate | ⚠️ 代码存在，链路可达，但 MCP→CLI 迁移未完成导致未触发 |
+| **Foreman prompt** | 引导使用 workflow submit | ⚠️ 引导已加入，但 MCP 工具仍暴露，AI 会优先使用可见工具 |
+| **Worker prompt** | 引导使用 task complete | ⚠️ 引导已加入，但 MCP 路径仍可用 |
+| **MCP → CLI 迁移** | MCP 工具从 AI 上下文中移除 | ❌ 未开始，MCP 工具仍注册/暴露 |
+| **Verify gate** | task complete → verifying → done/failed | ⚠️ 链路代码可达，待迁移完成后验证 |
 
-**核心教训：Prompt 是引导层不是权威层。必须有系统级约束让错误路径无法改变状态。**
+**当前阶段：Ralph 基础已建好，下一步是完成 MCP → CLI 迁移（问题清单 v3 剩余内容），而非给旧路径打补丁。**
 
 ---
 
@@ -270,7 +270,7 @@ Use cccc_message_send for progress updates or blockers only.
 | 新 session，无历史 | ✅ 使用 workflow submit | 未测到 |
 | 有历史上下文 | ❌ 回退到 cccc_task + message_send | ❌ 使用 message_send + task.move |
 
-**结论：Prompt 改动是必要层但不是充分层。**
+**结论：AI 使用旧路径是因为 MCP 工具仍然暴露在上下文中，不是 prompt 引导失败。完成 MCP → CLI 迁移后需重新验证。**
 
 ---
 
@@ -320,22 +320,18 @@ E2E 应该是"确认已验收的模块能组合"，而不是"第一次发现问�
 
 ## 7. 待解决问题（按优先级）
 
-### P0 — 系统约束层（A-1, A-2）
+### P0 — 完成 MCP → CLI 迁移
 
-| 问题 | 描述 | 方向 |
-|------|------|------|
-| A-1 | Prompt 引导不足以保证 AI 走新路径 | Completion guardrail + canonical backend entry |
-| A-2 | 旧路径仍能改变工作流状态 | MCP cccc_task 降级为只读/委托 |
+> 当前 AI 使用旧路径不是安全漏洞，是迁移未完成。不需要给旧路径打补丁，需要完成迁移。
 
-### P1 — 架构优化
+| 步骤 | 描述 | 对应问题清单 v3 |
+|------|------|----------------|
+| MCP 工具移除 | 从 AI 可见上下文中移除 cccc_task 等用于状态变更的 MCP 工具 | M-1 |
+| CLI 唯一化 | CLI 成为 AI 唯一可用的操作接口 | M-1 |
+| Prompt 收敛 | Prompt 只引导 CLI 用法，不再提及 MCP 备选 | R-1 |
+| Ralph 校验 | Ralph 检查 AI 是否正确使用了 CLI | 新 |
 
-| 问题 | 描述 |
-|------|------|
-| project_root 手传 | 应提升为 group 元数据 |
-| Prompt 4 处分散 | 应收敛为单一 canonical fragment |
-| M-1b 适配层 | MCP/CLI/HTTP 统一到同一 backend service |
-
-### P2 — Ralph v2
+### P1 — Ralph v2
 
 | 方向 | 描述 |
 |------|------|
@@ -344,6 +340,13 @@ E2E 应该是"确认已验收的模块能组合"，而不是"第一次发现问�
 | Schema 契约匹配 | 超越名字匹配，检查类型兼容性 |
 | Role-based rules | 按 role 字段强化 integration/verification 任务的检查 |
 | Ready 排序 | 按解锁下游数量排优先级 |
+
+### P2 — 架构优化
+
+| 问题 | 描述 |
+|------|------|
+| project_root 手传 | 应提升为 group 元数据 |
+| Prompt 4 处分散 | 应收敛为单一 canonical fragment |
 
 ### P3 — Worker 协作
 
