@@ -1,0 +1,84 @@
+# Sample plan that mimics the 27-task failure mode:
+# - Each task only claims its own file
+# - Verification is compile-only
+# - No task owns the integration entry points (daemon/server.py, MCP toolspecs)
+# - No cross-task verification
+# - No critical entrypoints/flows declared (which itself is a problem)
+#
+# ralph validate should flag multiple issues on this plan.
+
+tasks:
+  - id: T1
+    title: Implement RalphService core logic
+    claimed_paths: ["src/cccc/daemon/foreman/ralph_service.py"]
+    depends_on: []
+    acceptance_criteria: "RalphService class with suggest_ready_batch, verify_completion"
+    verification:
+      level: compile
+      command: "python -m py_compile src/cccc/daemon/foreman/ralph_service.py"
+      covers:
+        tasks: ["T1"]
+
+  - id: T2
+    title: Define Ralph IPC contracts
+    claimed_paths: ["src/cccc/contracts/v1/ralph_ipc.py"]
+    depends_on: []
+    acceptance_criteria: "Pydantic models for TaskRef, ReadyBatchSuggestion, VerificationResult"
+    verification:
+      level: compile
+      command: "python -m py_compile src/cccc/contracts/v1/ralph_ipc.py"
+      covers:
+        tasks: ["T2"]
+
+  - id: T3
+    title: Implement workflow state engine
+    claimed_paths: ["src/cccc/kernel/workflow_state_engine.py"]
+    depends_on: ["T2"]
+    acceptance_criteria: "WorkflowEngine with state transitions"
+    verification:
+      level: compile
+      command: "python -m py_compile src/cccc/kernel/workflow_state_engine.py"
+      covers:
+        tasks: ["T3"]
+
+  - id: T4
+    title: Build Ralph IPC handler
+    claimed_paths: ["src/cccc/daemon/ralph_ipc_handler.py"]
+    depends_on: ["T1", "T2"]
+    acceptance_criteria: "Handle ralph_batch_suggest and ralph_task_event messages"
+    verification:
+      level: compile
+      command: "python -m py_compile src/cccc/daemon/ralph_ipc_handler.py"
+      covers:
+        tasks: ["T4"]
+
+  - id: T5
+    title: Add workflow CLI commands
+    claimed_paths: ["src/cccc/cli/workflow_cmds.py"]
+    depends_on: ["T3"]
+    acceptance_criteria: "cccc workflow submit/status/verify commands"
+    verification:
+      level: compile
+      command: "python -m py_compile src/cccc/cli/workflow_cmds.py"
+      covers:
+        tasks: ["T5"]
+
+  - id: T6
+    title: Add workflow HTTP routes
+    claimed_paths: ["src/cccc/ports/web/routes/workflow.py"]
+    depends_on: ["T3"]
+    acceptance_criteria: "HTTP endpoints for workflow operations"
+    verification:
+      level: compile
+      command: "python -m py_compile src/cccc/ports/web/routes/workflow.py"
+      covers:
+        tasks: ["T6"]
+
+# No critical_entrypoints declared — this plan doesn't express
+# that server.py and toolspecs.py MUST be touched for integration.
+# No critical_flows declared.
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

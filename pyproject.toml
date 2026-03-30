@@ -49,6 +49,7 @@ Issues = "https://github.com/ChesterRa/cccc/issues"
 [project.scripts]
 cccc = "cccc.cli:main"
 ccccd = "cccc.daemon_main:main"
+ralph = "cccc.ralph.cli:main"
 
 [tool.setuptools]
 include-package-data = true
@@ -64,4 +65,4 @@ include = ["cccc*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]

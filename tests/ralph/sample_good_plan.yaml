@@ -1,0 +1,123 @@
+# A corrected plan that declares critical entrypoints, flows, contracts,
+# and includes integration verification — should pass ralph validate.
+
+tasks:
+  - id: T1
+    title: Implement RalphService core logic
+    claimed_paths: ["src/cccc/daemon/foreman/ralph_service.py"]
+    depends_on: []
+    acceptance_criteria: "RalphService class with suggest_ready_batch, verify_completion"
+    verification:
+      level: unit
+      command: "pytest tests/test_ralph_service.py -q"
+      covers:
+        tasks: ["T1"]
+    provides:
+      - name: ralph_service_class
+        kind: module
+
+  - id: T2
+    title: Define Ralph IPC contracts
+    claimed_paths: ["src/cccc/contracts/v1/ralph_ipc.py"]
+    depends_on: []
+    acceptance_criteria: "Pydantic models for TaskRef, ReadyBatchSuggestion, VerificationResult"
+    verification:
+      level: unit
+      command: "pytest tests/test_ralph_contracts.py -q"
+      covers:
+        tasks: ["T2"]
+    provides:
+      - name: ralph_ipc_models
+        kind: module
+
+  - id: T3
+    title: Implement workflow state engine
+    claimed_paths: ["src/cccc/kernel/workflow_state_engine.py"]
+    depends_on: ["T2"]
+    acceptance_criteria: "WorkflowEngine with state transitions"
+    verification:
+      level: unit
+      command: "pytest tests/test_workflow_engine.py -q"
+      covers:
+        tasks: ["T3"]
+    consumes:
+      - name: ralph_ipc_models
+        from: T2
+    provides:
+      - name: workflow_engine
+        kind: module
+
+  - id: T4
+    title: Wire Ralph into daemon startup
+    claimed_paths:
+      - "src/cccc/daemon/server.py"
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+    depends_on: ["T1", "T2", "T3"]
+    acceptance_criteria: "Daemon creates RalphService on startup, IPC handler registered"
+    verification:
+      level: integration
+      command: "pytest tests/e2e/test_smoke_workflow.py -q"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4"]
+        paths: ["src/cccc/daemon/server.py"]
+        flows: ["daemon_startup_loads_ralph"]
+    consumes:
+      - name: ralph_service_class
+        from: T1
+      - name: ralph_ipc_models
+        from: T2
+      - name: workflow_engine
+        from: T3
+    provides:
+      - name: ralph_daemon_initialized
+        kind: runtime_capability
+
+  - id: T5
+    title: Add workflow CLI commands
+    claimed_paths: ["src/cccc/cli/workflow_cmds.py", "src/cccc/cli/main.py"]
+    depends_on: ["T3"]
+    acceptance_criteria: "cccc workflow submit/status/verify commands work"
+    verification:
+      level: unit
+      command: "pytest tests/test_workflow_cli.py -q"
+      covers:
+        tasks: ["T5"]
+    consumes:
+      - name: workflow_engine
+        from: T3
+
+  - id: T6
+    title: E2E integration — full workflow loop
+    claimed_paths:
+      - "src/cccc/ports/web/routes/workflow.py"
+      - "src/cccc/kernel/system_prompt.py"
+    depends_on: ["T4", "T5"]
+    acceptance_criteria: "submit -> assign -> complete -> verify gate -> done"
+    verification:
+      level: e2e
+      command: "pytest tests/e2e/test_workflow_e2e.py -q"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5", "T6"]
+        flows: ["worker_complete_triggers_verify_gate", "daemon_startup_loads_ralph"]
+    consumes:
+      - name: ralph_daemon_initialized
+        from: T4
+
+critical_entrypoints:
+  - src/cccc/daemon/server.py
+  - src/cccc/ports/mcp/toolspecs.py
+  - src/cccc/kernel/system_prompt.py
+
+critical_flows:
+  - id: daemon_startup_loads_ralph
+    description: "Daemon startup creates RalphService and registers IPC handler"
+    entrypoints: ["src/cccc/daemon/server.py"]
+    required_verification_level: integration
+  - id: worker_complete_triggers_verify_gate
+    description: "Worker task complete -> verify gate -> state advances"
+    required_verification_level: e2e
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

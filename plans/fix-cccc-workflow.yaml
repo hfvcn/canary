@@ -1,0 +1,324 @@
+# Plan: Fix CCCC Workflow — Make CLI the default path, wire verify gate
+#
+# Scope: CLI path only. HTTP path is a follow-up (existing routes work but
+#         are not the focus of this plan).
+#
+# Goal: Foreman and Worker use CLI commands (not MCP) for workflow operations.
+#       Worker completion triggers verify gate. Ralph validates task quality.
+#
+# Principle: Change prompts first (highest ROI), then verify wiring, then E2E.
+#
+# Note on M-1: This plan addresses M-1a (default path switches to CLI).
+#   M-1b (MCP/CLI/HTTP unified to same backend service) is a follow-up.
+#
+# Execution protocol: Dynamic DAG, not rigid waves.
+#   After each task completes, update state.completed_task_ids and re-run
+#   `ralph suggest` to unlock the next batch. Do NOT wait for an entire
+#   wave to finish before starting the next available tasks.
+
+required_issues:
+  - "R-1"    # Ralph functions unreachable by Foreman
+  - "R-2"    # Verify gate never triggers
+  - "R-3"    # Daemon doesn't initialize RalphService
+  - "M-1a"   # Default operation path still MCP-dominated (split from M-1)
+
+tasks:
+  # ── Wave 1: Prompt changes (parallel, no deps) ──────────────────────────
+
+  - id: P1-foreman-prompt
+    title: Update Foreman system prompt to use workflow CLI commands
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/system_prompt.py"
+    depends_on: []
+    addresses: ["R-1"]
+    goal_behavior: >
+      Foreman prompt explicitly instructs: use `cccc workflow submit` for batch
+      task submission, `cccc workflow status` for tracking. cccc_task is shared
+      kanban, not workflow truth source.
+    acceptance_criteria: >
+      render_system_prompt() output for foreman role contains 'workflow submit'
+      and 'workflow status'. cccc_task guidance is demoted.
+    verification:
+      level: unit
+      command: >
+        grep -c "workflow submit\|workflow status" src/cccc/kernel/system_prompt.py |
+        xargs test 0 -lt
+      covers:
+        tasks: ["P1-foreman-prompt"]
+    provides:
+      - name: foreman_workflow_awareness
+        kind: prompt_change
+
+  - id: P2-worker-prompt
+    title: Update Worker completion instructions in orchestrator
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    depends_on: []
+    addresses: ["R-1", "R-2"]
+    goal_behavior: >
+      Worker assignment prompt (around line 654-687) tells workers to report
+      completion via `cccc task complete <task_id> --changed-file ...`
+      instead of cccc_message_send to @foreman. cccc_message_send remains
+      available for progress updates, not completion.
+    acceptance_criteria: >
+      Worker prompt section contains 'cccc task complete' as primary completion
+      mechanism. cccc_message_send is positioned as optional progress reporting.
+    verification:
+      level: unit
+      command: >
+        grep -c "task complete" src/cccc/daemon/foreman/workflow_orchestrator.py |
+        xargs test 0 -lt
+      covers:
+        tasks: ["P2-worker-prompt"]
+    provides:
+      - name: worker_completion_protocol
+        kind: prompt_change
+
+  - id: P3-capability-yaml
+    title: Update task_management.yaml with workflow-first guidance
+    role: leaf
+    claimed_paths:
+      - "src/cccc/resources/capabilities/task_management.yaml"
+    depends_on: []
+    addresses: ["R-1", "M-1a"]
+    goal_behavior: >
+      Capability YAML provides workflow-first instructions: `cccc workflow submit`
+      for batch planning, `cccc workflow status` for tracking.
+      cccc_task is positioned as shared kanban display.
+    acceptance_criteria: >
+      task_management.yaml foreman section mentions workflow CLI commands.
+    verification:
+      level: unit
+      command: >
+        grep -c "workflow submit" src/cccc/resources/capabilities/task_management.yaml |
+        xargs test 0 -lt
+      covers:
+        tasks: ["P3-capability-yaml"]
+    provides:
+      - name: capability_yaml_updated
+        kind: prompt_change
+
+  - id: P4-help-doc
+    title: Update cccc-help.md and preamble with workflow commands reference
+    role: leaf
+    claimed_paths:
+      - "src/cccc/resources/cccc-help.md"
+      - "src/cccc/kernel/prompt_files.py"
+    depends_on: []
+    addresses: ["R-1"]
+    goal_behavior: >
+      Help document and default preamble list workflow CLI commands
+      (submit, status, verify, retry, fail) and task complete command.
+    acceptance_criteria: >
+      cccc-help.md has a section with workflow commands.
+      prompt_files.py DEFAULT_PREAMBLE_BODY references workflow commands.
+    verification:
+      level: unit
+      command: >
+        grep -q "workflow submit" src/cccc/resources/cccc-help.md &&
+        grep -q "task complete" src/cccc/resources/cccc-help.md &&
+        grep -q "workflow" src/cccc/kernel/prompt_files.py
+      covers:
+        tasks: ["P4-help-doc"]
+    provides:
+      - name: help_doc_updated
+        kind: prompt_change
+
+  # ── Wave 2: Runtime wiring (depends on prompt changes) ──────────────────
+
+  - id: W1-verify-gate
+    title: Wire task complete CLI through verify gate to state machine
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+      - "src/cccc/cli/workflow_cmds.py"
+      - "src/cccc/cli/main.py"
+    depends_on: ["P2-worker-prompt"]
+    addresses: ["R-2"]
+    goal_behavior: >
+      `cccc task complete T1 --changed-file a.py` -> daemon IPC ralph_task_event
+      -> orchestrator.apply_task_event() -> task state to 'verifying'
+      -> RalphService.verify_completion() -> state advance based on result.
+      Verify the full path is connected, not just individual files.
+    acceptance_criteria: >
+      The path from CLI task-complete -> daemon IPC -> orchestrator apply_task_event
+      -> ralph verify_completion -> state advance is exercised by a test.
+    verification:
+      level: integration
+      command: "pytest tests/e2e/test_smoke_workflow.py -q -k task_event"
+      covers:
+        tasks: ["P2-worker-prompt", "W1-verify-gate"]
+        flows: ["worker_complete_triggers_verify"]
+    consumes:
+      - name: worker_completion_protocol
+        from: P2-worker-prompt
+    provides:
+      - name: verify_gate_wired
+        kind: runtime_capability
+
+  - id: W2-daemon-init
+    title: Ensure RalphService is initialized when workflow ops are triggered
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    depends_on: []
+    addresses: ["R-3"]
+    goal_behavior: >
+      get_orchestrator(group_id, project_root=...) creates WorkflowOrchestrator
+      which instantiates RalphService. Verify this path works by calling it with
+      a real project_root. If lazy-init has gaps (e.g. callers not passing
+      project_root), fix those callers.
+      NOTE: External review correctly identified that this test manually passes
+      project_root, which doesn't prove real callers do. Architectural fix
+      (project_root as group metadata) is tracked as follow-up.
+    acceptance_criteria: >
+      A test calls get_orchestrator with project_root and confirms
+      orchestrator.ralph is a RalphService instance.
+    verification:
+      level: integration
+      command: >
+        python -c "
+        from pathlib import Path;
+        from cccc.daemon.foreman.workflow_orchestrator import get_orchestrator, clear_orchestrator;
+        clear_orchestrator('ralph-test');
+        o = get_orchestrator('ralph-test', project_root=Path('.'));
+        assert o is not None and hasattr(o, 'ralph') and o.ralph is not None, 'RalphService not initialized';
+        clear_orchestrator('ralph-test');
+        print('OK: RalphService initialized via lazy-init')
+        "
+      covers:
+        tasks: ["W2-daemon-init"]
+        flows: ["daemon_wires_ralph"]
+    provides:
+      - name: ralph_initialized
+        kind: runtime_capability
+
+  - id: W3-prompt-assembly
+    title: Verify prompt assembly includes workflow guidance for all roles
+    role: integration
+    claimed_paths:
+      - "tests/test_prompt_assembly.py"
+    depends_on: ["P1-foreman-prompt", "P3-capability-yaml", "P4-help-doc"]
+    addresses: ["R-1"]
+    goal_behavior: >
+      Integration test that loads the built prompts for foreman and worker
+      roles and asserts they contain workflow CLI references.
+    acceptance_criteria: >
+      Test reads help markdown and system prompt, confirms 'workflow' appears
+      and cccc_task is demoted to kanban/display role.
+    verification:
+      level: integration
+      command: "pytest tests/test_prompt_assembly.py -q"
+      covers:
+        tasks: ["P1-foreman-prompt", "P3-capability-yaml", "P4-help-doc", "W3-prompt-assembly"]
+        flows: ["foreman_sees_workflow_commands"]
+    consumes:
+      - name: foreman_workflow_awareness
+        from: P1-foreman-prompt
+      - name: capability_yaml_updated
+        from: P3-capability-yaml
+      - name: help_doc_updated
+        from: P4-help-doc
+
+  # ── Wave 3: E2E (positive + negative) ──────────────────────────────────
+
+  - id: E1-e2e-positive
+    title: "E2E positive: submit -> complete -> verify -> done"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_workflow_e2e.py"
+    depends_on: ["W1-verify-gate", "W2-daemon-init", "W3-prompt-assembly"]
+    addresses: ["R-1", "R-2", "R-3", "M-1a"]
+    goal_behavior: >
+      Positive E2E: workflow submit with task batch -> task assigned ->
+      worker calls cccc task complete -> verify gate runs ->
+      task state advances to completed (or failed on verify failure).
+      Must assert intermediate 'verifying' state, not just final 'done'.
+    acceptance_criteria: >
+      pytest passes, exercising submit->assign->complete->verifying->done path.
+      Also tests verify-failure branch (complete->verifying->failed).
+    verification:
+      level: e2e
+      command: "pytest tests/e2e/test_workflow_e2e.py -v -k 'positive or verify_pass or verify_fail'"
+      covers:
+        tasks: ["P1-foreman-prompt", "P2-worker-prompt", "P3-capability-yaml",
+                "P4-help-doc", "W1-verify-gate", "W2-daemon-init",
+                "W3-prompt-assembly", "E1-e2e-positive"]
+        flows: ["worker_complete_triggers_verify", "foreman_sees_workflow_commands",
+                "daemon_wires_ralph"]
+    consumes:
+      - name: verify_gate_wired
+        from: W1-verify-gate
+      - name: ralph_initialized
+        from: W2-daemon-init
+
+  - id: E2-e2e-negative
+    title: "E2E negative: message_send must NOT complete tasks"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_workflow_anti_bypass.py"
+    depends_on: ["W1-verify-gate"]
+    addresses: ["R-2"]
+    goal_behavior: >
+      Anti-bypass test: worker is assigned a task, then sends
+      cccc_message_send "I'm done" to @foreman. Assert that:
+      1. Task state does NOT advance to completed
+      2. Task remains in running/assigned state
+      3. Only cccc task complete can trigger verify gate
+      This pins down the exact failure mode from the original incident.
+    acceptance_criteria: >
+      pytest passes, proving message_send cannot bypass verify gate.
+    verification:
+      level: e2e
+      command: "pytest tests/e2e/test_workflow_anti_bypass.py -v"
+      covers:
+        tasks: ["W1-verify-gate", "E2-e2e-negative"]
+        flows: ["message_send_cannot_complete_task"]
+    consumes:
+      - name: verify_gate_wired
+        from: W1-verify-gate
+
+# ── Critical declarations ─────────────────────────────────────────────────
+
+critical_entrypoints:
+  - src/cccc/kernel/system_prompt.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - src/cccc/resources/capabilities/task_management.yaml
+  - src/cccc/resources/cccc-help.md
+  - src/cccc/kernel/prompt_files.py
+  - src/cccc/daemon/ralph_ipc_handler.py
+  - src/cccc/cli/main.py
+  - src/cccc/cli/workflow_cmds.py
+
+critical_flows:
+  - id: foreman_sees_workflow_commands
+    description: "Foreman prompt includes workflow CLI as primary tools"
+    entrypoints:
+      - src/cccc/kernel/system_prompt.py
+      - src/cccc/kernel/prompt_files.py
+    required_verification_level: integration
+
+  - id: worker_complete_triggers_verify
+    description: "Worker calls `task complete` -> daemon -> verify gate -> state advance"
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/ralph_ipc_handler.py
+    required_verification_level: e2e
+
+  - id: daemon_wires_ralph
+    description: "Daemon workflow path instantiates RalphService"
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+    required_verification_level: integration
+
+forbidden_flows:
+  - id: message_send_cannot_complete_task
+    description: "cccc_message_send must NOT trigger task completion or bypass verify gate"
+    required_verification_level: e2e
+
+state:
+  completed_task_ids: ["P1-foreman-prompt", "P2-worker-prompt", "P3-capability-yaml", "P4-help-doc", "W1-verify-gate", "W2-daemon-init", "W3-prompt-assembly", "E1-e2e-positive", "E2-e2e-negative"]
+  running_tasks: []
+  failed_task_ids: []
