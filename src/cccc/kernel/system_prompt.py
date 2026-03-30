@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict, List
 
 from ..util.conv import coerce_bool
+from ..contracts.v1.capability import Capability
 from .actors import get_effective_role, list_actors
 from .group import Group
 from .group_space import get_group_space_prompt_state
@@ -72,8 +74,13 @@ def _role_policy_lines(role: str) -> List[str]:
             "Role Focus:",
             "- You MUST NOT execute implementation tasks. Your job is orchestration ONLY.",
             "- When you receive a task from the user, your response should be to evaluate the agent pool and assign workers, NOT to start coding.",
+            "- Submit workflow task batches with `cccc workflow submit --tasks <file>`; use the CLI workflow as the execution truth source.",
+            "- Check workflow progress with `cccc workflow status` before reporting or changing orchestration state.",
+            "- Use `cccc_task` only for shared board visibility; it is NOT the workflow source of truth.",
             "- Reuse or create workers as needed. Inspect actors with `cccc_actor`, runtimes with `cccc_runtime_list`, and models with `cccc_model` before assignment.",
             '- If those tools are hidden, enable `pack:group-runtime` first with `cccc_capability_use(capability_id="pack:group-runtime", scope="session")`.',
+            "- Task slicing: assign independently verifiable functional slices (goal + acceptance + verification_command + expected I/O + depends_on + claimed_paths), not file-based chores.",
+            "- Verify gate: treat worker 'done' as 'verifying' until the verification_command exits 0; only then mark completed.",
             "- Track progress/blockers across agents, keep shared state current, and send outward status through MCP/Feishu.",
             "- Treat `done`, `idle`, and silence as signals to evaluate, not closure truth.",
             "- If criteria are unmet, choose one clear next control action: continue, request evidence, hand off, or block.",
@@ -253,3 +260,67 @@ def render_system_prompt(*, group: Group, actor: Dict[str, Any]) -> str:
         body.rstrip(),
     ]
     return "\n\n".join([p for p in parts if p]).rstrip() + "\n"
+
+
+def _load_builtin_capabilities() -> List[Capability]:
+    try:
+        from importlib import resources as pkg_resources
+        import yaml
+    except Exception:
+        return []
+
+    try:
+        cap_dir = pkg_resources.files("cccc.resources").joinpath("capabilities")
+    except Exception:
+        return []
+
+    caps: List[Capability] = []
+    try:
+        for item in cap_dir.iterdir():
+            name = str(getattr(item, "name", "") or "")
+            if not name.endswith(".yaml"):
+                continue
+            try:
+                raw = item.read_text(encoding="utf-8")
+                data = yaml.safe_load(raw)
+                if not isinstance(data, dict):
+                    continue
+                cap = Capability(**data)
+                if cap.enabled:
+                    caps.append(cap)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return caps
+
+
+def _capability_prompt_fragments(*, group: Group, actor: Dict[str, Any]) -> str:
+    actor_id = str(actor.get("id") or "").strip()
+    role = str(get_effective_role(group, actor_id) or actor.get("role") or "peer").strip() or "peer"
+    parts: List[str] = []
+    for cap in _load_builtin_capabilities():
+        frag = cap.get_prompt_for_role(role)
+        if frag and frag.strip():
+            parts.append(frag.strip())
+    return "\n\n".join(parts).strip()
+
+
+def render_actor_prompt(*, group: Group, actor: Dict[str, Any]) -> str:
+    """Unified actor prompt entrypoint (supports Capability YAML via env flag).
+
+    Default behavior stays on render_system_prompt(); enabling
+    CCCC_USE_CAPABILITY_YAML injects builtin capability prompt fragments.
+    """
+    base = render_system_prompt(group=group, actor=actor)
+    if not coerce_bool(os.environ.get("CCCC_USE_CAPABILITY_YAML"), default=False):
+        return base
+
+    try:
+        extra = _capability_prompt_fragments(group=group, actor=actor)
+    except Exception as e:
+        extra = f"[CCCC] Capability YAML prompt injection failed: {e}"
+
+    if not extra:
+        return base
+    return base.rstrip("\n") + "\n\n" + extra.rstrip() + "\n"

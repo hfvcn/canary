@@ -12,6 +12,7 @@ from .messaging_cmds import *  # noqa: F401,F403
 from .space_cmds import *  # noqa: F401,F403
 from .im_cmds import *  # noqa: F401,F403
 from .system_cmds import *  # noqa: F401,F403
+from .workflow_cmds import *  # noqa: F401,F403
 
 
 def _apply_invocation_web_overrides(args: argparse.Namespace) -> tuple[dict[str, Optional[str]], dict[str, str]]:
@@ -497,6 +498,62 @@ def build_parser() -> argparse.ArgumentParser:
     p_space_jobs_cancel.add_argument("--by", default="user", help="Requester (default: user)")
     p_space_jobs_cancel.set_defaults(func=cmd_space_jobs_cancel)
 
+    p_workflow = sub.add_parser("workflow", help="Workflow operations (Ralph/Foreman)")
+    workflow_sub = p_workflow.add_subparsers(dest="action", required=True)
+
+    p_workflow_submit = workflow_sub.add_parser("submit", help="Submit a batch suggestion (tasks JSON)")
+    p_workflow_submit.add_argument("--workflow-id", required=True, help="Workflow identifier")
+    p_workflow_submit.add_argument("--tasks", required=True, help="Path to tasks JSON (list or {tasks:[...]})")
+    p_workflow_submit.add_argument("--rationale", default="", help="Optional rationale")
+    p_workflow_submit.add_argument("--parallelism", type=int, default=1, help="Estimated parallelism (default: 1)")
+    p_workflow_submit.add_argument("--auto-process", action="store_true", help="Auto-process suggestion immediately")
+    p_workflow_submit.add_argument("--auto-start-agents", action="store_true", help="Auto-start assigned agents (default: false)")
+    p_workflow_submit.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_workflow_submit.set_defaults(func=cmd_workflow_submit)
+
+    p_workflow_status = workflow_sub.add_parser("status", help="Show workflow progress snapshot")
+    p_workflow_status.add_argument("--workflow-id", default="", help="Workflow identifier (optional)")
+    p_workflow_status.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_workflow_status.set_defaults(func=cmd_workflow_status)
+
+    p_workflow_verify = workflow_sub.add_parser("verify", help="Run Ralph verification for a task")
+    p_workflow_verify.add_argument("task_id", help="Task id")
+    p_workflow_verify.add_argument("--changed-file", action="append", default=[], help="Changed file path (repeatable)")
+    p_workflow_verify.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_workflow_verify.set_defaults(func=cmd_workflow_verify)
+
+    p_workflow_retry = workflow_sub.add_parser("retry", help="Request retry for a task after verification failure")
+    p_workflow_retry.add_argument("task_id", help="Task id")
+    p_workflow_retry.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_workflow_retry.set_defaults(func=cmd_workflow_retry)
+
+    p_workflow_fail = workflow_sub.add_parser("fail", help="Report task failure via task_event")
+    p_workflow_fail.add_argument("task_id", help="Task id")
+    p_workflow_fail.add_argument("--message", required=True, help="Failure message")
+    p_workflow_fail.add_argument("--suggestion", default="", help="Optional suggestion")
+    p_workflow_fail.add_argument("--agent-name", default="", help="Optional agent name")
+    p_workflow_fail.add_argument("--assignment-id", default="", help="Optional assignment id")
+    p_workflow_fail.add_argument("--actor-run-id", default="", help="Optional actor run id")
+    p_workflow_fail.add_argument("--idempotency-key", default="", help="Optional idempotency key")
+    p_workflow_fail.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_workflow_fail.set_defaults(func=cmd_workflow_fail)
+
+    p_task = sub.add_parser("task", help="Worker task lifecycle helpers")
+    task_sub = p_task.add_subparsers(dest="action", required=True)
+
+    p_task_complete = task_sub.add_parser("complete", help="Report worker completion (enters verify gate)")
+    p_task_complete.add_argument("task_id", help="Task id")
+    p_task_complete.add_argument("--agent-id", default="", help="Agent id (default: CCCC_ACTOR_ID)")
+    p_task_complete.add_argument("--workflow-id", default="", help="Workflow id (optional)")
+    p_task_complete.add_argument("--duration-seconds", type=int, default=0, help="Duration seconds (optional)")
+    p_task_complete.add_argument("--changed-file", action="append", default=[], help="Changed file path (repeatable)")
+    p_task_complete.add_argument("--evidence", default="", help="Optional JSON object evidence")
+    p_task_complete.add_argument("--assignment-id", default="", help="Optional assignment id")
+    p_task_complete.add_argument("--actor-run-id", default="", help="Optional actor run id")
+    p_task_complete.add_argument("--idempotency-key", default="", help="Optional idempotency key")
+    p_task_complete.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_task_complete.set_defaults(func=cmd_task_complete)
+
     p_ver = sub.add_parser("version", help="Show version")
     p_ver.set_defaults(func=cmd_version)
 
@@ -514,7 +571,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     previous_env, applied_env = _apply_invocation_web_overrides(args)
     try:
         if not getattr(args, "cmd", None):
-            return int(_default_entry())
+            return int(
+                _default_entry(
+                    web_host_override=str(getattr(args, "web_host", "") or "").strip(),
+                    web_port_override=getattr(args, "web_port", None),
+                )
+            )
         return int(args.func(args))
     finally:
         _restore_invocation_web_overrides(previous_env, applied_env)

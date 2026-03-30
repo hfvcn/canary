@@ -13,6 +13,7 @@ Uses existing daemon IPC infrastructure (Unix socket + JSON line protocol).
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -690,6 +691,47 @@ def handle_ralph_workflow_progress(args: Dict[str, Any]) -> DaemonResponse:
         return _error("progress_error", f"Failed to get progress: {e}")
 
 
+def handle_ralph_workflow_health(args: Dict[str, Any]) -> DaemonResponse:
+    """Health check for workflow wiring (orchestrator + ledger)."""
+    group_id = str(args.get("group_id") or "").strip()
+    if not group_id:
+        return _error("missing_group_id", "Missing group_id")
+
+    try:
+        from ..kernel.group import load_group
+        from ..kernel.ledger import read_last_lines
+        from .foreman.workflow_orchestrator import get_orchestrator
+
+        orchestrator = get_orchestrator(group_id)
+        has_orchestrator = orchestrator is not None
+        has_ralph = bool(getattr(orchestrator, "ralph", None)) if has_orchestrator else False
+
+        last_workflow_ts = ""
+        group = load_group(group_id)
+        if group is not None:
+            for raw in reversed(read_last_lines(group.ledger_path, 200)):
+                try:
+                    event = json.loads(raw)
+                except Exception:
+                    continue
+                kind = str(event.get("kind") or "").strip()
+                if kind.startswith("workflow."):
+                    last_workflow_ts = str(event.get("ts") or "").strip()
+                    break
+
+        return _success(
+            {
+                "group_id": group_id,
+                "orchestrator_instantiated": has_orchestrator,
+                "ralph_wired": has_ralph,
+                "last_workflow_event_ts": last_workflow_ts,
+            }
+        )
+    except Exception as e:
+        logger.warning(f"Failed to get workflow health: {e}")
+        return _error("workflow_health_error", f"Failed to get workflow health: {e}")
+
+
 def handle_ralph_task_event(args: Dict[str, Any]) -> DaemonResponse:
     """Handle ralph_task_event operation — unified task lifecycle event."""
     from ..contracts.v1.ralph_ipc import TaskEvent
@@ -720,15 +762,106 @@ def handle_ralph_task_event(args: Dict[str, Any]) -> DaemonResponse:
         if orchestrator is None:
             return _error("orchestrator_not_found", "No active orchestrator for group")
 
-        if hasattr(orchestrator, "ralph") and orchestrator.ralph is not None:
-            result = orchestrator.ralph.apply_task_event(event)
-        else:
-            result = {"accepted": False, "reason": "ralph_service_not_wired"}
+        # Important: drive the orchestrator's main path (updates internal workflow state
+        # + triggers downstream hooks). Calling orchestrator.ralph.apply_task_event()
+        # only updates RalphService internal memory and breaks the loop.
+        result = orchestrator.apply_task_event(event)
 
         return _success(result)
     except Exception as e:
         logger.warning(f"Failed to process task event: {e}")
         return _error("task_event_error", f"Failed to process task event: {e}")
+
+def handle_ralph_task_retry(args: Dict[str, Any]) -> DaemonResponse:
+    """Handle ralph_task_retry operation — Foreman decision entrypoint."""
+    group_id = str(args.get("group_id") or "").strip()
+    project_root = str(args.get("project_root") or "").strip() or None
+    task_id = str(args.get("task_id") or "").strip()
+
+    if not group_id:
+        return _error("missing_group_id", "Missing group_id")
+    if not task_id:
+        return _error("missing_task_id", "Missing task_id")
+
+    try:
+        from .foreman.workflow_orchestrator import get_orchestrator
+
+        orchestrator = get_orchestrator(group_id, project_root=Path(project_root) if project_root else None)
+        if orchestrator is None:
+            return _error("orchestrator_not_found", "No active orchestrator for group")
+
+        result = orchestrator.retry_task(task_id)
+        return _success(result)
+    except Exception as e:
+        logger.warning(f"Failed to request task retry: {e}")
+        return _error("task_retry_error", f"Failed to request task retry: {e}")
+
+
+def handle_ralph_task_block(args: Dict[str, Any]) -> DaemonResponse:
+    """Handle ralph_task_block operation — Foreman decision entrypoint."""
+    group_id = str(args.get("group_id") or "").strip()
+    project_root = str(args.get("project_root") or "").strip() or None
+    task_id = str(args.get("task_id") or "").strip()
+    reason = str(args.get("reason") or "").strip()
+
+    if not group_id:
+        return _error("missing_group_id", "Missing group_id")
+    if not task_id:
+        return _error("missing_task_id", "Missing task_id")
+
+    try:
+        from .foreman.workflow_orchestrator import get_orchestrator
+
+        orchestrator = get_orchestrator(group_id, project_root=Path(project_root) if project_root else None)
+        if orchestrator is None:
+            return _error("orchestrator_not_found", "No active orchestrator for group")
+
+        result = orchestrator.block_task(task_id, reason)
+        return _success(result)
+    except Exception as e:
+        logger.warning(f"Failed to block task: {e}")
+        return _error("task_block_error", f"Failed to block task: {e}")
+
+def handle_ralph_task_verify(args: Dict[str, Any]) -> DaemonResponse:
+    """Handle ralph_task_verify operation — run Ralph verification on demand."""
+    group_id = str(args.get("group_id") or "").strip()
+    project_root = str(args.get("project_root") or "").strip() or None
+    task_id = str(args.get("task_id") or "").strip()
+    changed_files = args.get("changed_files") if isinstance(args.get("changed_files"), list) else []
+
+    if not group_id:
+        return _error("missing_group_id", "Missing group_id")
+    if not task_id:
+        return _error("missing_task_id", "Missing task_id")
+
+    try:
+        from .foreman.workflow_orchestrator import get_orchestrator
+
+        orchestrator = get_orchestrator(group_id, project_root=Path(project_root) if project_root else None)
+        if orchestrator is None:
+            return _error("orchestrator_not_found", "No active orchestrator for group")
+
+        state = orchestrator.engine.get_task(task_id)
+        if state is None:
+            return _error("task_not_found", f"task not found: {task_id}")
+
+        files = [str(p or "").strip() for p in changed_files if str(p or "").strip()]
+        verification = orchestrator.ralph.verify_completion(
+            task_id,
+            files,
+            workflow_id=state.workflow_id,
+            task_ref=state.task,
+        )
+        return _success(
+            {
+                "task_id": task_id,
+                "workflow_id": state.workflow_id,
+                "verification": verification.model_dump(),
+            }
+        )
+    except Exception as e:
+        logger.warning(f"Failed to verify task completion: {e}")
+        return _error("task_verify_error", f"Failed to verify task completion: {e}")
 
 
 # Operation dispatcher
@@ -743,7 +876,11 @@ _RALPH_OPS = {
     "ralph_clear_workflow": handle_ralph_clear_workflow,
     "ralph_process_pending": handle_ralph_process_pending,
     "ralph_workflow_progress": handle_ralph_workflow_progress,
+    "ralph_workflow_health": handle_ralph_workflow_health,
     "ralph_task_event": handle_ralph_task_event,
+    "ralph_task_retry": handle_ralph_task_retry,
+    "ralph_task_block": handle_ralph_task_block,
+    "ralph_task_verify": handle_ralph_task_verify,
 }
 
 

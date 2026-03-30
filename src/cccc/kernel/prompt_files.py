@@ -28,6 +28,7 @@ Ralph workflow:
 - Reuse workers first; use `cccc_actor` only when the pool is not enough.
 - Inspect runtimes with `cccc_runtime_list` and model registry evidence with `cccc_model(action="list"|"get")` before assigning new work.
 - If actor/runtime/model tools are hidden, enable `pack:group-runtime` with `cccc_capability_use(capability_id="pack:group-runtime", scope="session")` first.
+- Workflow CLI commands are the primary task-coordination path: use `cccc workflow submit|status|verify|retry|fail` and `cccc task complete` for workflow state changes.
 - Peer workers execute assigned scope, report evidence/blockers, and hand results back; they do not renegotiate scope.
 
 Coordination checklist:

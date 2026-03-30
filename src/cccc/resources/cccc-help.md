@@ -19,6 +19,15 @@ You are in a working group with history. Your messages change what happens next.
 - If actor/runtime/model tools are hidden, enable `pack:group-runtime` with `cccc_capability_use(capability_id="pack:group-runtime", scope="session")`.
 - User-visible progress belongs in MCP chat. Feishu fan-out may happen downstream; worker completion is not user delivery until foreman accepts it.
 
+### Workflow Commands
+
+- `cccc workflow submit --tasks <file>` - submit a task batch to the workflow.
+- `cccc workflow status [--workflow-id X]` - inspect workflow progress.
+- `cccc workflow verify <task_id>` - run verification for a task.
+- `cccc workflow retry <task_id>` - retry a failed task.
+- `cccc workflow fail <task_id> --message <msg>` - mark a task as failed with a message.
+- `cccc task complete <task_id> [--changed-file <path>]` - worker completion report.
+
 ## Working World Model
 
 `environment_summary`: repo, runtime, local state, and facts shaping your next move.

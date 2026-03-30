@@ -28,7 +28,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from ...contracts.v1 import DaemonResponse
-from ...kernel.group import load_group
+from ...kernel.group import Group, load_group
+from ...kernel.workflow_state import WorkflowEngine, WorkflowTaskStatus
 from ..ops.agent_ops import get_agent
 from ...contracts.v1.ralph_ipc import (
     BatchDecision,
@@ -146,9 +147,16 @@ class WorkflowOrchestrator:
             sender=feishu_sender,
             log_fn=self._log,
         )
+        group = load_group(self.group_id)
+        if group is None:
+            # Unit tests instantiate orchestrator without a persisted group; keep a
+            # local ledger-backed engine under the project root for deterministic replay.
+            group = self._create_ephemeral_group()
+        self.engine = WorkflowEngine(group)
+        self.engine.replay_from_ledger()
         from .ralph_service import RalphService
 
-        self.ralph = RalphService(project_root=project_root, group_id=group_id)
+        self.ralph = RalphService(project_root=project_root, group_id=group_id, workflow_engine=self.engine)
 
         # Actor lifecycle functions
         self._start_actor_fn = start_actor_fn
@@ -160,6 +168,16 @@ class WorkflowOrchestrator:
         self._active_workflows: Dict[str, Dict[str, Any]] = {}
         self._task_to_agent: Dict[str, str] = {}
         self._task_to_model: Dict[str, str] = {}  # task_id -> model_key
+
+    def _create_ephemeral_group(self) -> Group:
+        root = Path(self.project_root) / ".cccc" / "orchestrator" / str(self.group_id or "group")
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "ledger.jsonl").touch(exist_ok=True)
+        return Group(
+            group_id=str(self.group_id or "group"),
+            path=root,
+            doc={"group_id": str(self.group_id or "group"), "active_scope_key": "", "scopes": [], "actors": []},
+        )
 
     def process_batch_suggestion(
         self,
@@ -182,6 +200,12 @@ class WorkflowOrchestrator:
         batch_id = suggestion.suggestion_id
 
         self._log(f"[orchestrator] Processing batch {batch_id} for workflow {workflow_id}")
+
+        for task in suggestion.tasks:
+            self.engine.register_task(task, workflow_id)
+        states = [self.engine.get_task(t.id) for t in suggestion.tasks]
+        if not all(s and s.batch_id == batch_id for s in states):
+            self.engine.register_batch(batch_id, [t.id for t in suggestion.tasks])
 
         # Initialize workflow tracking if needed
         if workflow_id not in self._active_workflows:
@@ -223,6 +247,13 @@ class WorkflowOrchestrator:
                     "claimed_paths": self._extract_claimed_paths(assignment.task),
                     "status": TASK_STATUS_PENDING,
                 }
+
+        approved_ids = {t.id for t in result.approved_tasks}
+        approved_assignments = [
+            a for a in result.assignments if a.agent_id and a.task.id in approved_ids
+        ]
+        if approved_assignments:
+            self.engine.approve_batch(batch_id, approved_assignments)
 
         self._sync_batch_to_control_plane(result)
 
@@ -614,9 +645,9 @@ class WorkflowOrchestrator:
     def _build_runtime_adapter_hint(self, runtime: str) -> str:
         runtime_name = str(runtime or "").strip().lower()
         runtime_hints = {
-            "claude": "Write code directly. Report via cccc_message_send.",
-            "codex": "Use your internal workflow. Report progress and completion.",
-            "gemini": "Execute the task. Report via cccc_message_send.",
+            "claude": "Write code directly. Use cccc_message_send for progress/help; report completion via cccc task complete.",
+            "codex": "Use your internal workflow. Use cccc_message_send for progress/help; report completion via cccc task complete.",
+            "gemini": "Execute the task. Use cccc_message_send for progress/help; report completion via cccc task complete.",
         }
         return runtime_hints.get(runtime_name, "")
 
@@ -645,11 +676,12 @@ Do not contact the user to renegotiate scope."""
         if adapter_hint:
             sections.append(f"Runtime Adapter:\n{adapter_hint}")
         sections.append(
-            """Report back to Foreman with:
+            f"""Report back to Foreman with:
 - progress delta or blockers
 - changed files or evidence
 - anything still unverified
-- Report via `cccc_message_send(to="@foreman", text=...)`.
+- Report completion via `cccc task complete {task.id} --changed-file <path> --evidence "<说明>"`.
+- Use `cccc_message_send(to="@foreman", text=...)` for progress updates or help, not for completion.
 
 Use CCCC MCP tools for visible coordination."""
         )
@@ -828,25 +860,154 @@ Use CCCC MCP tools for visible coordination."""
         )
 
     def apply_task_event(self, event) -> Dict[str, Any]:
-        """Process a task event via RalphService, then update internal state."""
-        result = self.ralph.apply_task_event(event)
+        """Process a unified task event with a verification gate (ledger-backed)."""
+        payload = event.payload or {}
+        task_id = str(getattr(event, "task_id", "") or "").strip()
+        event_type = str(getattr(event, "event_type", "") or "").strip()
+        if not task_id:
+            raise ValueError("task_id is required")
 
-        if event.event_type == "completed":
-            payload = event.payload or {}
-            self.on_task_completed(
-                task_id=event.task_id,
-                agent_id=payload.get("agent_id", ""),
-                duration_seconds=payload.get("duration_seconds", 0),
-                changed_files=payload.get("changed_files", []),
+        state = self.engine.get_task(task_id)
+        if state is None:
+            raise ValueError(f"task not found: {task_id}")
+
+        result: Dict[str, Any] = {"accepted": True, "task_id": task_id, "event_type": event_type}
+        agent_id = str(payload.get("agent_id") or "").strip() or str(getattr(state, "agent_id", "") or "").strip()
+
+        if event_type == "completed":
+            duration_seconds = int(payload.get("duration_seconds") or 0)
+            changed_files = payload.get("changed_files") if isinstance(payload.get("changed_files"), list) else []
+            if state.status in (
+                WorkflowTaskStatus.COMPLETED,
+                WorkflowTaskStatus.FAILED,
+                WorkflowTaskStatus.BLOCKED,
+                WorkflowTaskStatus.ARCHIVED,
+            ):
+                result["reason"] = f"terminal_state:{state.status.value}"
+                return result
+
+            if state.status == WorkflowTaskStatus.ASSIGNED:
+                self.engine.report_worker_started(task_id, agent_id)
+                state = self.engine.get_task(task_id) or state
+
+            if state.status != WorkflowTaskStatus.RUNNING:
+                result["accepted"] = False
+                result["reason"] = f"task_not_running status={state.status.value}"
+                return result
+
+            self.engine.report_worker_completion(
+                task_id,
+                {
+                    "agent_id": agent_id,
+                    "duration_seconds": duration_seconds,
+                    "changed_files": list(changed_files),
+                    "idempotency_key": str(getattr(event, "idempotency_key", "") or "").strip(),
+                },
             )
-        elif event.event_type == "failed":
-            payload = event.payload or {}
+
+            try:
+                verification = self.ralph.verify_completion(
+                    task_id,
+                    list(changed_files),
+                    workflow_id=state.workflow_id,
+                    task_ref=state.task,
+                )
+            except Exception as e:
+                verification = VerificationResult(
+                    verification_id=f"ver-error-{task_id}",
+                    workflow_id=state.workflow_id,
+                    task_id=task_id,
+                    overall_outcome="failed",
+                    checks=[],
+                    summary=f"verification_error: {e}",
+                )
+
+            self.engine.record_verification_result(task_id, verification)
+            result["verification_outcome"] = verification.overall_outcome
+
+            if verification.overall_outcome in ("passed", "skipped"):
+                self.on_task_completed(
+                    task_id=task_id,
+                    agent_id=agent_id,
+                    duration_seconds=duration_seconds,
+                    changed_files=list(changed_files),
+                    workflow_id=payload.get("workflow_id") or state.workflow_id,
+                )
+            else:
+                self.on_task_failed(
+                    task_id=task_id,
+                    error_message=verification.summary or "Verification failed",
+                    agent_name=agent_id,
+                )
+
+            return result
+
+        if event_type == "failed":
+            error_message = str(payload.get("error_message") or "").strip()
+            suggestion = str(payload.get("suggestion") or "").strip()
+            agent_name = str(payload.get("agent_name") or "").strip() or agent_id
+            if state.status == WorkflowTaskStatus.ASSIGNED:
+                self.engine.report_worker_started(task_id, agent_id)
+                state = self.engine.get_task(task_id) or state
+            if state.status == WorkflowTaskStatus.RUNNING:
+                self.engine.report_worker_failed(
+                    task_id,
+                    {"error_message": error_message, "suggestion": suggestion, "agent_name": agent_name},
+                )
             self.on_task_failed(
-                task_id=event.task_id,
-                error_message=payload.get("error_message", ""),
+                task_id=task_id,
+                error_message=error_message,
+                suggestion=suggestion,
+                agent_name=agent_name,
             )
+            return result
 
+        result["accepted"] = False
+        result["reason"] = "unknown_event_type"
         return result
+
+    def retry_task(self, task_id: str) -> Dict[str, Any]:
+        """Foreman decision: request a retry after verification failure."""
+        tid = str(task_id or "").strip()
+        if not tid:
+            raise ValueError("task_id is required")
+        state = self.engine.get_task(tid)
+        if state is None:
+            raise ValueError(f"task not found: {tid}")
+
+        self.engine.retry_after_verification(tid)
+
+        # Keep progress API consistent: treat retry as returning to pending.
+        for wdata in self._active_workflows.values():
+            td = wdata.get("tasks", {}).get(tid)
+            if td:
+                td["status"] = TASK_STATUS_PENDING
+                td.pop("error_message", None)
+                break
+
+        return {"accepted": True, "task_id": tid, "action": "retry_requested", "workflow_id": state.workflow_id}
+
+    def block_task(self, task_id: str, reason: str) -> Dict[str, Any]:
+        """Foreman decision: block a task with a human-readable reason."""
+        tid = str(task_id or "").strip()
+        why = str(reason or "").strip()
+        if not tid:
+            raise ValueError("task_id is required")
+        state = self.engine.get_task(tid)
+        if state is None:
+            raise ValueError(f"task not found: {tid}")
+
+        self.engine.block_task(tid, why)
+
+        # Progress API does not have a first-class 'blocked' status; surface as failed with context.
+        for wdata in self._active_workflows.values():
+            td = wdata.get("tasks", {}).get(tid)
+            if td:
+                td["status"] = TASK_STATUS_FAILED
+                td["error_message"] = f"blocked: {why}" if why else "blocked"
+                break
+
+        return {"accepted": True, "task_id": tid, "action": "blocked", "workflow_id": state.workflow_id, "reason": why}
 
     def on_verification_result(
         self,
@@ -961,6 +1122,49 @@ Use CCCC MCP tools for visible coordination."""
 _ORCHESTRATORS: Dict[str, WorkflowOrchestrator] = {}
 
 
+def _resolve_orchestrator_project_root(group_id: str, project_root: Optional[Path]) -> Optional[Path]:
+    if project_root is not None:
+        return project_root.expanduser().resolve()
+
+    group = load_group(group_id)
+    if group is None:
+        logger.info("Cannot lazy-init orchestrator for %s: group not found", group_id)
+        return None
+
+    scopes = group.doc.get("scopes")
+    scope_entries = scopes if isinstance(scopes, list) else []
+    active_scope_key = str(group.doc.get("active_scope_key") or "").strip()
+    first_candidate: Optional[Path] = None
+
+    for item in sorted(
+        (entry for entry in scope_entries if isinstance(entry, dict)),
+        key=lambda entry: str(entry.get("scope_key") or "").strip() != active_scope_key,
+    ):
+        raw_url = str(item.get("url") or "").strip()
+        if not raw_url:
+            continue
+        try:
+            candidate = Path(raw_url).expanduser().resolve()
+        except Exception:
+            continue
+        if first_candidate is None:
+            first_candidate = candidate
+        if candidate.exists() and candidate.is_dir():
+            logger.info("Lazy-init orchestrator for %s using scope root %s", group_id, candidate)
+            return candidate
+
+    if first_candidate is not None:
+        logger.warning(
+            "Lazy-init orchestrator for %s using unresolved scope root %s",
+            group_id,
+            first_candidate,
+        )
+        return first_candidate
+
+    logger.info("Cannot lazy-init orchestrator for %s: no attached project root", group_id)
+    return None
+
+
 def get_orchestrator(
     group_id: str,
     *,
@@ -971,11 +1175,12 @@ def get_orchestrator(
     if group_id in _ORCHESTRATORS:
         return _ORCHESTRATORS[group_id]
 
-    if project_root is None:
+    resolved_project_root = _resolve_orchestrator_project_root(group_id, project_root)
+    if resolved_project_root is None:
         return None
 
     orchestrator = WorkflowOrchestrator(
-        project_root=project_root,
+        project_root=resolved_project_root,
         group_id=group_id,
         **kwargs,
     )
