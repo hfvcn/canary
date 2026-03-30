@@ -115,3 +115,42 @@ Wave 3 联合审查发现了 7 个代码级问题（handler 调用路径错误�
 | 讨论 MCP 优化 | 渐进改善 | 用户的判断是去掉 MCP，不是优化 |
 
 **核心教训：不可运行的代码，无论计划多精细、审查多严格、并行度多高，都只是假进展。真正的进展是系统能做到昨天做不到的事。**
+
+---
+
+## 十、Prompt 修改有效但不稳定，系统级约束才可靠（Day 5 E2E 验证）
+
+> 来源：2026-03-30 第三轮真实 E2E 测试（test3 项目）
+
+### 测试设计
+在 Ralph 独立化 + 9 任务修复计划执行完成后（41 项 pytest 全通过），用真实 daemon + Foreman (Claude) + Worker (Codex) 跑 test3 项目。
+
+### 发现
+
+**Prompt 改动在新 session 生效，在有历史上下文时回退：**
+- 第一次（无历史）：Foreman 正确使用 `cccc workflow submit`，ledger 出现 `workflow.task_registered` + `workflow.batch_registered`
+- 第二次（有历史）：Foreman 回退到旧模式——`context.sync task.create` + `cccc_message_send` 直接分配 Worker
+- Worker 始终使用 `cccc_message_send` + `context.sync task.move done` 报告完成，从未调用 `cccc task complete`
+
+**新发现的断裂点：**
+- `auto_process` 默认为 `False`，导致 batch 被注册但永远不进入分配流程（已修复为 `True`）
+- 即使 Foreman 走了 workflow submit，orchestrator batch → agent assignment → worker prompt 链条仍有缝隙
+
+### 结论
+
+**外部审查 (gp-4, gpp-4) 的核心判断被验证为正确：**
+
+> "仅靠 prompt 把 AI 引到正确路径是不够的。必须让错误路径在系统层面失效或无法改变状态。"
+
+具体表现为：
+1. Prompt 修改是**必要的**（让 AI 知道新路径存在），但**不充分**（无法阻止 AI 使用旧路径）
+2. AI 在上下文压力下（历史消息、长对话）会回退到训练数据中更常见的模式
+3. 41 个 pytest 全通过 ≠ 真实场景中 AI 会走新路径
+
+### 下一步方向
+
+这验证了架构层面修复的必要性（原标记为"后续方向"，现需提前）：
+
+1. **Completion guardrail** — `cccc_message_send` 发送类完成消息时，系统应拒绝状态推进或自动转换
+2. **Canonical backend entry** — 无论 CLI/MCP/消息，任务完成都必须走同一个 `complete_task()` 入口
+3. **MCP 降级** — `cccc_task` 的状态变更能力应被限制为只读/委托
