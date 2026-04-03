@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Implement WorkspaceIndex and tests,DONE,"workspace_index module exists and targeted tests pass","pytest tests/ralph/test_workspace_index.py -q",2026-03-31T23:00:00,0,Wave 2A T1 passed
+2,Implement filesystem validator and tests,DONE,"filesystem_validator module exists and targeted tests pass","pytest tests/ralph/test_filesystem_validator.py -q",2026-03-31T23:10:00,0,Wave 2A T2 passed
+3,Wire project-aware validation into validator and CLI,DONE,"validator/cli integration updated and ralph tests pass","pytest tests/ralph/ -q",2026-03-31T23:15:00,0,Wave 2A T3 passed

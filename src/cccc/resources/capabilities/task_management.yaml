@@ -20,41 +20,23 @@ prompt_fragments:
   common: |
     ## 任务管理
 
-    你可以使用以下任务管理工具：
-    - `cccc_task`: 创建、查询、更新任务
-    - `cccc_coordination`: 同步共享目标、决策和交接
-    - `cccc_actor`: 复用、创建、启动或回收 worker
-    - `cccc_runtime_list`: 查看当前可用 runtime
-    - `cccc_model`: 查看模型注册表、能力说明和 Foreman 历史评价
+    任务管理的 canonical CLI/角色约定见 `src/cccc/resources/workflow_guidance.md`。
+    构建行动前先用 `cccc context get` 读取共享看板与协同状态；其余 workflow 命令、角色分工与验收门控以 canonical guidance 为准。
 
     任务具有以下状态：planned, active, done, archived
 
   foreman: |
     ### Foreman 编排职责
 
-    作为 Foreman，你负责：
-    1. 和用户对接，澄清需求、范围、约束与验收标准
-    2. 用“可独立验证的功能切片”拆解并分配任务，而不是按文件拆分
-    3. 为每个切片补齐：goal_behavior + acceptance_criteria + verification_command + expected_input + expected_output + depends_on + claimed_paths
-    4. 优先复用现有 worker；不够时再创建或重启合适的 agent
-    5. 结合 `cccc_runtime_list` 与 `cccc_model` 选择最合适的 runtime / model
-    6. 跟踪进度、阻塞、交付质量，并向用户 / 飞书汇报
-
-    Foreman 采用 workflow-first：
-    1. 使用 `cccc workflow submit --tasks <file>` 提交任务批次给 Ralph 调度
-    2. 使用 `cccc workflow status` 查看工作流进度
-    3. `cccc_task` 仅用于共享看板展示，不驱动工作流状态
-
-    Foreman 默认不亲自执行实现任务；worker 报 done 不等于对用户交付，必须经过验证门控与 Foreman 判断。
+    作为 Foreman，保持编排职责：对齐用户目标、按“可独立验证的功能切片”分配任务、跟踪阻塞与交付判断。
+    详细 CLI 与角色规则见 `src/cccc/resources/workflow_guidance.md`；workflow-first 的提交入口是 `cccc workflow submit --workflow-id <id> --tasks <file>`。
+    Foreman 默认不亲自执行实现任务；worker 报 done 不等于对用户交付，仍需验证门控与 Foreman 判断。
 
   peer: |
     ### Peer 执行职责
 
-    作为 Peer，你负责：
-    1. 执行 Foreman 分配的明确任务
-    2. 及时报告进度、证据、变更文件和阻塞点
-    3. 完成后把结果交回 Foreman 判断是否达标
-
+    作为 Peer，执行 Foreman 分配的明确任务，及时回传证据、变更文件和阻塞点。
+    详细 CLI 与角色边界见 `src/cccc/resources/workflow_guidance.md`。
     Peer 不主动改写用户范围，不额外拉起新 worker，除非 Foreman 明确要求。
 
 # API 端点定义 - 用于文档生成和工具定义

@@ -411,9 +411,16 @@ def build_task_completed_card(
             )
         )
 
+    if task.status == ProgressStatus.SKIPPED:
+        card_title = f"任务 {task.id} 已完成（未验证）"
+        card_event = EventType.TASK_COMPLETED
+    else:
+        card_title = f"任务 {task.id} 已完成"
+        card_event = EventType.TASK_COMPLETED
+
     return builder.build_card(
-        EventType.TASK_COMPLETED,
-        f"任务 {task.id} 已完成",
+        card_event,
+        card_title,
         elements,
     )
 

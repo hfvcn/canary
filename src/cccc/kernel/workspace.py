@@ -35,6 +35,8 @@ def resolve_workspace_root(group: Group) -> Path:
     root = resolve_active_scope_root(group)
     if root is None:
         raise ValueError("group has no active workspace root")
+    if not root.exists():
+        raise ValueError(f"workspace root does not exist: {root}")
     return root
 
 

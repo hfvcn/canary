@@ -3,9 +3,9 @@
 This document is on-demand operational guidance.
 Always-on rules live in system/preamble; this file expands details, examples, and edge cases.
 
-Run `cccc_help` to refresh this playbook; rerun when reminded.
+Refer to this document when you need operational guidance; rerun when reminded.
 
-Cold start default: `cccc_bootstrap` gives a lean `session + recovery + inbox_preview + memory_recall_gate` packet. Pull `cccc_help`, `cccc_project_info`, or `cccc_context_get` only when you need colder detail. For deep recall, use local memory first and `cccc_space(action="query", lane="memory")` only as a fallback when a memory notebook is bound.
+Cold start: use `cccc context get` to load session + recovery context. Use `cccc inbox` for inbox preview. Pull `cccc_project_info` or `cccc_space(action="query", lane="memory")` only when you need deeper detail (MCP-only, requires MCP server enabled).
 
 You are in a working group with history. Your messages change what happens next. Act from inside the work, not like a detached assistant.
 
@@ -13,20 +13,11 @@ You are in a working group with history. Your messages change what happens next.
 
 - Ralph suggests ready work; foreman decides whether to approve, modify, defer, or reject the batch.
 - Foreman stays on the control plane: clarify the user ask, define success criteria, route execution to workers, and judge completion.
-- Reuse workers first. Inspect the current pool with `cccc_actor(action="list")` or `cccc_actor(action="profile_list")`; create/start/restart only when the current pool is not enough.
-- Check runtime availability with `cccc_runtime_list` before spawning new workers.
-- Check model registry evidence with `cccc_model(action="list")` and `cccc_model(action="get", model_key=...)` before assigning new work.
-- If actor/runtime/model tools are hidden, enable `pack:group-runtime` with `cccc_capability_use(capability_id="pack:group-runtime", scope="session")`.
-- User-visible progress belongs in MCP chat. Feishu fan-out may happen downstream; worker completion is not user delivery until foreman accepts it.
-
-### Workflow Commands
-
-- `cccc workflow submit --tasks <file>` - submit a task batch to the workflow.
-- `cccc workflow status [--workflow-id X]` - inspect workflow progress.
-- `cccc workflow verify <task_id>` - run verification for a task.
-- `cccc workflow retry <task_id>` - retry a failed task.
-- `cccc workflow fail <task_id> --message <msg>` - mark a task as failed with a message.
-- `cccc task complete <task_id> [--changed-file <path>]` - worker completion report.
+- Canonical workflow CLI commands and shared foreman/worker responsibilities now live in `workflow_guidance.md`; treat that file as the source of truth for `cccc workflow ...`, `cccc task complete`, `cccc context get`, and `cccc send`.
+- Check model registry evidence with `cccc_model(action="list")` (MCP) and `cccc_model(action="get", model_key=...)` (MCP) before assigning new work.
+- If actor/runtime/model tools are hidden, enable `pack:group-runtime` with `cccc_capability_use(capability_id="pack:group-runtime", scope="session")` (MCP).
+- Use `cccc reply <event_id> <message>` for replies tied to a visible chat event, and `cccc inbox` when you need the unread queue during cold start or recovery.
+- User-visible progress belongs in CLI messaging. Feishu fan-out may happen downstream; worker completion is not user delivery until foreman accepts it.
 
 ## Working World Model
 
@@ -54,9 +45,9 @@ You are in a working group with history. Your messages change what happens next.
 
 ## Core Routes
 
-- Bootstrap / resume: start with `cccc_bootstrap`.
-- Visible replies go through `cccc_message_send` / `cccc_message_reply`; terminal output is not delivery.
-- At key transitions, sync `cccc_coordination` / `cccc_task` and refresh `cccc_agent_state`.
+- Bootstrap / resume: start with `cccc context get`.
+- Visible replies go through `cccc send` / `cccc reply`; terminal output is not delivery.
+- At key transitions, inspect shared state with `cccc context get` and refresh `cccc_agent_state`.
 - For strategy questions, align before implementation.
 - For recall, read `memory_recall_gate`, then local `cccc_memory`; use `cccc_space(..., lane="memory")` only as deeper fallback.
 - For foreman orchestration, review context, task board, actor list, runtime list, and model registry before adding new workers.
@@ -66,24 +57,24 @@ You are in a working group with history. Your messages change what happens next.
 
 ### Chat
 
-- Visible coordination belongs in `cccc_message_send` / `cccc_message_reply`.
+- Visible coordination belongs in `cccc send` / `cccc reply`.
 - Targets: `@all`, `@foreman`, `@peers`, `user`, or one actor.
 - Use `@all` only when the whole group needs the message.
 
 ### Coordination (shared control plane)
 
 - Shared truth lives in `coordination.brief` plus task cards.
-- Read the current snapshot with `cccc_context_get`.
+- Read the current snapshot with `cccc context get`.
 - Update the brief with `cccc_coordination(action="update_brief"|...)`.
 - Add decisions and handoffs with `cccc_coordination(action="add_decision"|"add_handoff", ...)`.
-- Use `cccc_task` for shared work units; runtime todo stays private.
+- Use workflow batches plus `cccc context get` visibility for shared work units; runtime todo stays private.
 
 ### Agent State (personal working memory)
 
 - `cccc_agent_state` is per-actor working memory, not just task status.
 - Refresh hot fields at key transitions: `focus`, `next_action`, `what_changed`, `active_task_id` when needed, and real `blockers`.
 - Mind context is your current model of environment, user, and stance: `environment_summary`, `user_model`, `persona_notes`.
-- `cccc_bootstrap().recovery.self_state.mind_context_mini` is continuity under token pressure, not a substitute for real state upkeep.
+- Recovery `mind_context_mini` is continuity under token pressure, not a substitute for real state upkeep.
 
 ### PROJECT.md
 
@@ -94,13 +85,13 @@ You are in a working group with history. Your messages change what happens next.
 ### Inbox
 
 - Inbox is an unread queue, not a task board.
-- Bootstrap includes only `inbox_preview`; use `cccc_inbox_list` for the full unread queue.
-- Mark read intentionally via `cccc_inbox_mark_read`.
+- Bootstrap includes only `inbox_preview`; use `cccc inbox` for the full unread queue.
+- Mark read intentionally via `cccc read <event_id>`.
 - If `reply_required=true`, do not stop at mark-read: send a concrete reply.
 
 ### Task Board
 
-- Promote shared, long-horizon, or user-requested tracking into `cccc_task`.
+- Promote shared, long-horizon, or user-requested tracking into workflow batches via `cccc workflow submit --workflow-id X --tasks <file>`.
 - Foreman should keep one clear owner per active task.
 - Peers should update evidence, blockers, and handoff state instead of vague narrative status.
 
@@ -108,9 +99,9 @@ You are in a working group with history. Your messages change what happens next.
 
 ### Information gap
 
-1. `cccc_bootstrap` / `cccc_context_get`
-2. `cccc_project_info`
-3. `cccc_inbox_list`
+1. `cccc context get`
+2. `cccc_project_info` (MCP-only)
+3. `cccc inbox`
 4. `cccc_memory(action="search", ...)`
 5. external web search (if policy/runtime allows)
 
@@ -145,7 +136,7 @@ You are in a working group with history. Your messages change what happens next.
 
 - Stay on orchestration: talk to the user, keep scope/constraints clear, and turn requests into executable tasks.
 - Do not execute implementation tasks yourself unless the user explicitly narrows scope to foreman-only work.
-- Reuse or create workers deliberately: inspect actors with `cccc_actor`, runtimes with `cccc_runtime_list`, and models with `cccc_model`.
+- Reuse or create workers deliberately: inspect actors with `cccc actor list`, runtimes with `cccc runtime list`, and models with `cccc_model` (MCP).
 - If those tools are hidden, enable `pack:group-runtime` first.
 - Keep `goal -> success criteria -> owner` explicit; stop drift early.
 - Treat `done`, `idle`, and silence as evaluation signals, not closure truth.
@@ -184,5 +175,5 @@ You are in a working group with history. Your messages change what happens next.
 ### Attachments
 
 - Inbox events may include `data.attachments[]` with `path` like `state/blobs/<sha256>_<name>`.
-- Resolve blob relative path to absolute path: `cccc_file(action=blob_path, rel_path=...)`
-- Send local file as attachment: `cccc_file(action=send, path=...)`
+- Resolve blob relative path to absolute path: `cccc_file(action=blob_path, rel_path=...)` (MCP)
+- Send local file as attachment: `cccc_file(action=send, path=...)` (MCP)

@@ -1,0 +1,115 @@
+# Wave 2A: RV-2 验证命令静态预检 + WorkspaceIndex
+# 前置：Wave 1 完成
+# 修订：经 Codex 审查修复 2 BLOCK（测试文件归属 + fatal 定义）
+
+tasks:
+  - id: T1
+    title: "实现 WorkspaceIndex 共享文件系统索引"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/workspace_index.py"
+      - "tests/ralph/test_workspace_index.py"
+    depends_on: []
+    goal_behavior: >
+      新建 workspace_index.py 提供 WorkspaceIndex 类。
+      模块解析优先按 project_root/src 查找（pyproject.toml package-dir），
+      不依赖 sys.path 扫描。stdlib/第三方用 importlib.util.find_spec fallback。
+    acceptance_criteria: >
+      1. path_exists 对存在/不存在文件返回正确结果并缓存
+      2. resolve_module("cccc.ralph.validator") → project_root/src/cccc/ralph/validator.py
+      3. resolve_module("os.path") → None（stdlib，返回 None 表示非本地）
+      4. ast_parse 对语法错误返回 None
+      5. projected_paths 正确计算依赖闭包 claimed_paths（含目录覆盖子文件）
+      6. 测试文件随源码一起创建
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_workspace_index.py -q"
+      covers:
+        tasks: ["T1"]
+    provides:
+      - name: workspace_index
+        kind: module
+
+  - id: T2
+    title: "实现 filesystem_validator RV-2 命令预检（10 码）"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/filesystem_validator.py"
+      - "tests/ralph/test_filesystem_validator.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      新建 filesystem_validator.py，实现 validate_filesystem()。
+      wrapper unwrap 支持：env/env -u/timeout/gtimeout/uv run/poetry run。
+      10 个诊断码完整实现。projected state 感知目录 claim 覆盖子文件。
+      import 检查对 stdlib/第三方 find_spec 失败降为 hint，不报 error。
+    acceptance_criteria: >
+      1. E_VERIFICATION_PYCOMPILE_TARGET_MISSING — py_compile 目标不存在
+      2. E_VERIFICATION_IMPORT_MODULE_MISSING — 本地模块不存在
+      3. E_VERIFICATION_IMPORT_SYMBOL_MISSING — 本地模块存在但符号不存在
+      4. E_VERIFICATION_PYTEST_TARGET_MISSING — pytest 目标文件不存在
+      5. E_VERIFICATION_PYTEST_NODE_MISSING — pytest node (Class/method) 不存在
+      6. W_VERIFICATION_COMPLEX_SHELL_SKIPPED — 含 shell operator
+      7. W_VERIFICATION_TRIVIAL_COMMAND — true/echo ok 等
+      8. W_VERIFICATION_REDUNDANT_PYCOMPILE — 与 Ralph 内建重复
+      9. W_VERIFICATION_PYTHON_C_OPAQUE — python -c 含执行语义
+      10. W_VERIFICATION_SHAPE_UNKNOWN — 未知形状
+      11. projected state: 依赖闭包 claimed 但不存在 → hint（含目录覆盖）
+      12. env -u VAR pytest 正确 unwrap
+      13. 每个诊断码至少 1 个单测
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_filesystem_validator.py -q"
+      covers:
+        tasks: ["T1", "T2"]
+    consumes:
+      - name: workspace_index
+        from: T1
+    provides:
+      - name: filesystem_validator
+        kind: module
+
+  - id: T3
+    title: "集成到 validator.py + CLI（含 fatal 短路）"
+    role: integration
+    claimed_paths:
+      - "src/cccc/ralph/validator.py"
+      - "src/cccc/ralph/cli.py"
+      - "tests/ralph/test_ralph_standalone.py"
+    depends_on: ["T2"]
+    goal_behavior: >
+      validate_with_project(plan, project_root) 聚合结构+FS 校验。
+      fatal 短路仅对图结构破损类 error：E_DUPLICATE_TASK_ID, E_DEP_UNKNOWN,
+      E_DEP_SELF, E_DEP_CYCLE。E_MISSING_CLAIMED_PATHS/E_MISSING_VERIFICATION
+      不触发短路（内容缺失不等于图不可遍历）。
+      CLI validate 使用 validate_with_project。
+    acceptance_criteria: >
+      1. validate_with_project() 返回结构+FS 合并 ValidationReport
+      2. E_DEP_CYCLE 时跳过 FS 校验
+      3. E_MISSING_VERIFICATION 时不跳过 FS 校验
+      4. CLI ralph validate 自动调用 validate_with_project
+      5. JSON 输出包含 FS 校验结果
+      6. 纯 validate(plan) 向后兼容
+    verification:
+      level: integration
+      command: "pytest tests/ralph/ -q"
+      covers:
+        tasks: ["T1", "T2", "T3"]
+        flows: ["validate_with_filesystem"]
+    consumes:
+      - name: filesystem_validator
+        from: T2
+
+critical_entrypoints:
+  - "src/cccc/ralph/validator.py"
+  - "src/cccc/ralph/cli.py"
+
+critical_flows:
+  - id: validate_with_filesystem
+    description: "ralph validate → 结构校验 → fatal check → FS 校验 → 合并报告"
+    entrypoints: ["src/cccc/ralph/validator.py"]
+    required_verification_level: integration
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

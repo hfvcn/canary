@@ -67,18 +67,22 @@ class TestSystemPromptMemory(unittest.TestCase):
             self.assertIn("Work like a sharp teammate, not a customer-service script.", prompt)
             self.assertIn("Prefer silence over low-signal chatter; speak for real changes, not filler or routine @all updates.", prompt)
             self.assertIn("No fabrication. Verify before claiming done.", prompt)
-            self.assertIn("Visible replies must go through MCP", prompt)
-            self.assertIn("Cold start or resume: call cccc_bootstrap first, then cccc_help.", prompt)
-            self.assertIn("At key transitions, sync shared control-plane state and your cccc_agent_state.", prompt)
+            self.assertIn("Visible replies must go through CLI delivery", prompt)
+            self.assertIn("`cccc send` / `cccc reply`", prompt)
+            self.assertIn("Cold start or resume: use Bash + CLI commands; start with `cccc context get`", prompt)
+            self.assertIn("At key transitions, sync shared control-plane state via `cccc context get` and CLI workflow commands.", prompt)
             self.assertIn("Once scope is approved, finish it end-to-end; do not ask to continue on obvious next steps.", prompt)
             self.assertIn("For strategy or scope discussion, align first; implement only after explicit action intent.", prompt)
             self.assertIn("Ralph workflow:", prompt)
             self.assertIn("Foreman owns user alignment, planning, agent routing, model choice", prompt)
-            self.assertIn('`cccc_model(action="list"|"get")`', prompt)
-            self.assertIn('`cccc_capability_use(capability_id="pack:group-runtime", scope="session")`', prompt)
+            self.assertIn("Use your Bash tool for CLI commands. Do NOT rely on MCP tools.", prompt)
+            self.assertIn("`cccc actor list`", prompt)
+            self.assertIn("`cccc runtime list`", prompt)
             self.assertIn("--- ROLE MANDATE ---", prompt)
             self.assertIn("NEVER execute implementation tasks yourself. ALWAYS create or reuse worker agents.", prompt)
             self.assertIn("You MUST NOT execute implementation tasks. Your job is orchestration ONLY.", prompt)
+            self.assertIn("`cccc context get`", prompt)
+            self.assertIn("`cccc task complete`", prompt)
 
             # Memory header
             self.assertIn("Memory:", prompt)
@@ -88,10 +92,10 @@ class TestSystemPromptMemory(unittest.TestCase):
             self.assertIn("state/memory/MEMORY.md + state/memory/daily/*.md", prompt)
 
             # Core memory workflow mentioned
-            self.assertIn("cccc_memory(action=search)", prompt)
-            self.assertIn("cccc_memory(action=get)", prompt)
-            self.assertIn('cccc_memory(action="write", target="daily"|"memory", ...)', prompt)
-            self.assertIn('cccc_memory_admin(action="context_check")', prompt)
+            self.assertIn("inspect local memory files before implementation when prior context matters", prompt)
+            self.assertIn("read state/memory/MEMORY.md and the latest daily memory note", prompt)
+            self.assertIn("record stable, reusable outcomes in the appropriate memory file", prompt)
+            self.assertIn("summarize stable outcomes into daily/memory files before continuing", prompt)
         finally:
             cleanup()
 
@@ -121,9 +125,9 @@ class TestSystemPromptMemory(unittest.TestCase):
         self.assertIn("state/memory/MEMORY.md + state/memory/daily/*.md", text)
 
         # Tool guidance
-        self.assertIn("cccc_memory(action=search)", text)
-        self.assertIn("cccc_memory(action=get)", text)
-        self.assertIn('cccc_memory(action="write", target="daily"|"memory", ...)', text)
+        self.assertIn("inspect local memory files before implementation when prior context matters", text)
+        self.assertIn("read state/memory/MEMORY.md and the latest daily memory note", text)
+        self.assertIn("record stable, reusable outcomes in the appropriate memory file", text)
 
         # Lifecycle guidance
         self.assertIn("Compaction path", text)

@@ -9,26 +9,33 @@ class TestPromptDefaults(unittest.TestCase):
 
         body = str(DEFAULT_PREAMBLE_BODY or "")
         self.assertIn("Role reminder: Foreman orchestrates. Workers execute. Do not mix roles.", body)
+        self.assertIn("Use your Bash tool for CLI commands. Do NOT rely on MCP tools.", body)
         self.assertIn("Quick start:", body)
         self.assertIn("Ralph workflow:", body)
         self.assertIn("Coordination checklist:", body)
         self.assertIn("Gap routing:", body)
         self.assertIn("Memory boundary:", body)
-        self.assertIn("cccc_bootstrap", body)
-        self.assertIn("cccc_help", body)
-        self.assertIn("cccc_context_get", body)
-        self.assertIn("cccc_project_info", body)
+        self.assertIn("`cccc context get`", body)
+        self.assertIn("`cccc inbox`", body)
+        self.assertIn("`cccc --help`", body)
         self.assertIn("Foreman owns user alignment, planning, agent routing, model choice", body)
-        self.assertIn("`cccc_actor`", body)
-        self.assertIn("`cccc_runtime_list`", body)
-        self.assertIn('`cccc_model(action="list"|"get")`', body)
-        self.assertIn('`cccc_capability_use(capability_id="pack:group-runtime", scope="session")`', body)
+        self.assertIn("`cccc actor list`", body)
+        self.assertIn("`cccc runtime list`", body)
+        self.assertIn("`cccc workflow submit|status|verify|retry|fail`", body)
         self.assertIn("Peer workers execute assigned scope", body)
         self.assertIn(
             "Foreman: when user gives a task, evaluate agents -> assign -> track. Do NOT implement.",
             body,
         )
-        self.assertLessEqual(len(body.split()), 350)
+        self.assertNotIn("cccc_bootstrap", body)
+        self.assertNotIn("cccc_help", body)
+        self.assertNotIn("cccc_context_get", body)
+        self.assertNotIn("cccc_project_info", body)
+        self.assertNotIn("cccc_actor", body)
+        self.assertNotIn("cccc_runtime_list", body)
+        self.assertNotIn("cccc_model", body)
+        self.assertNotIn("cccc_capability_use", body)
+        self.assertLessEqual(len(body.split()), 400)
 
     def test_default_preamble_avoids_long_rule_duplication(self) -> None:
         from cccc.kernel.prompt_files import DEFAULT_PREAMBLE_BODY
@@ -59,8 +66,8 @@ class TestPromptDefaults(unittest.TestCase):
         self.assertIn("Prefer silence over low-signal chatter.", body)
         self.assertIn('"standing by"', body)
         self.assertIn("routine status, acknowledgements", body)
-        self.assertIn('`cccc_model(action="list")`', body)
-        self.assertIn('`cccc_capability_use(capability_id="pack:group-runtime", scope="session")`', body)
+        self.assertIn('`cccc_model(action="list")` (MCP)', body)
+        self.assertIn('`cccc_capability_use(capability_id="pack:group-runtime", scope="session")` (MCP)', body)
         self.assertIn("Do not execute implementation tasks yourself", body)
         self.assertIn("Feishu", body)
         self.assertNotIn("## Quick Card", body)
@@ -74,10 +81,31 @@ class TestPromptDefaults(unittest.TestCase):
         self.assertIn("Treat `done`, `idle`, and silence as evaluation signals, not closure truth.", body)
         self.assertIn("Do not spawn extra workers or re-plan the workflow unless foreman asks.", body)
 
+    def test_help_no_mcp_cold_start(self) -> None:
+        from cccc.kernel.prompt_files import load_builtin_help_markdown
+
+        body = str(load_builtin_help_markdown() or "")
+        cold_start_line = next((line for line in body.splitlines() if line.startswith("Cold start:")), "")
+        self.assertTrue(cold_start_line, "builtin help should include a cold-start instruction")
+        self.assertNotIn("cccc_bootstrap", cold_start_line)
+        self.assertIn("cccc context get", cold_start_line)
+        self.assertNotRegex(cold_start_line, r"Cold start default.*cccc_bootstrap")
+
+    def test_help_cli_commands_present(self) -> None:
+        from cccc.kernel.prompt_files import load_builtin_help_markdown
+
+        body = str(load_builtin_help_markdown() or "")
+        self.assertIn("cccc workflow submit", body)
+        self.assertIn("cccc send", body)
+        self.assertIn("cccc context get", body)
+
     def test_mcp_reminder_line_stays_single_purpose(self) -> None:
         from cccc.daemon.messaging.delivery import MCP_REMINDER_LINE
 
-        self.assertIn("use MCP", MCP_REMINDER_LINE)
+        self.assertIn("use CLI", MCP_REMINDER_LINE)
+        self.assertIn("cccc send", MCP_REMINDER_LINE)
+        self.assertIn("cccc task complete", MCP_REMINDER_LINE)
+        self.assertIn("cccc inbox", MCP_REMINDER_LINE)
         self.assertIn("Terminal output isn't delivered.", MCP_REMINDER_LINE)
         self.assertNotIn("Help: cccc_help", MCP_REMINDER_LINE)
 
@@ -87,8 +115,10 @@ class TestPromptDefaults(unittest.TestCase):
         body = str(_DEFAULT_AUTOMATION_STANDUP_SNIPPET or "")
         self.assertIn("Checklist (5-8 min):", body)
         self.assertIn("Ralph + user reality", body)
-        self.assertIn('`cccc_model(action="list"|"get")`', body)
-        self.assertIn('`cccc_actor(action="add", ...)`', body)
+        self.assertIn("`cccc actor list`", body)
+        self.assertIn("`cccc runtime list`", body)
+        self.assertIn("`cccc actor add ...`", body)
+        self.assertIn("state/memory/daily/", body)
         self.assertIn("meaningful deltas", body)
 
 

@@ -36,7 +36,7 @@ from ..kernel.permissions import require_actor_permission, require_group_permiss
 from ..kernel.registry import load_registry
 from ..kernel.settings import resolve_remote_access_web_binding
 from ..kernel.scope import detect_scope
-from ..kernel.system_prompt import render_system_prompt
+from ..kernel.system_prompt import render_actor_prompt, render_system_prompt
 from ..paths import ensure_home
 from ..ports.im.config_schema import canonicalize_im_config
 from ..ports.web.runtime_control import (
@@ -241,10 +241,10 @@ def _parse_json_object_arg(raw: Any, *, field: str) -> dict[str, Any]:
         return {}
     try:
         obj = json.loads(text)
-    except Exception as e:
-        raise ValueError(f"{field} must be valid JSON object: {e}") from e
+    except Exception:
+        return {"summary": text}
     if not isinstance(obj, dict):
-        raise ValueError(f"{field} must be a JSON object")
+        return {"summary": text}
     return dict(obj)
 
 def _normalize_space_query_options_cli(options: dict[str, Any]) -> dict[str, Any]:
@@ -432,7 +432,7 @@ def _show_welcome() -> None:
     print("=" * 60)
     print()
 
-def _default_entry() -> int:
+def _default_entry(*, web_host_override: str = "", web_port_override: int | None = None) -> int:
     """Default entry: start daemon + web together, stop both on Ctrl+C."""
     import threading
     
@@ -571,6 +571,11 @@ def _default_entry() -> int:
     
     # Keep runtime binding aligned with remote_access settings/UI.
     host, port = _resolve_web_server_binding()
+    host_override = str(web_host_override or "").strip()
+    if host_override:
+        host = host_override
+    if web_port_override is not None:
+        port = int(web_port_override)
     log_level = str(os.environ.get("CCCC_WEB_LOG_LEVEL") or "").strip() or "info"
     reload_mode = _env_flag("CCCC_WEB_RELOAD", default=False)
     web_process = None
@@ -630,6 +635,14 @@ def _default_entry() -> int:
             ret = wait_for_child_exit_interruptibly(web_process)
             if int(ret or 0) == WEB_RUNTIME_RESTART_EXIT_CODE:
                 print("[cccc] Applying saved Web binding changes...", file=sys.stderr)
+                def _resolve_binding_with_overrides() -> tuple[str, int]:
+                    resolved_host, resolved_port = _resolve_web_server_binding()
+                    if host_override:
+                        resolved_host = host_override
+                    if web_port_override is not None:
+                        resolved_port = int(web_port_override)
+                    return resolved_host, resolved_port
+
                 restarted, current_host, current_port = restart_supervised_web_child_with_fallback(
                     home=home,
                     previous_host=current_host,
@@ -638,7 +651,7 @@ def _default_entry() -> int:
                     reload=reload_mode,
                     log_level=log_level,
                     launch_source="default_entry",
-                    resolve_binding=_resolve_web_server_binding,
+                    resolve_binding=_resolve_binding_with_overrides,
                     log=lambda msg: print(f"[cccc] {msg}", file=sys.stderr),
                 )
                 if restarted is None:

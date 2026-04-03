@@ -1,0 +1,69 @@
+# Wave 4: Workflow Observability — task event contract + stalled detection
+# 前置：Wave 3 完成
+
+tasks:
+  - id: T1
+    title: "扩展 TaskEvent 契约（started/heartbeat）"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+      - "tests/test_ralph_ipc.py"
+    depends_on: []
+    goal_behavior: >
+      TaskEvent.event_type 从 completed|failed 扩展为
+      assigned|started|heartbeat|completed|failed。
+      不破坏现有消费端（新 event type 是 superset）。
+    acceptance_criteria: >
+      1. TaskEvent 接受 assigned/started/heartbeat/completed/failed
+      2. 现有 completed/failed 事件处理不变
+      3. model_validate round-trip 测试通过
+    verification:
+      level: unit
+      command: "pytest tests/test_ralph_ipc.py -q -k 'task_event'"
+      covers:
+        tasks: ["T1"]
+    provides:
+      - name: expanded_task_events
+        kind: runtime_capability
+
+  - id: T2
+    title: "实现 _run_heartbeat_sweep 填充"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/ralph_service.py"
+      - "tests/test_foreman_workflow.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      填充现有空骨架 sweep_stalled_tasks() 的调用方。
+      automation engine _run_heartbeat_sweep() 定期调用 sweep_stalled_tasks()，
+      检测 offline/stalled worker 并发出告警事件。
+      v5 scope：仅检测+告警，不自动重派。
+    acceptance_criteria: >
+      1. sweep_stalled_tasks 在 offline/stalled 情况下返回正确结果
+      2. stalled threshold 可配置（默认 600s）
+      3. offline threshold 可配置（默认 120s）
+      4. 不自动重派（仅返回状态变更列表）
+    verification:
+      level: integration
+      command: "pytest tests/test_foreman_workflow.py -q -k 'stalled or sweep'"
+      covers:
+        tasks: ["T1", "T2"]
+        flows: ["stalled_detection"]
+    consumes:
+      - name: expanded_task_events
+        from: T1
+
+critical_entrypoints:
+  - "src/cccc/contracts/v1/ralph_ipc.py"
+  - "src/cccc/daemon/foreman/ralph_service.py"
+
+critical_flows:
+  - id: stalled_detection
+    description: "heartbeat sweep → check assignments → detect stalled/offline → alert"
+    entrypoints: ["src/cccc/daemon/foreman/ralph_service.py"]
+    required_verification_level: unit
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

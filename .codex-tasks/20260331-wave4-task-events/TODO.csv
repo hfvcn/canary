@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect TaskEvent and stalled sweep usage,DONE,"Relevant implementation and tests identified","rg -n \"TaskEvent|sweep_stalled_tasks|stalled|offline\" src tests/test_ralph_ipc.py tests/test_foreman_workflow.py","2026-03-31 23:19",0,"Completed before edits"
+2,Expand TaskEvent contract and add compatibility tests,DONE,"TaskEvent accepts assigned/started/heartbeat and completed/failed remain covered","pytest tests/test_ralph_ipc.py -q -k task_event","2026-03-31 23:22",0,"5 passed"
+3,Add stalled sweep tests,DONE,"Sweep tests cover offline, stalled, completed ignore, and custom thresholds","pytest tests/test_foreman_workflow.py -q -k 'stalled or sweep'","2026-03-31 23:22",0,"4 passed"
+4,Run requested combined validation,DONE,"Requested pytest filter passes","pytest tests/test_ralph_ipc.py tests/test_foreman_workflow.py -q -k 'task_event or stalled or sweep'","2026-03-31 23:22",0,"9 passed"

@@ -88,11 +88,20 @@ class TestSystemPromptRoles(unittest.TestCase):
                 "When you receive a task from the user, your response should be to evaluate the agent pool and assign workers, NOT to start coding.",
                 prompt,
             )
+            self.assertIn("`cccc workflow submit --workflow-id X --tasks <file>`", prompt)
+            self.assertIn("`cccc workflow status`", prompt)
+            self.assertIn("`cccc context get`", prompt)
+            self.assertIn("`cccc send`", prompt)
+            self.assertIn("`cccc task complete`", prompt)
             self.assertIn("Reuse or create workers as needed.", prompt)
-            self.assertIn("`cccc_runtime_list`", prompt)
-            self.assertIn("`cccc_model`", prompt)
-            self.assertIn('`cccc_capability_use(capability_id="pack:group-runtime", scope="session")`', prompt)
+            self.assertIn("`cccc actor list`", prompt)
+            self.assertIn("`cccc runtime list`", prompt)
             self.assertIn("Treat `done`, `idle`, and silence as signals to evaluate, not closure truth.", prompt)
+            self.assertNotIn("`cccc_task`", prompt)
+            self.assertNotIn("`cccc_actor`", prompt)
+            self.assertNotIn("`cccc_runtime_list`", prompt)
+            self.assertNotIn("`cccc_model`", prompt)
+            self.assertNotIn("`cccc_capability_use`", prompt)
             self.assertNotIn("Execute the task assigned by foreman", prompt)
         finally:
             cleanup()

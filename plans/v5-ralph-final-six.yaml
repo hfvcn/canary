@@ -1,0 +1,375 @@
+# Plan: v5-ralph-final-six — 问题清单 v5 剩余 6 项改进
+# Source: todo/问题清单-v5-ralph.md (RV-6, RV-9, RO-1~4)
+# Date: 2026-04-02
+# Scope: AST class method collection, provenance tracking, flow segment ownership,
+#         schema type compatibility, role-based rules, ready ordering
+# Codex review: 6 findings adopted (F1-F6, see below)
+
+# Suppress pre-existing critical entrypoint/flow errors unrelated to this plan's scope
+suppress_codes:
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+
+tasks:
+  # ── T1: RV-6 — pytest -k AST collector recurse into ClassDef ───────
+  - id: T1
+    title: "RV-6: _collect_pytest_k_names recurses into ClassDef for test methods"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/filesystem_validator.py
+    depends_on: []
+    addresses: ["RV-6"]
+    goal_behavior: >
+      In _collect_pytest_k_names() (filesystem_validator.py:888-896),
+      when encountering an ast.ClassDef with name starting "Test",
+      add the class name AND recurse into node.body to collect
+      FunctionDef/AsyncFunctionDef names starting with "test_".
+      This aligns with pytest's collection behavior: `-k test_method`
+      should match a method inside a test class.
+      Note: _pytest_node_exists() at line 899 already handles
+      "TestClass::test_method" via _find_class + _module_has_named_node.
+      This fix is only for _collect_pytest_k_names() which feeds the
+      `-k` expression matching.
+    acceptance_criteria: >
+      1. _collect_pytest_k_names on a module with `class TestFoo` containing
+         `def test_bar` returns {"TestFoo", "test_bar"}.
+      2. Nested class methods with "test_" prefix are collected.
+      3. Non-test methods inside test classes are NOT collected.
+      4. Module-level test functions still collected as before.
+      5. No regression in existing _pytest_node_exists behavior.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_filesystem_validator.py -q -k collect_pytest_k_class"
+      covers:
+        tasks: ["T1"]
+        paths: ["src/cccc/ralph/filesystem_validator.py"]
+        flows:
+          - pytest_k_class_method_collection
+
+  # ── T2: RV-9 — load_plan() provenance tracking ────────────────────
+  - id: T2
+    title: "RV-9: Plan model tracks provenance of merged fields"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/plan_io.py
+    depends_on: []
+    addresses: ["RV-9"]
+    goal_behavior: >
+      Add provenance as a Pydantic PrivateAttr on Plan model (models.py):
+        _provenance: Dict[str, str] = PrivateAttr(default_factory=dict)
+      with a public property `provenance` that returns self._provenance.
+      [Codex F2 adopted: PrivateAttr is invisible to model_validate() input
+       and model_dump() output, so YAML with a stray "provenance" key won't
+       inject values, and serialization won't leak the field.]
+
+      Keys are item identifiers (e.g. "critical_flow:shell_command_execution",
+      "critical_entrypoint:src/cccc/daemon/foreman/ralph_service.py",
+      "registration_invariant:TaskEvent_fields").
+      Values are "plan" or "repo_defaults".
+
+      In plan_io.py _merge_repo_defaults(): before calling _merge_critical_*,
+      tag existing plan items with provenance "plan". In each _merge_*
+      function, tag newly appended items with provenance "repo_defaults".
+
+      In load_plan(): after Plan.model_validate(), tag all initial
+      critical_entrypoints/flows/invariants with "plan" provenance.
+    acceptance_criteria: >
+      1. Plan loaded from file only has provenance "plan" for its items.
+      2. After merge, repo_defaults items have provenance "repo_defaults".
+      3. Plan-declared items that overlap with repo_defaults keep "plan".
+      4. plan.model_dump() does NOT include "provenance" key.
+         [Codex F5 adopted: test model_dump() directly, not save_plan_state()]
+      5. Plan.model_validate({"provenance": {"x": "y"}}) ignores the input
+         (PrivateAttr is not populated from validate input).
+      6. Empty plans have empty provenance dict.
+      7. Existing load_plan/save_plan_state tests still pass.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k provenance"
+      covers:
+        tasks: ["T2"]
+        paths: ["src/cccc/ralph/models.py", "src/cccc/ralph/plan_io.py"]
+        flows:
+          - provenance_tracking
+
+  # ── T3: RO-1 — Flow segment ownership ─────────────────────────────
+  - id: T3
+    title: "RO-1: Validate that each critical flow segment has an owning task"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+    depends_on: []
+    addresses: ["RO-1"]
+    goal_behavior: >
+      Add _check_flow_segment_ownership() to validator.py, called from
+      _collect_structural_issues() after _check_critical_coverage().
+
+      For each CriticalFlow, check that every entrypoint path is
+      claimed (via claimed_paths or awareness_paths) by at least one
+      task that also covers this flow in its verification.covers.flows.
+      If a task covers the flow but doesn't claim any of its entrypoints,
+      issue W_FLOW_SEGMENT_UNOWNED warning: "task '{id}' covers flow
+      '{flow_id}' but doesn't claim any of its entrypoints".
+
+      Conversely, if a task claims a flow entrypoint but doesn't cover
+      the flow in verification, issue W_FLOW_OWNER_NO_VERIFICATION:
+      "task '{id}' claims entrypoint '{ep}' of flow '{flow_id}' but
+      doesn't verify the flow".
+    acceptance_criteria: >
+      1. Flow with all entrypoints claimed by covering tasks → no warning.
+      2. Task covers flow but claims none of its entrypoints → W_FLOW_SEGMENT_UNOWNED.
+      3. Task claims flow entrypoint but doesn't cover flow → W_FLOW_OWNER_NO_VERIFICATION.
+      4. Flow with no entrypoints defined → no warning from this check.
+      5. Verification task (role="verification") using awareness_paths to cover
+         a flow entrypoint should satisfy ownership without triggering
+         T5's W_VERIFICATION_ROLE_CLAIMS_SOURCE.
+         [Codex F4 adopted: cross-case with T5 awareness_paths escape hatch]
+      6. No regression in existing critical_coverage tests.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k flow_segment_ownership"
+      covers:
+        tasks: ["T3"]
+        paths: ["src/cccc/ralph/validator.py"]
+        flows:
+          - flow_segment_ownership_check
+
+  # ── T4: RO-2 — Schema contract type compatibility ─────────────────
+  - id: T4
+    title: "RO-2: Enhanced contract schema compatibility beyond name matching"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+    depends_on: []
+    addresses: ["RO-2"]
+    goal_behavior: >
+      Enhance _contract_schema_hints_compatible() (validator.py:535-548)
+      to support deeper type checking beyond just "type" and "format":
+
+      1. Add "properties" key comparison: if both schemas have "properties",
+         check that every key in consumer's properties exists in provider's
+         properties. Provider may have extra properties (structural subtyping).
+      2. Add "items" key comparison: if both schemas have "items" (array type),
+         recursively check items compatibility.
+      3. Add "required" check: if consumer specifies required fields, all must
+         be present in provider's required or properties.
+      4. Keep backward compatibility: string schema_hints skip all checks.
+         Missing keys in either side → compatible (permissive).
+
+      This is still a heuristic (not full JSON Schema), but catches the
+      most common structural mismatches between provides/consumes.
+    acceptance_criteria: >
+      1. Provider {type: object, properties: {id: {type: string}, name: {type: string}}}
+         compatible with consumer {type: object, properties: {id: {type: string}}} → True.
+      2. Provider missing a property that consumer requires → False.
+      3. Array items type mismatch → False.
+      4. String schema_hints → skip, no warning.
+      5. Both have "required" and consumer requires field not in provider → False.
+      6. Provider property type differs from consumer property type
+         (e.g. provider id: integer vs consumer id: string) → False.
+         [Codex F6 adopted: nested property type mismatch coverage]
+      7. No regression in existing contract tests.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_contract_schema_validation.py -q -k enhanced_schema"
+      covers:
+        tasks: ["T4"]
+        paths: ["src/cccc/ralph/validator.py"]
+        flows:
+          - schema_type_compatibility
+
+  # ── T5: RO-3 — Role-based validation rules ────────────────────────
+  - id: T5
+    title: "RO-3: Enforce constraints based on task role field"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+    depends_on: []
+    addresses: ["RO-3"]
+    goal_behavior: >
+      Add _check_role_constraints() to validator.py, called from
+      _collect_structural_issues() after _check_integration_spine().
+
+      Rules:
+      1. role="integration" tasks SHOULD have verification.level in
+         ("integration", "e2e") and verification.covers.tasks with ≥2 tasks.
+         Otherwise W_INTEGRATION_ROLE_WEAK_VERIFICATION.
+      2. role="verification" tasks SHOULD have verification with
+         covers.tasks non-empty. Otherwise W_VERIFICATION_ROLE_NO_COVERS.
+      3. role="verification" tasks SHOULD NOT have claimed_paths that
+         overlap with non-test source code (they should only claim test files).
+         Otherwise W_VERIFICATION_ROLE_CLAIMS_SOURCE: "verification task
+         '{id}' claims non-test path '{path}'".
+      4. Any task with verification.covers.tasks ≥2 and verification.level
+         in ("integration","e2e") but role="leaf" →
+         W_LEAF_ROLE_IS_INTEGRATOR: "task '{id}' looks like an integration
+         task but has role='leaf'".
+    acceptance_criteria: >
+      1. Integration task with unit verification → W_INTEGRATION_ROLE_WEAK_VERIFICATION.
+      2. Integration task with integration-level covering 3 tasks → no warning.
+      3. Verification task with no covers → W_VERIFICATION_ROLE_NO_COVERS.
+      4. Verification task claiming src/cccc/foo.py → W_VERIFICATION_ROLE_CLAIMS_SOURCE.
+      5. Verification task claiming only tests/ paths → no warning.
+      6. Leaf task with integration covers ≥2 → W_LEAF_ROLE_IS_INTEGRATOR.
+      7. Verification task using awareness_paths (not claimed_paths) to cover
+         a flow entrypoint should NOT trigger W_VERIFICATION_ROLE_CLAIMS_SOURCE.
+         [Codex F4 adopted: awareness_paths is the escape hatch for verification
+         tasks that need to reference source entrypoints without claiming them]
+      8. No regression in existing tests.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k role_constraint"
+      covers:
+        tasks: ["T5"]
+        paths: ["src/cccc/ralph/validator.py"]
+        flows:
+          - role_based_validation
+
+  # ── T6: RO-4 — Ready ordering by downstream unlock count ──────────
+  - id: T6
+    title: "RO-4: Sort ready tasks by number of downstream tasks unlocked"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/core.py
+    depends_on: []
+    addresses: ["RO-4"]
+    goal_behavior: >
+      [Codex F1 adopted: sort candidates BEFORE batch conflict selection,
+       not after. F3 adopted: count only dependents that would actually
+       become ready, not all direct dependents.]
+
+      In suggest() (core.py:32-112), restructure the main loop:
+      1. First pass: collect all "eligible" tasks (deps satisfied, not
+         in skip set) WITHOUT doing batch conflict checks yet.
+      2. Sort eligible tasks by _unlock_score() descending (stable sort
+         preserving definition order on ties).
+      3. Second pass: iterate sorted eligible tasks and apply write-set
+         conflict checks (running + batch) to build the final ready list.
+
+      _unlock_score(task_id, task_map, state) counts how many direct
+      dependents of task_id would become ready if task_id completed —
+      i.e., dependents whose OTHER dependencies are all in
+      done | running | {task_id}. This avoids overcounting dependents
+      still blocked by other unfinished deps.
+      [Codex F3 adopted: "would actually become ready" not "all dependents"]
+
+      Tie-breaking: preserve original definition order (stable sort).
+      Include ordering info in BatchResult.rationale.
+    acceptance_criteria: >
+      1. Task with 3 unlockable dependents appears before task with 1.
+      2. Tasks with equal scores preserve definition order.
+      3. Task with 0 unlockable dependents appears last among ready tasks.
+      4. Already-completed tasks in dependent's deps don't block unlock score.
+      5. Dependent blocked by OTHER unfinished deps does NOT count toward score.
+         [Codex F3: this is the key distinction from naive dependent count]
+      6. When two ready tasks have conflicting write-sets, the higher-scored
+         one gets into the batch and the lower-scored one is deferred.
+         [Codex F1: this is the key distinction from post-hoc sorting]
+      7. No change to blocked-by-dependency logic.
+      8. BatchResult.rationale mentions ordering.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k ready_ordering"
+      covers:
+        tasks: ["T6"]
+        paths: ["src/cccc/ralph/core.py"]
+        flows:
+          - ready_ordering_by_unlock
+
+  # ── T-int: Integration test covering all 6 improvements ────────────
+  - id: T-int
+    title: "Integration: verify all 6 improvements work together"
+    role: verification
+    claimed_paths:
+      - tests/ralph/test_ralph_standalone.py
+      - tests/ralph/test_filesystem_validator.py
+      - tests/ralph/test_contract_schema_validation.py
+    depends_on: ["T1", "T2", "T3", "T4", "T5", "T6"]
+    addresses: ["RV-6", "RV-9", "RO-1", "RO-2", "RO-3", "RO-4"]
+    goal_behavior: >
+      Add test cases for all 6 improvements in their respective test files:
+      (a) T1 tests in test_filesystem_validator.py (class method collection)
+      (b) T2 tests in test_ralph_standalone.py (provenance tracking)
+      (c) T3 tests in test_ralph_standalone.py (flow segment ownership)
+      (d) T4 tests in test_contract_schema_validation.py (enhanced schema)
+      (e) T5 tests in test_ralph_standalone.py (role constraints)
+      (f) T6 tests in test_ralph_standalone.py (ready ordering)
+    acceptance_criteria: >
+      1. All new test cases pass.
+      2. All existing tests still pass (no regression).
+      3. Tests cover positive and negative cases for each feature.
+    verification:
+      level: integration
+      command: "pytest tests/ralph/ -q"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5", "T6", "T-int"]
+        flows:
+          - pytest_k_class_method_collection
+          - provenance_tracking
+          - flow_segment_ownership_check
+          - schema_type_compatibility
+          - role_based_validation
+          - ready_ordering_by_unlock
+
+# ── Critical flows ────────────────────────────────────────────────────
+critical_flows:
+  - id: pytest_k_class_method_collection
+    description: >
+      pytest -k pattern matching recognizes test methods inside
+      TestClass definitions, not just module-level functions.
+    entrypoints:
+      - src/cccc/ralph/filesystem_validator.py
+    required_verification_level: unit
+
+  - id: provenance_tracking
+    description: >
+      After load_plan() merges repo defaults, each critical_entrypoint,
+      critical_flow, and registration_invariant carries provenance
+      metadata ("plan" or "repo_defaults").
+    entrypoints:
+      - src/cccc/ralph/plan_io.py
+      - src/cccc/ralph/models.py
+    required_verification_level: unit
+
+  - id: flow_segment_ownership_check
+    description: >
+      Ralph validate checks that each critical flow segment has
+      a task that both claims its entrypoints and verifies the flow.
+    entrypoints:
+      - src/cccc/ralph/validator.py
+    required_verification_level: unit
+
+  - id: schema_type_compatibility
+    description: >
+      Contract schema compatibility checks structural type matching
+      (properties, items, required) beyond just type+format.
+    entrypoints:
+      - src/cccc/ralph/validator.py
+    required_verification_level: unit
+
+  - id: role_based_validation
+    description: >
+      Ralph enforces role-specific constraints: integration tasks need
+      cross-task verification, verification tasks shouldn't claim source.
+    entrypoints:
+      - src/cccc/ralph/validator.py
+    required_verification_level: unit
+
+  - id: ready_ordering_by_unlock
+    description: >
+      suggest() orders ready tasks by downstream unlock count,
+      prioritizing tasks that unblock the most downstream work.
+    entrypoints:
+      - src/cccc/ralph/core.py
+    required_verification_level: unit
+
+# ── Required issues ───────────────────────────────────────────────────
+required_issues:
+  - "RV-6"
+  - "RV-9"
+  - "RO-1"
+  - "RO-2"
+  - "RO-3"
+  - "RO-4"

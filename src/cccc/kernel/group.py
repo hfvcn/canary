@@ -21,17 +21,17 @@ from .scope import ScopeIdentity
 
 _DEFAULT_AUTOMATION_STANDUP_SNIPPET = """{{interval_minutes}} minutes have passed. Stand-up + memory consolidation reminder (foreman only).
 
-Use MCP chat only (`cccc_message_send` / `cccc_message_reply`); terminal output is invisible to users.
+Use CLI delivery only (`cccc send` / `cccc reply`); terminal output is invisible to users.
 
 Checklist (5-8 min):
-1. Recall: run `cccc_memory(action=search, query=<2-3 keywords from current Overview/tasks>, actor_id="")`.
+1. Recall: scan current Overview/tasks and local memory files with shell only when prior context is needed.
 2. Ralph + user reality: confirm the latest user ask, current success criteria, ready/pending Ralph batches, and active blockers.
-3. Agent routing: reuse/start existing workers first; if the pool is wrong, inspect `cccc_runtime_list` + `cccc_model(action="list"|"get")` before `cccc_actor(action="add", ...)`.
+3. Agent routing: reuse/start existing workers first; if the pool is wrong, inspect `cccc actor list` + `cccc runtime list` before `cccc actor add ...`.
 4. Delivery view: map each active ask to `done` / `pending` / `blocked(owner)` and send only meaningful deltas outward.
-5. Consolidation (on milestone/done): write one durable daily note via
-   `cccc_memory(action="write", target="daily", content=...)`;
-   promote stable reusable know-how via
-   `cccc_memory(action="write", target="memory", content=...)`.
+5. Consolidation (on milestone/done): write one durable daily note under
+   `state/memory/daily/`;
+   promote stable reusable know-how into
+   `state/memory/MEMORY.md`.
 
 Keep the report concise and evidence-based.
 """
@@ -111,6 +111,19 @@ def load_group(group_id: str) -> Optional[Group]:
         return None
 
 
+def _scope_url_for_key(scopes: Any, scope_key: str) -> str:
+    if not isinstance(scopes, list):
+        return ""
+    wanted = scope_key.strip()
+    for item in scopes:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("scope_key") or "").strip() != wanted:
+            continue
+        return str(item.get("url") or "")
+    return ""
+
+
 def create_group(reg: Registry, *, title: str, topic: str = "") -> Group:
     home = ensure_home()
     groups_dir = home / "groups"
@@ -135,6 +148,7 @@ def create_group(reg: Registry, *, title: str, topic: str = "") -> Group:
         "running": False,
         "state": "active",  # active / idle / paused
         "active_scope_key": "",
+        "project_root": "",
         "scopes": [],
         "actors": [],
         # Single-layer storage: automation rules/snippets live in group.yaml under CCCC_HOME.
@@ -210,6 +224,7 @@ def attach_scope_to_group(reg: Registry, group: Group, scope: ScopeIdentity, *, 
 
     if set_active or not str(group.doc.get("active_scope_key") or "").strip():
         group.doc["active_scope_key"] = scope.scope_key
+    group.doc["project_root"] = scope.url
 
     group.save()
 
@@ -237,6 +252,7 @@ def set_active_scope(reg: Registry, group: Group, *, scope_key: str) -> Group:
         raise ValueError(f"scope not attached: {wanted}")
 
     group.doc["active_scope_key"] = wanted
+    group.doc["project_root"] = _scope_url_for_key(scopes, wanted)
     group.save()
 
     meta = reg.groups.get(group.group_id)
@@ -282,6 +298,7 @@ def ensure_group_for_scope(reg: Registry, scope: ScopeIdentity) -> Group:
         "running": False,
         "state": "active",  # active / idle / paused
         "active_scope_key": "",
+        "project_root": scope.url,
         "scopes": [],
         "actors": [],
         # Keep deterministic defaults consistent with create_group().
@@ -360,6 +377,7 @@ def detach_scope_from_group(reg: Registry, group: Group, *, scope_key: str) -> G
                 new_active = k
                 break
         group.doc["active_scope_key"] = new_active
+    group.doc["project_root"] = _scope_url_for_key(scopes, str(group.doc.get("active_scope_key") or ""))
 
     try:
         shutil.rmtree(group.path / "scopes" / wanted)

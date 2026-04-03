@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 
 from ....kernel.group import load_group
 from ....kernel.settings import get_im_defaults
+from ....paths import ensure_home
 from ....ports.im.config_schema import canonicalize_im_config, resolve_im_config
 from ....util.conv import coerce_bool
 from ....util.process import SOFT_TERMINATE_SIGNAL, best_effort_signal_pid, pid_is_alive, resolve_background_python_argv, supervised_process_popen_kwargs
@@ -86,7 +87,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             {"op": "inbox_mark_read", "args": {"group_id": group_id, "actor_id": actor_id, "event_id": req.event_id, "by": req.by}}
         )
 
-    @group_router.post("/start")
+    @group_router.post("/start", dependencies=[Depends(require_group_admin)])
     async def group_start(request: Request, group_id: str, by: str = "user") -> Dict[str, Any]:
         await invalidate_readonly_actor_list(group_id)
         return await ctx.daemon({"op": "group_start", "args": {"group_id": group_id, "by": by}})
@@ -394,7 +395,6 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         try:
             popen_kwargs: Dict[str, Any] = {
                 "env": env,
-                "stdin": subprocess.DEVNULL,
                 "close_fds": True,
                 "cwd": str(ensure_home()),
             }
@@ -404,8 +404,10 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                 popen_kwargs["start_new_session"] = True
 
             with log_path.open("a", encoding="utf-8") as log_file:
+                module_name = "cccc.ports.im.bridge" if platform == "telegram" else "cccc.ports.im"
+                argv = [sys.executable, "-m", module_name, req.group_id, platform]
                 proc = subprocess.Popen(
-                    resolve_background_python_argv([sys.executable, "-m", "cccc.ports.im", req.group_id, platform]),
+                    resolve_background_python_argv(argv),
                     stdout=log_file,
                     stderr=log_file,
                     **popen_kwargs,

@@ -13,6 +13,7 @@ from .space_cmds import *  # noqa: F401,F403
 from .im_cmds import *  # noqa: F401,F403
 from .system_cmds import *  # noqa: F401,F403
 from .workflow_cmds import *  # noqa: F401,F403
+from .model_cmds import *  # noqa: F401,F403
 
 
 def _apply_invocation_web_overrides(args: argparse.Namespace) -> tuple[dict[str, Optional[str]], dict[str, str]]:
@@ -199,6 +200,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_actor_secrets.add_argument("--group", default="", help="Target group_id (default: active group)")
     p_actor_secrets.set_defaults(func=cmd_actor_secrets)
 
+    p_model = sub.add_parser("model", help="Model-related operations")
+    model_sub = p_model.add_subparsers(dest="action", required=True)
+
+    p_model_review = model_sub.add_parser("review", help="Ask Foreman for a brief practical review of a model")
+    p_model_review.add_argument("model_key", help="Model key to review")
+    p_model_review.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_model_review.set_defaults(func=cmd_model_review)
+
     p_inbox = sub.add_parser("inbox", help="List unread messages for an actor (chat messages + system notifications)")
     p_inbox.add_argument("--actor-id", required=True, help="Target actor id")
     p_inbox.add_argument("--by", default="user", help="Requester (default: user)")
@@ -275,6 +284,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_daemon = sub.add_parser("daemon", help="Manage ccccd daemon")
     p_daemon.add_argument("action", choices=["start", "stop", "status"], help="Action")
     p_daemon.set_defaults(func=cmd_daemon)
+
+    p_capability = sub.add_parser("capability", help="Run a capability-backed tool via daemon")
+    p_capability.add_argument("tool_name", help="Tool name to call")
+    p_capability.add_argument("action", help="Tool action")
+    p_capability.add_argument("--args", dest="tool_arguments", default="", help="Optional JSON object tool arguments")
+    p_capability.add_argument("--capability-id", default="", help="Optional explicit capability id hint")
+    p_capability.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_capability.set_defaults(func=cmd_capability)
+
+    p_memory = sub.add_parser("memory", help="Memory operations via daemon")
+    p_memory.add_argument("action", choices=["layout_get", "search", "get", "write"], help="Memory action")
+    p_memory.add_argument("--key", default="", help="Action key: query/path/target")
+    p_memory.add_argument("--value", default="", help="Action value: content")
+    p_memory.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_memory.set_defaults(func=cmd_memory)
+
+    p_coordination = sub.add_parser("coordination", help="Coordination operations via daemon")
+    p_coordination.add_argument("action", choices=["status", "get", "add_decision", "add_handoff"], help="Coordination action")
+    p_coordination.add_argument("--note", default="", help="Decision or handoff note text")
+    p_coordination.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_coordination.set_defaults(func=cmd_coordination)
+
+    p_agent_state = sub.add_parser("agent-state", help="Query agent state via daemon")
+    p_agent_state.add_argument("--actor", default="", help="Optional actor id filter")
+    p_agent_state.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_agent_state.set_defaults(func=cmd_agent_state)
 
     # IM Bridge commands
     p_im = sub.add_parser("im", help="Manage IM bridge (Telegram/Slack/Discord/Feishu/Lark/DingTalk)")
@@ -498,16 +533,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_space_jobs_cancel.add_argument("--by", default="user", help="Requester (default: user)")
     p_space_jobs_cancel.set_defaults(func=cmd_space_jobs_cancel)
 
+    p_context = sub.add_parser("context", help="Context operations (board, coordination, tasks)")
+    context_sub = p_context.add_subparsers(dest="action", required=True)
+
+    p_context_get = context_sub.add_parser("get", help="Get context snapshot (coordination, board, tasks)")
+    p_context_get.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_context_get.add_argument("--include-archived", action="store_true", help="Include archived items")
+    p_context_get.set_defaults(func=cmd_context_get)
+
     p_workflow = sub.add_parser("workflow", help="Workflow operations (Ralph/Foreman)")
     workflow_sub = p_workflow.add_subparsers(dest="action", required=True)
 
     p_workflow_submit = workflow_sub.add_parser("submit", help="Submit a batch suggestion (tasks JSON)")
     p_workflow_submit.add_argument("--workflow-id", required=True, help="Workflow identifier")
-    p_workflow_submit.add_argument("--tasks", required=True, help="Path to tasks JSON (list or {tasks:[...]})")
+    p_workflow_submit.add_argument("--tasks", default="", help="Path to tasks JSON (list or {tasks:[...]})")
+    p_workflow_submit.add_argument("--plan", default="", help="Path to plan.yaml (alternative to --tasks, mutually exclusive)")
     p_workflow_submit.add_argument("--rationale", default="", help="Optional rationale")
     p_workflow_submit.add_argument("--parallelism", type=int, default=1, help="Estimated parallelism (default: 1)")
-    p_workflow_submit.add_argument("--auto-process", action="store_true", help="Auto-process suggestion immediately")
-    p_workflow_submit.add_argument("--auto-start-agents", action="store_true", help="Auto-start assigned agents (default: false)")
+    p_workflow_submit.add_argument(
+        "--auto-process",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-process suggestion immediately",
+    )
+    p_workflow_submit.add_argument(
+        "--auto-start-agents",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-start assigned agents (default: true)",
+    )
     p_workflow_submit.add_argument("--group", default="", help="Target group_id (default: active group)")
     p_workflow_submit.set_defaults(func=cmd_workflow_submit)
 
@@ -553,6 +607,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_task_complete.add_argument("--idempotency-key", default="", help="Optional idempotency key")
     p_task_complete.add_argument("--group", default="", help="Target group_id (default: active group)")
     p_task_complete.set_defaults(func=cmd_task_complete)
+
+    p_task_heartbeat = task_sub.add_parser("heartbeat", help="Report worker heartbeat / progress update")
+    p_task_heartbeat.add_argument("task_id", help="Task id")
+    p_task_heartbeat.add_argument("--progress", type=int, default=None, help="Progress percentage (optional)")
+    p_task_heartbeat.add_argument("--message", default="", help="Optional progress message")
+    p_task_heartbeat.add_argument("--workflow-id", default="", help="Workflow id (optional)")
+    p_task_heartbeat.add_argument("--group-id", "--group", dest="group_id", default="", help="Target group_id (default: active group)")
+    p_task_heartbeat.add_argument("--agent-id", default="", help="Agent id (default: CCCC_ACTOR_ID)")
+    p_task_heartbeat.set_defaults(func=cmd_task_heartbeat)
 
     p_ver = sub.add_parser("version", help="Show version")
     p_ver.set_defaults(func=cmd_version)

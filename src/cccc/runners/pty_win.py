@@ -105,8 +105,14 @@ class PtySession:
         spawn_err: Optional[Exception] = None
         proc = None
         for attempt in (
+            # Preferred: forward environment and requested terminal size.
             lambda: _WINPTY_PROCESS.spawn(cmdline, cwd=str(cwd), env=proc_env, dimensions=(int(cols), int(rows))),  # type: ignore[misc]
+            # Fallback: some pywinpty versions don't accept dimensions.
             lambda: _WINPTY_PROCESS.spawn(cmdline, cwd=str(cwd), env=proc_env),  # type: ignore[misc]
+            # Fallback: some spawn signatures don't accept env.
+            lambda: _WINPTY_PROCESS.spawn(cmdline, cwd=str(cwd)),  # type: ignore[misc]
+            # Last resort: bare spawn.
+            lambda: _WINPTY_PROCESS.spawn(cmdline),  # type: ignore[misc]
         ):
             try:
                 proc = attempt()

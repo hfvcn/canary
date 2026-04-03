@@ -2,6 +2,12 @@ from __future__ import annotations
 
 """Messaging/inbox/ledger CLI command handlers."""
 
+from ..daemon.ops.adapter_helpers import (
+    build_daemon_request,
+    normalize_priority,
+    normalize_reply_required,
+    resolve_sender_actor,
+)
 from .common import *  # noqa: F401,F403
 
 __all__ = [
@@ -14,7 +20,6 @@ __all__ = [
     "cmd_read",
     "cmd_prompt",
 ]
-
 def cmd_send(args: argparse.Namespace) -> int:
     group_id = _resolve_group_id(getattr(args, "group", ""))
     if not group_id:
@@ -33,85 +38,28 @@ def cmd_send(args: argparse.Namespace) -> int:
                 continue
             parts = [p.strip() for p in item.split(",") if p.strip()]
             to_tokens.extend(parts)
-    priority = str(getattr(args, "priority", "normal") or "normal").strip() or "normal"
-    if priority not in ("normal", "attention"):
-        _print_json({"ok": False, "error": {"code": "invalid_priority", "message": "priority must be 'normal' or 'attention'"}})
-        return 2
-    reply_required = bool(getattr(args, "reply_required", False))
+    priority = normalize_priority(getattr(args, "priority", "normal"))
+    reply_required = normalize_reply_required(getattr(args, "reply_required", False))
+    sender = resolve_sender_actor(group.doc, getattr(args, "by", "user"))
 
-    if _ensure_daemon_running():
-        resp = call_daemon(
-            {
-                "op": "send",
-                "args": {
-                    "group_id": group_id,
-                    "text": args.text,
-                    "by": str(args.by or "user"),
-                    "path": str(args.path or ""),
-                    "to": to_tokens,
-                    "priority": priority,
-                    "reply_required": reply_required,
-                },
-            }
-        )
-        if resp.get("ok"):
-            _print_json(resp)
-            return 0
-
-    # Fallback: local execution (dev convenience)
-    try:
-        to = resolve_recipient_tokens(group, to_tokens)
-    except Exception as e:
-        _print_json({"ok": False, "error": {"code": "invalid_recipient", "message": str(e)}})
+    if not _ensure_daemon_running():
+        _print_json({"ok": False, "error": {"code": "daemon_unavailable", "message": "ccccd unavailable"}})
         return 2
-    scope_key = str(group.doc.get("active_scope_key") or "")
-    if args.path:
-        scope = detect_scope(Path(args.path))
-        scope_key = scope.scope_key
-        scopes = group.doc.get("scopes")
-        attached = False
-        if isinstance(scopes, list):
-            attached = any(isinstance(item, dict) and item.get("scope_key") == scope_key for item in scopes)
-        if not attached:
-            _print_json(
-                {
-                    "ok": False,
-                    "error": {
-                        "code": "scope_not_attached",
-                        "message": f"scope not attached: {scope_key}",
-                        "details": {"hint": "cccc attach <path> --group <id>"},
-                    },
-                }
-            )
-            return 2
-    if not scope_key:
-        scope_key = ""
-    event = append_event(
-        group.ledger_path,
-        kind="chat.message",
-        group_id=group.group_id,
-        scope_key=scope_key,
-        by=str(args.by or "user"),
-        data=ChatMessageData(
+
+    resp = call_daemon(
+        build_daemon_request(
+            "send",
+            group_id=group_id,
             text=args.text,
-            format="plain",
-            to=to,
+            by=sender,
+            path=str(args.path or ""),
+            to=to_tokens,
             priority=priority,
             reply_required=reply_required,
-        ).model_dump(),
+        )
     )
-    try:
-        reg = load_registry()
-        meta = reg.groups.get(group.group_id)
-        if isinstance(meta, dict):
-            ts = str(event.get("ts") or meta.get("updated_at") or "")
-            if ts:
-                meta["updated_at"] = ts
-                reg.save()
-    except Exception:
-        pass
-    _print_json({"ok": True, "result": {"event": event}})
-    return 0
+    _print_json(resp)
+    return 0 if resp.get("ok") else 2
 
 def cmd_reply(args: argparse.Namespace) -> int:
     """Reply to a message (IM-style, with quote)"""
@@ -129,14 +77,6 @@ def cmd_reply(args: argparse.Namespace) -> int:
         _print_json({"ok": False, "error": {"code": "missing_event_id", "message": "missing event_id to reply to"}})
         return 2
 
-    # Find the original message to get quote_text
-    original = find_event(group, reply_to)
-    if original is None:
-        _print_json({"ok": False, "error": {"code": "event_not_found", "message": f"event not found: {reply_to}"}})
-        return 2
-
-    quote_text = get_quote_text(group, reply_to, max_len=100)
-
     to_tokens: list[str] = []
     to_raw = getattr(args, "to", None)
     if isinstance(to_raw, list):
@@ -146,69 +86,28 @@ def cmd_reply(args: argparse.Namespace) -> int:
             parts = [p.strip() for p in item.split(",") if p.strip()]
             to_tokens.extend(parts)
 
-    priority = str(getattr(args, "priority", "normal") or "normal").strip() or "normal"
-    if priority not in ("normal", "attention"):
-        _print_json({"ok": False, "error": {"code": "invalid_priority", "message": "priority must be 'normal' or 'attention'"}})
-        return 2
-    reply_required = bool(getattr(args, "reply_required", False))
+    priority = normalize_priority(getattr(args, "priority", "normal"))
+    reply_required = normalize_reply_required(getattr(args, "reply_required", False))
+    sender = resolve_sender_actor(group.doc, getattr(args, "by", "user"))
 
-    if _ensure_daemon_running():
-        resp = call_daemon(
-            {
-                "op": "reply",
-                "args": {
-                    "group_id": group_id,
-                    "text": args.text,
-                    "by": str(args.by or "user"),
-                    "reply_to": reply_to,
-                    "to": to_tokens,
-                    "priority": priority,
-                    "reply_required": reply_required,
-                },
-            }
-        )
-        if resp.get("ok"):
-            _print_json(resp)
-            return 0
-
-    # Fallback: local execution
-    if not to_tokens:
-        to_tokens = default_reply_recipients(group, by=str(args.by or "user"), original_event=original)
-    try:
-        to = resolve_recipient_tokens(group, to_tokens)
-    except Exception as e:
-        _print_json({"ok": False, "error": {"code": "invalid_recipient", "message": str(e)}})
+    if not _ensure_daemon_running():
+        _print_json({"ok": False, "error": {"code": "daemon_unavailable", "message": "ccccd unavailable"}})
         return 2
 
-    scope_key = str(group.doc.get("active_scope_key") or "")
-    event = append_event(
-        group.ledger_path,
-        kind="chat.message",
-        group_id=group.group_id,
-        scope_key=scope_key,
-        by=str(args.by or "user"),
-        data=ChatMessageData(
+    resp = call_daemon(
+        build_daemon_request(
+            "reply",
+            group_id=group_id,
             text=args.text,
-            format="plain",
-            to=to,
+            by=sender,
+            reply_to=reply_to,
+            to=to_tokens,
             priority=priority,
             reply_required=reply_required,
-            reply_to=reply_to,
-            quote_text=quote_text,
-        ).model_dump(),
+        )
     )
-    try:
-        reg = load_registry()
-        meta = reg.groups.get(group.group_id)
-        if isinstance(meta, dict):
-            ts = str(event.get("ts") or meta.get("updated_at") or "")
-            if ts:
-                meta["updated_at"] = ts
-                reg.save()
-    except Exception:
-        pass
-    _print_json({"ok": True, "result": {"event": event}})
-    return 0
+    _print_json(resp)
+    return 0 if resp.get("ok") else 2
 
 def cmd_tail(args: argparse.Namespace) -> int:
     group_id = _resolve_group_id(getattr(args, "group", ""))
@@ -418,7 +317,7 @@ def cmd_prompt(args: argparse.Namespace) -> int:
     if actor is None:
         _print_json({"ok": False, "error": {"code": "actor_not_found", "message": f"actor not found: {actor_id}"}})
         return 2
-    prompt = render_system_prompt(group=group, actor=actor)
+    prompt = render_actor_prompt(group=group, actor=actor)
 
     _print_json({"ok": True, "result": {"group_id": group_id, "actor_id": actor_id, "prompt": prompt}})
     return 0

@@ -48,6 +48,29 @@ VerificationOutcome = Literal[
 ]
 
 
+class VerificationCheckSpec(BaseModel):
+    """Individual verification check specification (e.g., build, test, lint)."""
+
+    name: str
+    command: str
+    required: bool = True
+    expected_exit_code: int = 0
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class VerificationSpec(BaseModel):
+    """Structured verification spec — contracts-layer mirror of ralph.models.Verification."""
+
+    level: str = "unit"  # compile, unit, integration, e2e
+    command: str = ""
+    checks: List[VerificationCheckSpec] = Field(default_factory=list)
+    covers_tasks: List[str] = Field(default_factory=list)
+    covers_paths: List[str] = Field(default_factory=list)
+    covers_flows: List[str] = Field(default_factory=list)
+    expected_exit_code: int = 0
+
+
 class TaskRef(BaseModel):
     """Reference to a task in the workflow."""
     id: str
@@ -55,6 +78,24 @@ class TaskRef(BaseModel):
     type: Literal["frontend", "backend", "general"] = "general"
     depends_on: List[str] = Field(default_factory=list)
     claimed_paths: List[str] = Field(default_factory=list)
+
+    # New (D-10): goal + acceptance
+    goal_behavior: str = ""
+    acceptance_criteria: str = ""
+
+    # New (D-10/D-11): verification
+    verification_command: str = ""  # DEPRECATED — use verification.command
+    verification: Optional[VerificationSpec] = None
+
+    # New (D-10): expected I/O (mock-friendly contract)
+    expected_input: Dict[str, Any] = Field(default_factory=dict)
+    expected_output: Dict[str, Any] = Field(default_factory=dict)
+
+    # WF-4 alignment: fields from TaskSpec (plan schema)
+    role: str = ""  # leaf, integration, verification
+    provides: List[Dict[str, Any]] = Field(default_factory=list)
+    consumes: List[Dict[str, Any]] = Field(default_factory=list)
+    addresses: List[str] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="ignore")
 
@@ -169,7 +210,7 @@ class ActorStatus(BaseModel):
 
 class TaskEvent(BaseModel):
     """Unified task lifecycle event for the ralph_task_event daemon op."""
-    event_type: Literal["completed", "failed"]
+    event_type: Literal["assigned", "started", "heartbeat", "completed", "failed"]
     task_id: str
     assignment_id: str = ""
     actor_run_id: str = ""

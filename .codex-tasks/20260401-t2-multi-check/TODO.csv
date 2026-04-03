@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Create task tracking artifacts,DONE,Task directory and tracking files exist,test -f .codex-tasks/20260401-t2-multi-check/TODO.csv,2026-04-01T10:28:38Z,0,Created single-full taskmaster files.
+2,Read verification execution paths and tests,DONE,Foreman and standalone verification flow understood,,2026-04-01T10:28:38Z,0,Reviewed RalphService verify_completion core.verify CLI verify and existing test coverage.
+3,Implement multi-check execution logic,DONE,Foreman and standalone verify support checks[] with command fallback,,2026-04-01T10:28:38Z,0,Added checks-first execution required short-circuit optional-failure pass-through and command fallback.
+4,Add focused multi-check tests,DONE,New tests cover required optional and backward compatibility cases,,2026-04-01T10:28:38Z,0,Added 4 foreman tests and 1 standalone verify output test.
+5,Run targeted pytest verification,DONE,Selected pytest subset passes,"pytest tests/test_foreman_workflow.py tests/ralph/test_ralph_standalone.py -q -k 'multi_check or verify_checks'",2026-04-01T10:28:38Z,0,5 passed 112 deselected.

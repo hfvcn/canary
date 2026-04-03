@@ -115,7 +115,7 @@ MCP_TOOLS = [
                         {"type": "array", "items": {"type": "string"}},
                     ]
                 },
-                "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal"},
+                "priority": {"type": "string", "enum": ["normal", "attention"], "default": "normal"},
                 "reply_required": {"type": "boolean", "default": False},
                 "refs": {"type": "array", "items": {"type": "object"}},
             },
@@ -138,7 +138,7 @@ MCP_TOOLS = [
                         {"type": "array", "items": {"type": "string"}},
                     ]
                 },
-                "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal"},
+                "priority": {"type": "string", "enum": ["normal", "attention"], "default": "normal"},
                 "reply_required": {"type": "boolean", "default": False},
                 "refs": {"type": "array", "items": {"type": "object"}},
             },
@@ -161,7 +161,7 @@ MCP_TOOLS = [
                         {"type": "array", "items": {"type": "string"}},
                     ]
                 },
-                "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal"},
+                "priority": {"type": "string", "enum": ["normal", "attention"], "default": "normal"},
                 "reply_required": {"type": "boolean", "default": False},
                 "rel_path": {"type": "string", "description": "Required for action=blob_path. Can be just the blob filename (e.g. 'sha256_image.png') or full relative path ('state/blobs/sha256_image.png')."},
             }
@@ -736,7 +736,7 @@ MCP_TOOLS = [
                 "title": {"type": "string"},
                 "message": {"type": "string"},
                 "target_actor_id": {"type": "string"},
-                "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal"},
+                "priority": {"type": "string", "enum": ["normal", "attention"], "default": "normal"},
                 "requires_ack": {"type": "boolean", "default": False},
                 "notify_event_id": {"type": "string"},
             }

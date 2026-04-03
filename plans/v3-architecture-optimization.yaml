@@ -1,0 +1,770 @@
+# CCCC 问题清单 v3 — 架构优化 + MCP 适配层统一 + Worker 协作
+#
+# 来源：todo/问题清单.md 剩余待解决项
+# 优先级：A-1 > A-3 > A-2 > M-1b > W-1 > W-2
+# 范围：6 个问题 → 20 个任务（含 5 个集成验证任务 + T3b）
+#
+# 依赖结构：
+#   Wave 1 (A-1): T1 → T2,T3 并行 → T4 集成验证
+#   Wave 2 (A-3+A-2): T5 → T6 → T7; T8 → T9 → T10; T7+T10 → T11
+#   Wave 3 (M-1b): T12 → T13 → T14 集成验证 (依赖 Wave 1 T1)
+#   Wave 4 (W-1+W-2): T15 → T16; T17 → T18; T16+T18 → T19
+#
+# 关键教训遵循（来自 findings.md）：
+#   - 任务按"可独立验证的功能切片"拆，不按文件拆
+#   - 验证标准是"路径能走通"，不是 py_compile
+#   - 每个 wave 有集成验证任务
+
+required_issues:
+  - "A-1"
+  - "A-2"
+  - "A-3"
+  - "M-1b"
+  - "W-1"
+  - "W-2"
+
+# 只列出本计划实际修改的入口文件（覆盖系统默认）
+critical_entrypoints:
+  - "src/cccc/daemon/ops/workflow_task_ops.py"
+  - "src/cccc/cli/workflow_cmds.py"
+  - "src/cccc/ports/web/routes/workflow.py"
+  - "src/cccc/daemon/ralph_ipc_handler.py"
+  - "src/cccc/kernel/system_prompt.py"
+  - "src/cccc/kernel/prompt_files.py"
+  - "src/cccc/kernel/group.py"
+  - "src/cccc/ralph/validator.py"
+  - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+
+# ============================================================
+# Wave 1: A-1 状态迁移权威收敛 (High)
+# ============================================================
+
+tasks:
+  # --- T1: 创建 canonical 状态操作服务层 ---
+  - id: T1
+    title: "创建 WorkflowTaskOps — daemon 内唯一的状态变更入口"
+    role: leaf
+    addresses: ["A-1"]
+    claimed_paths:
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+    depends_on: []
+    goal_behavior: >
+      在 daemon/ops/ 下创建 workflow_task_ops.py，提供 6 个 canonical 函数：
+      complete_task(), fail_task(), retry_task(), block_task(), start_task(), verify_task()。
+      每个函数：(1) 获取 orchestrator, (2) 委托给 orchestrator 对应方法,
+      (3) 返回统一的 Result dict。这是所有入口（CLI/HTTP/IPC）的唯一委托目标。
+      函数签名包含 group_id, task_id 等必要参数，内部负责 get_orchestrator 和错误处理。
+      注意：start_task 委托给 engine.report_worker_started()，verify_task 委托给
+      orchestrator 的验证逻辑（当前在 apply_task_event 内部，需要提取）。
+    acceptance_criteria: >
+      1. workflow_task_ops.py 导出 complete_task, fail_task, retry_task, block_task, start_task, verify_task
+      2. 每个函数内部调用 get_orchestrator() 并委托给 orchestrator 的对应方法
+      3. 返回格式统一为 {"ok": True/False, "result": {...}, "error": {...}}
+      4. 任何函数被调用时，对应的 ledger event 被写入
+      5. 模块可独立 import 无循环依赖
+    verification:
+      level: unit
+      command: >
+        python -c "
+        from cccc.daemon.ops.workflow_task_ops import complete_task, fail_task, retry_task, block_task, start_task, verify_task;
+        print('All 6 canonical ops importable')
+        " && pytest tests/test_workflow_task_ops.py -q
+      covers:
+        tasks: ["T1"]
+        flows: []
+    provides:
+      - name: canonical_task_ops
+        kind: runtime_capability
+
+  # --- T2: CLI 委托到 canonical ops ---
+  - id: T2
+    title: "重构 CLI workflow_cmds — 委托到 WorkflowTaskOps"
+    role: leaf
+    addresses: ["A-1"]
+    claimed_paths:
+      - "src/cccc/cli/workflow_cmds.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      重构 workflow_cmds.py 中的 cmd_task_complete, cmd_workflow_verify,
+      cmd_workflow_retry, cmd_workflow_fail 等命令，使其通过 daemon IPC 最终
+      委托到 workflow_task_ops 中的 canonical 函数，而非各自构造 daemon 请求。
+      CLI 层只负责参数解析和输出格式化，不含业务逻辑。
+    acceptance_criteria: >
+      1. cmd_task_complete 最终走到 workflow_task_ops.complete_task
+      2. cmd_workflow_retry 最终走到 workflow_task_ops.retry_task
+      3. cmd_workflow_fail 最终走到 workflow_task_ops.fail_task
+      4. CLI 层无直接状态变更逻辑，全部委托
+      5. 现有 CLI 行为不变（参数、输出格式兼容）
+    verification:
+      level: unit
+      command: >
+        pytest tests/test_foreman_workflow.py tests/test_workflow_state.py tests/e2e/test_cli_workflow_e2e.py -q
+      covers:
+        tasks: ["T2"]
+        flows: []
+    consumes:
+      - name: canonical_task_ops
+        from: T1
+
+  # --- T3: HTTP 委托到 canonical ops ---
+  - id: T3
+    title: "重构 HTTP workflow routes — 委托到 WorkflowTaskOps"
+    role: leaf
+    addresses: ["A-1"]
+    claimed_paths:
+      - "src/cccc/ports/web/routes/workflow.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      重构 workflow.py 中的 report_task_completed, retry_task, fail_task 等
+      HTTP 路由处理函数，使其通过内部 daemon 调用委托到 workflow_task_ops 中的
+      canonical 函数。HTTP 层只负责请求解析/响应格式化。
+    acceptance_criteria: >
+      1. POST /task/completed 最终走到 workflow_task_ops.complete_task
+      2. POST /task/retry 最终走到 workflow_task_ops.retry_task
+      3. POST /task/fail 最终走到 workflow_task_ops.fail_task
+      4. HTTP 层无直接状态变更逻辑
+      5. API 契约不变（请求/响应格式兼容）
+    verification:
+      level: unit
+      command: >
+        pytest tests/test_workflow_state.py tests/test_foreman_workflow.py -q
+      covers:
+        tasks: ["T3"]
+        flows: []
+    consumes:
+      - name: canonical_task_ops
+        from: T1
+
+  # --- T4: IPC handler 委托到 canonical ops ---
+  - id: T3b
+    title: "重构 ralph_ipc_handler — 委托到 WorkflowTaskOps"
+    role: leaf
+    addresses: ["A-1"]
+    claimed_paths:
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      重构 ralph_ipc_handler.py 中的 handle_ralph_task_event, handle_ralph_task_retry,
+      handle_ralph_task_block 等 handler，使其委托到 workflow_task_ops 的 canonical
+      函数，而非直接调用 orchestrator 方法。IPC 层只负责参数提取和响应包装。
+    acceptance_criteria: >
+      1. handle_ralph_task_event ("completed") → workflow_task_ops.complete_task
+      2. handle_ralph_task_event ("failed") → workflow_task_ops.fail_task
+      3. handle_ralph_task_retry → workflow_task_ops.retry_task
+      4. handle_ralph_task_block → workflow_task_ops.block_task
+      5. 现有 IPC 行为不变
+    verification:
+      level: unit
+      command: >
+        pytest tests/test_ralph_ipc.py tests/test_ralph_verification.py tests/test_foreman_workflow.py -q
+      covers:
+        tasks: ["T3b"]
+        flows: []
+    consumes:
+      - name: canonical_task_ops
+        from: T1
+
+  # --- T4: Wave 1 集成验证 ---
+  - id: T4
+    title: "Wave 1 集成验证 — 三条路径状态变更一致性"
+    role: integration
+    addresses: ["A-1"]
+    claimed_paths:
+      - "tests/test_canonical_task_ops_integration.py"
+    depends_on: ["T1", "T2", "T3", "T3b"]
+    goal_behavior: >
+      验证 CLI、HTTP、IPC 三条路径对同一 task 进行 complete/fail/retry/block 操作时，
+      最终产生相同的 ledger events 和 engine 状态。测试模拟 3 条路径各自触发一次
+      complete_task，验证 ledger 中 event kind 一致、engine 中 task status 一致。
+    acceptance_criteria: >
+      1. 3 条路径 complete_task → 相同 ledger event kind (workflow.task_reported_completed + workflow.verification_*)
+      2. 3 条路径 fail_task → 相同 ledger event kind (workflow.task_failed)
+      3. 3 条路径 retry_task → 相同 ledger event kind (workflow.retry_requested)
+      4. 至少 6 个测试用例覆盖所有路径 × 主要操作
+      5. 负测试：验证 CLI/HTTP 不直接调用 orchestrator（forbidden flow: direct_state_mutation）
+    verification:
+      level: integration
+      command: >
+        pytest tests/test_canonical_task_ops_integration.py -q
+      covers:
+        tasks: ["T1", "T2", "T3", "T3b", "T4"]
+        flows: ["canonical_state_transition", "direct_state_mutation"]
+
+# ============================================================
+# Wave 2: A-3 Prompt 源收敛 + A-2 project_root 元数据化
+# ============================================================
+
+  # --- T5: 创建 canonical workflow guidance fragment ---
+  - id: T5
+    title: "创建 workflow_guidance.md — prompt 的唯一权威源"
+    role: leaf
+    addresses: ["A-3"]
+    claimed_paths:
+      - "src/cccc/resources/workflow_guidance.md"
+    depends_on: []
+    goal_behavior: >
+      从 system_prompt.py、prompt_files.py、cccc-help.md、task_management.yaml 中
+      提取重叠的工作流指导内容，合并为单一 canonical markdown 文件。包含：
+      CLI 命令列表、Foreman 职责、Peer/Worker 职责、Verify gate 规则、
+      Task slicing 原则。其他文件引用此文件而非各自重复。
+    acceptance_criteria: >
+      1. workflow_guidance.md 包含完整的 CLI 命令参考（workflow submit/status/verify/retry/fail, task complete, context get, send）
+      2. 包含 Foreman 职责（不实现、评估 pool、功能切片拆分、verify gate）
+      3. 包含 Peer/Worker 职责（执行不重谈、证据交付、不扩 worker）
+      4. 内容覆盖现有 4 个文件中的所有重叠部分
+    verification:
+      level: unit
+      command: >
+        python -c "
+        from pathlib import Path;
+        p = Path('src/cccc/resources/workflow_guidance.md');
+        assert p.exists(), 'file missing';
+        text = p.read_text();
+        assert 'cccc workflow submit' in text, 'missing submit';
+        assert 'cccc task complete' in text, 'missing task complete';
+        assert 'Foreman' in text or 'foreman' in text, 'missing foreman';
+        assert 'Peer' in text or 'Worker' in text or 'peer' in text, 'missing peer';
+        print('canonical fragment OK')
+        "
+      covers:
+        tasks: ["T5"]
+        flows: []
+    provides:
+      - name: canonical_prompt_fragment
+        kind: prompt_change
+
+  # --- T6: 重构 prompt 源引用 canonical fragment ---
+  - id: T6
+    title: "重构 prompt 四源 — 引用 workflow_guidance.md"
+    role: leaf
+    addresses: ["A-3"]
+    claimed_paths:
+      - "src/cccc/kernel/system_prompt.py"
+      - "src/cccc/kernel/prompt_files.py"
+      - "src/cccc/resources/cccc-help.md"
+      - "src/cccc/resources/capabilities/task_management.yaml"
+    depends_on: ["T5"]
+    goal_behavior: >
+      修改 4 个文件，使工作流指导内容不再重复：
+      - prompt_files.py: DEFAULT_PREAMBLE_BODY 加载 workflow_guidance.md 而非硬编码
+      - system_prompt.py: _role_policy_lines 保留核心条目，其余引用 bundled help
+      - cccc-help.md: Ralph Workflow 部分引用 canonical fragment，不重复
+      - task_management.yaml: prompt_fragments 改为引用，不重复
+      确保最终组装出的 prompt 内容不丢失任何关键指导。
+    acceptance_criteria: >
+      1. prompt_files.py 从 workflow_guidance.md 加载内容（importlib.resources 或 Path）
+      2. system_prompt.py _role_policy_lines 不再包含 CLI 命令列表的完整重复
+      3. cccc-help.md 不再重复 workflow_guidance.md 中已有的内容
+      4. task_management.yaml prompt_fragments 不再重复 CLI 命令和职责描述
+      5. 现有 prompt 测试仍然通过（关键内容仍出现在最终 prompt 中）
+    verification:
+      level: unit
+      command: >
+        pytest tests/test_system_prompt_roles.py tests/test_prompt_defaults.py tests/test_prompt_assembly.py tests/test_system_prompt_memory.py tests/test_system_prompt_group_space.py -q
+      covers:
+        tasks: ["T6"]
+        flows: ["prompt_assembly"]
+    consumes:
+      - name: canonical_prompt_fragment
+        from: T5
+
+  # --- T7: Prompt 收敛集成验证 ---
+  - id: T7
+    title: "Prompt 收敛集成验证 — 最终 prompt 内容完整性"
+    role: integration
+    addresses: ["A-3"]
+    claimed_paths:
+      - "tests/test_prompt_convergence_integration.py"
+    depends_on: ["T5", "T6"]
+    goal_behavior: >
+      验证重构后的 prompt 组装流程仍然产生包含所有必要工作流指导的完整 prompt。
+      测试 foreman 和 peer 两种角色的 prompt，确认 CLI 命令、职责描述、
+      verify gate 规则等关键内容均出现在最终输出中。
+    acceptance_criteria: >
+      1. foreman prompt 包含 "cccc workflow submit" 和 "cccc task complete"
+      2. foreman prompt 包含 "Do NOT implement" 或等价的编排限制
+      3. peer prompt 包含 "cccc task complete" 和 "cccc send"
+      4. peer prompt 包含执行职责（不重谈、证据交付）
+      5. 无任何关键指导因收敛而丢失
+      6. 负测试：workflow_guidance.md 中的内容不在其他 3 个文件中逐字重复（forbidden flow: prompt_content_duplication）
+    verification:
+      level: integration
+      command: >
+        pytest tests/test_prompt_convergence_integration.py -q
+      covers:
+        tasks: ["T5", "T6", "T7"]
+        flows: ["prompt_assembly", "prompt_content_duplication"]
+
+  # --- T8: project_root 写入 group 元数据 ---
+  - id: T8
+    title: "project_root 写入 group.doc — scope attach 时自动设置"
+    role: leaf
+    addresses: ["A-2"]
+    claimed_paths:
+      - "src/cccc/kernel/group.py"
+    depends_on: []
+    goal_behavior: >
+      修改 group.py，在 attach_scope_to_group()、ensure_group_for_scope() 和
+      set_active_scope() 中维护 group.doc["project_root"]。create_group() 初始化
+      为空字符串。detach_scope_from_group() 在最后一个 scope 移除时清空。
+      set_active_scope() 切换时更新 project_root 为新 active scope 的 url。
+      group.doc["project_root"] 成为 project_root 的权威来源。
+    acceptance_criteria: >
+      1. create_group() 后 group.doc["project_root"] 为 ""
+      2. attach_scope_to_group() 后 group.doc["project_root"] == scope.url
+      3. ensure_group_for_scope() 后 group.doc["project_root"] == scope.url
+      4. set_active_scope() 切换后 group.doc["project_root"] == 新 active scope 的 url
+      5. detach 最后一个 scope 后 group.doc["project_root"] 为 ""
+      6. group.yaml 持久化包含 project_root 字段
+    verification:
+      level: unit
+      command: >
+        pytest tests/test_group_core_ops.py tests/test_group_lifecycle_ops.py tests/test_group_lifecycle_invariants.py -q
+      covers:
+        tasks: ["T8"]
+        flows: []
+    provides:
+      - name: group_project_root_metadata
+        kind: runtime_capability
+
+  # --- T9: callers 改为从 group 元数据读 project_root ---
+  - id: T9
+    title: "消除 project_root 手传 — callers 从 group.doc 读取"
+    role: leaf
+    addresses: ["A-2"]
+    claimed_paths:
+      - "src/cccc/cli/workflow_cmds.py"
+      - "src/cccc/ports/web/routes/workflow.py"
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+    depends_on: ["T8", "T2", "T3", "T3b"]
+    goal_behavior: >
+      重构 CLI _resolve_project_root_for_group() 和 HTTP resolve_group_runtime_context()，
+      使其从 group.doc["project_root"] 读取而非遍历 scopes 列表。
+      daemon 端 handler 在获取 group 后直接读 group.doc.get("project_root")。
+      保留向后兼容：如果 project_root 为空，fallback 到现有 scope 遍历逻辑。
+    acceptance_criteria: >
+      1. _resolve_project_root_for_group() 优先读 group.doc["project_root"]
+      2. resolve_group_runtime_context() 优先读 group.doc["project_root"]
+      3. daemon handler 直接从 group.doc 获取 project_root
+      4. fallback 逻辑在 project_root 为空时仍可工作（向后兼容旧 group）
+      5. 现有工作流命令行为不变
+    verification:
+      level: unit
+      command: >
+        pytest tests/test_foreman_workflow.py tests/test_ralph_ipc.py -q
+      covers:
+        tasks: ["T9"]
+        flows: []
+    consumes:
+      - name: group_project_root_metadata
+        from: T8
+
+  # --- T10: A-2 集成验证 ---
+  - id: T10
+    title: "project_root 元数据化集成验证"
+    role: integration
+    addresses: ["A-2"]
+    claimed_paths:
+      - "tests/test_group_project_root_integration.py"
+    depends_on: ["T8", "T9"]
+    goal_behavior: >
+      验证 group 创建 → scope attach → project_root 自动设置 →
+      CLI/HTTP/daemon 读取到正确 project_root 的完整流程。
+    acceptance_criteria: >
+      1. 创建 group → attach scope → group.doc["project_root"] 正确
+      2. CLI workflow 命令使用 group 元数据中的 project_root
+      3. HTTP 路由使用 group 元数据中的 project_root
+      4. 旧 group（无 project_root 字段）的 fallback 仍然工作
+    verification:
+      level: integration
+      command: >
+        pytest tests/test_group_project_root_integration.py -q
+      covers:
+        tasks: ["T8", "T9", "T10"]
+        flows: ["group_metadata_project_root"]
+
+# ============================================================
+# Wave 3: M-1b MCP/CLI/HTTP 适配层统一
+# ============================================================
+
+  # --- T11: 提取共享 helpers ---
+  - id: T11
+    title: "提取适配层共享 helpers — resolve_group, resolve_sender, normalization"
+    role: leaf
+    addresses: ["M-1b"]
+    claimed_paths:
+      - "src/cccc/daemon/ops/adapter_helpers.py"
+    depends_on: []
+    goal_behavior: >
+      从 CLI、HTTP、MCP 三个适配层中提取重复的辅助函数到统一模块：
+      - resolve_group_and_project_root(group_id) — 获取 group + project_root
+      - resolve_sender_actor(group, by) — 解析发送者身份
+      - normalize_priority(value) — 统一优先级格式
+      - normalize_reply_required(value) — 统一回复要求格式
+      - build_daemon_request(op, **kwargs) — 标准化 daemon 请求构建
+    acceptance_criteria: >
+      1. adapter_helpers.py 导出 5 个函数
+      2. 每个函数有明确的类型标注和 docstring
+      3. 模块可独立 import 无循环依赖
+      4. 函数行为与原有 CLI/HTTP 中的实现一致
+    verification:
+      level: unit
+      command: >
+        python -c "
+        from cccc.daemon.ops.adapter_helpers import (
+            resolve_group_and_project_root, resolve_sender_actor,
+            normalize_priority, normalize_reply_required, build_daemon_request
+        );
+        print('All helpers importable')
+        " && pytest tests/test_adapter_helpers.py -q
+      covers:
+        tasks: ["T11"]
+        flows: []
+    provides:
+      - name: shared_adapter_helpers
+        kind: runtime_capability
+
+  # --- T12: CLI/HTTP/MCP 使用共享 helpers ---
+  - id: T12
+    title: "适配层统一 — CLI/HTTP 使用共享 helpers + 消除 CLI 本地 fallback"
+    role: leaf
+    addresses: ["M-1b"]
+    claimed_paths:
+      - "src/cccc/cli/messaging_cmds.py"
+      - "src/cccc/ports/web/routes/messaging.py"
+      - "src/cccc/ports/mcp/handlers/cccc_messaging.py"
+    depends_on: ["T11", "T9"]
+    goal_behavior: >
+      重构 CLI、HTTP、MCP 三个适配层的 messaging 实现：
+      - CLI messaging_cmds.py：替换 resolve_group/resolve_sender 为共享 helpers，删除 local fallback
+      - HTTP messaging.py：替换内联逻辑为共享 helpers
+      - MCP cccc_messaging.py：替换 priority/reply normalization 和 daemon request 组装为共享 helpers
+      三个适配层都只负责参数解析/输出格式化，业务逻辑全部委托给 daemon。
+    acceptance_criteria: >
+      1. CLI messaging_cmds.py 无 local fallback（删除直接 append_event 的代码路径）
+      2. CLI、HTTP、MCP 三层都使用 adapter_helpers 中的共享函数
+      3. MCP cccc_messaging.py 不再自行做 priority/reply normalization
+      4. 现有 messaging 行为不变
+      5. daemon 不可用时 CLI send 报错而非 fallback 到本地写入
+    verification:
+      level: unit
+      command: >
+        pytest tests/test_chat_ops.py tests/test_cli_main.py tests/test_mcp_message_send_reply_required.py -q
+      covers:
+        tasks: ["T12"]
+        flows: []
+    consumes:
+      - name: shared_adapter_helpers
+        from: T11
+
+  # --- T13: 适配层统一集成验证 ---
+  - id: T13
+    title: "适配层统一集成验证 — CLI/HTTP 行为一致性"
+    role: integration
+    addresses: ["M-1b"]
+    claimed_paths:
+      - "tests/test_adapter_unification_integration.py"
+    depends_on: ["T11", "T12"]
+    goal_behavior: >
+      验证 CLI 和 HTTP 两条路径对相同操作（send message, complete task）
+      产生相同的 daemon 请求格式和行为。验证 CLI 无 local fallback。
+    acceptance_criteria: >
+      1. CLI send 和 HTTP send 产生相同格式的 daemon 请求
+      2. CLI 在 daemon 不可用时不写入本地 ledger（报错退出）
+      3. 共享 helpers 被正确使用（无内联重复逻辑）
+      4. 负测试：CLI send 在 daemon 不可用时报错退出，不写本地 ledger（forbidden flow: cli_local_ledger_write）
+      5. 至少 5 个测试用例
+    verification:
+      level: integration
+      command: >
+        pytest tests/test_adapter_unification_integration.py -q
+      covers:
+        tasks: ["T11", "T12", "T13"]
+        flows: ["adapter_unification", "cli_local_ledger_write"]
+
+# ============================================================
+# Wave 4: W-1 共享类型合约 + W-2 Worker 进度推送
+# ============================================================
+
+  # --- T14: 增强 Contract schema 校验 ---
+  - id: T14
+    title: "增强 provides/consumes Contract — 从名字匹配到 schema 校验"
+    role: leaf
+    addresses: ["W-1"]
+    claimed_paths:
+      - "src/cccc/ralph/models.py"
+      - "src/cccc/ralph/validator.py"
+    depends_on: []
+    goal_behavior: >
+      增强 Contract model 的 schema_hint 字段：从 Optional[str] 改为结构化的
+      schema 描述（JSON Schema 子集或简单类型声明）。在 validator.py 中增加
+      新规则 W_CONTRACT_SCHEMA_MISMATCH：当 provider 和 consumer 的 schema_hint
+      不兼容时报 warning。保持向后兼容——schema_hint 为空或纯字符串时跳过校验。
+    acceptance_criteria: >
+      1. Contract.schema_hint 支持结构化格式（如 {"type": "string", "format": "uuid"}）
+      2. validator 新增 W_CONTRACT_SCHEMA_MISMATCH 规则
+      3. 两个 task 的 provides/consumes 同名但 schema 不兼容时报 warning
+      4. schema_hint 为空或旧格式字符串时不报错（向后兼容）
+      5. 现有 Ralph 测试不受影响
+    verification:
+      level: unit
+      command: >
+        pytest tests/ralph/test_ralph_standalone.py tests/ralph/test_wave1_integration.py tests/ralph/test_wave2b_integration.py -q
+      covers:
+        tasks: ["T14"]
+        flows: []
+    provides:
+      - name: contract_schema_validation
+        kind: validation_rule
+
+  # --- T15: Ralph 校验规则增强测试 ---
+  - id: T15
+    title: "Contract schema 校验集成测试"
+    role: integration
+    addresses: ["W-1"]
+    claimed_paths:
+      - "tests/ralph/test_contract_schema_validation.py"
+    depends_on: ["T14"]
+    goal_behavior: >
+      为 Contract schema 校验写完整测试：schema 匹配通过、schema 不匹配报 warning、
+      空 schema 跳过、旧格式兼容、嵌套类型匹配。
+    acceptance_criteria: >
+      1. 匹配的 schema（如 provider: uuid string, consumer: uuid string）→ 无 warning
+      2. 不匹配（provider: integer, consumer: uuid string）→ W_CONTRACT_SCHEMA_MISMATCH
+      3. 空 schema_hint → 无 warning（向后兼容）
+      4. 纯字符串 schema_hint → 无 warning（向后兼容）
+      5. 至少 5 个测试用例
+    verification:
+      level: integration
+      command: >
+        pytest tests/ralph/test_contract_schema_validation.py -q
+      covers:
+        tasks: ["T14", "T15"]
+        flows: ["contract_schema_check"]
+    consumes:
+      - name: contract_schema_validation
+        from: T14
+
+  # --- T16: Worker heartbeat 事件处理 ---
+  - id: T16
+    title: "实现 Worker heartbeat — 进度推送 + 停滞检测"
+    role: leaf
+    addresses: ["W-2"]
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/foreman/progress_report.py"
+      - "src/cccc/cli/workflow_cmds.py"
+      - "src/cccc/cli/main.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    depends_on: ["T2", "T9"]
+    goal_behavior: >
+      实现 worker 进度推送机制：
+      1. 在 workflow_state_types.py 新增 KIND_TASK_HEARTBEAT 事件类型
+      2. 在 workflow_state_engine.py 新增 record_heartbeat() 方法
+      3. 在 main.py CLI parser 注册 `task heartbeat` 子命令
+      4. 在 workflow_cmds.py 实现 cmd_task_heartbeat()
+      5. orchestrator 新增 on_heartbeat() 方法，更新 task 的 last_heartbeat 时间
+      6. progress_report.py 接收 heartbeat 更新进度百分比
+      7. orchestrator 新增 check_stalled_tasks() 方法，检测超过阈值未 heartbeat 的 task
+      Worker 通过定期调用 heartbeat CLI 推送进度，foreman 不再靠 sleep/poll。
+    acceptance_criteria: >
+      1. `cccc task heartbeat T1 --progress 50 --message "halfway"` 可执行
+      2. heartbeat 事件写入 ledger（kind: workflow.task_heartbeat）
+      3. orchestrator.on_heartbeat() 更新 last_heartbeat 时间戳
+      4. check_stalled_tasks() 返回超过 N 秒未 heartbeat 的 task 列表
+      5. progress_report 展示最新进度百分比
+    verification:
+      level: unit
+      command: >
+        pytest tests/test_foreman_workflow.py tests/test_progress_report.py tests/test_workflow_state.py tests/test_ralph_ipc.py -q
+      covers:
+        tasks: ["T16"]
+        flows: []
+    provides:
+      - name: worker_heartbeat
+        kind: runtime_capability
+
+  # --- T17: 自动通知 foreman ---
+  - id: T17
+    title: "Worker 完成/阻塞自动通知 Foreman"
+    role: leaf
+    addresses: ["W-2"]
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/messaging/delivery.py"
+    depends_on: ["T16"]
+    goal_behavior: >
+      在 worker 完成/失败/阻塞时自动向 foreman 发送消息通知：
+      1. on_task_completed() 后自动 send message to foreman
+      2. on_task_failed() 后自动 send message to foreman
+      3. check_stalled_tasks() 发现停滞时自动 send message to foreman
+      foreman 不再需要主动 poll，被动接收通知即可。
+    acceptance_criteria: >
+      1. task complete 后 foreman 收到通知消息（通过 daemon messaging delivery，不直接 append_event）
+      2. task fail 后 foreman 收到通知消息（同上，走 delivery 模块）
+      3. stalled task 检测后 foreman 收到通知消息
+      4. 通知消息包含 task_id、状态、关键信息
+      5. 通知走 daemon 内部 messaging（如 delivery.deliver_message），不直接写 ledger（单写者原则）
+    verification:
+      level: unit
+      command: >
+        pytest tests/test_foreman_workflow.py tests/test_progress_report.py tests/test_workflow_state.py tests/test_delivery_state_behavior.py tests/test_delivery_throttle.py -q
+      covers:
+        tasks: ["T17"]
+        flows: []
+    consumes:
+      - name: worker_heartbeat
+        from: T16
+
+  # --- T18: Wave 4 集成验证 ---
+  - id: T18
+    title: "Worker 协作集成验证 — heartbeat + 通知 + contract 端到端"
+    role: integration
+    addresses: ["W-1", "W-2"]
+    claimed_paths:
+      - "tests/test_worker_collaboration_integration.py"
+    depends_on: ["T15", "T16", "T17"]
+    goal_behavior: >
+      端到端验证 worker 协作机制：worker heartbeat → progress 更新 →
+      stall 检测 → foreman 通知 → task complete → foreman 通知。
+      同时验证 contract schema 校验在 validate 中生效。
+    acceptance_criteria: >
+      1. worker heartbeat → progress 报告更新
+      2. worker 停止 heartbeat → stall 检测触发 → foreman 通知
+      3. worker complete → foreman 收到完成通知
+      4. contract schema 不匹配 → ralph validate 报 warning
+      5. 至少 6 个测试用例
+    verification:
+      level: integration
+      command: >
+        pytest tests/test_worker_collaboration_integration.py -q
+      covers:
+        tasks: ["T14", "T15", "T16", "T17", "T18"]
+        flows: ["worker_heartbeat_flow", "contract_schema_check"]
+
+# ============================================================
+# E2E 验证任务
+# ============================================================
+
+  - id: T19
+    title: "全量 E2E 验证 — 所有 wave 变更的端到端确认"
+    role: verification
+    addresses: ["A-1", "A-2", "A-3", "M-1b", "W-1", "W-2"]
+    claimed_paths:
+      - "tests/e2e/test_v3_architecture_e2e.py"
+      - "src/cccc/daemon/server.py"
+      - "src/cccc/cli/main.py"
+      - "src/cccc/ralph/cli.py"
+    depends_on: ["T4", "T7", "T10", "T13", "T18"]
+    goal_behavior: >
+      在所有 wave 完成后，跑完整的端到端验证：
+      1. 创建 group → attach scope → project_root 自动设置 ✓
+      2. CLI workflow submit → canonical ops → state transition ✓
+      3. worker heartbeat → progress → stall detection ✓
+      4. worker complete → canonical ops → verify gate → foreman notify ✓
+      5. prompt assembly 包含完整工作流指导 ✓
+      6. ralph validate 对 schema 不匹配报 warning ✓
+    acceptance_criteria: >
+      1. 完整 workflow lifecycle 从 submit 到 complete 跑通
+      2. 所有状态变更走 canonical ops
+      3. heartbeat + 通知机制工作
+      4. prompt 内容完整
+      5. 现有全量 pytest 不回退（无新 failure）
+    verification:
+      level: e2e
+      command: >
+        pytest tests/ -q --tb=short
+      covers:
+        tasks: ["T1", "T2", "T3", "T3b", "T4", "T5", "T6", "T7", "T8", "T9", "T10", "T11", "T12", "T13", "T14", "T15", "T16", "T17", "T18", "T19"]
+        flows: ["canonical_state_transition", "prompt_assembly", "group_metadata_project_root", "adapter_unification", "worker_heartbeat_flow", "contract_schema_check", "daemon_startup", "cli_workflow"]
+
+# ============================================================
+# Critical Flows
+# ============================================================
+
+critical_flows:
+  - id: canonical_state_transition
+    description: "CLI/HTTP/IPC → WorkflowTaskOps → orchestrator → engine → ledger — 三条路径产生相同状态变更"
+    entrypoints:
+      - src/cccc/daemon/ops/workflow_task_ops.py
+      - src/cccc/cli/workflow_cmds.py
+      - src/cccc/ports/web/routes/workflow.py
+      - src/cccc/daemon/ralph_ipc_handler.py
+    required_verification_level: integration
+
+  - id: prompt_assembly
+    description: "workflow_guidance.md → prompt_files.py / system_prompt.py → 最终 prompt 包含完整工作流指导"
+    entrypoints:
+      - src/cccc/resources/workflow_guidance.md
+      - src/cccc/kernel/prompt_files.py
+      - src/cccc/kernel/system_prompt.py
+    required_verification_level: integration
+
+  - id: group_metadata_project_root
+    description: "create_group → attach_scope → group.doc['project_root'] set → callers 读取元数据"
+    entrypoints:
+      - src/cccc/kernel/group.py
+      - src/cccc/cli/workflow_cmds.py
+    required_verification_level: integration
+
+  - id: adapter_unification
+    description: "CLI/HTTP 使用共享 helpers → daemon 请求格式一致 → 无 local fallback"
+    entrypoints:
+      - src/cccc/daemon/ops/adapter_helpers.py
+      - src/cccc/cli/messaging_cmds.py
+      - src/cccc/ports/web/routes/workflow.py
+    required_verification_level: integration
+
+  - id: worker_heartbeat_flow
+    description: "worker heartbeat CLI → orchestrator.on_heartbeat → progress update → stall detection → foreman notify"
+    entrypoints:
+      - src/cccc/cli/workflow_cmds.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/progress_report.py
+    required_verification_level: integration
+
+  - id: contract_schema_check
+    description: "plan.yaml provides/consumes schema_hint → ralph validate → W_CONTRACT_SCHEMA_MISMATCH warning"
+    entrypoints:
+      - src/cccc/ralph/validator.py
+    required_verification_level: integration
+
+  # 系统级 flows（Ralph 内置检查，由 E2E 覆盖）
+  - id: daemon_startup
+    description: "daemon 启动后所有 ops 模块可用，包括新增的 workflow_task_ops"
+    entrypoints:
+      - src/cccc/daemon/server.py
+    required_verification_level: e2e
+
+  - id: cli_workflow
+    description: "CLI workflow 命令通过 daemon IPC 到达 canonical ops"
+    entrypoints:
+      - src/cccc/cli/main.py
+    required_verification_level: e2e
+
+# ============================================================
+# Forbidden Flows
+# ============================================================
+
+forbidden_flows:
+  - id: direct_state_mutation
+    description: "CLI/HTTP/MCP 绝不可直接调用 orchestrator/engine 方法修改状态，必须通过 WorkflowTaskOps"
+    required_verification_level: integration
+
+  - id: cli_local_ledger_write
+    description: "CLI send 在 daemon 不可用时绝不可 fallback 到直接写 ledger（违反单写者原则）"
+    required_verification_level: integration
+
+  - id: prompt_content_duplication
+    description: "工作流指导内容绝不可在多个文件中重复，必须引用 workflow_guidance.md"
+    required_verification_level: unit
+
+# ============================================================
+# State
+# ============================================================
+
+state:
+  completed_task_ids: ["T1", "T5", "T8", "T11", "T14", "T2", "T3", "T3b", "T6", "T15", "T4", "T7", "T9", "T10", "T12", "T16", "T13", "T17", "T18", "T19"]
+  running_tasks: []
+  failed_task_ids: []

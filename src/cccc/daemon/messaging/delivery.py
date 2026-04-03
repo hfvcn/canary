@@ -3,7 +3,7 @@
 This module handles:
 1. Lazy Preamble: System prompt is delivered with the first message, not at actor startup
 2. Message Throttling: Batches messages within a time window to prevent message bombing
-3. MCP Reminders: Periodically reminds actors to use MCP tools for messaging
+3. CLI Reminders: Periodically reminds actors to use CLI commands for messaging
 4. Delivery Formatting: Renders messages in IM-style format for PTY injection
 5. State-aware Delivery: Respects group state (active/idle/paused)
 
@@ -35,7 +35,7 @@ from ...kernel.actors import find_actor, list_actors
 from ...kernel.group import Group, get_group_state, set_group_state
 from ...kernel.inbox import is_message_for_actor, set_cursor
 from ...kernel.ledger import append_event
-from ...kernel.system_prompt import render_system_prompt
+from ...kernel.system_prompt import render_actor_prompt
 from ...paths import ensure_home
 from ...runners import pty as pty_runner
 from ...runners import headless as headless_runner
@@ -482,7 +482,7 @@ THROTTLE = DeliveryThrottle()
 
 REMINDER_EVERY_N_MESSAGES = 1
 MCP_REMINDER_LINE = (
-    "[cccc] If you respond: use MCP (cccc_message_send / cccc_message_reply). "
+    "[cccc] If you respond: use CLI (cccc send / cccc task complete / cccc inbox). "
     "Terminal output isn't delivered."
 )
 
@@ -697,7 +697,7 @@ def deliver_message_with_preamble(
     # Deliver system prompt first (lazy preamble) when needed.
     if not is_preamble_sent(group, aid):
         try:
-            prompt = render_system_prompt(group=group, actor=actor)
+            prompt = render_actor_prompt(group=group, actor=actor)
             if prompt and prompt.strip():
                 if pty_submit_text(group, actor_id=aid, text=prompt, file_fallback=True, wait_for_submit=True):
                     mark_preamble_sent(group, aid)
@@ -920,7 +920,7 @@ def flush_pending_messages(group: Group, *, actor_id: str) -> bool:
     preamble_just_sent = False
     if not preamble_already_sent:
         try:
-            prompt = render_system_prompt(group=group, actor=actor)
+            prompt = render_actor_prompt(group=group, actor=actor)
             if prompt and prompt.strip():
                 preamble_ok = pty_submit_text(group, actor_id=aid, text=prompt.strip(), wait_for_submit=True)
                 if preamble_ok:
@@ -1026,7 +1026,7 @@ def inject_system_prompt(group: Group, *, actor: Dict[str, Any]) -> None:
     aid = str(actor.get("id") or "").strip()
     if not aid:
         return
-    prompt = render_system_prompt(group=group, actor=actor)
+    prompt = render_actor_prompt(group=group, actor=actor)
     pty_submit_text(group, actor_id=aid, text=prompt, file_fallback=True, wait_for_submit=True)
 
 

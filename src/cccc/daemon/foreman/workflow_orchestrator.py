@@ -24,12 +24,15 @@ from __future__ import annotations
 
 import logging
 import posixpath
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from ...contracts.v1 import DaemonResponse
+from ...contracts.v1 import DaemonRequest, DaemonResponse
+from ...kernel.actors import find_actor, find_foreman, get_effective_role, list_actors
 from ...kernel.group import Group, load_group
 from ...kernel.workflow_state import WorkflowEngine, WorkflowTaskStatus
+from ...util.conv import coerce_bool
 from ..ops.agent_ops import get_agent
 from ...contracts.v1.ralph_ipc import (
     BatchDecision,
@@ -38,9 +41,18 @@ from ...contracts.v1.ralph_ipc import (
     TaskRef,
     VerificationResult,
 )
+from .context_store import ContextStore, TaskContext
 from .workflow import ForemanWorkflow, BatchEvaluationResult
 from .progress_report import ProgressReporter, FeishuSender
 from .agent_pool import TaskAssignment
+from .workflow_monitor import (
+    check_file_overstepping,
+    check_path_deviation,
+    check_completer_mismatch,
+    check_silent_agent,
+    check_unauthorized_subagent,
+    MonitorAlert,
+)
 
 
 logger = logging.getLogger("cccc.daemon.foreman.orchestrator")
@@ -152,6 +164,7 @@ class WorkflowOrchestrator:
             # Unit tests instantiate orchestrator without a persisted group; keep a
             # local ledger-backed engine under the project root for deterministic replay.
             group = self._create_ephemeral_group()
+        self.group = group
         self.engine = WorkflowEngine(group)
         self.engine.replay_from_ledger()
         from .ralph_service import RalphService
@@ -168,6 +181,78 @@ class WorkflowOrchestrator:
         self._active_workflows: Dict[str, Dict[str, Any]] = {}
         self._task_to_agent: Dict[str, str] = {}
         self._task_to_model: Dict[str, str] = {}  # task_id -> model_key
+        self._context_store = ContextStore(self.project_root) if self.project_root else None
+
+    def _ensure_active_workflow(
+        self,
+        workflow_id: str,
+        *,
+        started_at: str = "",
+    ) -> Dict[str, Any]:
+        workflow = self._active_workflows.get(workflow_id)
+        if workflow is not None:
+            if started_at and not workflow.get("started_at"):
+                workflow["started_at"] = started_at
+            return workflow
+
+        workflow = {
+            "started_at": started_at or "",
+            "batches": [],
+            "tasks": {},
+            "synced_batches": set(),
+        }
+        self._active_workflows[workflow_id] = workflow
+        self.reporter.init_workflow(workflow_id)
+        return workflow
+
+    def _track_task_ref(
+        self,
+        workflow_id: str,
+        task: TaskRef,
+        *,
+        status: Optional[str] = None,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        workflow_tasks = self._ensure_active_workflow(workflow_id)["tasks"]
+        tracked = dict(workflow_tasks.get(task.id) or {})
+        tracked.update(
+            {
+                "task_id": task.id,
+                "task_title": task.title,
+                "task_type": task.type,
+                "claimed_paths": self._extract_claimed_paths(task),
+                "task_ref": task,
+            }
+        )
+        tracked.setdefault("agent_id", "")
+        tracked.setdefault("agent_name", "")
+        tracked.setdefault("is_new_agent", False)
+        tracked.setdefault("model_runtime", "")
+        tracked.setdefault("model_id", "")
+        tracked.setdefault("progress_pct", None)
+        tracked.setdefault("last_heartbeat", None)
+        if status is not None:
+            tracked["status"] = status
+        else:
+            tracked.setdefault("status", TASK_STATUS_PENDING)
+        if reason:
+            tracked["reason"] = reason
+        workflow_tasks[task.id] = tracked
+        return tracked
+
+    def _serialize_assignment(self, assignment: Dict[str, Any]) -> Dict[str, Any]:
+        serialized = dict(assignment)
+        task_ref = serialized.get("task_ref")
+        if isinstance(task_ref, TaskRef):
+            serialized["task_ref"] = task_ref.model_dump()
+        return serialized
+
+    def _get_running_write_sets(self) -> List[List[str]]:
+        return [
+            self._extract_assignment_claimed_paths(assignment)
+            for assignment in self._get_all_assignments()
+            if assignment.get("status") == TASK_STATUS_RUNNING
+        ]
 
     def _create_ephemeral_group(self) -> Group:
         root = Path(self.project_root) / ".cccc" / "orchestrator" / str(self.group_id or "group")
@@ -203,23 +288,19 @@ class WorkflowOrchestrator:
 
         for task in suggestion.tasks:
             self.engine.register_task(task, workflow_id)
+            self._track_task_ref(workflow_id, task)
         states = [self.engine.get_task(t.id) for t in suggestion.tasks]
         if not all(s and s.batch_id == batch_id for s in states):
             self.engine.register_batch(batch_id, [t.id for t in suggestion.tasks])
 
-        # Initialize workflow tracking if needed
-        if workflow_id not in self._active_workflows:
-            self._active_workflows[workflow_id] = {
-                "started_at": suggestion.created_at,
-                "batches": [],
-                "tasks": {},
-                "synced_batches": set(),
-            }
-            self.reporter.init_workflow(workflow_id)
+        workflow_data = self._ensure_active_workflow(
+            workflow_id,
+            started_at=suggestion.created_at,
+        )
 
         deferred_result = self._defer_batch_for_single_writer(suggestion)
         if deferred_result is not None:
-            self._active_workflows[workflow_id]["batches"].append(batch_id)
+            workflow_data["batches"].append(batch_id)
             return deferred_result
 
         # Process through Foreman
@@ -228,25 +309,28 @@ class WorkflowOrchestrator:
             auto_approve=True,
             notify_feishu=False,  # We handle Feishu through reporter
         )
+        result = self._fallback_to_group_actors(result)
 
         # Track batch
-        self._active_workflows[workflow_id]["batches"].append(batch_id)
+        workflow_data["batches"].append(batch_id)
 
         # Store assignment details for progress API
         for assignment in result.assignments:
             if assignment.agent_id:
-                self._active_workflows[workflow_id]["tasks"][assignment.task.id] = {
-                    "task_id": assignment.task.id,
-                    "task_title": assignment.task.title,
-                    "task_type": assignment.task.type,
-                    "agent_id": assignment.agent_id,
-                    "agent_name": assignment.agent_name or assignment.agent_id,
-                    "is_new_agent": assignment.is_new_agent,
-                    "model_runtime": assignment.model_runtime or "",
-                    "model_id": assignment.model_id or "",
-                    "claimed_paths": self._extract_claimed_paths(assignment.task),
-                    "status": TASK_STATUS_PENDING,
-                }
+                tracked = self._track_task_ref(
+                    workflow_id,
+                    assignment.task,
+                    status=TASK_STATUS_PENDING,
+                )
+                tracked.update(
+                    {
+                        "agent_id": assignment.agent_id,
+                        "agent_name": assignment.agent_name or assignment.agent_id,
+                        "is_new_agent": assignment.is_new_agent,
+                        "model_runtime": assignment.model_runtime or "",
+                        "model_id": assignment.model_id or "",
+                    }
+                )
 
         approved_ids = {t.id for t in result.approved_tasks}
         approved_assignments = [
@@ -273,6 +357,97 @@ class WorkflowOrchestrator:
             self._start_assigned_agents(result)
 
         return result
+
+    def register_and_suggest(
+        self,
+        task_dicts: List[Dict[str, Any]],
+        workflow_id: str,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        task_refs = [TaskRef.model_validate(task) for task in task_dicts]
+        self._ensure_active_workflow(workflow_id)
+        for task in task_refs:
+            self.engine.register_task(task, workflow_id)
+            self._track_task_ref(workflow_id, task)
+
+        suggestion = self.ralph.suggest_ready_batch(
+            task_refs,
+            running_write_sets=self._get_running_write_sets(),
+            workflow_id=workflow_id,
+        )
+        ready_task_ids = [task.id for task in suggestion.tasks] if suggestion else []
+        if suggestion and suggestion.tasks:
+            if kwargs.get("suggestion_id"):
+                suggestion.suggestion_id = str(kwargs["suggestion_id"])
+            if kwargs.get("rationale"):
+                suggestion.rationale = str(kwargs["rationale"])
+            if kwargs.get("estimated_parallelism"):
+                suggestion.estimated_parallelism = int(kwargs["estimated_parallelism"])
+            self.process_batch_suggestion(
+                suggestion,
+                auto_start_agents=bool(kwargs.get("auto_start_agents", True)),
+            )
+
+        return {
+            "registered": len(task_refs),
+            "submitted": len(ready_task_ids),
+            "ready_task_ids": ready_task_ids,
+        }
+
+    def _fallback_to_group_actors(
+        self,
+        result: BatchEvaluationResult,
+    ) -> BatchEvaluationResult:
+        if result.decision != "rejected":
+            return result
+        if "No suitable agents" not in result.reason:
+            return result
+
+        peer_actors = self._load_enabled_peer_actors()
+        if not peer_actors:
+            return result
+
+        warning = "Agent pool empty, falling back to group actors"
+        logger.warning(warning)
+        self._log(f"[orchestrator] {warning}")
+
+        rejected_tasks = list(result.rejected_tasks) or list(result.suggestion.tasks)
+        fallback_assignments: List[TaskAssignment] = []
+        for index, task in enumerate(rejected_tasks):
+            actor = peer_actors[index % len(peer_actors)]
+            actor_id = str(actor.get("id") or "").strip()
+            actor_name = str(actor.get("title") or "").strip() or actor_id
+            fallback_assignments.append(
+                TaskAssignment(
+                    task=task,
+                    agent_id=actor_id,
+                    agent_name=actor_name,
+                    is_new_agent=False,
+                    assignment_reason="Fallback to group actor",
+                    model_runtime=str(actor.get("runtime") or "").strip(),
+                )
+            )
+
+        result.assignments = fallback_assignments
+        result.approved_tasks = rejected_tasks
+        result.rejected_tasks = []
+        result.decision = "approved"
+        result.reason = f"Approved all {len(rejected_tasks)} tasks via group actor fallback"
+        return result
+
+    def _load_enabled_peer_actors(self) -> List[Dict[str, Any]]:
+        group = load_group(self.group_id) or self.group
+        peer_actors: List[Dict[str, Any]] = []
+        for actor in list_actors(group):
+            actor_id = str(actor.get("id") or "").strip()
+            if not actor_id:
+                continue
+            if not coerce_bool(actor.get("enabled"), default=True):
+                continue
+            if get_effective_role(group, actor_id) != "peer":
+                continue
+            peer_actors.append(actor)
+        return peer_actors
 
     def handle_restart(
         self,
@@ -383,22 +558,14 @@ class WorkflowOrchestrator:
         workflow_id: str,
         tasks: List[TaskRef],
     ) -> List[TaskAssignment]:
-        workflow_tasks = self._active_workflows[workflow_id]["tasks"]
         deferred_assignments: List[TaskAssignment] = []
         for task in tasks:
-            workflow_tasks[task.id] = {
-                "task_id": task.id,
-                "task_title": task.title,
-                "task_type": task.type,
-                "agent_id": "",
-                "agent_name": "",
-                "is_new_agent": False,
-                "model_runtime": "",
-                "model_id": "",
-                "claimed_paths": self._extract_claimed_paths(task),
-                "status": TASK_STATUS_DEFERRED,
-                "reason": SINGLE_WRITER_REASON,
-            }
+            self._track_task_ref(
+                workflow_id,
+                task,
+                status=TASK_STATUS_DEFERRED,
+                reason=SINGLE_WRITER_REASON,
+            )
             deferred_assignments.append(
                 TaskAssignment(
                     task=task,
@@ -544,11 +711,12 @@ class WorkflowOrchestrator:
             model_key = model_id if "-" in model_id else f"claude-{model_id}"
             self._task_to_model[task.id] = model_key
 
-            # Update assignment status to running
+            tracked_task: Optional[Dict[str, Any]] = None
             for wdata in self._active_workflows.values():
                 td = wdata.get("tasks", {}).get(task.id)
                 if td:
-                    td["status"] = TASK_STATUS_RUNNING
+                    td["status"] = "assigned"
+                    tracked_task = td
                     break
 
             # Register as real group actor (creates tab in UI)
@@ -566,21 +734,66 @@ class WorkflowOrchestrator:
                     resp = self._start_actor_fn(self.group_id, agent_id, config)
                     if not resp.ok:
                         self._log(f"[orchestrator] Failed to start agent {agent_id}: {resp.error}")
+                    else:
+                        started = True
                 except Exception as e:
                     self._log(f"[orchestrator] Error starting agent {agent_id}: {e}")
 
+            if not started:
+                if tracked_task is not None:
+                    tracked_task["status"] = TASK_STATUS_PENDING
+                continue
+
             # Send task to agent
+            worker_prompt = self._load_worker_prompt(agent_id)
+            task_prompt = self._build_task_prompt(
+                task,
+                worker_prompt=worker_prompt,
+                runtime=assignment.model_runtime,
+            )
+            send_ok = False
             if self._send_message_fn:
-                worker_prompt = self._load_worker_prompt(agent_id)
-                task_prompt = self._build_task_prompt(
-                    task,
-                    worker_prompt=worker_prompt,
-                    runtime=assignment.model_runtime,
-                )
                 try:
-                    self._send_message_fn(self.group_id, agent_id, task_prompt)
+                    resp = self._send_message_fn(self.group_id, agent_id, task_prompt)
+                    send_ok = bool(resp is None or resp.ok)
+                    if not send_ok:
+                        err_msg = resp.error.message if resp and resp.error else "unknown"
+                        self._log(f"[orchestrator] Failed to send task to {agent_id}: {err_msg}")
                 except Exception as e:
                     self._log(f"[orchestrator] Error sending task to {agent_id}: {e}")
+            elif self._daemon_request_fn:
+                try:
+                    req = DaemonRequest(
+                        op="send",
+                        args={
+                            "group_id": self.group_id,
+                            "by": ORCHESTRATOR_SERVICE_ACTOR,
+                            "to": [agent_id],
+                            "text": task_prompt,
+                        },
+                    )
+                    resp, _ = self._daemon_request_fn(req)
+                    send_ok = resp.ok
+                    if not send_ok:
+                        err_msg = resp.error.message if resp.error else "unknown"
+                        self._log(f"[orchestrator] Failed to send task to {agent_id}: {err_msg}")
+                except Exception as e:
+                    self._log(f"[orchestrator] Error sending task to {agent_id}: {e}")
+            else:
+                warning = (
+                    f"Cannot send task to {agent_id}: both send_message_fn and "
+                    "daemon_request_fn are unavailable"
+                )
+                logger.warning(warning)
+                self._log(f"[orchestrator] {warning}")
+
+            if not send_ok:
+                if tracked_task is not None:
+                    tracked_task["status"] = TASK_STATUS_PENDING
+                continue
+
+            if tracked_task is not None:
+                tracked_task["status"] = TASK_STATUS_RUNNING
 
     def _load_worker_prompt(self, agent_id: str) -> str:
         """Load the persisted worker prompt for an assigned agent."""
@@ -611,6 +824,9 @@ class WorkflowOrchestrator:
         if group is None:
             self._log(f"[orchestrator] Cannot register agent {assignment.agent_id}: group {self.group_id} not found")
             return False
+        if find_actor(group, assignment.agent_id) is not None:
+            self._log(f"[orchestrator] Agent {assignment.agent_id} already registered as group actor")
+            return True
         runtime = assignment.model_runtime or "claude"
         agent_id = assignment.agent_id
         agent_name = assignment.agent_name or agent_id
@@ -645,9 +861,9 @@ class WorkflowOrchestrator:
     def _build_runtime_adapter_hint(self, runtime: str) -> str:
         runtime_name = str(runtime or "").strip().lower()
         runtime_hints = {
-            "claude": "Write code directly. Use cccc_message_send for progress/help; report completion via cccc task complete.",
-            "codex": "Use your internal workflow. Use cccc_message_send for progress/help; report completion via cccc task complete.",
-            "gemini": "Execute the task. Use cccc_message_send for progress/help; report completion via cccc task complete.",
+            "claude": "Write code directly. Use `cccc send --to @foreman --text \"...\"` for progress/help; report completion via `cccc task complete <task_id> --changed-file <path> --evidence \"summary\"`.",
+            "codex": "Use your internal workflow. Use `cccc send --to @foreman --text \"...\"` for progress/help; report completion via `cccc task complete <task_id> --changed-file <path> --evidence \"summary\"`.",
+            "gemini": "Execute the task. Use `cccc send --to @foreman --text \"...\"` for progress/help; report completion via `cccc task complete <task_id> --changed-file <path> --evidence \"summary\"`.",
         }
         return runtime_hints.get(runtime_name, "")
 
@@ -659,16 +875,25 @@ class WorkflowOrchestrator:
         runtime: str = "",
     ) -> str:
         """Build the task prompt to send to an agent."""
-        sections = [
-            f"""[Foreman Assignment]
-Task ID: {task.id}
-Title: {task.title}
-Type: {task.type}
-
-Assigned by Foreman inside the Ralph workflow.
-Execute this task only.
-Do not contact the user to renegotiate scope."""
+        # Build rich assignment with metadata (WF-1/WF-2)
+        header_lines = [
+            "[Foreman Assignment]",
+            f"Task ID: {task.id}",
+            f"Title: {task.title}",
+            f"Type: {task.type}",
         ]
+        if task.goal_behavior:
+            header_lines.append(f"\nGoal: {task.goal_behavior}")
+        if task.acceptance_criteria:
+            header_lines.append(f"\nAcceptance Criteria: {task.acceptance_criteria}")
+        if task.claimed_paths:
+            header_lines.append(f"\nScope (claimed files): {', '.join(task.claimed_paths)}")
+        if task.verification and task.verification.command:
+            header_lines.append(f"\nVerification Command: {task.verification.command}")
+        header_lines.append("\nAssigned by Foreman inside the Ralph workflow.")
+        header_lines.append("Execute this task only.")
+        header_lines.append("Do not contact the user to renegotiate scope.")
+        sections = ["\n".join(header_lines)]
         worker_prompt_text = str(worker_prompt or "").strip()
         if worker_prompt_text:
             sections.append(f"Worker Assignment:\n{worker_prompt_text}")
@@ -680,12 +905,15 @@ Do not contact the user to renegotiate scope."""
 - progress delta or blockers
 - changed files or evidence
 - anything still unverified
-- Report completion via `cccc task complete {task.id} --changed-file <path> --evidence "<说明>"`.
-- Use `cccc_message_send(to="@foreman", text=...)` for progress updates or help, not for completion.
-
-Use CCCC MCP tools for visible coordination."""
+- Report completion via `cccc task complete {task.id} --changed-file <path> --evidence "summary"` as the primary completion method.
+- Use `cccc send --to @foreman --text "..."` for progress updates or blockers only, not for completion."""
         )
-        return "\n\n".join(sections).rstrip() + "\n"
+        prompt = "\n\n".join(sections).rstrip()
+        if self._context_store is not None:
+            prev_context = self._context_store.load(task.id)
+            if prev_context is not None:
+                prompt += "\n\n" + ContextStore.render_prompt_section(prev_context)
+        return prompt + "\n"
 
     def _sync_batch_to_control_plane(self, result: BatchEvaluationResult) -> None:
         """Mirror Ralph batch decisions into shared coordination/task state."""
@@ -722,6 +950,7 @@ Use CCCC MCP tools for visible coordination."""
                     "status": status,
                     "assignee": assignment.agent_id or None,
                     "notes": notes,
+                    "workflow_task_id": task.id,  # WF-5: use workflow task_id for context.sync
                 }
             )
 
@@ -762,6 +991,7 @@ Use CCCC MCP tools for visible coordination."""
         changed_files: List[str],
         *,
         workflow_id: Optional[str] = None,
+        verification: Optional[VerificationResult] = None,
     ) -> bool:
         """Handle task completion event.
 
@@ -801,12 +1031,138 @@ Use CCCC MCP tools for visible coordination."""
             agent_name,
             duration_seconds,
             changed_files,
+            verification_checks=verification.checks if verification else None,
+            verification_outcome=verification.overall_outcome if verification else "passed",
         )
 
         # Check if batch is complete
         self._check_batch_completion(wf_id)
 
+        # WF-3: DAG gating — immediately check if downstream tasks are now ready
+        self._resuggest_ready_tasks(wf_id)
+        self._notify_foreman_task_update(
+            task_id=task_id,
+            new_status=TASK_STATUS_COMPLETED,
+            summary=self._build_completion_summary(
+                agent_id=agent_name,
+                duration_seconds=duration_seconds,
+                changed_files=changed_files,
+                verification=verification,
+            ),
+        )
+
+        # Monitor checks (best-effort)
+        try:
+            claimed_paths_for_task: List[str] = []
+            assigned_agent_id: str = ""
+            if wf_id and wf_id in self._active_workflows:
+                task_data = self._active_workflows[wf_id]["tasks"].get(task_id)
+                if task_data:
+                    claimed_paths_for_task = list(task_data.get("claimed_paths") or [])
+                    assigned_agent_id = str(task_data.get("agent_id") or "")
+            known_agents = set(self._task_to_agent.values())
+            alert = check_unauthorized_subagent(agent_id, known_agents)
+            if alert:
+                logger.warning(
+                    "Monitor alert: %s — %s",
+                    alert.alert_type,
+                    alert.message,
+                    extra={"evidence": alert.evidence},
+                )
+            alert = check_file_overstepping(task_id, changed_files, claimed_paths_for_task)
+            if alert:
+                logger.warning(
+                    "Monitor alert: %s — %s",
+                    alert.alert_type,
+                    alert.message,
+                    extra={"evidence": alert.evidence},
+                )
+            alert = check_completer_mismatch(task_id, assigned_agent_id, agent_id)
+            if alert:
+                logger.warning(
+                    "Monitor alert: %s — %s",
+                    alert.alert_type,
+                    alert.message,
+                    extra={"evidence": alert.evidence},
+                )
+                # WF-6: emit verification_warning to engine ledger
+                try:
+                    self.engine.record_verification_warning(
+                        task_id=task_id,
+                        warning_type=alert.alert_type,
+                        message=alert.message,
+                        evidence=alert.evidence,
+                    )
+                except Exception:
+                    logger.debug("Failed to record verification warning", exc_info=True)
+        except Exception:
+            logger.debug("Monitor check failed", exc_info=True)
+
         return success
+
+    def _resuggest_ready_tasks(self, workflow_id: Optional[str]) -> None:
+        """WF-3: After a task completes, check if downstream tasks are now ready.
+
+        Instead of waiting for the entire batch to complete, immediately suggest
+        and start tasks whose depends_on are now fully satisfied.
+        """
+        if not workflow_id or workflow_id not in self._active_workflows:
+            return
+
+        wf_data = self._active_workflows[workflow_id]
+        all_tasks = wf_data.get("tasks", {})
+
+        # Collect remaining non-completed task refs
+        remaining_refs: List[TaskRef] = []
+        running_write_sets: List[List[str]] = []
+        for tid, tdata in all_tasks.items():
+            status = tdata.get("status", "")
+            if status in (TASK_STATUS_COMPLETED, TASK_STATUS_RUNNING):
+                if status == TASK_STATUS_RUNNING:
+                    running_write_sets.append(list(tdata.get("claimed_paths") or []))
+                continue
+            task_ref = tdata.get("task_ref")
+            if isinstance(task_ref, TaskRef):
+                remaining_refs.append(task_ref)
+            elif isinstance(task_ref, dict):
+                try:
+                    remaining_refs.append(TaskRef.model_validate(task_ref))
+                except Exception:
+                    continue
+
+        if not remaining_refs:
+            return
+
+        # Ask Ralph for newly ready tasks
+        suggestion = self.ralph.suggest_ready_batch(
+            remaining_refs,
+            running_write_sets=running_write_sets,
+            workflow_id=workflow_id,
+        )
+        if not suggestion or not suggestion.tasks:
+            return
+
+        self._log(f"[DAG gating] {len(suggestion.tasks)} downstream tasks now ready after completion")
+
+        # Process the new batch through normal flow
+        try:
+            self.process_batch_suggestion(suggestion, auto_start_agents=True)
+        except Exception as e:
+            self._log(f"[DAG gating] Error processing re-suggested batch: {e}")
+
+    def monitor_incoming_event(self, task_id: str, event_type: str, event_payload: dict) -> None:
+        """Check an incoming event for path deviation (direct messaging bypass). Called by daemon event handling layer when processing raw events."""
+        try:
+            alert = check_path_deviation(task_id, event_type, event_payload)
+            if alert:
+                logger.warning(
+                    "Monitor alert: %s — %s",
+                    alert.alert_type,
+                    alert.message,
+                    extra={"evidence": alert.evidence},
+                )
+        except Exception:
+            logger.debug("Monitor check failed", exc_info=True)
 
     def _record_model_usage(
         self,
@@ -842,6 +1198,7 @@ Use CCCC MCP tools for visible coordination."""
         *,
         suggestion: str = "",
         agent_name: str = "",
+        verification: Optional[VerificationResult] = None,
     ) -> bool:
         """Handle task failure event."""
         # Update assignment status
@@ -852,12 +1209,285 @@ Use CCCC MCP tools for visible coordination."""
                 td["error_message"] = error_message
                 break
 
-        return self.reporter.on_task_failed(
+        success = self.reporter.on_task_failed(
             task_id,
             error_message,
             suggestion=suggestion,
             agent_name=agent_name,
+            verification_checks=verification.checks if verification else None,
         )
+        self._notify_foreman_task_update(
+            task_id=task_id,
+            new_status=TASK_STATUS_FAILED,
+            summary=self._build_failure_summary(
+                agent_name=agent_name,
+                error_message=error_message,
+                suggestion=suggestion,
+                verification=verification,
+            ),
+        )
+        return success
+
+    def on_heartbeat(
+        self,
+        task_id: str,
+        progress_pct: Optional[int],
+        message: str,
+    ) -> bool:
+        """Handle worker heartbeat and propagate progress into state/reporting."""
+        tid = str(task_id or "").strip()
+        progress = None if progress_pct is None else int(progress_pct)
+        note = str(message or "").strip()
+        self.engine.record_heartbeat(tid, progress, note)
+        state = self.engine.get_task(tid)
+        heartbeat_at = time.time()
+        agent_name = ""
+        for wdata in self._active_workflows.values():
+            td = wdata.get("tasks", {}).get(tid)
+            if not td:
+                continue
+            td["status"] = TASK_STATUS_RUNNING
+            if progress is not None:
+                td["progress_pct"] = progress
+            td["last_heartbeat"] = getattr(state, "last_heartbeat", None) if state is not None else heartbeat_at
+            if note:
+                td["message"] = note
+            agent_name = str(td.get("agent_name") or td.get("agent_id") or "").strip()
+            break
+        return self.reporter.on_task_heartbeat(
+            tid,
+            progress_pct=progress,
+            message=note,
+            agent_name=agent_name or str(getattr(state, "agent_id", "") or "").strip(),
+        )
+
+    def check_stalled_tasks(self, threshold_seconds: int = 300) -> List[str]:
+        """Return running task IDs whose last heartbeat exceeds the threshold.
+
+        Also emits MonitorAlert warnings via check_silent_agent for any
+        running task that has been silent longer than threshold_seconds.
+        Monitor calls are best-effort and never raise.
+        """
+        threshold = int(threshold_seconds)
+        now = time.time()
+        stalled: List[str] = []
+        for task in self.engine.list_tasks(status=WorkflowTaskStatus.RUNNING):
+            last_beat = task.last_heartbeat
+            if last_beat is None:
+                # No heartbeat ever — use assigned_at or task start as reference
+                last_beat = getattr(task, "assigned_at", None) or getattr(task, "started_at", None)
+                if last_beat is None:
+                    continue  # cannot determine age — skip
+            if now - last_beat > threshold:
+                stalled.append(task.task.id)
+                self._notify_foreman_task_update(
+                    task_id=task.task.id,
+                    new_status="stalled",
+                    summary=self._build_stalled_summary(
+                        agent_id=task.agent_id,
+                        threshold_seconds=threshold,
+                        idle_seconds=int(now - task.last_heartbeat),
+                        progress_pct=task.progress_pct,
+                    ),
+                )
+                # Monitor alert (best-effort)
+                try:
+                    alert = check_silent_agent(
+                        task_id=task.task.id,
+                        assigned_at=task.last_heartbeat,
+                        last_event_at=task.last_heartbeat,
+                        now=now,
+                        timeout_s=float(threshold),
+                    )
+                    if alert:
+                        logger.warning(
+                            "Monitor alert: %s — %s",
+                            alert.alert_type,
+                            alert.message,
+                            extra={"evidence": alert.evidence},
+                        )
+                except Exception:
+                    logger.debug("Monitor check failed", exc_info=True)
+        return stalled
+
+    def _notify_foreman_task_update(
+        self,
+        *,
+        task_id: str,
+        new_status: str,
+        summary: str,
+    ) -> bool:
+        if not self._daemon_request_fn:
+            self._log(f"[orchestrator] Skip foreman notification for {task_id}: daemon request fn unavailable")
+            return False
+
+        group = load_group(self.group_id) or self.group
+        foreman = find_foreman(group)
+        if foreman is None:
+            self._log(f"[orchestrator] Skip foreman notification for {task_id}: no foreman actor")
+            return False
+
+        text = (
+            "Workflow task update\n"
+            f"task_id: {task_id}\n"
+            f"status: {new_status}\n"
+            f"summary: {str(summary or '').strip() or '(none)'}"
+        )
+        try:
+            req = DaemonRequest(
+                op="send",
+                args={
+                    "group_id": self.group_id,
+                    "by": ORCHESTRATOR_SERVICE_ACTOR,
+                    "to": ["@foreman"],
+                    "text": text,
+                },
+            )
+            resp, _ = self._daemon_request_fn(req)
+        except Exception as e:
+            self._log(f"[orchestrator] Error notifying foreman for {task_id}: {e}")
+            return False
+
+        if resp.ok:
+            return True
+
+        err_msg = resp.error.message if resp.error else "unknown"
+        self._log(f"[orchestrator] Failed to notify foreman for {task_id}: {err_msg}")
+        return False
+
+    @staticmethod
+    def _build_completion_summary(
+        *,
+        agent_id: str,
+        duration_seconds: int,
+        changed_files: List[str],
+        verification: Optional[VerificationResult] = None,
+    ) -> str:
+        files_text = ", ".join(str(path).strip() for path in changed_files if str(path).strip())
+        summary = f"agent={str(agent_id or '').strip() or 'unknown'}, duration={int(duration_seconds)}s"
+        if files_text:
+            summary += f", changed_files={files_text}"
+        return WorkflowOrchestrator._append_verification_checks(summary, verification)
+
+    @staticmethod
+    def _build_failure_summary(
+        *,
+        agent_name: str,
+        error_message: str,
+        suggestion: str,
+        verification: Optional[VerificationResult] = None,
+    ) -> str:
+        summary = f"agent={str(agent_name or '').strip() or 'unknown'}, error={str(error_message or '').strip() or '(none)'}"
+        hint = str(suggestion or "").strip()
+        if hint:
+            summary += f", suggestion={hint}"
+        return WorkflowOrchestrator._append_verification_checks(summary, verification)
+
+    @staticmethod
+    def _append_verification_checks(
+        summary: str,
+        verification: Optional[VerificationResult],
+    ) -> str:
+        checks_text = WorkflowOrchestrator._format_verification_checks(verification)
+        if not checks_text:
+            return summary
+        return f"{summary}\n{checks_text}"
+
+    @staticmethod
+    def _format_verification_checks(
+        verification: Optional[VerificationResult],
+    ) -> str:
+        if verification is None or not verification.checks:
+            return ""
+
+        lines = ["Verification checks:"]
+        for check in verification.checks:
+            lines.append(f"  {WorkflowOrchestrator._format_verification_check(check)}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_verification_check(check: Any) -> str:
+        name = str(getattr(check, "name", "") or "").strip() or "unknown"
+        outcome = str(getattr(check, "outcome", "") or "").strip() or "unknown"
+        line = f"{name}: {outcome}"
+
+        duration_ms = int(getattr(check, "duration_ms", 0) or 0)
+        if duration_ms > 0:
+            line += f" ({duration_ms}ms)"
+
+        message = str(getattr(check, "message", "") or "").strip()
+        if message:
+            line += f" - {message}"
+        return line
+
+    @staticmethod
+    def _build_stalled_summary(
+        *,
+        agent_id: str,
+        threshold_seconds: int,
+        idle_seconds: int,
+        progress_pct: Optional[int],
+    ) -> str:
+        summary = (
+            f"agent={str(agent_id or '').strip() or 'unknown'}, "
+            f"idle_for={int(idle_seconds)}s, threshold={int(threshold_seconds)}s"
+        )
+        if progress_pct is not None:
+            summary += f", progress={int(progress_pct)}%"
+        return summary
+
+    def _notify_foreman_verification_result(
+        self,
+        *,
+        task_id: str,
+        verification_outcome: str,
+        evidence_summary: str,
+        changed_files: List[str],
+    ) -> None:
+        summary = str(evidence_summary or "").strip() or "(none provided)"
+        files_text = ", ".join(str(path).strip() for path in changed_files if str(path).strip()) or "(none)"
+        self._notify_foreman_task_update(
+            task_id=task_id,
+            new_status=f"verification_{verification_outcome}",
+            summary=f"evidence_summary={summary}, changed_files={files_text}",
+        )
+
+    @staticmethod
+    def _extract_evidence_summary(payload: Dict[str, Any]) -> str:
+        summary = str(payload.get("evidence_summary") or "").strip()
+        if summary:
+            return summary
+
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, dict):
+            return ""
+
+        for key in ("summary", "text", "message"):
+            value = str(evidence.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _save_task_context(
+        self,
+        *,
+        task_id: str,
+        task: TaskRef,
+        changed_files: List[str],
+        last_error: str = "",
+    ) -> None:
+        if self._context_store is None:
+            return
+
+        context = TaskContext(
+            goal=str(task.goal_behavior or task.title or "").strip(),
+            changed_files=[str(path).strip() for path in changed_files if str(path).strip()],
+            last_error=str(last_error or "").strip(),
+        )
+        try:
+            self._context_store.save(task_id, context)
+        except Exception as e:
+            self._log(f"[orchestrator] Failed to save task context for {task_id}: {e}")
 
     def apply_task_event(self, event) -> Dict[str, Any]:
         """Process a unified task event with a verification gate (ledger-backed)."""
@@ -874,9 +1504,23 @@ Use CCCC MCP tools for visible coordination."""
         result: Dict[str, Any] = {"accepted": True, "task_id": task_id, "event_type": event_type}
         agent_id = str(payload.get("agent_id") or "").strip() or str(getattr(state, "agent_id", "") or "").strip()
 
+        if event_type == "heartbeat":
+            if state.status != WorkflowTaskStatus.RUNNING:
+                result["accepted"] = False
+                result["reason"] = f"task_not_running status={state.status.value}"
+                return result
+            self.on_heartbeat(
+                task_id=task_id,
+                progress_pct=payload.get("progress_pct"),
+                message=str(payload.get("message") or "").strip(),
+            )
+            result["status"] = WorkflowTaskStatus.RUNNING.value
+            return result
+
         if event_type == "completed":
             duration_seconds = int(payload.get("duration_seconds") or 0)
             changed_files = payload.get("changed_files") if isinstance(payload.get("changed_files"), list) else []
+            evidence_summary = self._extract_evidence_summary(payload)
             if state.status in (
                 WorkflowTaskStatus.COMPLETED,
                 WorkflowTaskStatus.FAILED,
@@ -884,6 +1528,16 @@ Use CCCC MCP tools for visible coordination."""
                 WorkflowTaskStatus.ARCHIVED,
             ):
                 result["reason"] = f"terminal_state:{state.status.value}"
+                return result
+
+            if state.status == WorkflowTaskStatus.READY:
+                result["accepted"] = False
+                result["reason"] = (
+                    f"task_still_ready task_id={task_id} — task was registered but never approved/assigned. "
+                    f"Was auto_process=True used in workflow submit? "
+                    f"Task must pass through approve→assign before completion can be processed."
+                )
+                logger.warning("apply_task_event rejected: task %s still in READY (not approved)", task_id)
                 return result
 
             if state.status == WorkflowTaskStatus.ASSIGNED:
@@ -932,20 +1586,47 @@ Use CCCC MCP tools for visible coordination."""
                     duration_seconds=duration_seconds,
                     changed_files=list(changed_files),
                     workflow_id=payload.get("workflow_id") or state.workflow_id,
+                    verification=verification,
                 )
+                notification_outcome = verification.overall_outcome  # preserves "passed" or "skipped"
+                context_error = ""
             else:
                 self.on_task_failed(
                     task_id=task_id,
                     error_message=verification.summary or "Verification failed",
                     agent_name=agent_id,
+                    verification=verification,
+                )
+                notification_outcome = "failed"
+                context_error = verification.summary or "Verification failed"
+
+            try:
+                self._notify_foreman_verification_result(
+                    task_id=task_id,
+                    verification_outcome=notification_outcome,
+                    evidence_summary=evidence_summary,
+                    changed_files=list(changed_files),
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to send verification notification to foreman for task %s",
+                    task_id,
+                    exc_info=True,
                 )
 
+            self._save_task_context(
+                task_id=task_id,
+                task=state.task,
+                changed_files=list(changed_files),
+                last_error=context_error,
+            )
             return result
 
         if event_type == "failed":
             error_message = str(payload.get("error_message") or "").strip()
             suggestion = str(payload.get("suggestion") or "").strip()
             agent_name = str(payload.get("agent_name") or "").strip() or agent_id
+            changed_files = payload.get("changed_files") if isinstance(payload.get("changed_files"), list) else []
             if state.status == WorkflowTaskStatus.ASSIGNED:
                 self.engine.report_worker_started(task_id, agent_id)
                 state = self.engine.get_task(task_id) or state
@@ -959,6 +1640,12 @@ Use CCCC MCP tools for visible coordination."""
                 error_message=error_message,
                 suggestion=suggestion,
                 agent_name=agent_name,
+            )
+            self._save_task_context(
+                task_id=task_id,
+                task=state.task,
+                changed_files=list(changed_files),
+                last_error=error_message,
             )
             return result
 
@@ -1019,11 +1706,11 @@ Use CCCC MCP tools for visible coordination."""
 
         self._log(f"[orchestrator] Verification for {workflow_id}: {outcome}")
 
-        if outcome == "passed":
-            # Check if workflow should complete
+        if outcome in ("passed", "skipped"):
+            # Check if workflow should complete (skipped also counts as success)
             state = self.reporter.get_state()
             if state and state.current_batch_id:
-                # Batch verification passed, mark complete
+                # Batch verification passed/skipped, mark complete
                 self.reporter.on_batch_completed()
         elif outcome == "failed":
             # Notify about verification failure
@@ -1081,9 +1768,15 @@ Use CCCC MCP tools for visible coordination."""
 
         assignments: List[Dict[str, Any]] = []
         if workflow_id and workflow_id in self._active_workflows:
-            assignments = list(self._active_workflows[workflow_id].get("tasks", {}).values())
+            assignments = [
+                self._serialize_assignment(assignment)
+                for assignment in self._active_workflows[workflow_id].get("tasks", {}).values()
+            ]
         elif not workflow_id:
-            assignments = self._get_all_assignments()
+            assignments = [
+                self._serialize_assignment(assignment)
+                for assignment in self._get_all_assignments()
+            ]
 
         snapshot = {
             "batches": progress.get("batches", {"total": 0, "completed": 0}),

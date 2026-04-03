@@ -7,12 +7,21 @@ Not an external process; runs inside the daemon.
 from __future__ import annotations
 
 import posixpath
+import shlex
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ...contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskEvent, TaskRef
+from ...contracts.v1.ralph_ipc import (
+    ReadyBatchSuggestion,
+    TaskEvent,
+    TaskRef,
+    VerificationCheck,
+    VerificationCheckSpec,
+    VerificationResult,
+)
 
 GLOBAL_WRITE_CLAIM = "/"
 READY_BATCH_ID_HEX_LEN = 12
@@ -22,14 +31,74 @@ GIT_COMMAND_TIMEOUT_SECONDS = 10
 STUCK_LOOP_LOOKBACK = 6
 STUCK_LOOP_MIN_REPEATS = 3
 WORKTREE_ROOT_DIRNAME = ".ralph-worktrees"
+VERIFICATION_COMMAND_TIMEOUT_SECONDS = 60
+SUSPICIOUS_DURATION_THRESHOLD_MS = 50
+_SHELL_OPERATOR_TOKENS = {"&&", "||", "|", ";"}
+_TRIVIAL_VERIFY_COMMANDS = {"true", ":", "echo", "printf"}
+
+
+def _has_shell_operators(command: str) -> bool:
+    """Check if command contains bare (unquoted) shell operators.
+
+    Scans the raw command string character-by-character, tracking
+    single/double quote state.  Only detects operators (&&, ||, |, ;)
+    that appear outside of quoted regions.  Handles both spaced
+    ('a && b') and unspaced ('a&&b') forms correctly, and does NOT
+    false-positive on quoted data like 'echo "a && b"'.
+    """
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(command)
+    while i < n:
+        c = command[i]
+        # Skip escaped characters (not inside single quotes)
+        if c == "\\" and not in_single and i + 1 < n:
+            i += 2
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if c == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double:
+            two_char = command[i : i + 2]
+            if two_char in ("&&", "||"):
+                return True
+            if c in ("|", ";"):
+                return True
+        i += 1
+    # Unterminated quotes → assume shell is needed
+    return in_single or in_double
+
+
+def _is_trivial_command(command: str) -> bool:
+    """Check if command is trivial (echo, true, etc.) for RV-25 threshold."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    base = tokens[0].rsplit("/", 1)[-1]
+    return base in _TRIVIAL_VERIFY_COMMANDS
 
 
 class RalphService:
     """Observation layer service for workflow scheduling."""
 
-    def __init__(self, project_root: Path, group_id: str):
+    def __init__(
+        self,
+        project_root: Path,
+        group_id: str,
+        workflow_engine: Optional[Any] = None,
+    ):
         self.project_root = project_root
         self.group_id = group_id
+        self.workflow_engine = workflow_engine
         self._task_refs: Dict[str, TaskRef] = {}
         self._task_statuses: Dict[str, str] = {}
         self._processed_keys: set[str] = set()
@@ -117,6 +186,7 @@ class RalphService:
         tasks: List[TaskRef],
         *,
         running_write_sets: Optional[List[List[str]]] = None,
+        workflow_id: str = "",
     ) -> Optional[ReadyBatchSuggestion]:
         """Analyze tasks and return a batch of non-conflicting parallel tasks.
 
@@ -153,7 +223,7 @@ class RalphService:
 
         return ReadyBatchSuggestion(
             suggestion_id=f"ralph-{uuid.uuid4().hex[:READY_BATCH_ID_HEX_LEN]}",
-            workflow_id="",
+            workflow_id=workflow_id,
             tasks=ready,
             rationale=f"Ralph: {len(ready)} tasks passed dependency and claimed_paths gating",
             estimated_parallelism=len(ready),
@@ -185,21 +255,38 @@ class RalphService:
     def get_snapshot(self) -> Dict[str, Any]:
         """Return workflow snapshot in kind + reason_code + snapshot format.
 
-        Delegates to ProgressReporter for data, wraps in standard envelope.
-        Skeleton — actual wiring in batch-1A.
+        Uses local ``_task_statuses`` (maintained by :meth:`apply_task_event`)
+        to derive real task counts.  For full orchestrator-level progress
+        (batches, duration, assignments) use ``orchestrator.get_workflow_state()``
+        via the ``ralph_workflow_progress`` IPC op instead.
         """
+        running_statuses = {TASK_STATUS_RUNNING, "started", "heartbeat"}
+        total = len(self._task_statuses)
+        completed = sum(1 for s in self._task_statuses.values() if s == TASK_STATUS_COMPLETED)
+        running = sum(1 for s in self._task_statuses.values() if s in running_statuses)
+        failed = sum(1 for s in self._task_statuses.values() if s == "failed")
+        pending = total - completed - running - failed
+
+        kind = "idle" if total == 0 else "active"
+
         return {
-            "kind": "unavailable",
-            "reason_code": "ralph_service_not_wired",
+            "kind": kind,
+            "reason_code": "",
             "snapshot": {
                 "batches": {"total": 0, "completed": 0},
-                "tasks": {"total": 0, "completed": 0, "failed": 0, "running": 0, "pending": 0},
+                "tasks": {
+                    "total": total,
+                    "completed": completed,
+                    "failed": failed,
+                    "running": running,
+                    "pending": max(0, pending),
+                },
                 "duration": {"workflow_seconds": 0, "batch_seconds": 0},
                 "recent_events": [],
                 "assignments": [],
             },
             "workflow_id": "",
-            "active": False,
+            "active": total > 0,
         }
 
     def check_dependencies(self, task_id: str) -> Dict[str, Any]:
@@ -257,6 +344,12 @@ class RalphService:
     ) -> List[Dict[str, Any]]:
         """Check assignments for stalled/offline workers.
 
+        This is a standalone utility that operates on raw assignment dicts
+        (with ``last_seen_at`` / ``last_progress_at`` timestamps).  For
+        periodic heartbeat-based stall detection on live orchestrator tasks,
+        prefer ``orchestrator.check_stalled_tasks()`` via the
+        ``ralph_check_stalled`` IPC op.
+
         - stalled: last_seen_at recent but last_progress_at exceeded threshold
         - offline: last_seen_at exceeded threshold
 
@@ -301,9 +394,183 @@ class RalphService:
         """Detect tests that may be affected by a change set."""
         return []
 
-    def verify_completion(self, task_id: str, changed_files: List[str]) -> Dict[str, Any]:
-        """Return a placeholder completion verdict for a task."""
-        return {"passed": True, "checks": []}
+    def verify_completion(
+        self,
+        task_id: str,
+        changed_files: List[str],
+        *,
+        workflow_id: str,
+        task_ref: Optional[TaskRef] = None,
+    ) -> VerificationResult:
+        """Run task verification and return a structured verification result."""
+        del changed_files
+
+        resolved_task = task_ref or self._find_task_ref(task_id)
+        if resolved_task is None:
+            return VerificationResult(
+                verification_id=f"ver-{uuid.uuid4().hex[:READY_BATCH_ID_HEX_LEN]}",
+                workflow_id=workflow_id,
+                task_id=task_id,
+                overall_outcome="failed",
+                checks=[],
+                summary=f"verification failed: task '{task_id}' not found",
+            )
+
+        specs = self._resolve_verification_specs(resolved_task)
+        if not specs:
+            return VerificationResult(
+                verification_id=f"ver-{uuid.uuid4().hex[:READY_BATCH_ID_HEX_LEN]}",
+                workflow_id=workflow_id,
+                task_id=task_id,
+                overall_outcome="skipped",
+                checks=[],
+                summary="verification skipped: no command configured",
+            )
+
+        checks, overall_outcome = self._execute_verification_checks(specs)
+        summary = self._summarize_verification(checks, overall_outcome)
+        return VerificationResult(
+            verification_id=f"ver-{uuid.uuid4().hex[:READY_BATCH_ID_HEX_LEN]}",
+            workflow_id=workflow_id,
+            task_id=task_id,
+            overall_outcome=overall_outcome,
+            checks=checks,
+            summary=summary,
+        )
+
+    def _resolve_verification_specs(
+        self,
+        task_ref: TaskRef,
+    ) -> List[tuple[VerificationCheckSpec, str]]:
+        structured = getattr(task_ref, "verification", None)
+        if structured is not None and structured.checks:
+            return [(check, check.command) for check in structured.checks]
+
+        if structured is not None and structured.command.strip():
+            return [
+                (
+                    VerificationCheckSpec(
+                        name="verification",
+                        command=structured.command.strip(),
+                        required=True,
+                        expected_exit_code=structured.expected_exit_code,
+                    ),
+                    structured.command.strip(),
+                )
+            ]
+
+        legacy_command = task_ref.verification_command.strip()
+        if legacy_command:
+            return [
+                (
+                    VerificationCheckSpec(name="verification", command=legacy_command),
+                    legacy_command,
+                )
+            ]
+        return []
+
+    def _execute_verification_checks(
+        self,
+        specs: List[tuple[VerificationCheckSpec, str]],
+    ) -> tuple[List[VerificationCheck], str]:
+        checks: List[VerificationCheck] = []
+        for spec, command in specs:
+            check = self._run_verification_check(
+                name=spec.name,
+                command=command,
+                expected_exit_code=spec.expected_exit_code,
+            )
+            checks.append(check)
+            if check.outcome != "passed" and spec.required:
+                return checks, check.outcome
+        return checks, "passed"
+
+    def _summarize_verification(
+        self,
+        checks: List[VerificationCheck],
+        overall_outcome: str,
+    ) -> str:
+        if not checks:
+            return "verification skipped: no command configured"
+        if overall_outcome != "passed":
+            return checks[-1].message or f"verification {overall_outcome}"
+
+        optional_failures = [check.name for check in checks if check.outcome != "passed"]
+        if optional_failures:
+            failed_names = ", ".join(optional_failures)
+            return f"verification passed; optional checks failed: {failed_names}"
+        return "verification passed"
+
+    def _run_verification_check(
+        self,
+        *,
+        name: str = "verification",
+        command: str,
+        expected_exit_code: int = 0,
+    ) -> VerificationCheck:
+        """Execute a verification command and return the normalized check result."""
+        use_shell = _has_shell_operators(command)
+        started_at = time.perf_counter()
+        try:
+            if use_shell:
+                proc = subprocess.run(
+                    ["bash", "-c", command],
+                    cwd=str(self.project_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=VERIFICATION_COMMAND_TIMEOUT_SECONDS,
+                )
+            else:
+                proc = subprocess.run(
+                    shlex.split(command),
+                    cwd=str(self.project_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=VERIFICATION_COMMAND_TIMEOUT_SECONDS,
+                )
+        except subprocess.TimeoutExpired:
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
+            return VerificationCheck(
+                name=name,
+                outcome="timeout",
+                message=f"{name} timed out after {VERIFICATION_COMMAND_TIMEOUT_SECONDS}s",
+                duration_ms=duration_ms,
+                details={"command": command, "expected_exit_code": expected_exit_code},
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
+            return VerificationCheck(
+                name=name,
+                outcome="failed",
+                message=f"{name} failed to start: {exc}",
+                duration_ms=duration_ms,
+                details={"command": command, "expected_exit_code": expected_exit_code},
+            )
+
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        outcome = "passed" if proc.returncode == expected_exit_code else "failed"
+        message = f"{name} exited with {proc.returncode} (expected {expected_exit_code})"
+        details: dict[str, Any] = {
+            "command": command,
+            "returncode": proc.returncode,
+            "expected_exit_code": expected_exit_code,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+        }
+
+        # RV-25: flag suspiciously fast completions
+        if outcome == "passed" and duration_ms < SUSPICIOUS_DURATION_THRESHOLD_MS:
+            if not _is_trivial_command(command):
+                message = f"[SUSPICIOUS: completed in {duration_ms}ms] {message}"
+                details["suspicious_duration"] = True
+
+        return VerificationCheck(
+            name=name,
+            outcome=outcome,
+            message=message,
+            duration_ms=duration_ms,
+            details=details,
+        )
 
     def _remember_tasks(self, tasks: List[TaskRef]) -> None:
         for task in tasks:

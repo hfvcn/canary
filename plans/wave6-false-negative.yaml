@@ -1,0 +1,207 @@
+# Plan: Wave 6 — 假阴性治理 + 召回精炼
+# Source: todo/问题清单-v5-ralph.md §六 下一波
+# Date: 2026-04-02
+# Scope: RV-10, RV-14, RV-16
+# Codex review: 2026-04-02 — 4 findings fixed
+
+tasks:
+  # ── Batch 1: independent leaf tasks ──────────────────────────────
+
+  - id: T1
+    title: "RV-10: W_TEST_COVERAGE_GAP recall refinement — direct vs indirect test"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/filesystem_validator.py
+      - tests/ralph/test_filesystem_validator.py
+    depends_on: []
+    addresses: ["RV-10"]
+    goal_behavior: >
+      Refine test-source relationship classification in filesystem_validator.py
+      to distinguish "direct tests" (warning) from "indirect imports" (hint).
+
+      Add helper function:
+        _is_direct_test_file(test_path: str, source_path: str) -> bool
+      Returns True if Path(test_path).stem contains Path(source_path).stem.
+      E.g., test_validator.py ↔ validator.py = True (contains "validator").
+      test_system_prompt_memory.py ↔ system_prompt.py = True (contains "system_prompt").
+      test_core.py ↔ validator.py = False.
+
+      Restructure _check_test_coverage_gaps() (starting at line 183):
+      The current accumulator `gaps: dict[(task_id, source_path), list[str]]`
+      collects all test_paths equally. Change to track classification:
+        gaps: dict[(task_id, source_path), dict[str, list[str]]]
+        # keys: "direct" → [paths], "indirect" → [paths]
+      In the loop where test_paths are accumulated (around line 206-217),
+      classify each test_path using _is_direct_test_file.
+      In the consolidated emission (around line 219), emit TWO separate issues:
+        - direct tests not covered → W_TEST_COVERAGE_GAP (warning)
+        - indirect imports not covered → W_INDIRECT_TEST_IMPORT (hint)
+      Conftest handling (W_CONFTEST_COVERAGE_GAP) stays unchanged.
+
+      ALSO apply the same classification to _check_unclaimed_tests_for_source()
+      (around line 196-218, added in Wave 5). Indirect imports should emit
+      W_UNCLAIMED_TEST_FOR_SOURCE at hint severity, direct tests at warning.
+      This ensures consistent behavior between the two related rules.
+    acceptance_criteria: >
+      1. test_foo.py importing foo → W_TEST_COVERAGE_GAP (warning).
+      2. test_bar.py importing foo → W_INDIRECT_TEST_IMPORT (hint).
+      3. W_UNCLAIMED_TEST_FOR_SOURCE: direct test → warning, indirect → hint.
+      4. Conftest handling unchanged (W_CONFTEST_COVERAGE_GAP).
+      5. _is_direct_test_file stem matching: "test_validator"↔"validator"=True,
+         "test_system_prompt_memory"↔"system_prompt"=True, "test_core"↔"validator"=False.
+      6. No regression in existing filesystem_validator tests.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_filesystem_validator.py -q -k coverage_gap_recall"
+      covers:
+        tasks: ["T1"]
+        paths:
+          - src/cccc/ralph/filesystem_validator.py
+
+  - id: T2
+    title: "RV-14: W_SHARED_FILE_PARTIAL_VERIFICATION hint"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+      - tests/ralph/test_ralph_standalone.py
+    depends_on: []
+    addresses: ["RV-14"]
+    goal_behavior: >
+      Add _check_shared_file_verification() in validator.py.
+      For each pair of tasks (T1, T2) that have explicit depends_on AND
+      share overlapping claimed_paths (via _paths_overlap):
+
+      1. If either task lacks verification, skip.
+      2. Get the shared paths (intersection of write-sets).
+      3. Use _command_mentions_any_path() (line 803) to check if each
+         task's verification command references ANY of the shared paths.
+      4. If NEITHER verification mentions the shared paths, emit
+         W_SHARED_FILE_PARTIAL_VERIFICATION as hint.
+
+      This catches the case where two serialized tasks modify the same
+      file but neither verification directly tests that file — each
+      tests a different code path through it.
+
+      Wire into validate() after _check_implicit_serialization (around
+      line 82-83).
+    acceptance_criteria: >
+      1. Fires when two tasks share a file, have depends_on, both have
+         verification, but neither verification mentions shared paths.
+      2. Does NOT fire when either verification mentions a shared path.
+      3. Does NOT fire when tasks have no depends_on (separate concern).
+      4. Severity is hint.
+      5. Evidence includes both task IDs and shared paths.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k shared_file_verification"
+      covers:
+        tasks: ["T2"]
+        paths:
+          - src/cccc/ralph/validator.py
+
+  - id: T3
+    title: "RV-16: W_INTEGRATION_INTERFACE_MISMATCH hint"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+    depends_on: ["T2"]
+    addresses: ["RV-16"]
+    goal_behavior: >
+      Add _check_contract_verification_coverage() in validator.py.
+      For each task that consumes a contract with from_task specified:
+
+      1. Look up the providing task's claimed_paths.
+      2. Use _command_mentions_any_path() (line 803) to check if the
+         consuming task's verification command references any provider path.
+      3. If not, emit W_INTEGRATION_INTERFACE_MISMATCH as hint.
+
+      Skip when:
+      - consumes has no from_task (can't determine provider)
+      - providing task doesn't exist (already caught by E_CONSUMER_FROM_UNKNOWN)
+      - consuming task has no verification
+
+      Note: this uses substring matching which is imperfect for pytest -k
+      patterns, but catches the common case where verification commands
+      reference test files or source files directly.
+
+      Wire into validate() after _check_contracts (around line 84).
+    acceptance_criteria: >
+      1. Fires when consumer's verification doesn't mention provider's paths.
+      2. Does NOT fire when verification mentions a provider path.
+      3. Does NOT fire without from_task.
+      4. Severity is hint.
+      5. No overlap with W_COVERS_CLAIM_UNVERIFIABLE (which checks
+         covers.tasks, not consumes).
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k interface_mismatch"
+      covers:
+        tasks: ["T3"]
+        paths:
+          - src/cccc/ralph/validator.py
+
+  # ── Batch 2: integration ────────────────────────────────────────
+
+  - id: T-int
+    title: "Integration tests for Wave 6 rules"
+    role: integration
+    claimed_paths:
+      - tests/ralph/test_wave6_integration.py
+    depends_on: ["T1", "T2", "T3"]
+    addresses: ["RV-10", "RV-14", "RV-16"]
+    goal_behavior: >
+      Create tests/ralph/test_wave6_integration.py with integration tests:
+
+      1. Plan with direct test (test_foo.py→foo.py) → W_TEST_COVERAGE_GAP
+         warning; indirect test (test_bar.py→foo.py) → W_INDIRECT_TEST_IMPORT
+         hint.
+      2. W_UNCLAIMED_TEST_FOR_SOURCE: direct → warning, indirect → hint.
+      3. Two tasks sharing file with depends_on, neither verification
+         mentions shared file → W_SHARED_FILE_PARTIAL_VERIFICATION hint.
+      4. Task consuming contract, verification doesn't mention provider
+         paths → W_INTEGRATION_INTERFACE_MISMATCH hint.
+      5. Combined scenario with all three rules.
+    acceptance_criteria: >
+      1. At least 5 test cases.
+      2. All pass.
+      3. Severity levels verified correctly.
+    verification:
+      level: integration
+      command: "pytest tests/ralph/test_wave6_integration.py -q"
+      covers:
+        tasks: ["T1", "T2", "T3", "T-int"]
+        paths:
+          - src/cccc/ralph/filesystem_validator.py
+          - src/cccc/ralph/validator.py
+        flows:
+          - recall_refinement
+
+critical_flows:
+  - id: recall_refinement
+    description: >
+      Test coverage gap analysis correctly distinguishes direct tests
+      (warning) from indirect imports (hint), reducing false positive
+      noise while maintaining recall for genuine coverage gaps.
+    entrypoints:
+      - src/cccc/ralph/filesystem_validator.py
+    required_verification_level: integration
+
+required_issues:
+  - "RV-10"
+  - "RV-14"
+  - "RV-16"
+
+suppress_codes:
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+  - "W_REGISTRATION_INVARIANT_UNCOVERED"
+
+state:
+  completed_task_ids:
+    - T-int
+    - T3
+    - T2
+    - T1
+  running_tasks: []
+  failed_task_ids: []

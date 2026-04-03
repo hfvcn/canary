@@ -6,9 +6,9 @@ The plan file (YAML/JSON) is the single source of truth; Ralph never mutates it.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 
 # ---------------------------------------------------------------------------
@@ -28,11 +28,23 @@ class VerificationCovers(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+class CheckSpec(BaseModel):
+    """Individual verification check specification (e.g., build, test, lint)."""
+
+    name: str
+    command: str
+    required: bool = True
+    expected_exit_code: int = 0
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class Verification(BaseModel):
     """Structured verification spec — replaces free-text verification_command."""
 
     level: VerificationLevel
-    command: str
+    command: str = ""
+    checks: List[CheckSpec] = Field(default_factory=list)
     covers: VerificationCovers = Field(default_factory=VerificationCovers)
     expected_exit_code: int = 0
 
@@ -49,7 +61,9 @@ class Contract(BaseModel):
     name: str
     kind: str = "artifact"  # artifact, runtime_capability, api_endpoint, ...
     from_task: Optional[str] = Field(default=None, alias="from")
-    schema_hint: str = ""  # loose description or type hint for matching
+    schema_hint: Union[str, Dict[str, Any], None] = ""
+    # Supports legacy free-text hints and structured descriptors like
+    # {"type": "string", "format": "uuid"}.
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
@@ -67,8 +81,10 @@ class TaskSpec(BaseModel):
     id: str
     title: str = ""
     role: TaskRole = "leaf"
+    type: Literal["frontend", "backend", "general"] = "general"  # WF-4 alignment
     depends_on: List[str] = Field(default_factory=list)
     claimed_paths: List[str] = Field(default_factory=list)
+    awareness_paths: List[str] = Field(default_factory=list)
 
     goal_behavior: str = ""
     acceptance_criteria: str = ""
@@ -81,6 +97,41 @@ class TaskSpec(BaseModel):
     addresses: List[str] = Field(default_factory=list)  # issue IDs this task fixes
 
     model_config = ConfigDict(extra="ignore")
+
+    def to_task_ref(self) -> "TaskRef":
+        """Convert this TaskSpec to a TaskRef for IPC transmission."""
+        from ..contracts.v1.ralph_ipc import TaskRef, VerificationSpec
+
+        verification_spec = None
+        if self.verification is not None:
+            covers = self.verification.covers
+            verification_spec = VerificationSpec(
+                level=self.verification.level,
+                command=self.verification.command,
+                checks=[
+                    {"name": c.name, "command": c.command, "required": c.required, "expected_exit_code": c.expected_exit_code}
+                    for c in self.verification.checks
+                ],
+                covers_tasks=covers.tasks if covers else [],
+                covers_paths=covers.paths if covers else [],
+                covers_flows=covers.flows if covers else [],
+                expected_exit_code=self.verification.expected_exit_code,
+            )
+
+        return TaskRef(
+            id=self.id,
+            title=self.title,
+            type=self.type,
+            role=self.role,
+            depends_on=self.depends_on,
+            claimed_paths=self.claimed_paths,
+            goal_behavior=self.goal_behavior,
+            acceptance_criteria=self.acceptance_criteria,
+            verification=verification_spec,
+            provides=[c.model_dump() for c in self.provides],
+            consumes=[c.model_dump() for c in self.consumes],
+            addresses=self.addresses,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +155,17 @@ class ForbiddenFlow(BaseModel):
     id: str
     description: str = ""
     required_verification_level: VerificationLevel = "e2e"
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class RegistrationInvariant(BaseModel):
+    """A registry that must be updated when new items are added."""
+
+    name: str
+    description: str = ""
+    registry_file: str
+    registry_symbol: str = ""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -136,10 +198,17 @@ class Plan(BaseModel):
     critical_entrypoints: List[str] = Field(default_factory=list)
     critical_flows: List[CriticalFlow] = Field(default_factory=list)
     forbidden_flows: List[ForbiddenFlow] = Field(default_factory=list)
+    registration_invariants: List[RegistrationInvariant] = Field(default_factory=list)
 
     required_issues: List[str] = Field(default_factory=list)  # issue IDs that must be addressed
+    suppress_codes: List[str] = Field(default_factory=list)
+    _provenance: Dict[str, str] = PrivateAttr(default_factory=dict)
 
     model_config = ConfigDict(extra="ignore")
+
+    @property
+    def provenance(self) -> Dict[str, str]:
+        return self._provenance
 
 
 # ---------------------------------------------------------------------------

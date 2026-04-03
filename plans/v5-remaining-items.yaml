@@ -1,0 +1,211 @@
+tasks:
+- id: T1
+  title: 'RV-8: Extract graph algorithm utils to shared module'
+  role: leaf
+  depends_on: []
+  claimed_paths:
+  - src/cccc/ralph/graph_utils.py
+  - src/cccc/ralph/validator.py
+  - src/cccc/ralph/filesystem_validator.py
+  goal_behavior: 'Extract _transitive_deps(), _detect_cycle(), _find_components()
+    from validator.py into a new graph_utils.py module. Replace _transitive_deps_local()
+    in filesystem_validator.py with the shared transitive_deps() from graph_utils.
+    Both validator.py and filesystem_validator.py import from graph_utils.
+
+    '
+  acceptance_criteria: 'graph_utils.py exists with transitive_deps(), detect_cycle(),
+    find_components(). validator.py and filesystem_validator.py import from graph_utils.
+    No _transitive_deps_local function remains in filesystem_validator.py. All existing
+    tests pass unchanged (both test_ralph_standalone.py and test_filesystem_validator.py).
+
+    '
+  verification:
+    level: unit
+    command: pytest tests/ralph/test_ralph_standalone.py tests/ralph/test_filesystem_validator.py
+      -q
+    covers:
+      tasks:
+      - T1
+      paths:
+      - src/cccc/ralph/graph_utils.py
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/filesystem_validator.py
+      flows: []
+  provides:
+  - name: graph_utils_module
+    kind: module
+    schema_hint: transitive_deps(task_id, task_map) -> Set[str], detect_cycle(tasks,
+      task_ids) -> List[str], find_components(tasks, task_ids) -> List[Set[str]]
+  consumes: []
+  addresses:
+  - RV-8
+- id: T2
+  title: 'RV-7: Critical entrypoints exemption for focused plans'
+  role: leaf
+  depends_on:
+  - T1
+  claimed_paths:
+  - src/cccc/ralph/validator.py
+  - tests/ralph/test_ralph_standalone.py
+  goal_behavior: 'In _check_critical_coverage(), when checking critical_entrypoints,
+    compute the parent directory of the entrypoint. If no task''s claimed_paths has
+    any path under that same parent directory, downgrade E_CRITICAL_ENTRYPOINT_UNOWNED
+    from error to hint with message "plan does not appear to touch subsystem ''{parent_dir}''".
+    Same logic for E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED. This handles repo-injected
+    entrypoints without needing provenance tracking because the heuristic is purely
+    structural: if the plan doesn''t claim any file in that directory subtree, the
+    entrypoint is irrelevant.
+
+    '
+  acceptance_criteria: 'Plan with critical_entrypoint src/cccc/daemon/server.py but
+    no task claiming src/cccc/daemon/* produces hint instead of error. Plan with critical_entrypoint
+    src/cccc/ralph/validator.py and task claiming src/cccc/ralph/validator.py still
+    produces error if not claimed. Plan-declared critical_entrypoints in the plan''s
+    own subtree still produce error if unclaimed. Critical flow entrypoints follow
+    same logic. All existing tests pass. New tests cover both downgrade and non-downgrade.
+
+    '
+  verification:
+    level: unit
+    command: pytest tests/ralph/test_ralph_standalone.py -q
+    covers:
+      tasks:
+      - T2
+      paths:
+      - src/cccc/ralph/validator.py
+      - tests/ralph/test_ralph_standalone.py
+      flows:
+      - critical_ep_exemption
+  provides: []
+  consumes:
+  - name: graph_utils_module
+    kind: module
+    from_task: T1
+  addresses:
+  - RV-7
+- id: T3
+  title: 'CLI-1: ralph complete subcommand'
+  role: leaf
+  depends_on:
+  - T2
+  claimed_paths:
+  - src/cccc/ralph/cli.py
+  - src/cccc/ralph/plan_io.py
+  - tests/ralph/test_ralph_standalone.py
+  goal_behavior: "Add 'ralph complete plan.yaml --task T1' subcommand. Implementation:\
+    \ 1. Load the plan via load_plan() to validate task exists and check deps. 2.\
+    \ To save, read the raw YAML file, parse it, patch only the state section\n  \
+    \ (add task_id to state.completed_task_ids), and write back. This avoids\n   polluting\
+    \ the file with repo defaults that load_plan() merges in.\n3. --verify flag runs\
+    \ verification first via verify(), refuses completion\n   if verification fails.\n\
+    4. Refuse to complete if task has unmet dependencies (not all depends_on\n   are\
+    \ in state.completed_task_ids).\n"
+  acceptance_criteria: '''ralph complete plan.yaml --task T1'' adds T1 to state.completed_task_ids
+    in the YAML file. Only the state section is modified — no other fields (critical_entrypoints,
+    critical_flows, etc.) are added or changed. --verify runs verification and blocks
+    completion on failure. Cannot complete a task whose deps are not all completed.
+    Exit code 0 on success, 1 on failure. New tests cover: success path, dependency
+    check, verify-before-complete, and "state-only save" invariant.
+
+    '
+  verification:
+    level: unit
+    command: pytest tests/ralph/test_ralph_standalone.py -q
+    covers:
+      tasks:
+      - T3
+      paths:
+      - src/cccc/ralph/cli.py
+      - src/cccc/ralph/plan_io.py
+      flows:
+      - cli_complete
+  provides:
+  - name: save_plan_state
+    kind: module
+    schema_hint: 'save_plan_state(path: Path, completed_task_id: str) -> None'
+  consumes: []
+  addresses:
+  - CLI-1
+- id: T4
+  title: Integration verification — all three changes work together
+  role: integration
+  depends_on:
+  - T1
+  - T2
+  - T3
+  claimed_paths:
+  - tests/ralph/test_ralph_standalone.py
+  goal_behavior: 'Verify all three changes integrate correctly: graph_utils is used
+    by both validators, critical entrypoint exemption downgrades repo-injected entrypoints
+    for focused plans, ralph complete patches state without polluting plan files.
+
+    '
+  acceptance_criteria: 'All existing tests pass (test_ralph_standalone + test_filesystem_validator).
+    New tests for RV-7, RV-8, CLI-1 pass. ralph validate on this plan file itself
+    reports 0 errors and no coverage-gap warnings for the ralph module files (daemon
+    warnings are accepted as repo-injected scope).
+
+    '
+  verification:
+    level: integration
+    command: pytest tests/ralph/test_ralph_standalone.py tests/ralph/test_filesystem_validator.py
+      -q
+    covers:
+      tasks:
+      - T1
+      - T2
+      - T3
+      - T4
+      paths:
+      - src/cccc/ralph/graph_utils.py
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/filesystem_validator.py
+      - src/cccc/ralph/cli.py
+      - src/cccc/ralph/plan_io.py
+      flows:
+      - graph_utils_shared
+      - critical_ep_exemption
+      - cli_complete
+      - daemon_startup
+      - cli_workflow
+  provides: []
+  consumes:
+  - name: graph_utils_module
+    kind: module
+    from_task: T1
+  - name: save_plan_state
+    kind: module
+    from_task: T3
+  addresses: []
+critical_entrypoints:
+- src/cccc/ralph/validator.py
+- src/cccc/ralph/cli.py
+critical_flows:
+- id: graph_utils_shared
+  description: Both validators use graph_utils instead of local copies
+  entrypoints:
+  - src/cccc/ralph/validator.py
+  - src/cccc/ralph/filesystem_validator.py
+  required_verification_level: integration
+- id: critical_ep_exemption
+  description: Focused plans get hint instead of error for unrelated entrypoints
+  entrypoints:
+  - src/cccc/ralph/validator.py
+  required_verification_level: unit
+- id: cli_complete
+  description: ralph complete updates plan state and saves file
+  entrypoints:
+  - src/cccc/ralph/cli.py
+  required_verification_level: unit
+required_issues:
+- RV-7
+- RV-8
+- CLI-1
+state:
+  completed_task_ids:
+  - T1
+  - T2
+  - T3
+  - T4
+  running_tasks: []
+  failed_task_ids: []

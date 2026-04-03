@@ -6,6 +6,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
+from ....daemon.ops.adapter_helpers import build_daemon_request, normalize_priority, normalize_reply_required
 from ....kernel.blobs import resolve_blob_attachment_path, store_blob_bytes
 from ....kernel.group import load_group
 from ..message_visibility import sender_is_admin_for_principal, sender_user_id_for_principal
@@ -17,7 +18,6 @@ from ..schemas import (
     UserAckRequest,
     WEB_MAX_FILE_BYTES,
     WEB_MAX_FILE_MB,
-    _normalize_reply_required,
     check_group,
     get_principal,
     require_group,
@@ -54,23 +54,21 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
     @group_router.post("/send")
     async def send(request: Request, group_id: str, req: SendRequest) -> Dict[str, Any]:
         return await ctx.daemon(
-            {
-                "op": "send",
-                "args": {
-                    "group_id": group_id,
-                    "text": req.text,
-                    "by": req.by,
-                    "to": list(req.to),
-                    "path": req.path,
-                    "priority": req.priority,
-                    "reply_required": _normalize_reply_required(req.reply_required),
-                    "src_group_id": req.src_group_id,
-                    "src_event_id": req.src_event_id,
-                    "client_id": req.client_id,
-                    "refs": list(req.refs),
-                    **_sender_metadata(request),
-                },
-            }
+            build_daemon_request(
+                "send",
+                group_id=group_id,
+                text=req.text,
+                by=req.by,
+                to=list(req.to),
+                path=req.path,
+                priority=normalize_priority(req.priority),
+                reply_required=normalize_reply_required(req.reply_required),
+                src_group_id=req.src_group_id,
+                src_event_id=req.src_event_id,
+                client_id=req.client_id,
+                refs=list(req.refs),
+                **_sender_metadata(request),
+            )
         )
 
     @group_router.post("/send_cross_group")
@@ -82,39 +80,35 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         """
         check_group(request, req.dst_group_id)
         return await ctx.daemon(
-            {
-                "op": "send_cross_group",
-                "args": {
-                    "group_id": group_id,
-                    "dst_group_id": req.dst_group_id,
-                    "text": req.text,
-                    "by": req.by,
-                    "to": list(req.to),
-                    "priority": req.priority,
-                    "reply_required": _normalize_reply_required(req.reply_required),
-                    **_sender_metadata(request),
-                },
-            }
+            build_daemon_request(
+                "send_cross_group",
+                group_id=group_id,
+                dst_group_id=req.dst_group_id,
+                text=req.text,
+                by=req.by,
+                to=list(req.to),
+                priority=normalize_priority(req.priority),
+                reply_required=normalize_reply_required(req.reply_required),
+                **_sender_metadata(request),
+            )
         )
 
     @group_router.post("/reply")
     async def reply(request: Request, group_id: str, req: ReplyRequest) -> Dict[str, Any]:
         return await ctx.daemon(
-            {
-                "op": "reply",
-                "args": {
-                    "group_id": group_id,
-                    "text": req.text,
-                    "by": req.by,
-                    "to": list(req.to),
-                    "reply_to": req.reply_to,
-                    "priority": req.priority,
-                    "reply_required": _normalize_reply_required(req.reply_required),
-                    "client_id": req.client_id,
-                    "refs": list(req.refs),
-                    **_sender_metadata(request),
-                },
-            }
+            build_daemon_request(
+                "reply",
+                group_id=group_id,
+                text=req.text,
+                by=req.by,
+                to=list(req.to),
+                reply_to=req.reply_to,
+                priority=normalize_priority(req.priority),
+                reply_required=normalize_reply_required(req.reply_required),
+                client_id=req.client_id,
+                refs=list(req.refs),
+                **_sender_metadata(request),
+            )
         )
 
     @group_router.post("/events/{event_id}/ack")
@@ -213,28 +207,24 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             else:
                 msg_text = f"[files] {len(attachments)} attachments"
 
-        prio = str(priority or "normal").strip() or "normal"
-        if prio not in ("normal", "attention"):
-            raise HTTPException(status_code=400, detail={"code": "invalid_priority", "message": "priority must be 'normal' or 'attention'"})
+        prio = normalize_priority(priority)
         refs = _parse_refs_json(refs_json)
 
         return await ctx.daemon(
-            {
-                "op": "send",
-                "args": {
-                    "group_id": group_id,
-                    "text": msg_text,
-                    "by": by,
-                    "to": canonical_to,
-                    "path": path,
-                    "attachments": attachments,
-                    "priority": prio,
-                    "reply_required": _normalize_reply_required(reply_required),
-                    "client_id": str(client_id or "").strip(),
-                    "refs": refs,
-                    **_sender_metadata(request),
-                },
-            }
+            build_daemon_request(
+                "send",
+                group_id=group_id,
+                text=msg_text,
+                by=by,
+                to=canonical_to,
+                path=path,
+                attachments=attachments,
+                priority=prio,
+                reply_required=normalize_reply_required(reply_required),
+                client_id=str(client_id or "").strip(),
+                refs=refs,
+                **_sender_metadata(request),
+            )
         )
 
     @group_router.post("/reply_upload")
@@ -310,28 +300,24 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
             else:
                 msg_text = f"[files] {len(attachments)} attachments"
 
-        prio = str(priority or "normal").strip() or "normal"
-        if prio not in ("normal", "attention"):
-            raise HTTPException(status_code=400, detail={"code": "invalid_priority", "message": "priority must be 'normal' or 'attention'"})
+        prio = normalize_priority(priority)
         refs = _parse_refs_json(refs_json)
 
         return await ctx.daemon(
-            {
-                "op": "reply",
-                "args": {
-                    "group_id": group_id,
-                    "text": msg_text,
-                    "by": by,
-                    "to": canonical_to,
-                    "reply_to": reply_to_id,
-                    "attachments": attachments,
-                    "priority": prio,
-                    "reply_required": _normalize_reply_required(reply_required),
-                    "client_id": str(client_id or "").strip(),
-                    "refs": refs,
-                    **_sender_metadata(request),
-                },
-            }
+            build_daemon_request(
+                "reply",
+                group_id=group_id,
+                text=msg_text,
+                by=by,
+                to=canonical_to,
+                reply_to=reply_to_id,
+                attachments=attachments,
+                priority=prio,
+                reply_required=normalize_reply_required(reply_required),
+                client_id=str(client_id or "").strip(),
+                refs=refs,
+                **_sender_metadata(request),
+            )
         )
 
     @group_router.get("/blobs/{blob_name}")

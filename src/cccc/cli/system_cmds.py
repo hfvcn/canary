@@ -11,8 +11,36 @@ __all__ = [
     "cmd_web",
     "cmd_mcp",
     "cmd_setup",
+    "cmd_context_get",
+    "cmd_capability",
+    "cmd_memory",
+    "cmd_coordination",
+    "cmd_agent_state",
     "cmd_daemon",
 ]
+
+
+def _require_group_id_for_system_cmd(args: argparse.Namespace) -> str | None:
+    group_id = _resolve_group_id(getattr(args, "group", ""))
+    if group_id:
+        return group_id
+    _print_json({"ok": False, "error": {"code": "missing_group_id", "message": "missing group_id (no active group?)"}})
+    return None
+
+
+def _require_daemon_for_system_cmd() -> bool:
+    if _ensure_daemon_running():
+        return True
+    _print_json({"ok": False, "error": {"code": "daemon_unavailable", "message": "daemon unavailable"}})
+    return False
+
+
+def _parse_cli_json_args(raw: Any, *, field: str) -> dict[str, Any] | None:
+    try:
+        return _parse_json_object_arg(raw, field=field)
+    except Exception as e:
+        _print_json({"ok": False, "error": {"code": f"invalid_{field}", "message": str(e)}})
+        return None
 
 def cmd_version(_: argparse.Namespace) -> int:
     print(__version__)
@@ -160,7 +188,7 @@ def cmd_mcp(args: argparse.Namespace) -> int:
 
 def cmd_setup(args: argparse.Namespace) -> int:
     """Setup CCCC MCP for agent runtimes (configure MCP, print guidance)."""
-    from ..daemon.mcp_install import build_mcp_add_command, ensure_mcp_installed, is_mcp_installed
+    from ..daemon.mcp_install import build_mcp_add_command
     from ..kernel.runtime import detect_runtime
     from ..kernel.runtime import get_cccc_mcp_stdio_command
 
@@ -200,6 +228,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     cccc_cmd = get_cccc_mcp_stdio_command()
     auto_mcp_runtimes = tuple(name for name in SUPPORTED_RUNTIMES if name != "custom")
+    AUTO_SETUP_TIMEOUT_SECONDS = 30
 
     def _cmd_line(parts: list[str]) -> str:
         return " ".join(shlex.quote(p) for p in parts)
@@ -220,9 +249,25 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     def _auto_setup(rt: str) -> None:
         runtime_info = detect_runtime(rt)
-        was_ready = is_mcp_installed(rt) if runtime_info.available else False
-        if ensure_mcp_installed(rt, project_path, auto_mcp_runtimes=auto_mcp_runtimes):
-            results["mcp"][rt] = {"mode": "auto", "status": "present" if was_ready else "added"}
+        add_cmd = build_mcp_add_command(rt)
+        if not add_cmd:
+            _manual_setup(rt, runtime_available=runtime_info.available)
+            return
+
+        try:
+            result = subprocess.run(
+                resolve_subprocess_argv(add_cmd),
+                capture_output=True,
+                text=True,
+                timeout=AUTO_SETUP_TIMEOUT_SECONDS,
+                cwd=str(project_path),
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            _manual_setup(rt, runtime_available=runtime_info.available)
+            return
+
+        if result.returncode == 0:
+            results["mcp"][rt] = {"mode": "auto", "status": "added"}
             return
         _manual_setup(rt, runtime_available=runtime_info.available)
 
@@ -248,6 +293,152 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     _print_json({"ok": True, "result": results})
     return 0
+
+
+def cmd_context_get(args: argparse.Namespace) -> int:
+    """Get context snapshot (coordination, board, tasks_summary, agent_states)."""
+    group_id = _resolve_group_id(getattr(args, "group", ""))
+    if not group_id:
+        _print_json({"ok": False, "error": {"code": "missing_group_id", "message": "missing group_id (no active group?)"}})
+        return 2
+
+    if _ensure_daemon_running():
+        resp = call_daemon(
+            {
+                "op": "context_get",
+                "args": {
+                    "group_id": group_id,
+                    "include_archived": bool(getattr(args, "include_archived", False)),
+                },
+            }
+        )
+        _print_json(resp)
+        return 0 if resp.get("ok") else 2
+
+    group = load_group(group_id)
+    if group is None:
+        _print_json({"ok": False, "error": {"code": "group_not_found", "message": f"group not found: {group_id}"}})
+        return 2
+    from ..daemon.context.context_ops import context_get
+
+    result = context_get(group_id=group_id, include_archived=bool(getattr(args, "include_archived", False)))
+    _print_json({"ok": True, "result": result})
+    return 0
+
+
+def cmd_capability(args: argparse.Namespace) -> int:
+    """Run a capability tool via daemon."""
+    group_id = _require_group_id_for_system_cmd(args)
+    if not group_id:
+        return 2
+    tool_arguments = _parse_cli_json_args(getattr(args, "tool_arguments", ""), field="args")
+    if tool_arguments is None:
+        return 2
+    if not _require_daemon_for_system_cmd():
+        return 2
+    tool_arguments["action"] = str(getattr(args, "action", "") or "").strip()
+    resp = call_daemon(
+        {
+            "op": "capability_tool_call",
+            "args": {
+                "group_id": group_id,
+                "actor_id": "user",
+                "by": "user",
+                "capability_id": str(getattr(args, "capability_id", "") or "").strip(),
+                "tool_name": str(getattr(args, "tool_name", "") or "").strip(),
+                "arguments": tool_arguments,
+            },
+        }
+    )
+    _print_json(resp)
+    return 0 if resp.get("ok") else 2
+
+
+def cmd_memory(args: argparse.Namespace) -> int:
+    """Memory operations via daemon."""
+    group_id = _require_group_id_for_system_cmd(args)
+    if not group_id:
+        return 2
+    action = str(getattr(args, "action", "") or "").strip().lower()
+    op_map = {
+        "layout_get": "memory_reme_layout_get",
+        "search": "memory_reme_search",
+        "get": "memory_reme_get",
+        "write": "memory_reme_write",
+    }
+    op = op_map.get(action)
+    if not op:
+        _print_json({"ok": False, "error": {"code": "invalid_action", "message": f"unsupported memory action: {action}"}})
+        return 2
+    req_args: dict[str, Any] = {"group_id": group_id}
+    key = str(getattr(args, "key", "") or "").strip()
+    value = str(getattr(args, "value", "") or "")
+    if action == "search" and key:
+        req_args["query"] = key
+    elif action == "get" and key:
+        req_args["path"] = key
+    elif action == "write":
+        if key:
+            req_args["target"] = key
+        if value:
+            req_args["content"] = value
+    if not _require_daemon_for_system_cmd():
+        return 2
+    resp = call_daemon({"op": op, "args": req_args})
+    _print_json(resp)
+    return 0 if resp.get("ok") else 2
+
+
+def cmd_coordination(args: argparse.Namespace) -> int:
+    """Coordination operations via daemon."""
+    group_id = _require_group_id_for_system_cmd(args)
+    if not group_id:
+        return 2
+    action = str(getattr(args, "action", "") or "status").strip().lower()
+    if not _require_daemon_for_system_cmd():
+        return 2
+    if action in {"status", "get"}:
+        resp = call_daemon({"op": "context_get", "args": {"group_id": group_id, "include_archived": False}})
+    else:
+        note = str(getattr(args, "note", "") or "").strip()
+        kind = "handoff" if action == "add_handoff" else "decision"
+        resp = call_daemon(
+            {
+                "op": "context_sync",
+                "args": {
+                    "group_id": group_id,
+                    "by": "user",
+                    "ops": [{"op": "coordination.note.add", "kind": kind, "summary": note}],
+                },
+            }
+        )
+    _print_json(resp)
+    return 0 if resp.get("ok") else 2
+
+
+def cmd_agent_state(args: argparse.Namespace) -> int:
+    """Query agent state via daemon."""
+    group_id = _require_group_id_for_system_cmd(args)
+    if not group_id:
+        return 2
+    if not _require_daemon_for_system_cmd():
+        return 2
+    resp = call_daemon({"op": "context_get", "args": {"group_id": group_id, "include_archived": True}})
+    actor_id = str(getattr(args, "actor", "") or "").strip().lower()
+    if resp.get("ok") and actor_id:
+        result = resp.get("result") if isinstance(resp.get("result"), dict) else {}
+        states = result.get("agent_states") if isinstance(result.get("agent_states"), list) else []
+        target = next(
+            (
+                item
+                for item in states
+                if isinstance(item, dict) and str(item.get("id") or "").strip().lower() == actor_id
+            ),
+            None,
+        )
+        resp = {"ok": True, "result": {"agent_state": target, "version": result.get("version")}}
+    _print_json(resp)
+    return 0 if resp.get("ok") else 2
 
 def cmd_daemon(args: argparse.Namespace) -> int:
     if args.action == "status":

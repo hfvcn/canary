@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read CLI and daemon request patterns,DONE,Target op mappings and parser shape confirmed,,2026-04-01T10:20:00Z,0,Read system_cmds main common context and memory handlers.
+2,Implement non-core CLI handlers in system_cmds.py,DONE,Four commands build daemon requests and print JSON,,2026-04-01T10:33:00Z,0,capability/memory/coordination/agent-state.
+3,Register subparsers and add focused tests,DONE,Parser accepts commands and unit tests cover request shape,,2026-04-01T10:35:00Z,0,Added help tests and request assertions.
+4,Run pytest verification,DONE,tests/test_cli_noncore.py passes,pytest tests/test_cli_noncore.py -q,2026-04-01T10:36:00Z,0,6 passed.

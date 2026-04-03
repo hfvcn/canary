@@ -1,0 +1,59 @@
+# Wave 3: Repo-level Invariants — .cccc/ralph.yaml plan_defaults
+# 前置：Wave 2A+2B 完成
+
+tasks:
+  - id: T1
+    title: "实现 .cccc/ralph.yaml plan_defaults 加载"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/plan_io.py"
+      - "tests/ralph/test_ralph_standalone.py"
+    depends_on: []
+    goal_behavior: >
+      load_plan() 自动检查 plan 文件所在 repo 的 .cccc/ralph.yaml，
+      合并 plan_defaults.critical_entrypoints 和 plan_defaults.critical_flows。
+      Plan 显式声明优先（不覆盖）。
+    acceptance_criteria: >
+      1. .cccc/ralph.yaml 存在时自动合并 plan_defaults
+      2. plan 显式声明的 critical_entrypoints 不被覆盖
+      3. .cccc/ralph.yaml 不存在时正常工作（不报错）
+      4. 格式错误时 warning 而非 crash
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k 'plan_defaults or repo_metadata'"
+      covers:
+        tasks: ["T1"]
+
+  - id: T2
+    title: "创建 CCCC 项目的 .cccc/ralph.yaml"
+    role: leaf
+    claimed_paths:
+      - ".cccc/ralph.yaml"
+    depends_on: ["T1"]
+    goal_behavior: >
+      为 CCCC 项目创建实际的 repo 元数据文件，
+      列出关键入口和关键流。
+    acceptance_criteria: >
+      1. 文件包含 plan_defaults.critical_entrypoints
+      2. 文件包含 plan_defaults.critical_flows
+      3. ralph validate 自动加载并使用
+    verification:
+      level: integration
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k 'repo_metadata'"
+      covers:
+        tasks: ["T1", "T2"]
+        flows: ["repo_metadata_merge"]
+
+critical_entrypoints:
+  - "src/cccc/ralph/plan_io.py"
+
+critical_flows:
+  - id: repo_metadata_merge
+    description: ".cccc/ralph.yaml → load_plan → plan_defaults 合并 → validate"
+    entrypoints: ["src/cccc/ralph/plan_io.py"]
+    required_verification_level: unit
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

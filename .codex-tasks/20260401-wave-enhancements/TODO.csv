@@ -1,0 +1,7 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current Ralph validator hooks and tests,DONE,Relevant insertion points and edge cases are identified,rg -n "_check_pytest|validate\\(|covers\\.tasks|duplicate" src/cccc/ralph tests/ralph tests/test_ralph_ipc.py,2026-04-01,0,确认 `filesystem_validator.py` 与 `validator.py` 各自接入点
+2,Implement pytest -k zero-match warning and tests,DONE,New warning is emitted only for zero-match -k patterns on existing test files,pytest tests/ralph/ tests/test_ralph_ipc.py -q,2026-04-01,0,新增 `W_VERIFICATION_PYTEST_K_NO_MATCH` 与 3 条测试
+3,Run full regression after enhancement 1,DONE,Specified Ralph suite passes after enhancement 1,pytest tests/ralph/ tests/test_ralph_ipc.py -q,2026-04-01,0,通过: 129 passed in 5.29s
+4,Implement duplicate verification command warning and tests,DONE,Duplicate verification.command warning is emitted with self-covering leaf exemption,pytest tests/ralph/ tests/test_ralph_ipc.py -q,2026-04-01,0,新增 `W_VERIFICATION_DUPLICATE_COMMAND` 与 3 条测试
+5,Run final regression,DONE,Specified Ralph suite passes with both enhancements,pytest tests/ralph/ tests/test_ralph_ipc.py -q,2026-04-01,0,通过: 132 passed in 5.32s
+6,Record outcomes in progress log,DONE,Progress log captures implementation and verification results,test -f .codex-tasks/20260401-wave-enhancements/PROGRESS.md,2026-04-01,0,已记录两轮回归结果

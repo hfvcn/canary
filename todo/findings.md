@@ -1,8 +1,68 @@
 # Findings — CCCC 工作流实践教训
 
-> 来源：2026-03-26 ~ 2026-03-29 四天的完整实践
-> 过程：问题定位 → 方案讨论(4轮) → 外部审查(3份) → 代码修复(27 Task + Phase 0-6) → 两轮端到端测试
+> 来源：2026-03-26 ~ 2026-03-31 六天的完整实践
+> 过程：问题定位 → 方案讨论(4轮) → 外部审查(3份) → 代码修复(27 Task + Phase 0-6) → 两轮端到端测试 → Phase 2 修复(10 Task) → 第三轮实测
 > 参与：Claude (Opus 4.6) + Codex (GPT-5.4) + Gemini + 用户
+
+### 本文档的收录标准
+
+本文档记录**根本性教训**——改变思考方式或工作方法的认知，而非具体的 bug 或功能缺陷。
+
+**写入 findings 的**：
+- 揭示了错误的思维模式或工作假设（如"编译通过 = 功能可用"）
+- 需要改变流程或方法论才能避免的问题（如"先跑通一条路径再扩展"）
+- 在多个场景中反复出现的结构性规律（如"结构校验和语义审查互补"）
+
+**不写入 findings 的**：
+- 具体的代码 bug 或功能缺失 → 写入**问题清单**
+- 某个工具的具体改进项 → 写入**问题清单的后续改进**
+- 某次实践的操作记录 → 不需要记录
+
+判断标准：如果去掉具体的项目名称和技术细节，这条教训是否仍然有价值？如果是，它属于 findings。
+
+---
+
+## 〇、经验证的工作流程
+
+> 来源：Phase 2 修复实践 (2026-03-31)，10 个任务全部通过，54 pytest 通过
+
+**计划生成 → Ralph 验证 → Codex 审查 → 并行执行 → 实测**
+
+| 阶段 | 做什么 | 工具 | 产出 |
+|------|--------|------|------|
+| **计划生成** | 从问题清单提取**所有**待修复项，生成**一份完整的** plan.yaml（任务、依赖、claimed_paths、验收标准、验证命令、provides/consumes 契约、critical_flows、forbidden_flows）。用 `depends_on` 表达真实依赖，让 `ralph suggest` 决定并行批次，不要人为划分阶段/Wave。长期迭代类改进（如 Ralph 自身规则增强）除外——它们有独立的改进周期。 | Claude + 问题清单 + 代码探索 | `plans/fix-workflow-phase2.yaml` |
+| **Ralph 验证** | `ralph validate plan.yaml` — 检查依赖图、字段完整性、验收强度、契约匹配、关键流覆盖、禁止流覆盖、问题覆盖、隐式串行 | Ralph CLI | 0 error 才可进入下一步 |
+| **Codex 审查** | 将 plan.yaml + 关键代码上下文通过collaborate with codex发给 Codex并要求浏览todo/adversarial-review-web-v2.md(审查用到的提示词)，审查任务本身合理性, 任务边界、安全性、依赖完整性、验证命令有效性 | Codex (codex_bridge.py) | 采纳审查建议修正计划 |
+| **Ralph 不足记录** | 收集 Ralph 在本轮实践中暴露的所有不足（两类来源，见下方），写入问题清单作为 Ralph 后续改进项，附带触发该问题的具体实例 | Claude + 问题清单 | Ralph 改进项 + 实例 |
+| **并行执行** | 按 `ralph suggest` 输出的 ready 批次并行分发给 Codex(必须是codex而不是自带的agent)，每个任务独立执行，完成后更新 state 并 re-suggest | Codex 并行 × N | 代码变更 + 测试 |
+| **实测** | 启动真实 daemon，创建 group，跑完整 workflow 流程 | cccc CLI + daemon | 确认端到端可用 |
+
+**关键约束**：
+- 计划必须经过 Ralph validate（结构性保障）**和** Codex 审查（语义保障）才能执行
+- Ralph 能抓住结构性问题（孤岛、断连、漏 claim、弱验证），Codex 能抓住语义问题（假验收命令、危险的自动迁移、遗漏的测试文件）
+- 单独用任何一个都不够：Ralph 漏了假验收命令，Codex 漏了孤立子图
+
+**Ralph 自我改进机制**：
+
+Ralph 的每一轮实践使用都是它自身的测试用例。两类信号应被记录为问题清单的后续改进项：
+
+1. **验证阶段对规划 AI 造成的困难**（假阳性 / 阻塞 / 噪音）
+   - Ralph 报了 error 但规划 AI 不得不用 workaround 绕过 → 说明规则在该场景不合理，需要豁免或降级机制
+   - Ralph 报了 warning 但规划 AI 无法据此改善计划 → 说明反馈不够 actionable，需要改进诊断信息或调整触发条件
+   - Ralph 没报问题但规划 AI 仍然被卡住 → 说明缺少引导（如该报 hint 的没报）
+
+2. **验证通过后暴露的漏洞**（假阴性 / 遗漏）
+   - Codex 审查发现了 Ralph 没检查的问题 → 说明 Ralph 的规则集有盲区，需要新增规则
+   - 执行阶段发现的集成缺陷 → 说明验收标准或覆盖范围检查不够强
+   - 实测阶段发现的端到端失败 → 说明 Ralph 的结构性保障不足以替代运行时验证
+
+每条改进项必须附带**触发该问题的具体实例**（哪个计划、哪个任务、什么现象），避免抽象的改进方向无法落地。
+
+**反模式**：
+- 跳过 Ralph 直接执行 → 结构性缺陷（孤岛任务、断连子图）在执行中才暴露
+- 跳过 Codex 直接执行 → 语义缺陷（不存在的 import、危险的状态迁移）在测试中才暴露
+- 跳过实测 → 54 pytest 全通过但真实场景中 agent pool 匹配失败（第三轮验证）
+- **只用 Ralph 不记录不足** → Ralph 的规则集停滞，同样的困难在下一轮重复出现
 
 ---
 
@@ -250,3 +310,105 @@ AI 在上下文长、复杂度高的工作中，容易在后期被最近的表�
 - 阶段性回查：每完成一个大步骤后，重新读一遍原始问题清单，确认哪些做了哪些没做
 - 区分"新发现"和"未完成"：如果一个现象可以被"完成原计划剩余步骤"解释，那它不是新问题
 - 警惕"局部修补"冲动：当解决方案越来越复杂（guardrail + canonical entry + 降级），应该怀疑是不是走偏了
+
+---
+
+## 十三、结构性校验通过不等于计划无缺陷（MCP→CLI 迁移实践）
+
+> 来源：2026-03-31 MCP→CLI 迁移计划，Ralph validate + Codex 代码审查
+
+### 现象
+
+Ralph validate 对第一版迁移计划报 "valid"（0 error, 0 warning）。但 Codex 代码审查发现 3 类问题：
+1. **改源文件漏 claim 测试**：T4 改 system_prompt.py，但 test_system_prompt_roles.py 断言旧 MCP 文本会被打碎。Ralph 没检查 test→source 关系。
+2. **语义依赖缺失**：T3 需要读 T1 改过的 evidence 格式，但没有 depends_on。Ralph 只检查声明的依赖图结构，不分析"谁的输出被谁消费"。
+3. **acceptance_criteria 写错**：T2 写了返回 `tasks` 但实际是 `tasks_summary`。Ralph 不做语义校验。
+
+### 教训
+
+> **结构性校验（Ralph）和代码审查（AI/人工）是互补的，不能互相替代。Ralph 检查"计划有没有明显的结构缺陷"，代码审查检查"计划和代码的实际行为是否匹配"。**
+
+具体：
+- Ralph 的 27 条规则覆盖图结构、字段完整性、契约匹配、覆盖率——这些是**声明层面**的检查
+- "改了 A 会不会打碎测试 B"、"A 的输出格式被 B 消费"——这些是**运行时语义**，需要代码审查
+- 两者配合使用：先 Ralph validate 排除结构缺陷，再代码审查排除语义缺陷
+
+---
+
+## 十四、问题可能不在项目内部（MCP→CLI 迁移实践）
+
+> 来源：2026-03-31 MCP→CLI 迁移 E2E 实际验证
+
+### 现象
+
+完成 8 个任务（prompt 全改 CLI-only、verify gate 接通、auto-notify、E2E 测试全过）后，真实 foreman 仍然使用 MCP `cccc_task` 和 `cccc_message_send`，完全无视 prompt 中的 CLI 引导。
+
+调查发现 foreman 可见 27 个 MCP 工具——因为 MCP server 是在 AI 客户端的 `settings.json` 中配置的（如 Claude Code 的 MCP server 配置），不在 CCCC 项目代码内部。项目代码中的 `CORE_TOOLS`、`toolspecs.py`、`list_tools_for_caller()` 控制的是"MCP server 启动后暴露哪些工具"，而不是"MCP server 是否启动"。
+
+用户手动在客户端 settings 中关闭 MCP 后，问题立即解决。
+
+### 根因
+
+AI（包括作为开发者的 AI）在排查问题时，默认在当前项目代码库中搜索，形成了**项目内部视角偏差**。当问题的根源在项目外部（客户端配置、环境变量、系统设置、网络配置等），这种搜索方式会反复在错误的层面上提出方案：
+- 在 toolspecs.py 中删除工具定义 → 不影响 MCP server 是否启动
+- 在 CORE_TOOLS 中移除工具名 → MCP server 仍然注册所有工具
+- 在 prompt 中写"不要用 MCP" → AI 看到工具就会用
+
+### 教训
+
+> **当项目内部的修复反复不生效时，应该退一步问：这个行为是由项目代码控制的吗？还是由外部配置/环境决定的？**
+
+具体信号：
+- 代码改了但行为不变 → 可能控制权不在这段代码
+- 同一个问题在不同层面被反复"修复" → 可能在错误的层面
+- "AI 不听 prompt"这类问题 → 大概率是工具可见性问题，而工具可见性可能由外部配置决定
+
+---
+
+## 十五、改了一半的迁移比没改更危险——以及错误归因的代价
+
+> 来源：2026-03-31 MCP→CLI 迁移，关闭 MCP 后 foreman 完全无法回写 ledger
+> 更正：初次诊断为"传输层问题"，后经 Codex 二次分析证实是应用层 prompt 没改彻底
+
+### 现象
+
+8 个任务完成（prompt 全改 CLI-only、verify gate 接通、46 个 pytest 通过）后，关闭 MCP 进行真实测试。Daemon 成功通过 PTY 投递消息给 foreman，但 foreman 没有任何回复写回 ledger。同时 Codex worker 成功使用了 CLI（cccc send + cccc task complete）。
+
+### 初次诊断（错误）
+
+我们把问题归因为"传输层不同"——认为 PTY stdout 不到 ledger，CLI 和 MCP 走不同通道，所以传输层本身是迁移的一部分。
+
+**这个诊断是错的。** Codex 二次分析证实：
+1. Claude 有内建 Bash tool，`--dangerously-skip-permissions` 不禁用它
+2. PTY 传输层完全支持 CLI：agent 通过 Bash tool 执行 `cccc send` → IPC → daemon → ledger
+3. Codex worker 在同一环境中成功走通了这条路，证明传输层没问题
+
+### 真正的根因
+
+**prompt 没改彻底。** 我们改了 system_prompt 的 workflow 部分，但 preamble 的冷启动流程（`prompt_files.py:18`）仍然要求 claude 先调用 `cccc_bootstrap`、`cccc_help`、`cccc_capability_use` 等 MCP 工具。`group.py:22` 还有 "Use MCP chat only" 的片段。
+
+MCP 关闭后，claude 一启动就被 preamble 引导去找 MCP 工具，找不到就卡住——没有 fallback 到 CLI。
+
+### 同时发现的次要问题
+
+- `cccc send` 的 prompt 示例与实际 CLI parser 不一致（位置参数 vs 命名参数）——已修复
+- `cccc send` 不从环境变量读 `CCCC_ACTOR_ID`——已修复
+- `cccc workflow submit` 的 prompt 示例漏了必填参数 `--workflow-id`——已修复
+
+### 教训
+
+> **1. 改了一半的迁移比没改更危险。** 我们改了 workflow 部分的 prompt 但没改 preamble 冷启动流程，结果是 agent 一启动就走旧路径，根本到不了我们改好的新路径。迁移必须覆盖 agent 的完整生命周期：冷启动 → 工具发现 → 任务执行 → 结果回报。
+
+> **2. 没有充分证据时不要归因到更深的层面。** 我们看到"foreman 完全没响应"就跳到"传输层断了"的结论，但从未验证"claude 能不能执行 Bash 命令"这个前提。Codex worker 在同一 PTY 环境下成功使用 CLI 的事实，本应直接排除传输层问题——如果传输层断了，codex 也不会成功。
+
+### 错误归因的过程
+
+1. 看到"foreman 完全没响应" → 跳到"通道断了"
+2. 读 PTY runner 代码发现没有"输出回写 ledger"的逻辑 → 确认偏误
+3. 没有验证"claude Bash tool 是否可用"这个前提
+4. **忽略了关键反例**：Codex worker 在同一架构下成功使用 CLI，说明传输层不是问题
+5. 写了一条看起来深刻但方向错误的教训（"追踪完整数据通路"）
+
+### Ralph 的盲区
+
+Ralph 当前是计划校验器 + 任务调度器，不是运行时 agent 行为监控器。它在执行前检查计划质量、执行后验证任务结果，但执行中不观察 agent 做了什么。v4 文档描述了"Ralph 校验 AI 是否正确使用了 CLI"的目标，但尚未实现。这意味着即使 Ralph 在运行，它也无法发现"agent 卡在 MCP 冷启动流程上"这个问题。

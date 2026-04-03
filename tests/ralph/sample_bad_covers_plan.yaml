@@ -1,0 +1,33 @@
+tasks:
+  - id: T1
+    title: "Task 1"
+    claimed_paths: ["src/a.py"]
+    depends_on: []
+    verification:
+      level: unit
+      command: "pytest tests/test_a.py -q"
+      covers:
+        tasks: ["T1", "NONEXISTENT"]
+
+  - id: T2
+    title: "Task 2"
+    claimed_paths: ["src/b.py"]
+    depends_on: []
+    verification:
+      level: integration
+      command: "pytest tests/test_b.py -q"
+      covers:
+        tasks: ["T1", "T2"]
+
+  - id: T3
+    title: "Integration"
+    claimed_paths: ["src/c.py"]
+    depends_on: ["T1", "T2"]
+    verification:
+      level: integration
+      command: "pytest tests/test_c.py -q"
+      covers:
+        tasks: ["T1", "T2", "T3"]
+
+critical_entrypoints:
+  - "src/a.py"

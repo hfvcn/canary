@@ -1,0 +1,397 @@
+# Plan: Fix CCCC Workflow Phase 2 — State Flow, Init Gaps, MCP Cleanup
+#
+# Context: Previous plan (fix-cccc-workflow.yaml, 9 tasks) completed.
+#   R-1 (prompts), R-2 (verify gate), M-1a (CLI migration) are resolved.
+#   This plan addresses remaining issues from 问题清单 v4.
+#
+# Scope:
+#   - WF-NEW-1: Tasks stuck in READY after workflow submit (state machine gap)
+#   - R-3: IPC/HTTP callers missing project_root → orchestrator init fails
+#   - WF-NEW-2: Stale MCP references in help/capability docs (text cleanup,
+#               not CLI parity — full CLI equivalents are follow-up)
+#
+# Out of scope (follow-up):
+#   - WF-NEW-3: Ralph runtime agent behavior monitoring (new feature)
+#   - W-1: Worker shared type contracts
+#   - W-2: Worker progress push
+#   - Full CLI parity for MCP-only tools (cccc_capability_use, cccc_space, etc.)
+#
+# Goal: Tasks progress through state machine reliably even when Foreman
+#       manually assigns workers. Orchestrator initializes in all code paths.
+#       Help docs align with CLI-first direction.
+#
+# Codex review applied (2026-03-31):
+#   - T1 split: auto_process CLI default fix (main.py) + ASSIGNED-only
+#     auto-transition in orchestrator. READY auto-transition removed as
+#     dangerous (bypasses approval).
+#   - T2 verification command fixed (RalphIPCHandler doesn't exist).
+#   - T2 claimed_paths expanded to include tests/test_ralph_ipc.py
+#     (existing test asserts no project_root — will break after fix).
+#   - T8 split to separate test files for help vs capability YAML.
+#
+# Execution protocol: Dynamic DAG — after each task completes, update
+#   state.completed_task_ids and re-run `ralph suggest`.
+
+required_issues:
+  - "WF-NEW-1"  # Workflow submit → task stuck in ready
+  - "R-3"       # Daemon doesn't init RalphService in all paths
+  - "WF-NEW-2"  # Non-workflow MCP tool refs still in help/capability docs
+
+tasks:
+  # ── Wave 1: Core fixes (parallel, no deps) ──────────────────────────
+
+  - id: T1a-auto-process-default
+    title: Fix CLI workflow submit to default auto_process=True
+    role: leaf
+    claimed_paths:
+      - "src/cccc/cli/main.py"
+    depends_on: []
+    addresses: ["WF-NEW-1"]
+    goal_behavior: >
+      Change `--auto-process` argument from `store_true` (default False) to
+      `BooleanOptionalAction` with `default=True`. This means `cccc workflow
+      submit` auto-processes by default, and users can opt out with
+      `--no-auto-process`. Without this fix, tasks stay in READY after
+      submit because auto_process=False skips approve→assign flow.
+      Also fix `--auto-start-agents` to same pattern (default True).
+    acceptance_criteria: >
+      `cccc workflow submit --workflow-id test --tasks t.json` (without
+      explicit --auto-process flag) sends auto_process=True to daemon.
+    verification:
+      level: unit
+      command: >
+        grep -q "default=True" src/cccc/cli/main.py &&
+        ! grep -q "store_true.*auto.process" src/cccc/cli/main.py
+      covers:
+        tasks: ["T1a-auto-process-default"]
+    provides:
+      - name: auto_process_default_true
+        kind: runtime_capability
+
+  - id: T1b-ready-rejection-message
+    title: Improve READY state rejection message in apply_task_event
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    depends_on: []
+    addresses: ["WF-NEW-1"]
+    goal_behavior: >
+      In apply_task_event(), when a completion event arrives for a task in
+      READY state, return a clear error message: "task still in READY —
+      was auto_process=True used in workflow submit? Task must be approved
+      and assigned before completion can be processed." The existing
+      ASSIGNED→RUNNING auto-transition (line ~936) is correct and stays.
+      Do NOT add READY→RUNNING auto-transition — it would bypass approval
+      and mask real control-plane errors.
+    acceptance_criteria: >
+      apply_task_event() for READY-state tasks returns rejected=True with
+      a descriptive message mentioning auto_process. ASSIGNED→RUNNING
+      auto-transition remains unchanged. PLANNED state still rejected.
+    verification:
+      level: unit
+      command: >
+        python -c "
+        from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator;
+        print('OK: module compiles')
+        "
+      covers:
+        tasks: ["T1b-ready-rejection-message"]
+    provides:
+      - name: ready_rejection_improved
+        kind: runtime_capability
+
+  - id: T2-ipc-project-root
+    title: Fix 3 IPC handlers missing project_root in get_orchestrator calls
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+      - "tests/test_ralph_ipc.py"
+    depends_on: []
+    addresses: ["R-3"]
+    goal_behavior: >
+      Fix three IPC handlers that call get_orchestrator() without project_root:
+      (1) _try_forward_verification() (~line 181) — extract project_root
+          from args, matching _try_process_batch() pattern.
+      (2) handle_ralph_workflow_progress() (~line 670) — extract project_root
+          from args dict.
+      (3) handle_ralph_workflow_health() (~line 705) — extract project_root
+          from args dict.
+      Each must pass project_root to get_orchestrator() so lazy-init succeeds
+      even when the orchestrator cache is cold.
+      ALSO update tests/test_ralph_ipc.py: existing test asserts
+      get_orchestrator("group-1") without project_root (line ~258). This
+      assertion must be updated to expect project_root in the call.
+    acceptance_criteria: >
+      All get_orchestrator() calls in ralph_ipc_handler.py pass project_root
+      explicitly. test_ralph_ipc.py assertions updated to match.
+    verification:
+      level: unit
+      command: >
+        python -c "
+        from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op;
+        print('OK: module compiles with project_root fixes')
+        "
+      covers:
+        tasks: ["T2-ipc-project-root"]
+    provides:
+      - name: ipc_project_root_fixed
+        kind: runtime_capability
+
+  - id: T3-http-project-root
+    title: Fix HTTP health endpoint to pass project_root to daemon op
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ports/web/routes/workflow.py"
+    depends_on: []
+    addresses: ["R-3"]
+    goal_behavior: >
+      The get_workflow_health HTTP route (~line 195) passes group_id to
+      ralph_workflow_health but not project_root. Fix to include
+      project_root from resolve_group_runtime_context(), matching the
+      pattern used by get_workflow_progress route right above it.
+    acceptance_criteria: >
+      ralph_workflow_health daemon call includes project_root in args dict.
+    verification:
+      level: unit
+      command: >
+        grep -A5 "ralph_workflow_health" src/cccc/ports/web/routes/workflow.py |
+        grep -q "project_root"
+      covers:
+        tasks: ["T3-http-project-root"]
+    provides:
+      - name: http_project_root_fixed
+        kind: runtime_capability
+
+  - id: T4-help-mcp-cleanup
+    title: Replace MCP cold-start and primary tool references in cccc-help.md
+    role: leaf
+    claimed_paths:
+      - "src/cccc/resources/cccc-help.md"
+    depends_on: []
+    addresses: ["WF-NEW-2"]
+    goal_behavior: >
+      Replace cold-start flow (cccc_bootstrap, cccc_help as MCP calls) with
+      CLI-based flow (cccc context get, cccc send, cccc workflow).
+      For MCP-only tools without CLI equivalents (cccc_capability_use,
+      cccc_space, cccc_memory, cccc_coordination, cccc_agent_state,
+      cccc_project_info, cccc_file), move them to a clearly-marked
+      "MCP-only tools (when MCP server is enabled)" section instead of
+      presenting them as default tools agents should call first.
+      Remove instructions that tell agents to call MCP tools as first action.
+    acceptance_criteria: >
+      Cold-start section uses CLI commands (cccc context get), not MCP
+      (cccc_bootstrap). No MCP tool presented as default interface for
+      operations that have CLI equivalents.
+    verification:
+      level: unit
+      command: >
+        ! grep -q "Cold start default.*cccc_bootstrap" src/cccc/resources/cccc-help.md
+      covers:
+        tasks: ["T4-help-mcp-cleanup"]
+    provides:
+      - name: help_mcp_cleaned
+        kind: prompt_change
+
+  - id: T5-capability-mcp-cleanup
+    title: Replace MCP references in task_management.yaml with CLI commands
+    role: leaf
+    claimed_paths:
+      - "src/cccc/resources/capabilities/task_management.yaml"
+    depends_on: []
+    addresses: ["WF-NEW-2"]
+    goal_behavior: >
+      Replace cccc_runtime_list and cccc_model references with CLI
+      equivalents or remove them if no CLI equivalent exists. Ensure
+      foreman guidance section uses CLI commands (cccc workflow submit,
+      cccc workflow status, cccc send) consistently.
+    acceptance_criteria: >
+      task_management.yaml does not reference cccc_runtime_list or
+      cccc_model as primary commands. Foreman guidance uses CLI commands.
+    verification:
+      level: unit
+      command: >
+        ! grep -qE "cccc_runtime_list|cccc_model\(" src/cccc/resources/capabilities/task_management.yaml
+      covers:
+        tasks: ["T5-capability-mcp-cleanup"]
+    provides:
+      - name: capability_mcp_cleaned
+        kind: prompt_change
+
+  # ── Wave 2: Integration tests (depend on Wave 1 fixes) ──────────────
+
+  - id: T6-state-transition-test
+    title: Integration test for ASSIGNED auto-transition and READY rejection
+    role: integration
+    claimed_paths:
+      - "tests/test_workflow_state.py"
+    depends_on: ["T1a-auto-process-default", "T1b-ready-rejection-message"]
+    addresses: ["WF-NEW-1"]
+    goal_behavior: >
+      Test three scenarios:
+      (1) ASSIGNED→completion: approve batch first, then send completion
+          before worker starts → auto-transition ASSIGNED→RUNNING→VERIFYING
+          →COMPLETED. This is the expected path with auto_process=True.
+      (2) READY→completion: send completion for task still in READY →
+          rejected with descriptive error mentioning auto_process.
+      (3) PLANNED→completion: still rejected (no over-permissive transition).
+      Also test that auto_process=True in CLI default produces ASSIGNED state.
+    acceptance_criteria: >
+      pytest passes covering ASSIGNED→completion (success), READY→completion
+      (rejection with message), and PLANNED→rejection paths.
+    verification:
+      level: integration
+      command: "pytest tests/test_workflow_state.py -v"
+      covers:
+        tasks: ["T1a-auto-process-default", "T1b-ready-rejection-message",
+                "T6-state-transition-test"]
+        flows: ["submit_then_complete"]
+    consumes:
+      - name: auto_process_default_true
+        from: T1a-auto-process-default
+      - name: ready_rejection_improved
+        from: T1b-ready-rejection-message
+
+  - id: T7-ipc-init-test
+    title: Integration test for IPC handler orchestrator initialization
+    role: integration
+    claimed_paths:
+      - "tests/test_ralph_verification.py"
+    depends_on: ["T2-ipc-project-root"]
+    addresses: ["R-3"]
+    goal_behavior: >
+      Test that verification forwarding, workflow progress, and workflow
+      health IPC handlers all properly initialize orchestrator with
+      project_root when cache is cold. Confirm get_orchestrator does not
+      return None. Test the formerly-broken paths: _try_forward_verification,
+      handle_ralph_workflow_progress, handle_ralph_workflow_health.
+    acceptance_criteria: >
+      pytest passes, all three formerly-broken IPC handlers initialize
+      orchestrator successfully with project_root.
+    verification:
+      level: integration
+      command: "pytest tests/test_ralph_verification.py -v"
+      covers:
+        tasks: ["T2-ipc-project-root", "T7-ipc-init-test"]
+        flows: ["all_ipc_callers_init", "silent_init_failure"]
+    consumes:
+      - name: ipc_project_root_fixed
+        from: T2-ipc-project-root
+
+  - id: T8-prompt-consistency-test
+    title: Test help doc is CLI-first and capability YAML has no MCP primaries
+    role: integration
+    claimed_paths:
+      - "tests/test_prompt_defaults.py"
+      - "tests/test_prompt_assembly.py"
+    depends_on: ["T4-help-mcp-cleanup", "T5-capability-mcp-cleanup"]
+    addresses: ["WF-NEW-2"]
+    goal_behavior: >
+      In test_prompt_defaults.py: test that load_builtin_help_markdown()
+      output does not contain "Cold start default.*cccc_bootstrap" and does
+      contain CLI commands (cccc context get, cccc workflow).
+      In test_prompt_assembly.py: test that capability YAML loaded for
+      foreman role does not contain cccc_runtime_list or cccc_model as
+      primary commands. This ensures both help AND capability docs are
+      verified, not just help.
+    acceptance_criteria: >
+      pytest passes confirming CLI-first guidance in both help markdown
+      and capability YAML, no MCP cold-start instructions.
+    verification:
+      level: integration
+      command: "pytest tests/test_prompt_defaults.py tests/test_prompt_assembly.py -v"
+      covers:
+        tasks: ["T4-help-mcp-cleanup", "T5-capability-mcp-cleanup",
+                "T8-prompt-consistency-test"]
+        flows: ["help_docs_cli_first"]
+    consumes:
+      - name: help_mcp_cleaned
+        from: T4-help-mcp-cleanup
+      - name: capability_mcp_cleaned
+        from: T5-capability-mcp-cleanup
+
+  # ── Wave 3: E2E ─────────────────────────────────────────────────────
+
+  - id: T9-e2e-workflow-resilience
+    title: "E2E: submit (auto_process=True) → assign → complete → verify → done"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_cli_workflow_e2e.py"
+    depends_on: ["T1a-auto-process-default", "T1b-ready-rejection-message",
+                 "T2-ipc-project-root", "T3-http-project-root",
+                 "T6-state-transition-test", "T7-ipc-init-test",
+                 "T8-prompt-consistency-test"]
+    addresses: ["WF-NEW-1", "R-3"]
+    goal_behavior: >
+      End-to-end test covering the real-world scenario:
+      1. Foreman calls cccc workflow submit (auto_process=True by default)
+      2. Tasks auto-processed: READY → ASSIGNED
+      3. Worker calls cccc task complete (ASSIGNED → auto-transition →
+         RUNNING → VERIFYING)
+      4. Verify gate runs → COMPLETED (or FAILED on verify failure)
+      Also test: (a) submit without auto_process → tasks stay READY →
+      completion rejected with helpful message. (b) IPC handlers pass
+      project_root, orchestrator initializes from cold cache.
+    acceptance_criteria: >
+      pytest passes proving: (1) default submit + complete works end-to-end,
+      (2) non-auto-process submit + complete is rejected with good error,
+      (3) verify-pass and verify-fail branches exercised.
+    verification:
+      level: e2e
+      command: "pytest tests/e2e/test_cli_workflow_e2e.py -v"
+      covers:
+        tasks: ["T1a-auto-process-default", "T1b-ready-rejection-message",
+                "T2-ipc-project-root", "T3-http-project-root",
+                "T6-state-transition-test", "T7-ipc-init-test",
+                "T8-prompt-consistency-test", "T9-e2e-workflow-resilience"]
+        flows: ["submit_then_complete", "all_ipc_callers_init",
+                "help_docs_cli_first"]
+    consumes:
+      - name: auto_process_default_true
+        from: T1a-auto-process-default
+      - name: ready_rejection_improved
+        from: T1b-ready-rejection-message
+      - name: ipc_project_root_fixed
+        from: T2-ipc-project-root
+      - name: http_project_root_fixed
+        from: T3-http-project-root
+
+# ── Critical declarations ─────────────────────────────────────────────
+
+critical_entrypoints:
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - src/cccc/daemon/ralph_ipc_handler.py
+  - src/cccc/cli/main.py
+  - src/cccc/ports/web/routes/workflow.py
+  - src/cccc/resources/cccc-help.md
+  - src/cccc/resources/capabilities/task_management.yaml
+
+critical_flows:
+  - id: submit_then_complete
+    description: "Workflow submit (auto_process=True) → ASSIGNED → completion → auto-transition → verify → done"
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/cli/main.py
+    required_verification_level: e2e
+
+  - id: all_ipc_callers_init
+    description: "Every IPC handler calling get_orchestrator succeeds with proper project_root"
+    entrypoints:
+      - src/cccc/daemon/ralph_ipc_handler.py
+    required_verification_level: integration
+
+  - id: help_docs_cli_first
+    description: "Help docs and capability YAML use CLI as primary interface, not MCP tools"
+    entrypoints:
+      - src/cccc/resources/cccc-help.md
+      - src/cccc/resources/capabilities/task_management.yaml
+    required_verification_level: integration
+
+forbidden_flows:
+  - id: silent_init_failure
+    description: "get_orchestrator must not silently return None when project_root is available from args or group metadata"
+    required_verification_level: integration
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

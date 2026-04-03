@@ -1,0 +1,351 @@
+# Plan: Wave 5 — validate 噪音治理 + CLI 增强 + monitor wiring
+# Source: todo/问题清单-v5-ralph.md §五 下一波
+# Date: 2026-04-02
+# Scope: RV-1, RV-11, RV-12, RV-13, monitor-wiring
+# Codex review: 2026-04-02 — 7 findings addressed (see inline notes)
+
+tasks:
+  # ── Batch 1: independent leaf tasks ──────────────────────────────
+
+  - id: T1
+    title: "RV-11: awareness_paths model extension + validator adjustments"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/validator.py
+    depends_on: []
+    addresses: ["RV-11"]
+    goal_behavior: >
+      Add awareness_paths: List[str] = [] field to TaskSpec in models.py.
+      Semantics: paths the task needs to READ (for context/awareness) but
+      does NOT modify. Unlike claimed_paths (write), awareness_paths must
+      NOT participate in write-set conflict detection (suggest()), but MUST
+      satisfy E_CRITICAL_ENTRYPOINT_UNOWNED (a task "owns" a path if it
+      appears in either claimed_paths or awareness_paths).
+
+      In validator.py _check_critical_coverage() (line 530), build TWO
+      separate path sets:
+        - owned_paths = union of (claimed_paths + awareness_paths) for all tasks
+          → used for "is this entrypoint owned?" check (line 543)
+        - write_paths = union of claimed_paths only (current all_claimed)
+          → used for _plan_touches_subsystem() check (line 545)
+
+      CRITICAL: awareness_paths must NOT be added to all_claimed / write_paths.
+      Otherwise _plan_touches_subsystem() would treat read-awareness as
+      "plan modifies this subsystem", changing severity from hint→error
+      for unrelated entrypoints.
+
+      In core.py suggest(), no change needed — _normalize_write_set already
+      only uses task.claimed_paths.
+    acceptance_criteria: >
+      1. TaskSpec accepts awareness_paths field (optional, default []).
+      2. E_CRITICAL_ENTRYPOINT_UNOWNED does not fire when a critical
+         entrypoint is in a task's awareness_paths (not claimed_paths).
+      3. suggest() does NOT use awareness_paths for write-set conflict —
+         two tasks with overlapping awareness_paths can still run in parallel.
+      4. W_TEST_COVERAGE_GAP does NOT fire for awareness_paths entries
+         (filesystem_validator._claimed_source_paths only reads claimed_paths).
+      5. Existing plans without awareness_paths continue to work unchanged.
+      6. _plan_touches_subsystem() only considers write paths (claimed_paths),
+         NOT awareness_paths — a task with only awareness on a subsystem
+         does NOT escalate that subsystem's entrypoint severity to error.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k awareness"
+      covers:
+        tasks: ["T1"]
+        paths:
+          - src/cccc/ralph/models.py
+          - src/cccc/ralph/validator.py
+    provides:
+      - name: awareness_paths_field
+        kind: runtime_capability
+        schema_hint: "TaskSpec.awareness_paths: List[str] — read-only path awareness"
+
+  - id: T2
+    title: "RV-1: W_UNCLAIMED_TEST_FOR_SOURCE rule"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/filesystem_validator.py
+    depends_on: []
+    addresses: ["RV-1"]
+    goal_behavior: >
+      Add new function _check_unclaimed_tests_for_source() in
+      filesystem_validator.py. For each task's claimed_paths source files
+      (*.py not in tests/), find test files that import them using the
+      existing _grep_test_candidates + _classify_test_import pipeline.
+      Then check if each discovered test file appears in ANY task's
+      claimed_paths across the entire plan. If a test file imports a
+      claimed source but is not claimed by any task, emit
+      W_UNCLAIMED_TEST_FOR_SOURCE warning.
+
+      Wire _check_unclaimed_tests_for_source into validate_filesystem()
+      after the existing _check_test_coverage_gaps call.
+
+      The rule should NOT fire for test files that are already covered
+      by any verification command in the plan (to avoid overlap with
+      W_TEST_COVERAGE_GAP).
+    acceptance_criteria: >
+      1. W_UNCLAIMED_TEST_FOR_SOURCE fires when task claims src/foo.py,
+         tests/test_foo.py imports foo, and no task claims tests/test_foo.py.
+      2. Does NOT fire if another task claims tests/test_foo.py.
+      3. Does NOT fire if tests/test_foo.py is referenced in a verification
+         command (already covered by W_TEST_COVERAGE_GAP).
+      4. Only checks claimed_paths (write), not awareness_paths (read).
+      5. Evidence includes source_path, test_path, and importing_task_id.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_filesystem_validator.py -q -k unclaimed_test"
+      covers:
+        tasks: ["T2"]
+        paths:
+          - src/cccc/ralph/filesystem_validator.py
+
+  - id: T3
+    title: "RV-13: ralph validate --suppress CLI parameter"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/cli.py
+    depends_on: []
+    addresses: ["RV-13"]
+    goal_behavior: >
+      Add --suppress option to the validate subcommand in cli.py.
+      Accepts one or more validation codes (e.g., --suppress
+      E_CRITICAL_ENTRYPOINT_UNOWNED W_ISOLATED_TASK). Before calling
+      validate_with_project(), merge the CLI-provided suppress codes
+      into plan.suppress_codes (union, not replace — plan-level
+      suppress_codes are preserved). This is an in-memory merge only —
+      the plan file on disk must NOT be modified.
+
+      The --suppress flag is only on 'validate', not on other commands.
+      In _cmd_validate (line 95), after loading the plan and before
+      calling validate_with_project, do:
+        if args.suppress:
+            plan.suppress_codes = list(set(plan.suppress_codes) | set(args.suppress))
+    acceptance_criteria: >
+      1. `ralph validate plan.yaml --suppress E_CRITICAL_ENTRYPOINT_UNOWNED`
+         suppresses that code even if not in plan.suppress_codes.
+      2. Multiple codes: --suppress CODE1 CODE2 all suppressed.
+      3. CLI suppress merges with plan.suppress_codes (union).
+      4. Without --suppress, behavior is unchanged.
+      5. Suppressed codes appear in hints as "[suppressed]" (existing
+         suppress_codes behavior).
+      6. Plan file on disk is NOT modified by --suppress.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k cli_suppress"
+      covers:
+        tasks: ["T3"]
+        paths:
+          - src/cccc/ralph/cli.py
+
+  - id: T4
+    title: "Monitor wiring: check_unauthorized_subagent + check_path_deviation API"
+    role: leaf
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+    depends_on: []
+    addresses: ["WF-NEW-3"]
+    goal_behavior: >
+      Wire the two remaining WorkflowMonitor checks into the orchestrator:
+
+      1. check_unauthorized_subagent (already imported at line 52):
+         Call in on_task_completed() (around line 901), alongside the
+         existing check_file_overstepping/check_completer_mismatch block.
+         Build known_agents = set(self._task_to_agent.values()) BEFORE
+         the call. If the completing agent_id is not in known_agents,
+         check_unauthorized_subagent will return an alert. Log at WARNING
+         following the exact same pattern as check_file_overstepping (lines
+         910-917).
+
+      2. check_path_deviation: Import from workflow_monitor. Add a new
+         public method monitor_incoming_event(self, task_id, event_type,
+         event_payload) that calls check_path_deviation and logs any alert.
+         This method is an API for the daemon's event layer to call — the
+         actual daemon-side wiring is out of scope for this task. Wrap in
+         try/except like existing monitor checks.
+
+      Both follow the existing logger.warning pattern (lines 912-916),
+      NOT ledger events (the orchestrator has no direct ledger writer).
+    acceptance_criteria: >
+      1. check_unauthorized_subagent called in on_task_completed with
+         known_agents built from _task_to_agent.values().
+      2. check_path_deviation accessible via monitor_incoming_event() public method.
+      3. Both wrapped in try/except (no crash on error).
+      4. Alerts logged at WARNING with structured evidence.
+      5. Existing check_file_overstepping / check_completer_mismatch / check_silent_agent unaffected.
+    verification:
+      level: unit
+      command: "pytest tests/test_foreman_workflow.py -q -k \"path_deviation or unauthorized\""
+      covers:
+        tasks: ["T4"]
+        paths:
+          - src/cccc/daemon/foreman/workflow_orchestrator.py
+
+  # ── Batch 2: depends on T2 (same file) ─────────────────────────
+
+  - id: T5
+    title: "RV-12: W_VERIFICATION_PYTEST_K_NO_MATCH downgrade when task claims test file"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/filesystem_validator.py
+    depends_on: ["T2"]
+    addresses: ["RV-12"]
+    goal_behavior: >
+      Modify _check_pytest_k() in filesystem_validator.py to downgrade
+      W_VERIFICATION_PYTEST_K_NO_MATCH from "warning" to "hint" when
+      the pytest target file (file_path) is in the current task's
+      claimed_paths. This means the task will modify that test file
+      (e.g., add new test functions), so the -k pattern not matching
+      current test names is expected.
+
+      Primary scenario: test file EXISTS on disk but will be MODIFIED
+      by the task to add new test functions. _check_path_target passes,
+      _check_pytest_k runs but the new function names aren't there yet.
+
+      Note: if the test file doesn't exist at all, _check_pytest (line 554)
+      returns W_VERIFICATION_TARGET_MISSING via _check_path_target and
+      never reaches _check_pytest_k. That case is already handled by the
+      existing projected-paths hint mechanism.
+
+      Implementation approach (per Codex review recommendation): thread
+      task-local claimed_paths (NOT projected paths, which include
+      transitive deps) through the call chain. Pass claimed_paths to
+      _check_verification_command. In _check_pytest, compute
+      claims_target = any(_paths_overlap(file_path, cp) for cp in claimed).
+      Pass claims_target as bool to _check_pytest_k. In _check_pytest_k,
+      set severity = "hint" if claims_target else "warning".
+
+      When downgrading, append " (task claims this test file)" to the
+      message for clarity.
+    acceptance_criteria: >
+      1. W_VERIFICATION_PYTEST_K_NO_MATCH is "warning" when test file is
+         NOT in task's claimed_paths (unchanged behavior).
+      2. W_VERIFICATION_PYTEST_K_NO_MATCH is "hint" when test file IS in
+         task's claimed_paths.
+      3. Hint message includes "(task claims this test file)" explanation.
+      4. No regression — existing _check_pytest_k tests still pass.
+      5. Uses task-local claimed_paths, NOT projected (which includes
+         transitive dependency paths).
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_filesystem_validator.py -q -k pytest_k_downgrade"
+      covers:
+        tasks: ["T5"]
+        paths:
+          - src/cccc/ralph/filesystem_validator.py
+
+  # ── Batch 3: integration ────────────────────────────────────────
+
+  - id: T-int
+    title: "Integration tests for Wave 5 rules"
+    role: integration
+    claimed_paths:
+      - tests/ralph/test_wave5_integration.py
+    depends_on: ["T1", "T2", "T3", "T4", "T5"]
+    addresses: ["RV-1", "RV-11", "RV-12", "RV-13", "WF-NEW-3"]
+    goal_behavior: >
+      Create tests/ralph/test_wave5_integration.py with integration tests
+      that verify all Wave 5 rules work together on a realistic plan:
+
+      1. Plan with awareness_paths satisfying critical entrypoints + no
+         spurious W_TEST_COVERAGE_GAP (T1 + existing).
+      2. Plan where source changes trigger W_UNCLAIMED_TEST_FOR_SOURCE
+         when test files are unclaimed (T2).
+      3. Plan validated with --suppress CLI flag suppressing specific
+         codes (T3 mechanism via plan.suppress_codes merge).
+      4. Plan where pytest -k targets a file in claimed_paths → hint
+         not warning (T5).
+      5. Combination: awareness_paths + unclaimed test + suppression in
+         a single plan validation.
+      6. Negative test: two tasks with overlapping awareness_paths can
+         run in parallel (covers forbidden flow awareness_in_writeset).
+      7. Negative test: suppress_codes produces hints with [suppressed]
+         marker, not silent removal (covers forbidden flow
+         suppress_silences_completely).
+      8. Monitor wiring: check_unauthorized_subagent fires in
+         on_task_completed for unknown agents; monitor_incoming_event
+         API is callable (T4).
+    acceptance_criteria: >
+      1. At least 8 test cases covering cross-rule interactions.
+      2. Tests use real plan YAML fixtures (inline or file-based).
+      3. All tests pass with 0 errors.
+      4. Tests verify both positive (rule fires) and negative (rule silent) cases.
+      5. Forbidden flows covered by explicit negative assertions.
+    verification:
+      level: integration
+      command: "pytest tests/ralph/test_wave5_integration.py -q"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5", "T-int"]
+        paths:
+          - src/cccc/ralph/models.py
+          - src/cccc/ralph/validator.py
+          - src/cccc/ralph/filesystem_validator.py
+          - src/cccc/ralph/cli.py
+          - src/cccc/daemon/foreman/workflow_orchestrator.py
+        flows:
+          - awareness_reduces_noise
+          - unclaimed_test_detection
+          - awareness_in_writeset
+          - suppress_silences_completely
+
+critical_flows:
+  - id: awareness_reduces_noise
+    description: >
+      Plan with awareness_paths on a critical entrypoint file.
+      Validation: E_CRITICAL_ENTRYPOINT_UNOWNED does not fire.
+      W_TEST_COVERAGE_GAP does not fire for the awareness path.
+      suggest() does not serialize on awareness_paths overlap.
+    entrypoints:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/validator.py
+    required_verification_level: integration
+
+  - id: unclaimed_test_detection
+    description: >
+      Plan where task claims source file that has related tests.
+      Those tests are not claimed by any task.
+      W_UNCLAIMED_TEST_FOR_SOURCE fires with correct evidence.
+    entrypoints:
+      - src/cccc/ralph/filesystem_validator.py
+    required_verification_level: integration
+
+forbidden_flows:
+  - id: awareness_in_writeset
+    description: >
+      awareness_paths must NOT participate in write-set conflict
+      detection. Two tasks with overlapping awareness_paths must
+      be schedulable in parallel by suggest().
+    required_verification_level: unit
+
+  - id: suppress_silences_completely
+    description: >
+      --suppress must NOT silently swallow codes with zero audit trail.
+      Suppressed codes must appear as hints with [suppressed] marker.
+    required_verification_level: unit
+
+required_issues:
+  - "RV-1"
+  - "RV-11"
+  - "RV-12"
+  - "RV-13"
+  - "WF-NEW-3"
+
+# Suppress repo-level defaults that don't apply to this plan's scope
+# (we don't touch daemon startup, CLI routing, or IPC dispatch)
+suppress_codes:
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+  - "W_REGISTRATION_INVARIANT_UNCOVERED"
+
+state:
+  completed_task_ids:
+    - T-int
+    - T5
+    - T4
+    - T3
+    - T2
+    - T1
+  running_tasks: []
+  failed_task_ids: []

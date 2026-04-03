@@ -7,6 +7,7 @@ Tests the message models and daemon operations for Ralph-Foreman communication.
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
@@ -14,6 +15,11 @@ from uuid import uuid4
 
 class TestRalphIPCContracts(unittest.TestCase):
     """Test Ralph IPC message contracts."""
+
+    def _make_task_event(self, event_type: str):
+        from cccc.contracts.v1.ralph_ipc import TaskEvent
+
+        return TaskEvent(event_type=event_type, task_id="t1")
 
     def test_ready_batch_suggestion_model(self) -> None:
         from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef
@@ -103,6 +109,26 @@ class TestRalphIPCContracts(unittest.TestCase):
         self.assertEqual(status.status, "executing")
         self.assertEqual(status.progress_pct, 50)
 
+    def test_task_event_assigned(self) -> None:
+        event = self._make_task_event("assigned")
+        self.assertEqual(event.event_type, "assigned")
+
+    def test_task_event_started(self) -> None:
+        event = self._make_task_event("started")
+        self.assertEqual(event.event_type, "started")
+
+    def test_task_event_heartbeat(self) -> None:
+        event = self._make_task_event("heartbeat")
+        self.assertEqual(event.event_type, "heartbeat")
+
+    def test_task_event_completed_still_works(self) -> None:
+        event = self._make_task_event("completed")
+        self.assertEqual(event.event_type, "completed")
+
+    def test_task_event_failed_still_works(self) -> None:
+        event = self._make_task_event("failed")
+        self.assertEqual(event.event_type, "failed")
+
     def test_parse_ralph_message(self) -> None:
         from cccc.contracts.v1.ralph_ipc import parse_ralph_message, ReadyBatchSuggestion
 
@@ -124,6 +150,256 @@ class TestRalphIPCContracts(unittest.TestCase):
             parse_ralph_message({"message_type": "unknown"})
 
         self.assertIn("Unknown Ralph IPC message type", str(ctx.exception))
+
+
+class TestTaskRefVerificationContracts(unittest.TestCase):
+    """Test TaskRef verification field compatibility."""
+
+    def test_verification_check_spec_roundtrip(self) -> None:
+        from cccc.contracts.v1.ralph_ipc import VerificationCheckSpec
+        from cccc.ralph.models import CheckSpec
+
+        payload = {
+            "name": "lint",
+            "command": "ruff check src",
+            "required": False,
+            "expected_exit_code": 2,
+        }
+
+        ipc_spec = VerificationCheckSpec.model_validate(payload)
+        ipc_restored = VerificationCheckSpec.model_validate(ipc_spec.model_dump())
+        self.assertEqual(ipc_restored.name, "lint")
+        self.assertEqual(ipc_restored.command, "ruff check src")
+        self.assertFalse(ipc_restored.required)
+        self.assertEqual(ipc_restored.expected_exit_code, 2)
+
+        domain_spec = CheckSpec.model_validate(payload)
+        domain_restored = CheckSpec.model_validate(domain_spec.model_dump())
+        self.assertEqual(domain_restored.model_dump(), payload)
+
+    def test_task_ref_accepts_deprecated_verification_command(self) -> None:
+        from cccc.contracts.v1.ralph_ipc import TaskRef
+
+        task_ref = TaskRef(id="t1", verification_command="pytest tests/test_ralph_ipc.py -q")
+
+        self.assertEqual(task_ref.verification_command, "pytest tests/test_ralph_ipc.py -q")
+        self.assertIsNone(task_ref.verification)
+
+    def test_task_ref_accepts_structured_verification(self) -> None:
+        from cccc.contracts.v1.ralph_ipc import TaskRef
+
+        task_ref = TaskRef.model_validate(
+            {
+                "id": "t1",
+                "verification": {
+                    "level": "integration",
+                    "command": "pytest tests/test_ralph_ipc.py -q",
+                    "covers_tasks": ["T1"],
+                },
+            }
+        )
+
+        self.assertIsNotNone(task_ref.verification)
+        self.assertEqual(task_ref.verification.level, "integration")
+        self.assertEqual(task_ref.verification.command, "pytest tests/test_ralph_ipc.py -q")
+        self.assertEqual(task_ref.verification.covers_tasks, ["T1"])
+
+    def test_task_ref_round_trip_preserves_verification_fields(self) -> None:
+        from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationSpec
+
+        original = TaskRef(
+            id="t1",
+            verification_command="pytest legacy -q",
+            verification=VerificationSpec(
+                level="unit",
+                command="pytest structured -q",
+                covers_paths=["tests/test_ralph_ipc.py"],
+            ),
+        )
+
+        restored = TaskRef.model_validate(original.model_dump())
+
+        self.assertEqual(restored.verification_command, "pytest legacy -q")
+        self.assertIsNotNone(restored.verification)
+        self.assertEqual(restored.verification.command, "pytest structured -q")
+        self.assertEqual(restored.verification.covers_paths, ["tests/test_ralph_ipc.py"])
+
+    def test_verification_spec_model(self) -> None:
+        from cccc.contracts.v1.ralph_ipc import VerificationSpec
+
+        spec = VerificationSpec.model_validate(
+            {
+                "command": "pytest tests/test_ralph_ipc.py -q",
+                "covers_tasks": ["T1"],
+                "covers_paths": ["tests/test_ralph_ipc.py"],
+                "covers_flows": ["ralph-ipc"],
+            }
+        )
+
+        self.assertEqual(spec.level, "unit")
+        self.assertEqual(spec.command, "pytest tests/test_ralph_ipc.py -q")
+        self.assertEqual(spec.expected_exit_code, 0)
+        self.assertEqual(spec.covers_flows, ["ralph-ipc"])
+
+    def test_verification_spec_with_checks_roundtrip(self) -> None:
+        from cccc.contracts.v1.ralph_ipc import VerificationSpec
+        from cccc.ralph.models import Verification
+
+        payload = {
+            "level": "integration",
+            "command": "pytest tests/test_ralph_ipc.py -q",
+            "checks": [
+                {"name": "build", "command": "python -m build"},
+                {
+                    "name": "lint",
+                    "command": "ruff check src",
+                    "required": False,
+                    "expected_exit_code": 1,
+                },
+            ],
+            "covers_tasks": ["T1"],
+            "covers_paths": ["tests/test_ralph_ipc.py"],
+            "covers_flows": ["ralph-ipc"],
+            "expected_exit_code": 0,
+        }
+        domain_payload = {
+            "level": "integration",
+            "command": "pytest tests/test_ralph_ipc.py -q",
+            "checks": payload["checks"],
+            "covers": {
+                "tasks": ["T1"],
+                "paths": ["tests/test_ralph_ipc.py"],
+                "flows": ["ralph-ipc"],
+            },
+            "expected_exit_code": 0,
+        }
+
+        spec = VerificationSpec.model_validate(payload)
+        restored = VerificationSpec.model_validate(spec.model_dump())
+        self.assertEqual(len(restored.checks), 2)
+        self.assertEqual(restored.checks[0].name, "build")
+        self.assertFalse(restored.checks[1].required)
+        self.assertEqual(restored.covers_tasks, ["T1"])
+
+        domain_verification = Verification.model_validate(domain_payload)
+        domain_restored = Verification.model_validate(domain_verification.model_dump())
+        self.assertEqual(len(domain_restored.checks), 2)
+        self.assertEqual(domain_restored.checks[1].expected_exit_code, 1)
+        self.assertEqual(domain_restored.covers.tasks, ["T1"])
+
+    def test_verification_spec_backward_compat(self) -> None:
+        from cccc.contracts.v1.ralph_ipc import VerificationSpec
+        from cccc.ralph.models import Verification
+
+        spec = VerificationSpec.model_validate({"command": "pytest tests/test_ralph_ipc.py -q"})
+        self.assertEqual(spec.command, "pytest tests/test_ralph_ipc.py -q")
+        self.assertEqual(spec.checks, [])
+
+        verification = Verification.model_validate(
+            {"level": "unit", "command": "pytest tests/test_ralph_ipc.py -q"}
+        )
+        self.assertEqual(verification.command, "pytest tests/test_ralph_ipc.py -q")
+        self.assertEqual(verification.checks, [])
+
+    def test_verification_spec_checks_and_command(self) -> None:
+        from cccc.contracts.v1.ralph_ipc import VerificationSpec
+        from cccc.ralph.models import Verification
+
+        payload = {
+            "level": "unit",
+            "command": "pytest tests/test_ralph_ipc.py -q",
+            "checks": [{"name": "lint", "command": "ruff check src"}],
+        }
+
+        spec = VerificationSpec.model_validate(payload)
+        self.assertEqual(spec.command, "pytest tests/test_ralph_ipc.py -q")
+        self.assertEqual(len(spec.checks), 1)
+        self.assertEqual(spec.checks[0].command, "ruff check src")
+
+        verification = Verification.model_validate(payload)
+        self.assertEqual(verification.command, "pytest tests/test_ralph_ipc.py -q")
+        self.assertEqual(len(verification.checks), 1)
+        self.assertEqual(verification.checks[0].name, "lint")
+
+
+class TestRalphServiceVerificationCompatibility(unittest.TestCase):
+    """Test verification command compatibility in RalphService."""
+
+    def _make_service(self):
+        from cccc.daemon.foreman.ralph_service import RalphService
+
+        return RalphService(project_root=Path.cwd(), group_id="group-1")
+
+    def test_verify_completion_uses_deprecated_verification_command(self) -> None:
+        from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationCheck
+
+        service = self._make_service()
+        task_ref = TaskRef(id="t1", verification_command="pytest legacy -q")
+
+        with patch.object(
+            service,
+            "_run_verification_check",
+            return_value=VerificationCheck(name="verification", outcome="passed"),
+        ) as run_check:
+            service.verify_completion("t1", [], workflow_id="wf-1", task_ref=task_ref)
+
+        self.assertEqual(run_check.call_args.kwargs["command"], "pytest legacy -q")
+
+    def test_verify_completion_uses_structured_verification_command(self) -> None:
+        from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationCheck, VerificationSpec
+
+        service = self._make_service()
+        task_ref = TaskRef(
+            id="t1",
+            verification=VerificationSpec(command="pytest structured -q"),
+        )
+
+        with patch.object(
+            service,
+            "_run_verification_check",
+            return_value=VerificationCheck(name="verification", outcome="passed"),
+        ) as run_check:
+            service.verify_completion("t1", [], workflow_id="wf-1", task_ref=task_ref)
+
+        self.assertEqual(run_check.call_args.kwargs["command"], "pytest structured -q")
+        self.assertEqual(run_check.call_args.kwargs["expected_exit_code"], 0)
+
+    def test_verify_completion_passes_structured_expected_exit_code(self) -> None:
+        from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationCheck, VerificationSpec
+
+        service = self._make_service()
+        task_ref = TaskRef(
+            id="t1",
+            verification=VerificationSpec(command="pytest structured -q", expected_exit_code=3),
+        )
+
+        with patch.object(
+            service,
+            "_run_verification_check",
+            return_value=VerificationCheck(name="verification", outcome="passed"),
+        ) as run_check:
+            service.verify_completion("t1", [], workflow_id="wf-1", task_ref=task_ref)
+
+        self.assertEqual(run_check.call_args.kwargs["expected_exit_code"], 3)
+
+    def test_verify_completion_prefers_structured_verification_command(self) -> None:
+        from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationCheck, VerificationSpec
+
+        service = self._make_service()
+        task_ref = TaskRef(
+            id="t1",
+            verification_command="pytest legacy -q",
+            verification=VerificationSpec(command="  pytest structured -q  "),
+        )
+
+        with patch.object(
+            service,
+            "_run_verification_check",
+            return_value=VerificationCheck(name="verification", outcome="passed"),
+        ) as run_check:
+            service.verify_completion("t1", [], workflow_id="wf-1", task_ref=task_ref)
+
+        self.assertEqual(run_check.call_args.kwargs["command"], "pytest structured -q")
 
 
 class TestRalphIPCHandler(unittest.TestCase):
@@ -206,6 +482,51 @@ class TestRalphIPCHandler(unittest.TestCase):
         self.assertFalse(resp.ok)
         self.assertFalse(resp.ok)  # Empty tasks is either missing_field or invalid_tasks
 
+    def test_ralph_register_and_suggest(self) -> None:
+        from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op
+
+        daemon_request_fn = object()
+        fake_orchestrator = SimpleNamespace(
+            _daemon_request_fn=None,
+            register_and_suggest=lambda tasks, workflow_id, **kwargs: {
+                "registered": len(tasks),
+                "submitted": 1,
+                "ready_task_ids": ["t1"],
+                "workflow_id": workflow_id,
+                "kwargs": kwargs,
+            },
+        )
+
+        with patch(
+            "cccc.daemon.foreman.workflow_orchestrator.get_orchestrator",
+            return_value=fake_orchestrator,
+        ) as get_orchestrator:
+            resp = try_handle_ralph_op(
+                "ralph_register_and_suggest",
+                {
+                    "workflow_id": "wf-1",
+                    "group_id": "group-1",
+                    "project_root": "/tmp/project",
+                    "tasks": [{"id": "t1", "title": "Task 1", "type": "backend"}],
+                    "rationale": "phase-ready",
+                    "estimated_parallelism": 2,
+                    "auto_start_agents": False,
+                },
+                daemon_request_fn=daemon_request_fn,
+            )
+
+        self.assertIsNotNone(resp)
+        self.assertTrue(resp.ok)
+        self.assertEqual(resp.result["registered_count"], 1)
+        self.assertEqual(resp.result["submitted_count"], 1)
+        self.assertEqual(resp.result["ready_task_ids"], ["t1"])
+        self.assertIs(fake_orchestrator._daemon_request_fn, daemon_request_fn)
+        get_orchestrator.assert_called_once_with(
+            "group-1",
+            project_root=Path("/tmp/project"),
+            daemon_request_fn=daemon_request_fn,
+        )
+
     def test_ralph_verification_result(self) -> None:
         from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op
 
@@ -242,6 +563,7 @@ class TestRalphIPCHandler(unittest.TestCase):
                 {
                     "workflow_id": "wf-1",
                     "group_id": "group-1",
+                    "project_root": "/tmp/project",
                     "task_id": "t1",
                     "overall_outcome": "failed",
                     "summary": "tests failed",
@@ -255,7 +577,7 @@ class TestRalphIPCHandler(unittest.TestCase):
         self.assertEqual(forwarded[0].workflow_id, "wf-1")
         self.assertEqual(forwarded[0].task_id, "t1")
         self.assertIs(fake_orchestrator._daemon_request_fn, daemon_request_fn)
-        get_orchestrator.assert_called_once_with("group-1")
+        get_orchestrator.assert_called_once_with("group-1", project_root=Path("/tmp/project"))
 
     def test_ralph_verification_result_invalid_outcome(self) -> None:
         from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op
@@ -498,6 +820,50 @@ class TestRalphIPCHandler(unittest.TestCase):
         # Verify data cleared
         self.assertEqual(len(_RALPH_STATE["pending_suggestions"]), 0)
         self.assertEqual(len(_RALPH_STATE["actor_statuses"]), 0)
+
+    def test_ralph_batch_suggest_preserves_metadata_fields(self) -> None:
+        """WF-1: Verify that goal_behavior, acceptance_criteria, verification
+        and other TaskRef fields survive the IPC handler round-trip."""
+        from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op, _RALPH_STATE
+
+        _RALPH_STATE["pending_suggestions"].clear()
+
+        resp = try_handle_ralph_op("ralph_batch_suggest", {
+            "workflow_id": "wf-meta",
+            "tasks": [{
+                "id": "t1",
+                "title": "Test metadata",
+                "type": "backend",
+                "depends_on": [],
+                "claimed_paths": ["src/a.py"],
+                "goal_behavior": "Implement feature X",
+                "acceptance_criteria": "Feature X works end-to-end",
+                "verification": {
+                    "level": "unit",
+                    "command": "pytest tests/test_x.py -q",
+                    "checks": [{"name": "build", "command": "python -m py_compile src/a.py"}],
+                },
+                "expected_input": {"data_format": "json"},
+                "expected_output": {"status": "ok"},
+            }],
+        })
+
+        self.assertIsNotNone(resp)
+        self.assertTrue(resp.ok)
+
+        # Retrieve the stored suggestion and check fields survived
+        suggestion_id = resp.result["suggestion_id"]
+        stored = _RALPH_STATE["pending_suggestions"][suggestion_id]
+        task = stored["tasks"][0]
+
+        self.assertEqual(task["goal_behavior"], "Implement feature X")
+        self.assertEqual(task["acceptance_criteria"], "Feature X works end-to-end")
+        self.assertIsNotNone(task.get("verification"))
+        self.assertEqual(task["verification"]["level"], "unit")
+        self.assertEqual(task["verification"]["command"], "pytest tests/test_x.py -q")
+        self.assertEqual(len(task["verification"]["checks"]), 1)
+        self.assertEqual(task["expected_input"]["data_format"], "json")
+        self.assertEqual(task["expected_output"]["status"], "ok")
 
 
 if __name__ == "__main__":

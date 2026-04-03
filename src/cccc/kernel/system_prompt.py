@@ -21,10 +21,10 @@ def _memory_policy_lines(group_id: str) -> List[str]:
         "Memory:",
         "- Split by horizon: Context agent state is short-term execution memory; long-term memory lives in state/memory/MEMORY.md + state/memory/daily/*.md.",
         "- Keep transient execution status in Context; write only stable, reusable outcomes to memory files.",
-        "- Resume gate: use cccc_bootstrap.memory_recall_gate on start/resume; if empty, run cccc_memory(search/get) manually before implementation.",
-        "- Recall path: cccc_memory(action=search) -> cccc_memory(action=get) before planning or writing.",
-        '- Write path: cccc_memory(action="write", target="daily"|"memory", ...) with dedup intent.',
-        '- Compaction path (when context grows): cccc_memory_admin(action="context_check") -> cccc_memory_admin(action="compact"|"daily_flush").',
+        "- Resume gate: inspect local memory files before implementation when prior context matters.",
+        "- Recall path: read state/memory/MEMORY.md and the latest daily memory note before planning or writing.",
+        "- Write path: record stable, reusable outcomes in the appropriate memory file with dedup intent.",
+        "- Compaction path (when context grows): summarize stable outcomes into daily/memory files before continuing.",
     ]
 
 
@@ -46,20 +46,20 @@ def _group_space_policy_lines(group_id: str) -> List[str]:
         ]
         if work_bound or memory_bound:
             lines.append(
-                '- If cccc_space is hidden in this session, use cccc_capability_use(tool_name="cccc_space", tool_arguments={"action":"status"}) first to auto-enable pack:space.'
+                '- Check availability with `cccc_capability_use(tool_name="cccc_space", tool_arguments={"action":"status"})` before relying on Group Space for recall or shared knowledge.'
             )
         if work_bound:
             lines.extend([
-                '- Use cccc_space(action=query) on lane="work" for long-horizon/shared/project knowledge lookup.',
-                '- Use cccc_space(action=ingest) on lane="work" only for stable findings/resources worth reusing.',
-                '- For resource_ingest payloads, use source_type + {url|content|file_id} depending on source kind.',
-                '- Use cccc_space(action=artifact) on lane="work" for NotebookLM outputs (save_to_space=true persists to repo/space/artifacts).',
+                "- Use `cccc_space(action=query)` for long-horizon/shared/project knowledge lookup.",
+                "- Use `cccc_space(action=ingest)` only for stable findings/resources worth reusing.",
+                "- Use `cccc_space(action=artifact)` for artifact/materialization flows when supported.",
+                "- For ingest payloads, include `source_type` plus the matching source field (URL, content, or file input).",
                 "- If you see files matching '*.conflict.remote.*' under space/, report and ask user for resolution; do not auto-merge/delete.",
             ])
         if memory_bound:
             lines.extend([
-                '- Memory recall order: local memory first (`cccc_bootstrap.memory_recall_gate` -> `cccc_memory(search/get)`), then `cccc_space(action=query, lane="memory")` only when deeper recall is needed.',
-                '- Never ingest or generate artifacts on lane="memory"; it is daemon-synced from finalized daily memory files.',
+                '- Memory recall order: local memory files first, then `cccc space query --lane memory --query "..."` only when deeper recall is needed.',
+                '- Never ingest new material on lane="memory"; it is daemon-synced from finalized daily memory files.',
             ])
         lines.append("- If provider is degraded/disabled, continue with Context + ledger + local memory and report fallback explicitly.")
         return lines
@@ -74,15 +74,10 @@ def _role_policy_lines(role: str) -> List[str]:
             "Role Focus:",
             "- You MUST NOT execute implementation tasks. Your job is orchestration ONLY.",
             "- When you receive a task from the user, your response should be to evaluate the agent pool and assign workers, NOT to start coding.",
-            "- Submit workflow task batches with `cccc workflow submit --tasks <file>`; use the CLI workflow as the execution truth source.",
-            "- Check workflow progress with `cccc workflow status` before reporting or changing orchestration state.",
-            "- Use `cccc_task` only for shared board visibility; it is NOT the workflow source of truth.",
-            "- Reuse or create workers as needed. Inspect actors with `cccc_actor`, runtimes with `cccc_runtime_list`, and models with `cccc_model` before assignment.",
-            '- If those tools are hidden, enable `pack:group-runtime` first with `cccc_capability_use(capability_id="pack:group-runtime", scope="session")`.',
-            "- Task slicing: assign independently verifiable functional slices (goal + acceptance + verification_command + expected I/O + depends_on + claimed_paths), not file-based chores.",
-            "- Verify gate: treat worker 'done' as 'verifying' until the verification_command exits 0; only then mark completed.",
-            "- Track progress/blockers across agents, keep shared state current, and send outward status through MCP/Feishu.",
+            "- Use `cccc workflow submit --workflow-id X --tasks <file>` to hand task batches into workflow-first execution. [See workflow guidance for details]",
+            "- Reuse or create workers as needed. Inspect the current pool with `cccc actor list` and available runtimes with `cccc runtime list` before adding or reassigning workers.",
             "- Treat `done`, `idle`, and silence as signals to evaluate, not closure truth.",
+            "- [See workflow guidance for details] Use workflow CLI + visible delivery as the control plane, including verify-gate decisions and task handoff.",
             "- If criteria are unmet, choose one clear next control action: continue, request evidence, hand off, or block.",
         ]
     if role_norm == "peer":
@@ -92,6 +87,7 @@ def _role_policy_lines(role: str) -> List[str]:
             "- Deliver concrete evidence, changed files, and blockers; avoid vague status.",
             "- Raise risks or a better route early, with a specific recommendation.",
             "- Do not spawn extra workers or re-plan the workflow unless foreman asks.",
+            "- [See workflow guidance for details] Follow the foreman handoff and return results for acceptance judgment.",
         ]
     return []
 
@@ -101,8 +97,8 @@ def render_system_prompt(*, group: Group, actor: Dict[str, Any]) -> str:
     
     Design principles:
     - Minimal: Only session-specific context (identity, group, scopes)
-    - No tool docs: Agent sees MCP tools automatically
-    - Ops playbook lives in MCP: see cccc_help
+    - No duplicate command docs in the prompt body
+    - Ops playbook lives in bundled help markdown
     """
     group_id = str(group.group_id or "").strip()
     actor_id = str(actor.get("id") or "").strip()
@@ -197,7 +193,7 @@ def render_system_prompt(*, group: Group, actor: Dict[str, Any]) -> str:
     
     # Runner mode
     if runner == "headless":
-        lines.append("runner: headless (MCP-only, no PTY)")
+        lines.append("runner: headless (CLI-only, no PTY)")
 
     if project_md_line:
         lines.append(project_md_line)
@@ -217,7 +213,7 @@ def render_system_prompt(*, group: Group, actor: Dict[str, Any]) -> str:
             "If you catch yourself writing code, editing files, or implementing features - STOP and delegate to a worker instead.",
         ])
 
-    # Keep this stable and short. Long-lived playbook details belong in cccc_help.
+    # Keep this stable and short. Long-lived playbook details belong in bundled help markdown.
     core_lines = [
         "Working Style:",
         "- Work like a sharp teammate, not a customer-service script.",
@@ -227,10 +223,10 @@ def render_system_prompt(*, group: Group, actor: Dict[str, Any]) -> str:
         "",
         "Platform Invariants:",
         "- No fabrication. Verify before claiming done.",
-        "- Visible replies must go through MCP: cccc_message_send / cccc_message_reply.",
+        "- Visible replies must go through CLI delivery: `cccc send` / `cccc reply`.",
         "- Terminal output is not delivery.",
-        "- Cold start or resume: call cccc_bootstrap first, then cccc_help.",
-        "- At key transitions, sync shared control-plane state and your cccc_agent_state.",
+        "- Cold start or resume: use Bash + CLI commands; start with `cccc context get`, then `cccc inbox` or `cccc --help` only as needed.",
+        "- At key transitions, sync shared control-plane state via `cccc context get` and CLI workflow commands.",
         "- Once scope is approved, finish it end-to-end; do not ask to continue on obvious next steps.",
         "- For strategy or scope discussion, align first; implement only after explicit action intent.",
     ]

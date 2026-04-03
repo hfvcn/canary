@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,实现并验证 T1,DONE,T1 代码与至少 3 个 coverage_gap/test_gap/conftest_gap 测试通过,pytest tests/ralph/test_filesystem_validator.py -k 'coverage_gap or test_gap or conftest_gap' -q,2026-03-31T23:00:00,0,pytest tests/ralph/test_filesystem_validator.py -q -> 20 passed
+2,实现并验证 T2,DONE,T2 行为降级与 covers_unverifiable/behavior_mismatch 测试通过,pytest tests/ralph/test_ralph_standalone.py -k 'behavior_mismatch or covers_unverifiable' -q,2026-03-31T23:10:00,0,4 passed
+3,实现并验证 T3,DONE,T3 early checkpoint 测试通过,pytest tests/ralph/test_ralph_standalone.py -k 'early_checkpoint' -q,2026-03-31T23:20:00,0,pytest tests/ralph/test_ralph_standalone.py -q -> 53 passed
+4,实现并验证 T4,DONE,T4 集成测试与相关 Ralph 测试通过,pytest tests/ralph/test_wave2b_integration.py tests/ralph/test_filesystem_validator.py tests/ralph/test_ralph_standalone.py -q,2026-03-31T23:30:00,0,pytest tests/ralph -q -> 88 passed

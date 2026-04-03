@@ -1,0 +1,103 @@
+# Wave 2B: RV-1 测试覆盖缺口 + covers 启发式 + 早期 checkpoint
+# 前置：Wave 2A 完成（filesystem_validator + WorkspaceIndex 可用）
+
+tasks:
+  - id: T1
+    title: "RV-1 测试覆盖缺口检测（verification coverage gap）"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/filesystem_validator.py"
+      - "tests/ralph/test_filesystem_validator.py"
+    depends_on: []
+    goal_behavior: >
+      在 filesystem_validator.py 中增加 _check_test_coverage_gaps()。
+      新语义：发现关联测试 → 检查是否有任何 task 的 verification 执行该测试 → 只有无人覆盖才报 warning。
+      不再要求 claim 测试文件（避免污染 write-set）。
+      3 个新诊断码：W_TEST_COVERAGE_GAP, W_CONFTEST_COVERAGE_GAP, W_DYNAMIC_TEST_IMPORT_OPAQUE。
+    acceptance_criteria: >
+      1. 源文件被 claim 且有关联测试，但无 verification 执行该测试 → W_TEST_COVERAGE_GAP
+      2. conftest.py 关联但未覆盖 → W_CONFTEST_COVERAGE_GAP
+      3. 动态导入 → W_DYNAMIC_TEST_IMPORT_OPAQUE
+      4. 有 verification 执行关联测试时不报 warning
+      5. grep 召回 + AST 判定两阶段
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_filesystem_validator.py -q -k 'coverage_gap or test_gap or conftest_gap'"
+      covers:
+        tasks: ["T1"]
+
+  - id: T2
+    title: "RV-4 降级 + RV-3 覆盖声明可验证性"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/validator.py"
+      - "tests/ralph/test_ralph_standalone.py"
+    depends_on: []
+    goal_behavior: >
+      RV-4: W_VERIFICATION_BEHAVIOR_MISMATCH 被下游 covers 包含时降为 hint。
+      RV-3: W_COVERS_CLAIM_UNVERIFIABLE — A covers B 但 A 的 verification 无法接触 B 的 claimed_paths。
+      仅在 covers 完整性通过后评估。
+    acceptance_criteria: >
+      1. 被下游 integration/e2e covers 的任务，behavior mismatch 降为 hint
+      2. A covers B 但 verification 不引用 B 的 claimed_paths → W_COVERS_CLAIM_UNVERIFIABLE
+      3. 不影响现有测试通过
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k 'behavior_mismatch or covers_unverifiable'"
+      covers:
+        tasks: ["T2"]
+
+  - id: T3
+    title: "W_NO_EARLY_INTEGRATION_CHECKPOINT 图感知规则"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/validator.py"
+      - "tests/ralph/test_ralph_standalone.py"
+    depends_on: ["T2"]
+    goal_behavior: >
+      新增 _check_early_integration_checkpoint()。
+      用简单深度比例指标：min_verifier_depth / max_graph_depth >= 0.5 时报 warning。
+      前提：tasks >= 5 且至少有 cross-task verifier 且所有 verifier 都是 sink。
+    acceptance_criteria: >
+      1. 符合触发条件的计划报 W_NO_EARLY_INTEGRATION_CHECKPOINT
+      2. 3 leaf + 1 final e2e 不报（正常模式）
+      3. 宽浅 fan-in 不报
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k 'early_checkpoint'"
+      covers:
+        tasks: ["T3"]
+
+  - id: T4
+    title: "Wave 2B 集成验证"
+    role: integration
+    claimed_paths:
+      - "tests/ralph/test_wave2b_integration.py"
+    depends_on: ["T1", "T2", "T3"]
+    goal_behavior: >
+      验证所有 Wave 2B 规则协同工作。
+      在完整 ralph validate 流程中测试 FS + 结构规则交互。
+    acceptance_criteria: >
+      1. 全量 ralph test suite 通过
+      2. bad plan 同时触发结构和 FS 规则
+    verification:
+      level: integration
+      command: "pytest tests/ralph/ -q"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4"]
+        flows: ["full_validate_pipeline"]
+
+critical_entrypoints:
+  - "src/cccc/ralph/validator.py"
+  - "src/cccc/ralph/filesystem_validator.py"
+
+critical_flows:
+  - id: full_validate_pipeline
+    description: "validate_with_project → 结构校验 + covers 启发式 + FS 校验 → 合并报告"
+    entrypoints: ["src/cccc/ralph/validator.py"]
+    required_verification_level: integration
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

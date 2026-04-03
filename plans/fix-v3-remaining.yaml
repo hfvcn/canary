@@ -1,0 +1,389 @@
+# Plan: Fix v3 Remaining Issues — FIX-6, FIX-7, FIX-8, FIX-10
+#
+# Context: 问题清单 v3 (2026-04-02) — 4 remaining issues after WF-1~7 fixes.
+#   RV-23 (verify_completion shell execution) already implemented — excluded.
+#
+# Scope:
+#   - FIX-8 (P0): Worker PTY 不消费 inbox 消息 — _send_message_fn 未接线
+#   - FIX-6 (P0): --plan 全量提交而非分批 — 绕过 DAG 门控
+#   - FIX-10 (P1): 任务分配不匹配 Worker 能力 — claimed_paths 未影响评分
+#   - FIX-7 (P2): duration_seconds 被 CLI 的 0 覆盖
+#
+# Codex adversarial review findings (adopted):
+#   1. FIX-6: CLI-side suggest uses stale plan state → move ready computation
+#      to daemon as a single atomic op "ralph_register_and_suggest"
+#   2. FIX-6: _resuggest_ready_tasks() can't rebuild TaskRef from
+#      _active_workflows → store task_ref during registration
+#   3. FIX-8: Task enters running before actor_add/send succeeds → only
+#      mark running after both succeed; rollback on failure
+#   4. Verification commands were placeholders → replaced with real checks
+#
+# Root cause analysis (from code exploration + Codex review):
+#   FIX-8: workflow_orchestrator.py:647 checks self._send_message_fn but it's
+#          never set. Fix: fall back to _daemon_request_fn op="send" (like :1198).
+#          ALSO: _start_assigned_agents() marks running BEFORE actor_add/send.
+#          Fix: only transition to running after successful delivery.
+#
+#   FIX-6: workflow_cmds.py:147 sends ALL loaded tasks in one batch.
+#          Fix: new daemon op "ralph_register_and_suggest" that atomically
+#          (a) registers all tasks with engine + stores TaskRef in
+#          _active_workflows, (b) computes ready subset using daemon's
+#          real-time state, (c) submits only the ready subset as a batch.
+#          _resuggest_ready_tasks() needs task_ref persisted to rebuild
+#          remaining candidates after completion.
+#
+#   FIX-10: agent_pool.py:164-227 scores by task_affinity, role, capabilities,
+#           model fitness. claimed_paths only affects multi-file context bonus
+#           (+5 pts). Fix: infer domain from claimed_paths, add affinity bonus.
+#
+#   FIX-7: workflow_state_engine.py:117 uses ev.setdefault("duration_seconds",
+#          computed) but evidence already contains duration_seconds=0 from
+#          orchestrator. Fix: use ev[key]=val unconditionally.
+#
+# Execution protocol: Dynamic DAG — after each task completes, re-run suggest.
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED    # Out of scope: auto-discovered entrypoints
+  - E_CRITICAL_FLOW_UNCOVERED        # Out of scope: auto-discovered flows
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+
+required_issues:
+  - "FIX-8"   # Worker PTY 进程不消费 inbox 消息
+  - "FIX-6"   # --plan 提交应分批而非全量
+  - "FIX-10"  # 任务分配不匹配 Worker 能��
+  - "FIX-7"   # duration_seconds engine 计算值被覆盖
+
+critical_flows:
+  - id: task-prompt-delivery-to-pty
+    description: >
+      Orchestrator builds task prompt → sends via daemon op="send" →
+      message enters ledger + throttle queue → delivery tick writes to PTY stdin.
+      Task status only transitions to running after successful delivery.
+    entrypoints:
+      - "workflow_orchestrator._start_assigned_agents"
+  - id: plan-register-and-suggest
+    description: >
+      CLI sends all tasks to daemon → daemon registers all with engine + stores
+      TaskRef in _active_workflows → daemon computes ready subset using real-time
+      state → submits only ready subset → on completion, _resuggest_ready_tasks
+      rebuilds candidates from stored TaskRef and triggers next batch
+    entrypoints:
+      - "cli.workflow_cmds.cmd_workflow_submit"
+  - id: agent-pool-path-scoring
+    description: >
+      Task with claimed_paths arrives → agent pool infers domain from path
+      prefixes → domain-affinity bonus added to scoring → best-match agent selected
+    entrypoints:
+      - "agent_pool.AgentPoolManager.evaluate_for_task"
+
+tasks:
+  # ── T1: Wire up message delivery + status rollback (FIX-8) ��─────────────
+
+  - id: T1
+    title: Wire orchestrator message delivery with status rollback on failure
+    type: backend
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    depends_on: []
+    addresses: ["FIX-8"]
+    goal_behavior: >
+      Two changes in _start_assigned_agents() at workflow_orchestrator.py:
+
+      (1) Message delivery fallback: When _send_message_fn is None but
+      _daemon_request_fn is available, construct DaemonRequest(op="send",
+      args={group_id, by=ORCHESTRATOR_SERVICE_ACTOR, to=[agent_id],
+      text=task_prompt}) — exactly as done at line 1198 for foreman
+      notifications. This reuses the proven daemon delivery pipeline.
+
+      (2) Status rollback on failure (Codex finding #3): Currently the code
+      sets status to "running" at line 621 BEFORE actor_add/send. Change to:
+      keep status as "assigned" during actor registration and message sending.
+      Only transition to "running" after BOTH _add_actor_via_daemon() succeeds
+      AND the task prompt send succeeds (resp.ok=True). If either fails,
+      keep status as "pending" and log the error. This prevents "running but
+      no worker received the task" zombie states.
+
+      Guard: if both _send_message_fn and _daemon_request_fn are None,
+      log a warning and skip sending (don't crash).
+    acceptance_criteria: >
+      (a) Orchestrator with _daemon_request_fn but no _send_message_fn delivers
+      task prompts via op="send". (b) If send returns ok=False, task status
+      does NOT transition to "running" — remains "pending". (c) If both
+      callbacks are None, a warning is logged and task remains "pending".
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_e2e_closure.py -q --tb=short -k 'daemon_send or status_rollback'"
+      checks:
+        - name: send-fallback-exists
+          command: >
+            python -c "
+            import ast, inspect;
+            from cccc.daemon.foreman import workflow_orchestrator as wo;
+            src = inspect.getsource(wo.WorkflowOrchestrator._start_assigned_agents);
+            assert 'op' in src and 'send' in src, 'No daemon op=send fallback found';
+            print('PASS: _start_assigned_agents has daemon op=send fallback')
+            "
+          required: true
+          expected_exit_code: 0
+      covers:
+        tasks: ["T1"]
+        paths: ["src/cccc/daemon/foreman/workflow_orchestrator.py"]
+        flows: ["task-prompt-delivery-to-pty"]
+    provides:
+      - name: reliable_message_delivery
+        kind: runtime_capability
+        schema_hint: "Orchestrator delivers task prompts via daemon op=send with status rollback on failure"
+
+  # ── T2: Fix duration_seconds setdefault override (FIX-7) ─────────────────
+
+  - id: T2
+    title: Fix duration_seconds computation — engine value always wins
+    type: backend
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    depends_on: []
+    addresses: ["FIX-7"]
+    goal_behavior: >
+      In report_worker_completion() at workflow_state_engine.py:117, change
+      ev.setdefault("duration_seconds", duration_seconds) to
+      ev["duration_seconds"] = duration_seconds. The engine-computed value
+      (from started_at) is authoritative and must override any CLI-provided
+      value. When started_at is None (edge case: completion without start),
+      keep existing behavior of defaulting to 0.
+    acceptance_criteria: >
+      After report_worker_started(t, {}) + sleep(0.1) +
+      report_worker_completion(t, {"duration_seconds": 0}), the completion
+      event in the ledger has duration_seconds > 0 (engine-computed, not
+      CLI's 0). Existing tests pass.
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_e2e_closure.py -q --tb=short -k duration"
+      checks:
+        - name: engine-duration-overrides-cli
+          command: >
+            python -c "
+            import inspect;
+            from cccc.kernel import workflow_state_engine as wse;
+            src = inspect.getsource(wse.WorkflowEngine.report_worker_completion);
+            assert 'setdefault' not in src or 'duration_seconds' not in src.split('setdefault')[0][-50:], \
+                'ev.setdefault still used for duration_seconds';
+            print('PASS: setdefault replaced for duration_seconds')
+            "
+          required: true
+          expected_exit_code: 0
+      covers:
+        tasks: ["T2"]
+        paths: ["src/cccc/kernel/workflow_state_engine.py"]
+    provides:
+      - name: authoritative_duration
+        kind: data_quality
+        schema_hint: "duration_seconds in completion events reflects actual elapsed time from engine timestamps"
+
+  # ── T3: Atomic register-and-suggest daemon op (FIX-6) ───────────────────
+
+  - id: T3
+    title: Atomic daemon op register_and_suggest for --plan phased submission
+    type: backend
+    role: leaf
+    claimed_paths:
+      - "src/cccc/cli/workflow_cmds.py"
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    depends_on: ["T1"]
+    addresses: ["FIX-6"]
+    goal_behavior: >
+      Codex review identified two critical issues with the original design:
+      (a) CLI-side suggest uses stale plan state, not daemon real-time state.
+      (b) _resuggest_ready_tasks() can't rebuild TaskRef because it's not
+      stored in _active_workflows.
+
+      Fix with a single daemon-side atomic operation:
+
+      (1) New IPC op "ralph_register_and_suggest" in ralph_ipc_handler.py:
+      Receives ALL tasks from CLI. Delegates to
+      orchestrator.register_and_suggest(tasks, workflow_id) which:
+        - Registers ALL tasks with engine (engine.register_task())
+        - Stores TaskRef objects in _active_workflows[wf]["tasks"][tid]["task_ref"]
+          (this fixes the data chain for _resuggest_ready_tasks)
+        - Calls self.ralph.suggest_ready_batch(remaining_refs, running_write_sets)
+          using daemon's real-time state (not stale plan state)
+        - Submits ONLY the ready subset via process_batch_suggestion()
+        - Returns which tasks were registered vs which were submitted
+
+      (2) CLI change: cmd_workflow_submit --plan path calls the new
+      "ralph_register_and_suggest" op instead of "ralph_batch_suggest".
+      --tasks path remains unchanged (backward compatible).
+
+      (3) Fix _resuggest_ready_tasks(): ensure it reads TaskRef from
+      _active_workflows[wf]["tasks"][tid]["task_ref"]. This data is now
+      guaranteed to exist because register_and_suggest stores it.
+
+      If registration succeeds but suggest returns empty (all tasks have
+      unmet deps), all tasks remain PLANNED — no orphan state.
+    acceptance_criteria: >
+      Given a plan with T1(no deps), T2(depends T1), T3(no deps),
+      T4(depends T2+T3): the first batch_registered event only contains
+      [T1, T3]. T2 and T4 remain PLANNED. After T1 completes,
+      _resuggest_ready_tasks() fires and T2 becomes ready. After T2+T3
+      complete, T4 becomes ready. --tasks path is unchanged.
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_workflow_e2e_closure.py tests/test_ralph_ipc.py -q --tb=short -k 'phased or register_and_suggest'"
+      checks:
+        - name: register-and-suggest-op-exists
+          command: >
+            python -c "
+            from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op;
+            from cccc.contracts.v1 import DaemonResponse;
+            # Verify the new op is recognized (won't crash on unknown op)
+            resp = try_handle_ralph_op('ralph_register_and_suggest', {
+                'workflow_id': 'test', 'tasks': [], 'group_id': 'g', 'project_root': '/tmp'
+            });
+            assert isinstance(resp, DaemonResponse), f'Expected DaemonResponse, got {type(resp)}';
+            print('PASS: ralph_register_and_suggest op exists')
+            "
+          required: true
+          expected_exit_code: 0
+      covers:
+        tasks: ["T3"]
+        paths:
+          - "src/cccc/cli/workflow_cmds.py"
+          - "src/cccc/daemon/ralph_ipc_handler.py"
+          - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+        flows: ["plan-register-and-suggest"]
+    consumes:
+      - name: reliable_message_delivery
+        from: T1
+    provides:
+      - name: phased_plan_submission
+        kind: runtime_capability
+        schema_hint: "Daemon-side atomic register+suggest ensures real-time state gating and TaskRef persistence for resuggest"
+
+  # ���─ T4: Add path-domain inference to agent pool scoring (FIX-10) ─────────
+
+  - id: T4
+    title: Add claimed_paths domain inference to agent pool scoring
+    type: backend
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/agent_pool.py"
+      - "tests/test_agent_pool_scoring.py"
+    depends_on: []
+    addresses: ["FIX-10"]
+    goal_behavior: >
+      In _score_agent_for_task() at agent_pool.py:164, add a new scoring
+      factor: path-domain inference. Extract domain signals from
+      task.claimed_paths by checking path prefixes:
+      - Paths containing "frontend/", "components/", "pages/", "styles/",
+        ".tsx", ".jsx", ".css", ".vue" → domain "frontend"
+      - Paths containing "backend/", "api/", "server/", "models/",
+        "database/", ".go", ".rs" → domain "backend"
+      - Paths containing "test", "spec" → domain "testing"
+      - Mixed or unrecognized → domain "general"
+
+      Scoring adjustment:
+      - If inferred domain matches agent's task_affinity: +25 points
+      - If inferred domain partially matches (related type): +10 points
+
+      Add helper _infer_domain_from_paths(paths: List[str]) -> str.
+      Do NOT change existing scoring factors — purely additive.
+
+      Also add tests to test_agent_pool_scoring.py for path-domain scoring.
+    acceptance_criteria: >
+      A task with claimed_paths=["src/frontend/App.tsx"] scores 25 points
+      higher on a frontend-worker than on a backend-worker. Mixed paths
+      get "general" domain and no bonus. All existing tests pass.
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_agent_pool_scoring.py -q --tb=short"
+      checks:
+        - name: path-domain-scoring-applied
+          command: >
+            python -c "
+            from cccc.daemon.foreman.agent_pool import AgentPoolManager;
+            pm = AgentPoolManager.__new__(AgentPoolManager);
+            domain = pm._infer_domain_from_paths(['src/frontend/App.tsx', 'src/frontend/index.css']);
+            assert domain == 'frontend', f'expected frontend, got {domain}';
+            domain2 = pm._infer_domain_from_paths(['src/api/handler.go']);
+            assert domain2 == 'backend', f'expected backend, got {domain2}';
+            domain3 = pm._infer_domain_from_paths(['src/frontend/a.tsx', 'src/backend/b.py']);
+            assert domain3 == 'general', f'expected general for mixed, got {domain3}';
+            print('PASS: path domain inference works')
+            "
+          required: true
+          expected_exit_code: 0
+      covers:
+        tasks: ["T4"]
+        paths: ["src/cccc/daemon/foreman/agent_pool.py"]
+        flows: ["agent-pool-path-scoring"]
+    provides:
+      - name: path_aware_scoring
+        kind: runtime_capability
+        schema_hint: "Agent pool considers claimed_paths domain for task-worker matching"
+
+  # ── T5: Integration tests — cross-task validation ────────────────────────
+
+  - id: T5
+    title: Integration tests for FIX-6/7/8/10 end-to-end
+    type: backend
+    role: integration
+    claimed_paths:
+      - "tests/test_workflow_e2e_closure.py"
+    depends_on: ["T1", "T2", "T3", "T4"]
+    addresses: ["FIX-6", "FIX-7", "FIX-8", "FIX-10"]
+    goal_behavior: >
+      Add integration tests to test_workflow_e2e_closure.py that validate
+      the 4 fixes work together:
+
+      (1) test_daemon_send_fallback_delivers_task (FIX-8): Create
+      orchestrator with mock _daemon_request_fn (no _send_message_fn).
+      Call process_batch_suggestion(). Verify _daemon_request_fn was called
+      with op="send", to=[agent_id], text containing task prompt.
+
+      (2) test_status_rollback_on_send_failure (FIX-8): Create orchestrator
+      where _daemon_request_fn returns ok=False for "send" ops. Process a
+      batch. Verify task status is NOT "running" (stays "pending").
+
+      (3) test_duration_engine_overrides_cli (FIX-7): Engine start task,
+      sleep 0.1s, complete with evidence={"duration_seconds":0}. Read
+      ledger and verify completion event's duration_seconds > 0.
+
+      (4) test_phased_plan_only_submits_ready (FIX-6): Register 4 tasks
+      via register_and_suggest (T1 no dep, T2 dep T1, T3 no dep, T4 dep
+      T2+T3). Verify first batch is [T1, T3] only. Complete T1, call
+      _resuggest_ready_tasks, verify T2 becomes ready.
+
+      (5) test_path_domain_scoring_frontend (FIX-10): Two agents
+      (frontend-worker, backend-worker). Score both on task with
+      claimed_paths=["src/frontend/App.tsx"]. Assert frontend > backend.
+    acceptance_criteria: >
+      All 5 integration tests pass. Total test suite has 0 new failures.
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_workflow_e2e_closure.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5"]
+        paths:
+          - "tests/test_workflow_e2e_closure.py"
+          - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+          - "src/cccc/kernel/workflow_state_engine.py"
+          - "src/cccc/cli/workflow_cmds.py"
+          - "src/cccc/daemon/ralph_ipc_handler.py"
+          - "src/cccc/daemon/foreman/agent_pool.py"
+        flows: ["task-prompt-delivery-to-pty", "plan-register-and-suggest", "agent-pool-path-scoring"]
+    consumes:
+      - name: reliable_message_delivery
+        from: T1
+      - name: authoritative_duration
+        from: T2
+      - name: phased_plan_submission
+        from: T3
+      - name: path_aware_scoring
+        from: T4
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

@@ -1,0 +1,309 @@
+tasks:
+- id: T1
+  title: E-1 验证分层数据模型：VerificationSpec.checks[]
+  role: leaf
+  claimed_paths:
+  - src/cccc/contracts/v1/ralph_ipc.py
+  - src/cccc/ralph/models.py
+  - tests/test_ralph_ipc.py
+  depends_on: []
+  addresses:
+  - E-1
+  goal_behavior: '在 VerificationSpec（contracts 层）中新增 checks: List[VerificationCheckSpec]
+    字段。 VerificationCheckSpec 包含 name (str), command (str), required (bool, default
+    True), expected_exit_code (int, default 0)。 当 checks 非空时，verify_completion 使用
+    checks 列表； 当 checks 为空但 command 非空时，自动包装为单条 check（向后兼容）。 同步在 ralph.models.Verification
+    中添加对应 checks 字段。
+
+    '
+  acceptance_criteria: '1. VerificationSpec.checks 是 List[VerificationCheckSpec]，默认空列表
+    2. VerificationCheckSpec 包含 name/command/required/expected_exit_code 3. 只有 command
+    的旧格式 model_validate 不报错（向后兼容） 4. checks + command 同时存在时 checks 优先 5. ralph.models.Verification
+    也有对应的 checks 字段 6. model_dump() / model_validate() round-trip 测试通过
+
+    '
+  verification:
+    level: unit
+    command: pytest tests/test_ralph_ipc.py -q -k 'verification_check or verification_spec
+      or check_spec'
+    covers:
+      tasks:
+      - T1
+  provides:
+  - name: multi_check_model
+    kind: data_model
+    schema_hint: VerificationCheckSpec + VerificationSpec.checks
+- id: T2
+  title: E-1 多步验证执行：verify_completion + ralph verify 迭代 checks[]
+  role: leaf
+  claimed_paths:
+  - src/cccc/daemon/foreman/ralph_service.py
+  - src/cccc/ralph/core.py
+  - tests/test_foreman_workflow.py
+  - tests/ralph/test_ralph_standalone.py
+  depends_on:
+  - T1
+  addresses:
+  - E-1
+  goal_behavior: "两条执行路径都需要支持 checks[]： A. Daemon 路径 — RalphService.verify_completion()（ralph_service.py）：\n\
+    \   1. 从 task_ref.verification 解析 checks 列表（若空则 fallback 到单 command）\n   2. 按顺序执行每个\
+    \ check，每个产生一个 VerificationCheck 结果\n   3. required=True 的 check 失败时短路（跳过后续 check）\n\
+    \   4. required=False 的 check 失败不影响 overall_outcome\n   5. overall_outcome = passed\
+    \ 仅当所有 required check 通过\nB. 独立 CLI 路径 — ralph/core.py 的 verify 逻辑：\n   1. 解析\
+    \ checks 列表，向后兼容单 command\n   2. 按顺序执行，汇总结果\n   3. ralph verify / ralph complete\
+    \ --verify 正确处理多步结果\n"
+  acceptance_criteria: '1. daemon: 3 个 checks (build, test, lint) 全通过 → overall passed,
+    3 条 check 记录 2. daemon: required check 失败 → overall failed, 短路后续 3. daemon: optional
+    check 失败 → overall passed（如果其他 required 都通过） 4. 空 checks + 有 command → 向后兼容（两条路径均不变）
+    5. standalone: ralph verify plan.yaml T1 → 执行 checks[] 并逐项输出 6. 每个 check 有 name,
+    outcome, duration_ms, message
+
+    '
+  verification:
+    level: unit
+    command: pytest tests/test_foreman_workflow.py tests/ralph/test_ralph_standalone.py
+      tests/test_ralph_verification.py -q -k 'multi_check or verify_layered or verification_check
+      or verify_checks'
+    covers:
+      tasks:
+      - T1
+      - T2
+  consumes:
+  - name: multi_check_model
+    kind: data_model
+    from_task: T1
+- id: T3
+  title: E-1 多步验证报告：orchestrator + progress 逐项结果
+  role: leaf
+  claimed_paths:
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - src/cccc/daemon/foreman/progress_report.py
+  - tests/test_foreman_workflow.py
+  depends_on:
+  - T2
+  addresses:
+  - E-1
+  goal_behavior: "1. orchestrator.apply_task_event() 在处理 completed/failed 事件时，\n \
+    \  将 VerificationResult.checks 详情包含在 foreman 通知中，\n   让 Foreman 看到是 build/test/lint\
+    \ 哪一步挂了。\n2. progress_report.on_task_completed/failed() 在 task_info 中记录\n   per-check\
+    \ 结果（name + outcome），summarize_progress 输出包含。\n3. _notify_foreman_task_update\
+    \ 的 summary 包含每个 check 的结果摘要。\n"
+  acceptance_criteria: '1. foreman 通知包含 "build: passed, test: failed, lint: skipped"
+    格式的摘要 2. progress state task_info 有 verification_checks 字段 3. summarize_progress
+    输出中包含 check 级别信息 4. 无 checks 时行为不变（向后兼容）
+
+    '
+  verification:
+    level: unit
+    command: pytest tests/test_foreman_workflow.py -q -k 'check_report or progress_check
+      or multi_check_notify'
+    covers:
+      tasks:
+      - T3
+- id: T4
+  title: E-2 模型能力驱动评分：strengths/weaknesses/context_window/rating
+  role: leaf
+  claimed_paths:
+  - src/cccc/daemon/foreman/agent_pool.py
+  - tests/test_agent_pool_scoring.py
+  depends_on: []
+  addresses:
+  - E-2
+  goal_behavior: "增强 _score_agent_for_task() 评分逻辑： 1. model.weaknesses 匹配 task.type\
+    \ → -15 分 + reason \"Model weakness: {type}\" 2. model.context_window 解析为数值，大上下文（>=200k）对多文件任务（claimed_paths>=5）+5\
+    \ 分 3. model.best_for 关键词匹配 task.title/type → +10 分 4. model.foreman_rating（1-5\
+    \ 分）→ +floor(rating * 2) 分（最多 10 分） 5. 所有评分因素记录到 AgentEvaluation.reasons 中 更新总分上限：affinity\
+    \ 40 + role 30 + caps 20 + model_strength 10\n  + best_for 10 + rating 10 + context\
+    \ 5 - weakness 15 = 理论最高 110\n"
+  acceptance_criteria: '1. 有 weakness 匹配时分数降低并记录 reason 2. foreman_rating=5 的模型比 unrated
+    多 10 分 3. best_for="后端开发" 对 type=backend 任务加分 4. context_window="1m" 对多文件任务加分
+    5. reasons 列表包含每项评分因素的说明 6. 现有无 rating/weakness 的 agent 评分不变（向后兼容）
+
+    '
+  verification:
+    level: unit
+    command: pytest tests/test_agent_pool_scoring.py -q
+    covers:
+      tasks:
+      - T4
+- id: T5
+  title: E-3 TaskContext 模型 + 持久化
+  role: leaf
+  claimed_paths:
+  - src/cccc/daemon/foreman/context_store.py
+  - tests/test_context_store.py
+  depends_on: []
+  addresses:
+  - E-3
+  goal_behavior: "新建 context_store.py，实现： 1. TaskContext dataclass：goal (str), completed_steps\
+    \ (List[str]),\n   unresolved (List[str]), next_steps (List[str]), iteration (int),\n\
+    \   last_error (str), changed_files (List[str]), updated_at (str)\n2. ContextStore\
+    \ 类：\n   - save(task_id, context) → 写入 {project_root}/.cccc/task_contexts/{task_id}.yaml\n\
+    \   - load(task_id) → 读取并返回 TaskContext，不存在返回 None\n   - render_prompt_section(context)\
+    \ → 格式化为 worker 可读的 markdown 片段\n3. 自动创建 .cccc/task_contexts/ 目录\n"
+  acceptance_criteria: '1. save → load round-trip 正确 2. load 不存在的 task_id 返回 None
+    3. render_prompt_section 输出包含 goal/completed/unresolved/next_steps 4. iteration
+    每次 save 自增 5. 目录不存在时自动创建
+
+    '
+  verification:
+    level: unit
+    command: pytest tests/test_context_store.py -q
+    covers:
+      tasks:
+      - T5
+  provides:
+  - name: context_store
+    kind: module
+    schema_hint: ContextStore + TaskContext
+- id: T6
+  title: E-3 Context 注入：重试时通过 _build_task_prompt 加载上下文
+  role: leaf
+  claimed_paths:
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - tests/test_foreman_workflow.py
+  depends_on:
+  - T3
+  - T5
+  addresses:
+  - E-3
+  goal_behavior: "注入点是 orchestrator 的 _build_task_prompt()（~line 721）， 不是 agent_pool._generate_worker_prompt()。重试流程：\
+    \ retry_task() 改状态为 READY → 下一轮 batch 分配时 _build_task_prompt() 构造 worker prompt\
+    \ → 这里注入上下文。 具体改动： 1. apply_task_event() 在 completed/failed 时调用 context_store.save()，\n\
+    \   保存 goal_behavior、changed_files、error_message 等。\n2. _build_task_prompt() 调用\
+    \ context_store.load(task_id)，\n   有值时追加 \"## 上次执行记录\" section（由 render_prompt_section\
+    \ 生成）。\n3. iteration 自增，worker 看到 \"这是第 N 次尝试\"。\n"
+  acceptance_criteria: '1. 任务完成后 .cccc/task_contexts/{task_id}.yaml 存在 2. 任务失败后 context
+    包含 last_error 3. 重新分配时 _build_task_prompt 输出包含 "上次执行记录" section 4. iteration 从
+    1 开始，每次 retry 递增 5. 首次执行（无上下文）时 prompt 无额外 section
+
+    '
+  verification:
+    level: integration
+    command: pytest tests/test_foreman_workflow.py -q -k 'context_rollover or context_inject
+      or retry_context or build_task_prompt'
+    covers:
+      tasks:
+      - T5
+      - T6
+      flows:
+      - context_rollover_flow
+  consumes:
+  - name: context_store
+    kind: module
+    from_task: T5
+- id: T7
+  title: M-2 非核心 CLI 命令：capability/memory/coordination/agent-state
+  role: leaf
+  claimed_paths:
+  - src/cccc/cli/system_cmds.py
+  - src/cccc/cli/main.py
+  - tests/test_cli_noncore.py
+  depends_on: []
+  addresses:
+  - M-2
+  goal_behavior: "在 system_cmds.py 中新增 4 个 CLI 子命令，通过 daemon IPC 调用对应功能。 IPC op 映射（与现有\
+    \ daemon handler 对齐）： 1. cccc capability <tool_name> <action> [--args JSON]\n\
+    \   → daemon op \"capability_tool_call\"（handler: capability_ops/_handlers.py）\n\
+    2. cccc memory <action> [--key KEY] [--value VALUE]\n   → daemon op \"memory\"\
+    （handler: memory/memory_ops.py，action: layout_get/search/get/write）\n3. cccc coordination\
+    \ <action> [--note TEXT]\n   → daemon op \"context_sync\"（sub-action: coordination.note.add\
+    \ 等，handler: context/context_ops.py）\n4. cccc agent-state [--actor ACTOR_ID]\n\
+    \   → daemon op \"context_sync\"（sub-action: agent_state.update/get，handler: context/context_ops.py）\n\
+    在 main.py 的 subparsers 中注册。 每个命令的模式与现有 CLI 一致：解析参数 → daemon_request → 输出 JSON。\n"
+  acceptance_criteria: '1. cccc capability cccc_space status → 返回 space 状态（daemon
+    运行时） 2. cccc memory layout_get → 返回 memory 布局 3. cccc coordination status → 返回协调状态
+    4. cccc agent-state → 返回当前 agent 状态 5. daemon 未运行时报明确错误 6. --help 显示用法
+
+    '
+  verification:
+    level: unit
+    command: pytest tests/test_cli_noncore.py -q
+    covers:
+      tasks:
+      - T7
+- id: T8
+  title: 全量集成验证 + 回归测试
+  role: integration
+  claimed_paths:
+  - tests/test_capability_expansion_integration.py
+  - src/cccc/daemon/server.py
+  - src/cccc/daemon/ralph_ipc_handler.py
+  - src/cccc/ralph/validator.py
+  - src/cccc/ralph/cli.py
+  depends_on:
+  - T3
+  - T4
+  - T6
+  - T7
+  addresses:
+  - E-1
+  - E-2
+  - E-3
+  - M-2
+  goal_behavior: "新建集成测试文件，验证所有能力扩展协同工作： 1. E-1：构造带 3 个 checks 的 TaskRef → verify_completion\
+    \ →\n   VerificationResult 有 3 条 check → progress 报告逐项结果\n2. E-2：构造带 weakness/rating\
+    \ 的 ModelCapability →\n   agent_pool.evaluate_for_task → 验证评分差异和 reasons\n3. E-3：模拟\
+    \ task complete → save context → retry →\n   worker prompt 包含上次记录\n4. 全量回归：pytest\
+    \ tests/ 不引入新的 failure 5. 确认关键入口（server.py, ralph_ipc_handler.py, validator.py,\
+    \ cli.py）无回归\n"
+  acceptance_criteria: '1. E-1 端到端：multi-check → verify → report → foreman 通知 2. E-2：weakness
+    匹配降分 + rating 加分 3. E-3：save → retry → prompt inject 闭环 4. 现有 1192+ tests 无回归
+    5. ralph validate 对本计划自身 0 error（自举验证）
+
+    '
+  verification:
+    level: e2e
+    command: pytest tests/ -q
+    covers:
+      tasks:
+      - T1
+      - T2
+      - T3
+      - T4
+      - T5
+      - T6
+      - T7
+      - T8
+      flows:
+      - multi_check_verification
+      - registry_driven_assignment
+      - context_rollover_flow
+      - daemon_startup
+      - cli_workflow
+critical_flows:
+- id: multi_check_verification
+  description: TaskRef.checks[] → verify_completion 逐项执行 → VerificationResult.checks
+    → foreman 通知包含逐项结果
+  entrypoints:
+  - src/cccc/daemon/foreman/ralph_service.py
+  required_verification_level: integration
+- id: registry_driven_assignment
+  description: ModelCapability strengths/weaknesses/rating → agent_pool 评分 → AgentEvaluation.reasons
+    包含评分因素
+  entrypoints:
+  - src/cccc/daemon/foreman/agent_pool.py
+  required_verification_level: unit
+- id: context_rollover_flow
+  description: task complete → context_store.save → retry → context_store.load → worker
+    prompt inject
+  entrypoints:
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  required_verification_level: integration
+required_issues:
+- E-1
+- E-2
+- E-3
+- M-2
+state:
+  completed_task_ids:
+  - T1
+  - T4
+  - T5
+  - T7
+  - T2
+  - T3
+  - T6
+  - T8
+  running_tasks: []
+  failed_task_ids: []

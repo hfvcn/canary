@@ -489,11 +489,12 @@ def _task_delete_plan(
 
 
 def _get_or_create_agent(agents_state: AgentsData, agent_id: str) -> AgentState:
-    canonical = str(agent_id or "").strip().replace("_", "-").lower()
+    canonical = str(agent_id or "").strip().replace("_", "-")
     if not canonical:
         raise ValueError("actor_id must be non-empty")
+    norm = canonical.casefold()
     for agent in agents_state.agents:
-        if agent.id == canonical:
+        if str(getattr(agent, "id", "") or "").strip().casefold() == norm:
             return agent
     created = AgentState(id=canonical)
     agents_state.agents.append(created)
@@ -623,6 +624,28 @@ def _coordination_brief_to_dict(brief: CoordinationBrief) -> Dict[str, Any]:
     }
 
 
+def _panorama_mermaid(*, context: Context, tasks: List[Task]) -> str:
+    brief = context.coordination.brief if isinstance(context.coordination, Coordination) else CoordinationBrief()
+    objective = str(brief.objective or "").strip()
+    focus = str(brief.current_focus or "").strip()
+
+    label_parts = ["Coordination"]
+    if objective:
+        label_parts.append(objective)
+    if focus:
+        label_parts.append(focus)
+    label = "\\n".join(label_parts)
+
+    lines = ["graph TD", f'Coordination["{label}"]']
+    for task in _sort_tasks(tasks)[:8]:
+        title = str(task.title or "").strip() or str(task.id or "").strip()
+        assignee = str(task.assignee or "").strip()
+        task_label = title if not assignee else f"{title}\\n{assignee}"
+        lines.append(f'Task_{task.id}["{task_label}"]')
+        lines.append(f"Coordination --> Task_{task.id}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _build_context_full_result(
     *,
     storage: ContextStorage,
@@ -641,6 +664,7 @@ def _build_context_full_result(
             "recent_handoffs": [_note_to_dict(note) for note in context.coordination.recent_handoffs],
         },
         "agent_states": [_agent_state_to_dict(agent) for agent in ordered_agents],
+        "panorama": {"mermaid": _panorama_mermaid(context=context, tasks=tasks)},
         "attention": attention,
         "board": board,
         "tasks_summary": _tasks_summary(tasks, attention=attention),
@@ -865,7 +889,11 @@ def handle_context_sync(args: Dict[str, Any]) -> DaemonResponse:
                 if not title:
                     raise ValueError(f"op[{idx}] task.create title is required")
                 status = _parse_task_status(raw.get("status")) if "status" in raw else TaskStatus.PLANNED
-                task_id = storage.generate_task_id()
+                workflow_task_id = str(raw.get("workflow_task_id") or "").strip()
+                if workflow_task_id and workflow_task_id in tasks_by_id:
+                    _mark_change(idx, op_name, f"Skipped existing task {workflow_task_id}")
+                    continue
+                task_id = workflow_task_id or storage.generate_task_id()
                 parent_id = str(raw.get("parent_id") or "").strip() or None
                 if parent_id and parent_id not in tasks_by_id:
                     raise ValueError(f"op[{idx}] parent task not found: {parent_id}")
@@ -913,8 +941,16 @@ def handle_context_sync(args: Dict[str, Any]) -> DaemonResponse:
                         updated = True
                 if "assignee" in raw:
                     value = str(raw.get("assignee") or "").strip() or None
-                    if by not in {"system", "user"} and value and value != by:
-                        raise ValueError(f"Permission denied: peer cannot reassign task to {value}")
+                    if (
+                        by not in {"system", "user"}
+                        and not str(by or "").startswith("service:")
+                        and value
+                        and value != by
+                    ):
+                        group = load_group(group_id)
+                        role = get_effective_role(group, by) if group is not None else "peer"
+                        if role != "foreman":
+                            raise ValueError(f"Permission denied: peer cannot reassign task to {value}")
                     if task.assignee != value:
                         task.assignee = value
                         updated = True
@@ -1075,7 +1111,7 @@ def handle_context_sync(args: Dict[str, Any]) -> DaemonResponse:
                 if perm_err:
                     raise ValueError(perm_err)
                 if task.status != TaskStatus.ARCHIVED:
-                    continue
+                    raise ValueError("task.restore requires archived status")
                 restore_to = str(task.archived_from or TaskStatus.PLANNED.value).strip().lower() or TaskStatus.PLANNED.value
                 try:
                     task.status = TaskStatus(restore_to)
@@ -1133,7 +1169,7 @@ def handle_context_sync(args: Dict[str, Any]) -> DaemonResponse:
                 continue
 
             if op_name == "agent_state.update":
-                actor_id = str(raw.get("actor_id") or raw.get("agent_id") or "").strip().lower()
+                actor_id = str(raw.get("actor_id") or raw.get("agent_id") or "").strip()
                 if not actor_id:
                     raise ValueError(f"op[{idx}] agent_state.update actor_id is required")
                 perm_err = _check_permission(by, op_name, group_id, target_actor_id=actor_id)
@@ -1210,7 +1246,7 @@ def handle_context_sync(args: Dict[str, Any]) -> DaemonResponse:
                 continue
 
             if op_name == "agent_state.clear":
-                actor_id = str(raw.get("actor_id") or raw.get("agent_id") or "").strip().lower()
+                actor_id = str(raw.get("actor_id") or raw.get("agent_id") or "").strip()
                 if not actor_id:
                     raise ValueError(f"op[{idx}] agent_state.clear actor_id is required")
                 perm_err = _check_permission(by, op_name, group_id, target_actor_id=actor_id)

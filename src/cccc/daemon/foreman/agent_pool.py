@@ -7,6 +7,7 @@ and decide whether to create new agents or reuse existing ones.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
@@ -27,7 +28,42 @@ from ..ops.agent_ops import (
 # Default capability sets for different task types
 DEFAULT_WORKER_CAPABILITIES = ["task_execution", "code_modification", "memory_access"]
 DEFAULT_REVIEWER_CAPABILITIES = ["code_review", "memory_access"]
+LARGE_CONTEXT_WINDOW = 200_000
+MULTI_FILE_TASK_PATH_COUNT = 5
+FOREMAN_RATING_MULTIPLIER = 2
+PATH_DOMAIN_AFFINITY_BONUS = 25
+PATH_DOMAIN_RELATED_BONUS = 10
+FRONTEND_PATH_SIGNALS = (
+    "frontend/",
+    "components/",
+    "pages/",
+    "styles/",
+    ".tsx",
+    ".jsx",
+    ".css",
+    ".vue",
+)
+BACKEND_PATH_SIGNALS = (
+    "backend/",
+    "api/",
+    "server/",
+    "models/",
+    "database/",
+    ".go",
+    ".rs",
+)
+TESTING_PATH_SIGNALS = ("test", "spec")
 logger = logging.getLogger(__name__)
+
+
+def _parse_context_window(value: str | int) -> int:
+    """Parse a model context window string into a token count."""
+    normalized = str(value).strip().lower()
+    if normalized.endswith("k"):
+        return int(float(normalized[:-1]) * 1_000)
+    if normalized.endswith("m"):
+        return int(float(normalized[:-1]) * 1_000_000)
+    return int(normalized)
 
 
 @dataclass
@@ -157,6 +193,10 @@ class AgentPoolManager:
         - Role type match: +30 points
         - Has required capabilities: +20 points
         - Model suitability: +10 points
+        - Model weakness penalty: -15 points
+        - Large context window bonus: +5 points
+        - Model best_for match: +10 points
+        - Foreman rating bonus: floor(rating * 2) points
 
         Args:
             agent: Agent to evaluate
@@ -181,7 +221,7 @@ class AgentPoolManager:
 
         # Role type match (0-30 points)
         # For regular tasks, worker role is preferred
-        if agent.role_type == "worker":
+        if agent.role_type in ("worker", "peer"):
             score += 30
             reasons.append("Worker role")
         elif agent.role_type == "specialist":
@@ -202,9 +242,79 @@ class AgentPoolManager:
         registry = self.get_model_registry()
         _, model = self._resolve_registry_model(registry, agent.model_id)
         if model:
-            if task.type in model.strengths:
-                score += 10
-                reasons.append(f"Model strength: {task.type}")
+            model_score, model_reasons = self._score_model_for_task(model, task)
+            score += model_score
+            reasons.extend(model_reasons)
+
+        inferred_domain = self._infer_domain_from_paths(task.claimed_paths or [])
+        if inferred_domain != "general":
+            if inferred_domain in agent.task_affinity:
+                score += PATH_DOMAIN_AFFINITY_BONUS
+                reasons.append(f"Path domain affinity: {inferred_domain}")
+            else:
+                related = self._get_related_types(inferred_domain)
+                if any(t in agent.task_affinity for t in related):
+                    score += PATH_DOMAIN_RELATED_BONUS
+                    reasons.append(f"Path domain related affinity: {inferred_domain}")
+
+        return score, reasons
+
+    def _infer_domain_from_paths(self, paths: List[str]) -> str:
+        """Infer a dominant task domain from claimed paths."""
+        if not paths:
+            return "general"
+
+        counts = {"frontend": 0, "backend": 0, "testing": 0}
+        for path in paths:
+            normalized = path.lower()
+            if any(signal in normalized for signal in FRONTEND_PATH_SIGNALS):
+                counts["frontend"] += 1
+            if any(signal in normalized for signal in BACKEND_PATH_SIGNALS):
+                counts["backend"] += 1
+            if any(signal in normalized for signal in TESTING_PATH_SIGNALS):
+                counts["testing"] += 1
+
+        if counts["frontend"] and counts["backend"]:
+            return "general"
+
+        dominant_domain = max(counts, key=counts.get)
+        dominant_score = counts[dominant_domain]
+        if dominant_score == 0:
+            return "general"
+        if list(counts.values()).count(dominant_score) > 1:
+            return "general"
+        return dominant_domain
+
+    def _score_model_for_task(
+        self,
+        model: ModelCapability,
+        task: TaskRef,
+    ) -> tuple[int, List[str]]:
+        """Score model-specific fitness for a task."""
+        score = 0
+        reasons: List[str] = []
+
+        if task.type in model.strengths:
+            score += 10
+            reasons.append(f"Model strength: {task.type}")
+        if task.type in model.weaknesses:
+            score -= 15
+            reasons.append(f"Model weakness: {task.type}")
+        if (
+            _parse_context_window(model.context_window) >= LARGE_CONTEXT_WINDOW
+            and len(task.claimed_paths) >= MULTI_FILE_TASK_PATH_COUNT
+        ):
+            score += 5
+            reasons.append("Large context window for multi-file task")
+        if model.best_for and task.type.lower() in model.best_for.lower():
+            score += 10
+            reasons.append(f"Model best_for match: {model.best_for}")
+        if model.foreman_rating is not None:
+            rating_points = math.floor(model.foreman_rating * FOREMAN_RATING_MULTIPLIER)
+            score += rating_points
+            reasons.append(
+                f"Foreman rating: {model.foreman_rating:g}/5 (+{rating_points})"
+            )
 
         return score, reasons
 
@@ -338,7 +448,7 @@ Rules:
 - Do not renegotiate user scope or re-plan the workflow on your own.
 - Work through the repo/task evidence first, then implement the smallest correct change.
 - Report concrete evidence, changed files, and blockers back to Foreman.
-- Report via `cccc_message_send(to="@foreman", text=...)` when handing off progress or completion.
+- Report progress or blockers via `cccc send "message" --to @foreman`. Report completion via `cccc task complete <task_id> --evidence "summary"`.
 - Raise risks or a better route early, with a specific recommendation.
 - Do not spawn extra workers unless Foreman explicitly asks.
 """

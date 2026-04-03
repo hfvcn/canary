@@ -1,0 +1,353 @@
+# Plan: v5-ralph remaining improvements
+# Source: todo/问题清单-v5-ralph.md (未解决项)
+# Date: 2026-04-02
+# Scope: CLI-2, RALPH-1, VER-1, VER-2, WF-NEW-3, RV-5
+
+tasks:
+  # ── T1: CLI-2 — save_plan_state format preservation ──────────────────
+  - id: T1
+    title: "CLI-2: save_plan_state surgical patch — preserve YAML formatting"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/plan_io.py
+    depends_on: []
+    addresses: ["CLI-2"]
+    goal_behavior: >
+      Rewrite save_plan_state() to use surgical text insertion instead of
+      yaml.dump(). Current code reads entire YAML → modifies dict → dumps
+      back, destroying comments, multi-line strings, and ordering. New code
+      should: (1) parse with yaml.safe_load for business logic validation,
+      (2) locate the state.completed_task_ids section in raw text,
+      (3) append the new task ID as a YAML list item, (4) create the
+      state section if absent. No new dependencies (no ruamel.yaml).
+    acceptance_criteria: >
+      1. Round-trip test: load a plan with comments and multi-line strings,
+         call save_plan_state, verify non-state content is byte-identical.
+      2. Works when state section is absent (creates it).
+      3. Works when completed_task_ids is empty list.
+      4. Works when completed_task_ids already has entries.
+      5. Idempotent: calling twice with same task_id doesn't duplicate.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k save_plan_state"
+      covers:
+        tasks: ["T1"]
+        paths: ["src/cccc/ralph/plan_io.py"]
+        flows: ["save_destroys_format"]
+    provides:
+      - name: format_preserving_save
+        kind: runtime_capability
+        schema_hint: "save_plan_state(path, task_id) preserves non-state content"
+
+  # ── T2: RALPH-1 — suppress_codes mechanism ───────────────────────────
+  - id: T2
+    title: "RALPH-1: Plan-level suppress_codes exemption mechanism"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/cli.py
+    depends_on: []
+    addresses: ["RALPH-1"]
+    goal_behavior: >
+      Add suppress_codes: List[str] field to Plan model. In validate() and
+      validate_with_project(), after collecting all issues, filter out any
+      issue whose code is in plan.suppress_codes. Suppressed issues should
+      still be collected internally but moved to hints with a note indicating
+      suppression, so they remain visible but don't block validation.
+    acceptance_criteria: >
+      1. Plan model accepts suppress_codes field (optional, default []).
+      2. validate() with suppress_codes=["W_ISOLATED_TASK"] demotes that
+         warning to hint with "[suppressed]" prefix in message.
+      3. Errors can also be suppressed (needed for self-referential plans).
+      4. Suppression noted in report hints for auditability.
+      5. Empty suppress_codes has no effect on existing behavior.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k suppress"
+      covers:
+        tasks: ["T2"]
+        paths: ["src/cccc/ralph/models.py", "src/cccc/ralph/validator.py"]
+    provides:
+      - name: suppress_codes_api
+        kind: runtime_capability
+        schema_hint: "Plan.suppress_codes: List[str] filters validation issues"
+
+  # ── T3: VER-1 — verification_skipped event semantics ─────────────────
+  - id: T3
+    title: "VER-1: Distinguish verification_skipped from verification_passed"
+    role: leaf
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/ops/workflow_task_ops.py
+    depends_on: []
+    addresses: ["VER-1"]
+    goal_behavior: >
+      Fix two locations where verification outcome "skipped" is silently
+      mapped to notification_outcome "passed":
+      (1) workflow_orchestrator.py:1292 — set notification_outcome="skipped"
+      (2) workflow_task_ops.py:226 — same fix.
+      The _notify_foreman_verification_result call should pass the true
+      outcome so foreman can distinguish "verified and passed" from
+      "verification was skipped".
+    acceptance_criteria: >
+      1. When verification.overall_outcome is "skipped", notification_outcome
+         is "skipped" (not "passed").
+      2. Task still transitions to completed (skipped is not a failure).
+      3. When verification.overall_outcome is "passed", behavior unchanged.
+      4. Foreman notification message includes "skipped" when applicable.
+    verification:
+      level: unit
+      command: "pytest tests/test_foreman_workflow.py -q -k verification"
+      covers:
+        tasks: ["T3"]
+        paths:
+          - src/cccc/daemon/foreman/workflow_orchestrator.py
+          - src/cccc/daemon/ops/workflow_task_ops.py
+        flows: ["skipped_as_passed"]
+    provides:
+      - name: verification_event_semantics
+        kind: api_endpoint
+        schema_hint: "notification_outcome in {passed, skipped, failed}"
+
+  # ── T4: VER-2 — progress report distinguishes skipped ────────────────
+  - id: T4
+    title: "VER-2: Progress report correctly shows verification skipped"
+    role: leaf
+    claimed_paths:
+      - src/cccc/daemon/foreman/progress_report.py
+    depends_on: ["T3"]
+    addresses: ["VER-2"]
+    goal_behavior: >
+      Update ProgressReporter and related card builders to handle the new
+      "skipped" verification outcome. When outcome is "skipped", the
+      progress card should show a distinct indicator (e.g., "⏭ skipped")
+      rather than "✓ passed". This ensures foreman and human observers
+      can distinguish verified completions from unverified ones.
+    acceptance_criteria: >
+      1. Progress card for "skipped" shows distinct label from "passed".
+      2. Progress card for "passed" unchanged.
+      3. Workflow summary counts skipped separately from passed.
+    verification:
+      level: unit
+      command: "pytest tests/test_foreman_workflow.py -q -k progress"
+      covers:
+        tasks: ["T3", "T4"]
+        paths: ["src/cccc/daemon/foreman/progress_report.py"]
+    consumes:
+      - name: verification_event_semantics
+        from: T3
+
+  # ── T5: WF-NEW-3 — WorkflowMonitor module ───────────────────────────
+  - id: T5
+    title: "WF-NEW-3: WorkflowMonitor — runtime anomaly detection"
+    role: leaf
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_monitor.py
+      - tests/test_workflow_monitor.py
+    depends_on: []
+    addresses: ["WF-NEW-3"]
+    goal_behavior: >
+      Create WorkflowMonitor class with 5 stateless check functions:
+      (a) check_silent_agent(task_id, assigned_at, last_event_at, timeout_s)
+          — returns alert if no events within timeout.
+      (b) check_path_deviation(event) — detects agent using cccc send to
+          directly assign tasks instead of waiting for workflow auto-assign.
+      (c) check_unauthorized_subagent(agent_id, known_agents) — detects
+          foreman creating unplanned workers.
+      (d) check_completer_mismatch(task_id, assigned_agent, completing_agent)
+          — detects wrong agent completing a task.
+      (e) check_file_overstepping(changed_files, claimed_paths) — detects
+          worker modifying files outside their claimed scope.
+      Each returns Optional[MonitorAlert] with severity, message, evidence.
+    acceptance_criteria: >
+      1. Each check function independently testable with simple inputs.
+      2. MonitorAlert dataclass with: alert_type, severity, task_id, message,
+         evidence dict.
+      3. check_file_overstepping uses the same path overlap logic as
+         ralph core._paths_overlap.
+      4. All 5 checks have unit tests with positive and negative cases.
+      5. No daemon/orchestrator imports — pure logic module.
+    verification:
+      level: unit
+      command: "pytest tests/test_workflow_monitor.py -q"
+      covers:
+        tasks: ["T5"]
+        paths: ["src/cccc/daemon/foreman/workflow_monitor.py"]
+    provides:
+      - name: workflow_monitor_api
+        kind: runtime_capability
+        schema_hint: "WorkflowMonitor with 5 check_* methods returning Optional[MonitorAlert]"
+
+  # ── T6: WF-NEW-3 integration — wire monitor into orchestrator ────────
+  - id: T6
+    title: "WF-NEW-3: Wire WorkflowMonitor into orchestrator event handling"
+    role: integration
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/server.py
+      - src/cccc/daemon/ralph_ipc_handler.py
+    depends_on: ["T5", "T3"]
+    addresses: ["WF-NEW-3"]
+    goal_behavior: >
+      Integrate WorkflowMonitor into WorkflowOrchestrator:
+      (1) In on_task_completed: call check_file_overstepping and
+          check_completer_mismatch, log warnings if alerts returned.
+      (2) In process_batch_suggestion: call check_unauthorized_subagent
+          for any new agent IDs not in the known agent pool.
+      (3) Add a periodic check_stalled_tasks method that iterates running
+          tasks and calls check_silent_agent for each.
+      Monitor alerts should be logged and optionally emitted as ledger
+      events (type: "workflow.monitor_alert").
+    acceptance_criteria: >
+      1. on_task_completed calls file overstepping + completer mismatch checks.
+      2. Alerts logged at WARNING level with structured evidence.
+      3. Monitor alerts emitted as ledger events when ledger is available.
+      4. check_stalled_tasks callable from outside (for periodic invocation).
+      5. No crash if monitor raises — alerts are best-effort.
+    verification:
+      level: integration
+      command: "pytest tests/test_foreman_workflow.py -q -k monitor"
+      covers:
+        tasks: ["T5", "T6"]
+        paths:
+          - src/cccc/daemon/foreman/workflow_orchestrator.py
+          - src/cccc/daemon/foreman/workflow_monitor.py
+        flows: ["runtime_monitoring", "daemon_startup"]
+    consumes:
+      - name: workflow_monitor_api
+        from: T5
+      - name: verification_event_semantics
+        from: T3
+
+  # ── T7: RV-5 — semantic dependency inference hints ───────────────────
+  - id: T7
+    title: "RV-5: Semantic dependency inference — goal_behavior keyword scan"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+    depends_on: []
+    addresses: ["RV-5"]
+    goal_behavior: >
+      Add W_SEMANTIC_DEP_HINT check to validate_with_project: for each task,
+      extract notable identifiers from goal_behavior (file names matching
+      *.py pattern, or snake_case identifiers that look like module/function
+      references). If an identifier matches a file path in the project that
+      is NOT claimed by any task in the plan, emit a hint suggesting the
+      author check whether a dependency is missing. Heuristic — hints only.
+    acceptance_criteria: >
+      1. Emits W_SEMANTIC_DEP_HINT when goal_behavior references a file
+         path (e.g., "workflow_orchestrator.py") not claimed by any task.
+      2. Does not emit for common English words or generic terms.
+      3. Hint includes the referenced identifier and which task triggered it.
+      4. Only runs in validate_with_project (needs filesystem access).
+      5. Zero false positives on existing sample_good_plan.yaml.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k semantic_dep"
+      covers:
+        tasks: ["T7"]
+        paths: ["src/cccc/ralph/validator.py"]
+
+  # ── T-int: Integration test ──────────────────────────────────────────
+  - id: T-int
+    title: "Integration test: all v5-ralph-remaining features"
+    role: verification
+    claimed_paths:
+      - tests/ralph/test_v5_remaining_integration.py
+    depends_on: ["T1", "T2", "T3", "T4", "T6", "T7"]
+    addresses: ["CLI-2", "RALPH-1", "VER-1", "VER-2", "WF-NEW-3", "RV-5"]
+    goal_behavior: >
+      Integration test that exercises all new features together:
+      (1) Create a plan with suppress_codes, save it via save_plan_state,
+          verify formatting preserved.
+      (2) Validate a plan that would normally fail but has suppress_codes
+          exempting the failing rule.
+      (3) Test WorkflowMonitor checks with realistic orchestrator payloads.
+      (4) Test verification event semantics through the complete flow.
+    acceptance_criteria: >
+      1. All test cases pass.
+      2. Covers cross-feature interactions (e.g., suppress_codes +
+         format preservation).
+      3. No imports from daemon internals in Ralph-only tests.
+    verification:
+      level: integration
+      command: "pytest tests/ralph/test_v5_remaining_integration.py -q"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T-int"]
+        flows:
+          - suppress_and_save
+          - runtime_monitoring
+          - verification_event_flow
+          - daemon_startup
+          - cli_workflow
+          - save_destroys_format
+          - skipped_as_passed
+
+# ── Critical flows ─────────────────────────────────────────────────────
+critical_flows:
+  - id: suppress_and_save
+    description: >
+      Plan with suppress_codes is loaded, validated (codes suppressed),
+      task completed via save_plan_state (formatting preserved), and
+      re-validated successfully.
+    entrypoints:
+      - src/cccc/ralph/plan_io.py
+      - src/cccc/ralph/validator.py
+    required_verification_level: integration
+
+  - id: runtime_monitoring
+    description: >
+      Task completion event triggers WorkflowMonitor checks (file
+      overstepping, completer mismatch) integrated into orchestrator,
+      alerts logged and emitted as ledger events.
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/workflow_monitor.py
+    required_verification_level: integration
+
+  - id: verification_event_flow
+    description: >
+      Verification with outcome=skipped propagates as "skipped" (not
+      "passed") through orchestrator → foreman notification → progress report.
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/progress_report.py
+    required_verification_level: integration
+
+# ── Forbidden flows ────────────────────────────────────────────────────
+forbidden_flows:
+  - id: save_destroys_format
+    description: >
+      save_plan_state must NOT destroy YAML comments, multi-line strings,
+      or key ordering outside the state section.
+    required_verification_level: unit
+
+  - id: skipped_as_passed
+    description: >
+      verification outcome "skipped" must NOT be reported as "passed"
+      to foreman or progress report.
+    required_verification_level: unit
+
+# ── Required issues ────────────────────────────────────────────────────
+required_issues:
+  - "CLI-2"
+  - "RALPH-1"
+  - "VER-1"
+  - "VER-2"
+  - "WF-NEW-3"
+  - "RV-5"
+
+# ── State ──────────────────────────────────────────────────────────────
+state:
+  completed_task_ids:
+    - T-int
+    - T7
+    - T6
+    - T4
+    - T5
+    - T3
+    - T2
+    - T1
+  running_tasks: []
+  failed_task_ids: []

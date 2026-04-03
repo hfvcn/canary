@@ -190,6 +190,11 @@ class ProgressReporter:
                 "recent_events": [],
             }
 
+        task_details = [
+            self._build_task_detail(task)
+            for task in self._state.tasks.values()
+        ]
+
         return {
             "status": "running",
             "workflow_id": self._state.workflow_id,
@@ -209,6 +214,7 @@ class ProgressReporter:
                 "workflow_seconds": self._state.get_workflow_duration(),
                 "batch_seconds": self._state.get_batch_duration(),
             },
+            "task_details": task_details,
             "recent_events": self._event_history[-10:],
         }
 
@@ -286,6 +292,8 @@ class ProgressReporter:
         changed_files: List[str],
         *,
         notify: bool = True,
+        verification_checks: Optional[List[Any]] = None,
+        verification_outcome: str = "passed",
     ) -> bool:
         """Handle task completed event.
 
@@ -295,6 +303,7 @@ class ProgressReporter:
             duration_seconds: Task duration
             changed_files: List of modified files
             notify: Whether to send notification
+            verification_outcome: Verification result — "passed", "skipped", or "failed"
 
         Returns:
             True if notification sent (or notify=False)
@@ -303,10 +312,17 @@ class ProgressReporter:
             self._log(f"[progress] No state for task completion: {task_id}")
             return False
 
+        # Map verification outcome to progress status
+        final_status = (
+            ProgressStatus.SKIPPED
+            if verification_outcome == "skipped"
+            else ProgressStatus.COMPLETED
+        )
+
         # Update task state
         if task_id in self._state.tasks:
             task_info = self._state.tasks[task_id]
-            task_info.status = ProgressStatus.COMPLETED
+            task_info.status = final_status
             task_info.agent_name = agent_name
             task_info.duration_seconds = duration_seconds
             task_info.changed_files = changed_files
@@ -315,12 +331,14 @@ class ProgressReporter:
             task_info = TaskInfo(
                 id=task_id,
                 title=task_id,
-                status=ProgressStatus.COMPLETED,
+                status=final_status,
                 agent_name=agent_name,
                 duration_seconds=duration_seconds,
                 changed_files=changed_files,
             )
             self._state.tasks[task_id] = task_info
+
+        self._set_task_verification_checks(task_info, verification_checks)
 
         # Record event
         self._record_event(EventType.TASK_COMPLETED, {
@@ -349,6 +367,76 @@ class ProgressReporter:
 
         return self._send_card(card)
 
+    def on_task_heartbeat(
+        self,
+        task_id: str,
+        *,
+        progress_pct: Optional[int] = None,
+        message: str = "",
+        agent_name: str = "",
+        notify: bool = True,
+    ) -> bool:
+        """Handle worker heartbeat event and optionally push a progress card."""
+        if not self._state:
+            self._log(f"[progress] No state for task heartbeat: {task_id}")
+            return False
+
+        if task_id in self._state.tasks:
+            task_info = self._state.tasks[task_id]
+            task_info.status = ProgressStatus.RUNNING
+            if agent_name:
+                task_info.agent_name = agent_name
+        else:
+            task_info = TaskInfo(
+                id=task_id,
+                title=task_id,
+                status=ProgressStatus.RUNNING,
+                agent_name=agent_name,
+            )
+            self._state.tasks[task_id] = task_info
+
+        if progress_pct is not None:
+            setattr(task_info, "progress_pct", int(progress_pct))
+
+        note = str(message or "").strip()
+        event_data: Dict[str, Any] = {
+            "task_id": task_id,
+            "agent_name": agent_name or task_info.agent_name,
+            "progress_pct": getattr(task_info, "progress_pct", None),
+        }
+        if note:
+            event_data["message"] = note
+        self._record_event("task_heartbeat", event_data)
+
+        if not notify:
+            return True
+
+        fields = [
+            ("任务", task_info.title),
+            ("执行者", task_info.agent_name or "自动分配"),
+            ("进度", f"{getattr(task_info, 'progress_pct', None)}%" if getattr(task_info, "progress_pct", None) is not None else "未上报"),
+        ]
+        elements = [self.card_builder.build_fields(fields)]
+        if getattr(task_info, "progress_pct", None) is not None:
+            elements.append(self.card_builder.build_divider())
+            elements.append(
+                self.card_builder.build_progress_bar(
+                    int(getattr(task_info, "progress_pct", 0) or 0),
+                    100,
+                    label="任务进度",
+                )
+            )
+        if note:
+            elements.append(self.card_builder.build_divider())
+            elements.append(self.card_builder.build_text_element(f"**进展**\n{note}"))
+
+        card = self.card_builder.build_card(
+            EventType.BATCH_STARTED,
+            f"任务 {task_id} 进度更新",
+            elements,
+        )
+        return self._send_card(card)
+
     def on_task_failed(
         self,
         task_id: str,
@@ -356,6 +444,7 @@ class ProgressReporter:
         *,
         suggestion: str = "",
         agent_name: str = "",
+        verification_checks: Optional[List[Any]] = None,
     ) -> bool:
         """Handle task failed event.
 
@@ -388,6 +477,8 @@ class ProgressReporter:
                 agent_name=agent_name,
             )
             self._state.tasks[task_id] = task_info
+
+        self._set_task_verification_checks(task_info, verification_checks)
 
         # Record event
         self._record_event(EventType.TASK_FAILED, {
@@ -674,7 +765,49 @@ class ProgressReporter:
             self._log(f"[progress] Failed to send card: {e}")
             return False
 
-    def _record_event(self, event_type: EventType, data: Dict[str, Any]) -> None:
+    @staticmethod
+    def _build_task_detail(task: TaskInfo) -> Dict[str, Any]:
+        detail: Dict[str, Any] = {
+            "task_id": task.id,
+            "status": task.status.value,
+            "agent_name": task.agent_name,
+            "progress_pct": getattr(task, "progress_pct", None),
+        }
+        verification_checks = getattr(task, "verification_checks", None)
+        if verification_checks:
+            detail["verification_checks"] = verification_checks
+        return detail
+
+    def _set_task_verification_checks(
+        self,
+        task_info: TaskInfo,
+        verification_checks: Optional[List[Any]],
+    ) -> None:
+        serialized = self._serialize_verification_checks(verification_checks)
+        if serialized:
+            setattr(task_info, "verification_checks", serialized)
+            return
+        if hasattr(task_info, "verification_checks"):
+            delattr(task_info, "verification_checks")
+
+    @staticmethod
+    def _serialize_verification_checks(
+        verification_checks: Optional[List[Any]],
+    ) -> List[Dict[str, str]]:
+        serialized: List[Dict[str, str]] = []
+        for check in verification_checks or []:
+            if isinstance(check, dict):
+                name = str(check.get("name") or "").strip()
+                outcome = str(check.get("outcome") or "").strip()
+            else:
+                name = str(getattr(check, "name", "") or "").strip()
+                outcome = str(getattr(check, "outcome", "") or "").strip()
+            if not name or not outcome:
+                continue
+            serialized.append({"name": name, "outcome": outcome})
+        return serialized
+
+    def _record_event(self, event_type: EventType | str, data: Dict[str, Any]) -> None:
         """Record an event in history.
 
         Args:
@@ -682,7 +815,7 @@ class ProgressReporter:
             data: Event data
         """
         event = {
-            "type": event_type.value,
+            "type": event_type.value if isinstance(event_type, EventType) else str(event_type),
             "timestamp": time.time(),
             **data,
         }

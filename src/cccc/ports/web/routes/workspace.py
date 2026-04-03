@@ -76,6 +76,11 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         group = _group_or_404(group_id)
         try:
             result = list_workspace_directory(group, rel_path=path, show_hidden=show_hidden)
+        except ValueError as exc:
+            msg = str(exc)
+            if "workspace root" in msg:
+                raise HTTPException(status_code=404, detail={"code": "no_workspace", "message": msg})
+            _raise_workspace_error(exc)
         except Exception as exc:
             _raise_workspace_error(exc)
         return {"ok": True, "result": result}

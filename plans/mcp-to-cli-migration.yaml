@@ -1,0 +1,350 @@
+# Plan: MCP → CLI Migration — Remove MCP dependency, CLI as sole AI interface
+#
+# Context: After 3 rounds of E2E testing, AI agents still use MCP tools despite
+# prompt changes. User decision: remove MCP entirely, not optimize it.
+# CLI commands already exist for workflow/messaging. This plan closes the gaps.
+#
+# Key constraint: "先跑通一条路径再扩展" — get one path working end-to-end first.
+#
+# Codex review findings incorporated:
+#   - --evidence requires JSON but prompt teaches plain text (will break workers)
+#   - Auto-notify should be in daemon/orchestrator, not CLI layer
+#   - CLI missing: context get
+#   - delivery.py has MCP reminder text, system_prompt.py has MCP references
+#   - Tests assert MCP text — must update them alongside prompt changes
+#
+# Scope note: actor startup MCP dependency (AUTO_MCP_RUNTIMES) is already
+#   disabled (set to empty tuple in server.py:239). Not in scope for this plan.
+#
+# Execution protocol: Dynamic DAG. After each task completes, re-evaluate readiness.
+
+required_issues:
+  - "M-1"    # Core workflow still MCP-bound
+  - "A-1"    # Prompt guidance insufficient (MCP tools still visible)
+  - "A-2"    # Old path can still change workflow state
+
+tasks:
+  # ── Wave 1: Fix blocking bugs + add missing CLI commands (parallel) ──────
+
+  - id: T1-evidence-fix
+    title: "Fix --evidence to accept plain text, not just JSON"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/cli/workflow_cmds.py"
+      - "src/cccc/cli/common.py"
+    depends_on: []
+    addresses: ["A-2"]
+    goal_behavior: >
+      cccc task complete --evidence accepts both plain text string and JSON object.
+      If the argument is valid JSON object, use it as-is. If it's a plain string,
+      wrap it as {"summary": "..."}. This prevents workers from failing when
+      following the prompt instruction to pass a text description.
+    acceptance_criteria: >
+      `cccc task complete T1 --evidence "I fixed the bug"` succeeds without
+      JSON parse error. `cccc task complete T1 --evidence '{"key":"val"}'` also works.
+    verification:
+      level: unit
+      command: >
+        python -c "
+        from cccc.cli.common import _parse_json_object_arg;
+        r = _parse_json_object_arg('plain text', field='--evidence');
+        assert 'summary' in r, f'expected summary key, got {r}';
+        r2 = _parse_json_object_arg('{\"k\":\"v\"}', field='--evidence');
+        assert r2 == {'k':'v'}, f'JSON passthrough failed: {r2}';
+        print('OK')
+        "
+      covers:
+        tasks: ["T1-evidence-fix"]
+    provides:
+      - name: evidence_accepts_text
+        kind: runtime_capability
+
+  - id: T2-context-cli
+    title: "Add cccc context get CLI command"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/cli/system_cmds.py"
+      - "src/cccc/cli/main.py"
+    depends_on: []
+    addresses: ["M-1"]
+    goal_behavior: >
+      New CLI command: `cccc context get [--group GROUP]`.
+      Calls daemon op "context_get" and prints JSON result containing
+      coordination, board, tasks_summary, agent_states.
+      Foreman uses this to read the shared board without MCP.
+    acceptance_criteria: >
+      system_cmds.py exports cmd_context_get. main.py registers "context" subparser
+      with "get" action. Function calls daemon with op "context_get" and
+      group_id, prints JSON result.
+    verification:
+      level: integration
+      command: >
+        grep -q "cmd_context_get" src/cccc/cli/system_cmds.py &&
+        grep -q '"context"' src/cccc/cli/main.py &&
+        python -c "from cccc.cli.system_cmds import cmd_context_get; print('importable')" &&
+        echo "OK"
+      covers:
+        tasks: ["T2-context-cli"]
+    provides:
+      - name: context_get_cli
+        kind: runtime_capability
+
+  - id: T3-auto-notify
+    title: "Auto-notify foreman when verify gate completes"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    depends_on: ["T1-evidence-fix"]
+    addresses: ["A-1"]
+    goal_behavior: >
+      After verify_completion() returns (pass or fail), orchestrator automatically
+      sends a chat.message to @foreman with task_id, outcome, evidence summary,
+      and changed_files. This is in apply_task_event() around the verify result
+      handling (line ~910-940). Worker does NOT need to send completion message
+      manually — the system does it. Evidence summary comes from the payload
+      passed through ralph_task_event (which T1 ensures can be plain text).
+    acceptance_criteria: >
+      After task completion + verification, a ledger event of kind "chat.message"
+      exists addressed to foreman containing: task_id, verification outcome,
+      and evidence content.
+    verification:
+      level: integration
+      command: "pytest tests/e2e/test_workflow_e2e.py -q -k verify_pass"
+      covers:
+        tasks: ["T3-auto-notify"]
+    consumes:
+      - name: evidence_accepts_text
+        from: T1-evidence-fix
+    provides:
+      - name: auto_notify_on_verify
+        kind: runtime_capability
+
+  - id: T5-delivery-cleanup
+    title: "Remove MCP reminder from message delivery, replace with CLI"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/messaging/delivery.py"
+      - "tests/test_prompt_defaults.py"
+    depends_on: []
+    addresses: ["M-1"]
+    goal_behavior: >
+      delivery.py currently injects periodic MCP tool reminders to actors
+      (around line 483-485, MCP_REMINDER_LINE). Replace MCP reminder with CLI reminder:
+      remind actors to use `cccc send` for messaging, `cccc task complete`
+      for completion, `cccc inbox` for reading messages.
+      Do NOT remove the reminder mechanism itself — just change the content
+      from MCP tools to CLI commands.
+      Also update tests/test_prompt_defaults.py which asserts the old MCP reminder text.
+    acceptance_criteria: >
+      delivery.py reminder text references CLI commands, not MCP tools.
+      No "use MCP" or "cccc_message_send" in reminder text.
+      test_prompt_defaults.py updated to match new CLI reminder content.
+    verification:
+      level: unit
+      command: >
+        ! grep -q "use MCP\|cccc_message_send" src/cccc/daemon/messaging/delivery.py &&
+        grep -q "cccc send\|cccc task complete" src/cccc/daemon/messaging/delivery.py &&
+        pytest tests/test_prompt_defaults.py -q &&
+        echo "OK"
+      covers:
+        tasks: ["T5-delivery-cleanup"]
+    provides:
+      - name: delivery_cli_reminders
+        kind: prompt_change
+
+  # ── Wave 2: Prompt cleanup (depends on CLI being ready) ──────────────────
+
+  - id: T4-prompt-cli-only
+    title: "Rewrite all prompts to CLI-only, remove MCP references"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/system_prompt.py"
+      - "src/cccc/resources/capabilities/task_management.yaml"
+      - "src/cccc/resources/cccc-help.md"
+      - "src/cccc/kernel/prompt_files.py"
+      - "tests/test_system_prompt_roles.py"
+      - "tests/test_system_prompt_memory.py"
+    depends_on: ["T2-context-cli"]
+    addresses: ["M-1", "A-1"]
+    goal_behavior: >
+      All AI-facing text references CLI commands only. No MCP tool names.
+      Foreman: cccc workflow submit/status, cccc context get, cccc send.
+      Worker: cccc task complete --evidence, cccc send for progress.
+      Remove "use MCP tools", "cccc_task", "cccc_message_send", "use MCP",
+      "MCP-only", "pack:group-runtime" from all prompts.
+      system_prompt.py: Foreman section lists CLI commands as primary interface.
+      task_management.yaml: workflow-first with CLI commands only.
+      cccc-help.md: CLI command reference, no MCP tool reference.
+      prompt_files.py: preamble references CLI workflow.
+      Also update tests that assert MCP text in prompts.
+    acceptance_criteria: >
+      No "cccc_task", "cccc_message_send", "use MCP" in any of the 4 source files.
+      CLI commands "cccc workflow", "cccc send", "cccc context" present.
+      Tests updated and passing.
+    verification:
+      level: unit
+      command: >
+        ! grep -l "cccc_task\|cccc_message_send\|use MCP" src/cccc/kernel/system_prompt.py
+        src/cccc/resources/capabilities/task_management.yaml
+        src/cccc/resources/cccc-help.md src/cccc/kernel/prompt_files.py &&
+        grep -q "cccc workflow" src/cccc/kernel/system_prompt.py &&
+        grep -q "cccc send" src/cccc/kernel/system_prompt.py &&
+        grep -q "cccc context" src/cccc/kernel/system_prompt.py &&
+        echo "OK"
+      covers:
+        tasks: ["T4-prompt-cli-only"]
+    consumes:
+      - name: context_get_cli
+        from: T2-context-cli
+    provides:
+      - name: prompts_cli_only
+        kind: prompt_change
+
+  - id: T6-worker-prompt
+    title: "Update worker assignment prompt to CLI-only"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "tests/test_foreman_workflow.py"
+    depends_on: ["T1-evidence-fix"]
+    addresses: ["A-1", "A-2"]
+    goal_behavior: >
+      Worker assignment prompt (orchestrator.py around line 654-688) tells
+      workers to report completion ONLY via
+      `cccc task complete <task_id> --changed-file <path> --evidence "summary"`.
+      Use `cccc send --to @foreman` for progress updates or blockers only.
+      Remove any reference to MCP tools or cccc_message_send.
+      Remove "Use CCCC MCP tools for visible coordination" line.
+      Also update tests/test_foreman_workflow.py which asserts old MCP text.
+    acceptance_criteria: >
+      Worker prompt section contains "cccc task complete" and "cccc send".
+      No "MCP" or "cccc_message_send" in worker prompt section.
+      test_foreman_workflow.py updated and passing.
+    verification:
+      level: unit
+      command: >
+        grep -q "cccc task complete" src/cccc/daemon/foreman/workflow_orchestrator.py &&
+        grep -q "cccc send" src/cccc/daemon/foreman/workflow_orchestrator.py &&
+        ! grep -q "cccc_message_send" src/cccc/daemon/foreman/workflow_orchestrator.py &&
+        pytest tests/test_foreman_workflow.py -q &&
+        echo "OK"
+      covers:
+        tasks: ["T1-evidence-fix", "T6-worker-prompt"]
+    consumes:
+      - name: evidence_accepts_text
+        from: T1-evidence-fix
+    provides:
+      - name: worker_prompt_cli_only
+        kind: prompt_change
+
+  # ── Wave 3: Integration + E2E ────────────────────────────────────────────
+
+  - id: T7-prompt-assembly-test
+    title: "Integration test: all prompts are CLI-only, zero MCP references"
+    role: integration
+    claimed_paths:
+      - "tests/test_prompt_assembly.py"
+    depends_on: ["T4-prompt-cli-only", "T5-delivery-cleanup", "T6-worker-prompt"]
+    addresses: ["M-1", "A-1"]
+    goal_behavior: >
+      Test loads built prompts for foreman and worker roles, asserts:
+      1. Contains CLI command references (cccc workflow, cccc send, cccc task complete)
+      2. Does NOT contain MCP tool references (cccc_task, cccc_message_send, "use MCP")
+      3. Contains cccc context get reference for foreman
+      4. Delivery reminder text is CLI-only
+    acceptance_criteria: >
+      pytest passes confirming all prompts are CLI-only.
+    verification:
+      level: integration
+      command: "pytest tests/test_prompt_assembly.py -q"
+      covers:
+        tasks: ["T4-prompt-cli-only", "T5-delivery-cleanup", "T6-worker-prompt", "T7-prompt-assembly-test"]
+        flows: ["all_prompts_cli_only", "mcp_tools_in_prompts"]
+    consumes:
+      - name: prompts_cli_only
+        from: T4-prompt-cli-only
+      - name: delivery_cli_reminders
+        from: T5-delivery-cleanup
+      - name: worker_prompt_cli_only
+        from: T6-worker-prompt
+
+  - id: T8-e2e-cli-workflow
+    title: "E2E: full CLI workflow — submit → complete → verify → notify"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_cli_workflow_e2e.py"
+    depends_on: ["T1-evidence-fix", "T2-context-cli", "T3-auto-notify", "T7-prompt-assembly-test"]
+    addresses: ["M-1", "A-1", "A-2"]
+    goal_behavior: >
+      End-to-end test using CLI commands only (no MCP):
+      1. cccc workflow submit with task batch
+      2. Worker calls cccc task complete --evidence "description" (plain text)
+      3. Verify gate runs, task advances to completed or failed
+      4. Foreman receives auto-notification with evidence
+      5. cccc context get returns updated board state
+      6. Also test verify-failure branch
+      Uses subprocess or direct daemon calls against running daemon.
+    acceptance_criteria: >
+      pytest passes exercising submit→complete→verify→notify path via CLI only.
+      Asserts auto-notification message exists in ledger for foreman.
+    verification:
+      level: e2e
+      command: "pytest tests/e2e/test_cli_workflow_e2e.py -v"
+      covers:
+        tasks: ["T1-evidence-fix", "T2-context-cli", "T3-auto-notify",
+                "T4-prompt-cli-only", "T5-delivery-cleanup", "T6-worker-prompt",
+                "T7-prompt-assembly-test", "T8-e2e-cli-workflow"]
+        flows: ["cli_workflow_end_to_end", "all_prompts_cli_only", "auto_notify_foreman"]
+    consumes:
+      - name: evidence_accepts_text
+        from: T1-evidence-fix
+      - name: context_get_cli
+        from: T2-context-cli
+      - name: auto_notify_on_verify
+        from: T3-auto-notify
+
+# ── Critical declarations ─────────────────────────────────────────────────
+
+critical_entrypoints:
+  - src/cccc/cli/workflow_cmds.py
+  - src/cccc/cli/common.py
+  - src/cccc/cli/system_cmds.py
+  - src/cccc/cli/main.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - src/cccc/kernel/system_prompt.py
+  - src/cccc/resources/capabilities/task_management.yaml
+  - src/cccc/resources/cccc-help.md
+  - src/cccc/kernel/prompt_files.py
+  - src/cccc/daemon/messaging/delivery.py
+
+critical_flows:
+  - id: cli_workflow_end_to_end
+    description: "CLI-only path: submit → complete(evidence) → verify → notify foreman"
+    entrypoints:
+      - src/cccc/cli/workflow_cmds.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+    required_verification_level: e2e
+
+  - id: all_prompts_cli_only
+    description: "All AI-facing prompts reference CLI, zero MCP tool names"
+    entrypoints:
+      - src/cccc/kernel/system_prompt.py
+      - src/cccc/kernel/prompt_files.py
+      - src/cccc/daemon/messaging/delivery.py
+    required_verification_level: integration
+
+  - id: auto_notify_foreman
+    description: "Verify gate completion auto-sends notification to foreman"
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+    required_verification_level: e2e
+
+forbidden_flows:
+  - id: mcp_tools_in_prompts
+    description: "No MCP tool names (cccc_task, cccc_message_send, use MCP) in any AI-facing prompt"
+    required_verification_level: integration
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

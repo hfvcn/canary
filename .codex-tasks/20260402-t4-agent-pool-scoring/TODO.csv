@@ -1,0 +1,5 @@
+id,task,status,completed_at,notes
+1,Read T4 plan and current scoring tests,DONE,2026-04-02,Read plans/fix-v3-remaining.yaml and target files
+2,Implement claimed_paths domain inference and additive scoring,DONE,2026-04-02,Added domain inference helper and additive scoring bonuses
+3,Add focused scoring tests for frontend backend mixed and empty paths,DONE,2026-04-02,Added four scoring tests covering frontend backend mixed and empty paths
+4,Run specified pytest targets and confirm results,IN_PROGRESS,,Running requested regression suite

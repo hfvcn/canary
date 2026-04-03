@@ -7,10 +7,14 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ....daemon.ops.adapter_helpers import (
+    build_daemon_request,
+    normalize_priority,
+    normalize_reply_required,
+)
 from ....kernel.actors import find_actor
 from ....kernel.blobs import resolve_blob_attachment_path, store_blob_bytes
 from ....kernel.group import load_group
-from ....util.conv import coerce_bool
 from ..common import MCPError, _call_daemon_or_raise
 
 
@@ -47,43 +51,37 @@ def message_send(
 ) -> Dict[str, Any]:
     """Send a message to the group (or cross-group)."""
     text = _normalize_runtime_escaped_text(group_id=group_id, actor_id=actor_id, text=text)
-    prio = str(priority or "normal").strip() or "normal"
-    if prio not in ("normal", "attention"):
-        raise MCPError(code="invalid_priority", message="priority must be 'normal' or 'attention'")
-    reply_required_flag = coerce_bool(reply_required, default=False)
+    prio = normalize_priority(priority)
+    reply_required_flag = normalize_reply_required(reply_required)
 
     dst_gid = str(dst_group_id or "").strip()
     if dst_gid and dst_gid != str(group_id or "").strip():
         return _call_daemon_or_raise(
-            {
-                "op": "send_cross_group",
-                "args": {
-                    "group_id": group_id,
-                    "dst_group_id": dst_gid,
-                    "text": text,
-                    "by": actor_id,
-                    "to": to if to is not None else [],
-                    "priority": prio,
-                    "reply_required": reply_required_flag,
-                    "refs": refs if refs is not None else [],
-                },
-            }
+            build_daemon_request(
+                "send_cross_group",
+                group_id=group_id,
+                dst_group_id=dst_gid,
+                text=text,
+                by=actor_id,
+                to=to if to is not None else [],
+                priority=prio,
+                reply_required=reply_required_flag,
+                refs=refs if refs is not None else [],
+            )
         )
 
     return _call_daemon_or_raise(
-        {
-            "op": "send",
-            "args": {
-                "group_id": group_id,
-                "text": text,
-                "by": actor_id,
-                "to": to if to is not None else [],
-                "path": "",
-                "priority": prio,
-                "reply_required": reply_required_flag,
-                "refs": refs if refs is not None else [],
-            },
-        }
+        build_daemon_request(
+            "send",
+            group_id=group_id,
+            text=text,
+            by=actor_id,
+            to=to if to is not None else [],
+            path="",
+            priority=prio,
+            reply_required=reply_required_flag,
+            refs=refs if refs is not None else [],
+        )
     )
 
 
@@ -102,24 +100,20 @@ def message_reply(
     if not str(reply_to or "").strip():
         raise MCPError(code="missing_event_id", message="missing event_id (reply target)")
     text = _normalize_runtime_escaped_text(group_id=group_id, actor_id=actor_id, text=text)
-    prio = str(priority or "normal").strip() or "normal"
-    if prio not in ("normal", "attention"):
-        raise MCPError(code="invalid_priority", message="priority must be 'normal' or 'attention'")
-    reply_required_flag = coerce_bool(reply_required, default=False)
+    prio = normalize_priority(priority)
+    reply_required_flag = normalize_reply_required(reply_required)
     return _call_daemon_or_raise(
-        {
-            "op": "reply",
-            "args": {
-                "group_id": group_id,
-                "text": text,
-                "by": actor_id,
-                "reply_to": reply_to,
-                "to": to if to is not None else [],
-                "priority": prio,
-                "reply_required": reply_required_flag,
-                "refs": refs if refs is not None else [],
-            },
-        }
+        build_daemon_request(
+            "reply",
+            group_id=group_id,
+            text=text,
+            by=actor_id,
+            reply_to=reply_to,
+            to=to if to is not None else [],
+            priority=prio,
+            reply_required=reply_required_flag,
+            refs=refs if refs is not None else [],
+        )
     )
 
 
@@ -194,22 +188,18 @@ def file_send(
     mt, _ = mimetypes.guess_type(src.name)
     att = store_blob_bytes(group, data=raw, filename=src.name, mime_type=str(mt or ""))
     msg = str(text or "").strip() or f"[file] {att.get('title') or src.name}"
-    prio = str(priority or "normal").strip() or "normal"
-    if prio not in ("normal", "attention"):
-        raise MCPError(code="invalid_priority", message="priority must be 'normal' or 'attention'")
-    reply_required_flag = coerce_bool(reply_required, default=False)
+    prio = normalize_priority(priority)
+    reply_required_flag = normalize_reply_required(reply_required)
     return _call_daemon_or_raise(
-        {
-            "op": "send",
-            "args": {
-                "group_id": gid,
-                "text": msg,
-                "by": actor_id,
-                "to": to if to is not None else [],
-                "path": "",
-                "attachments": [att],
-                "priority": prio,
-                "reply_required": reply_required_flag,
-            },
-        }
+        build_daemon_request(
+            "send",
+            group_id=gid,
+            text=msg,
+            by=actor_id,
+            to=to if to is not None else [],
+            path="",
+            attachments=[att],
+            priority=prio,
+            reply_required=reply_required_flag,
+        )
     )

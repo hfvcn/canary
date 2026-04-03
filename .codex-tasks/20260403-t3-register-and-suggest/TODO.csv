@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read plan and target code paths,DONE,Required files and flow are understood,sed -n '1,240p' plans/fix-v3-remaining.yaml,2026-04-03T00:00:00,0,Read plan and target files before edits
+2,Implement orchestrator atomic register-and-suggest,DONE,workflow_orchestrator stores task_ref and can resuggest from active workflow state,python -m pytest tests/test_workflow_e2e_closure.py tests/test_ralph_ipc.py -q --tb=short -k 'phased or register_and_suggest',2026-04-03T00:00:00,0,
+3,Implement IPC handler and dispatcher wiring,DONE,ralph_register_and_suggest op returns registered/submitted counts,python -m pytest tests/test_ralph_ipc.py -q --tb=short -k 'register_and_suggest',2026-04-03T00:00:00,0,
+4,Switch CLI --plan submission to new daemon op,DONE,cmd_workflow_submit uses ralph_register_and_suggest only for --plan path,python -m pytest tests/test_workflow_e2e_closure.py tests/test_ralph_ipc.py -q --tb=short -k 'phased or register_and_suggest',2026-04-03T00:00:00,0,
+5,Run requested verification and fix regressions,DONE,Requested pytest command passes,python -m pytest tests/test_workflow_e2e_closure.py tests/test_ralph_ipc.py -q --tb=short,2026-04-03T00:00:00,1,One failing test was fixed by registering the direct test orchestrator in the global cache used by RalphService.

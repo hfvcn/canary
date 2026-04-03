@@ -1,0 +1,23 @@
+我看完后，整体判断是：这份 v5 方案方向基本对，尤其是把问题聚焦在 **假验收命令、跨任务覆盖、测试遗漏、运行时静默监控、以及 validator 分层** 上，说明它已经抓到了 v4 真正失效的根因；但其中有几条规则设计会把“计划质量检查”做成“计划风格约束”，误报风险不低，尤其是 `RV-1`、`RV-3`、`NEW-2`、`NEW-3` 和 composition root 的处理方式。
+
+我先说我赞成保留的三点。第一，`filesystem_validator.py` 分层是对的，因为文档已经明确区分了纯结构校验的 `validator` 和运行时 `RalphService`，而 RV-1/RV-2 需要访问项目文件系统，硬塞回纯函数 validator 会把边界打坏。第二，`RV-2` 放在 Wave 1 且优先级高于 RV-1，也是对的，因为文档里的真实案例已经证明“假验收命令”会让计划在 validate 阶段产生严重假阳性。第三，`W_VERIFICATION_REDUNDANT_PYCOMPILE` 也应该尽快上，因为 v4 的核心教训就是“编译通过 ≠ 功能可用”，再允许自定义 verification 只重复 py_compile，等于继续给伪通过开绿灯。
+
+第一个我想明确质疑的是 `RV-1` 的表述方式。你现在把问题定义成“改了源文件，但没 claim 测试文件”，这在语义上并不稳，因为 `claimed_paths` 代表的是“计划修改意图”，不是“受影响集合”；很多健康的改动会修改源文件并运行现有测试，但完全不需要改测试文件。如果把“测试未 claim”当成 warning，团队很容易为了消警报去把大量测试文件机械塞进 `claimed_paths`，结果反而污染并行调度和责任边界。更合适的做法是把这条规则改写成两层：一层是 **`H_RELATED_TESTS_FOUND`** 或 **`W_IMPACTED_TESTS_NOT_IN_VERIFICATION_SCOPE`**，表示“发现关联测试，但当前 verification 没覆盖到”；另一层才是更弱的 **`H_RELATED_TESTS_UNCLAIMED`**，仅提示“这些测试可能需要修改”。也就是说，应优先检查“有没有测到”，而不是“有没有 claim 到”。这比现在的 `W_UNCLAIMED_TEST_FOR_SOURCE` 更符合 `claimed_paths` 的真实语义。
+
+第二个需要收紧的是 `RV-2` 的实现方式。文档现在用“白名单命令形状 + `shlex.split()`”做静态预检，这个方向没错，但还不够稳，因为真实仓库里高频命令往往会包一层 runner，例如 `uv run pytest`、`poetry run pytest`、`python -m pytest`、`timeout 30 pytest ...`，如果不先做命令归一化，就会把大量正常命令都打成 `W_VERIFICATION_SHAPE_UNKNOWN`。我更推荐做成“两阶段解析”：先做 **wrapper unwrap**（剥离 `env`、`timeout`、`uv run`、`poetry run`、`python -m` 这类包装层），再进入 pytest/import/py_compile 的具体解析器。再往前走一步，长期上最好给 plan schema 增一个可选的结构化字段，例如 `verification.kind + verification.target`，shell command 只作为 fallback。这样 Ralph 校验的是“结构化验证意图”，而不是一直和 shell 形状缠斗。
+
+第三个我不建议按原样落地的是 `RV-3: W_COVERS_CLAIM_UNVERIFIABLE`。文档的定义是：A 说 covers B，但 A 的 `verification.command` 静态引用和 A 的 `claimed_paths` 都无法接触到 B 的 `claimed_paths`，于是报 warning。这个规则的问题是，它把“测试命令不显式提到路径”误当成“无法覆盖”。可真实的 integration/e2e 测试往往只引用一个 smoke 文件，真正覆盖关系体现在运行路径里，而不是命令行或测试文件名里。于是这条规则很容易对正确的黑盒集成测试报假警。更合适的方法是做 **分级证据模型**：强证据是 `covers.paths` / 直接导入 / 明确测试节点；中证据是 flow ID 对齐、critical flow 对齐；弱证据才是“命令看不出来”。只有在“声称 covers，但存在反证”时才报 warning；如果只是“证据不足”，应该降成 hint，避免把黑盒验证普遍打成可疑。
+
+第四个，我对 `NEW-2: E_COVERS_WITHOUT_DEP_ORDER` 持保留意见。文档要求 `covers.tasks` 目标必须在当前任务的自反传递依赖闭包内，而且不给 integration 任务例外。这个规则的出发点是对的：覆盖了还没跑完的任务当然不行。但问题在于你把“语义依赖”和“执行顺序依赖”绑成了一种边。现实里一个集成验证任务，可能并不“消费”某个任务的 contract，却必须“等它做完”后再统一验证；这时让它用 `depends_on` 去表达，会把调度边和数据边混在一起。更好的解法不是放松校验，而是补 schema：新增 `must_run_after` 或 `verification_depends_on`，然后把规则改成“`covers.tasks` 必须落在 `(depends_on ∪ must_run_after)` 的传递闭包里”。如果 v5 不愿改 schema，那我建议先把现在这条从 error 降到 warning，并输出自动修复建议，让计划作者显式补边。
+
+第五个，我不太认同 `W_NO_EARLY_INTEGRATION_CHECKPOINT` 现在的触发条件。`len(tasks) >= 5`、所有 cross-task verifier 都是 sink、且 `min_depth >= 2`，这套规则依赖“任务数量”和“绝对深度”，但计划图可能很宽很浅，也可能很深很窄；同样的风险，在不同图形里会被完全不同地感知。更稳的办法是用 **相对位置** 而不是绝对阈值：例如计算 `earliest_cross_task_verifier_depth / max_graph_depth`，当这个比例超过 0.6 或 0.7 且所有 verifier 都是 sink 时再报 warning；或者更直接一点，用 critical path：如果第一个跨任务验证出现在 critical path 后半段，才提示“集成检查过晚”。这样能更准确地抓住“直到很晚才第一次汇合验证”的坏计划，而不是被任务总数误导。
+
+第六个需要质疑的是 composition root 的处理。文档说 v5 不做 CCCC-specific core rule，而是依赖计划生成器预填 `critical_entrypoints`，再复用现有 `E_CRITICAL_ENTRYPOINT_UNOWNED`。这个思路避免了把 CCCC 路径硬编码进 Ralph core，我赞成这点；但“只靠计划生成 discipline”还是太脆，因为文档自己已经承认 v4 的失败之一就是计划生成会漏掉“谁来负责 daemon 启动时创建 RalphService 实例”这种真正的装配点。更合适的方案不是把规则塞进 core，而是加一层 **repo-local policy pack**：例如 `ralph_policy.yaml` 或 `ralph/policies/cccc.py`，由仓库声明 composition roots、critical entrypoints、critical flows。这样 Ralph core 仍然通用，但 CCCC 也不会只能靠 Foreman 记忆力。
+
+第七个，我认为 Wave 排序还可以再调。文档把 `review_request` sidecar 放到 Wave 4，但前面已经把 “Ralph + Codex 审查互补” 列为 v4 的核心教训之一，这意味着 **两者的交接面本身就是高杠杆能力**。所以我建议把一个“极简版 review_request sidecar”提前到 Wave 1.5：先只输出 `cannot_validate`、`opaque_commands`、`complex_shells`、`related_tests`、`focus_paths` 这类信息，不做闭环回写也行。这样 Codex 审查会立刻更聚焦，而不用等到 v6 才真正发挥组合价值。相反，`RV-5` 这种“根据 goal_behavior 关键词去 plan 外文件做语义依赖推断”的能力，我会继续往后放，甚至降级成研究项，因为它高复杂、高噪音，而且很容易把 validator 变成一个半吊子的语义搜索器。
+
+第八个，我会补一条文档里没有充分展开、但其实对 WF-NEW-3 成败非常关键的改法：**先定义事件契约，再做静默检测**。文档现在的最小方案是“task 分配后 N 秒无 ledger 事件就报警”，但“任何 ledger 事件”太弱了，agent 完全可能在做无关动作、刷日志，仍被视作活跃；反过来，一个长时间运行的测试也可能无新事件，却并不是真停滞。更合适的是把 v5 的最小范围改成：先补一个轻量 task-scoped 事件模型，至少有 `task_assigned / task_started / heartbeat / progress / task_completed / task_failed`，每条事件都带 `task_id` 和 `actor_id`；然后静默检测只看“该任务相关事件”是否中断。这样 path deviation 和 state inconsistency 虽然仍可暂缓，但至少基础事件面已经成形，后续不会重做。
+
+综合起来，我给出的“更合适的 v5 收敛版”是：**Wave 1** 做 `RV-2`、`W_VERIFICATION_REDUNDANT_PYCOMPILE`、命令归一化、极简 `review_request`；**Wave 1.5** 做 `covers.tasks` 完整性，但把 `NEW-2` 改成“顺序边闭包”而不是“纯 depends_on 闭包”；**Wave 2** 做测试影响分析，但把重点从“未 claim 测试”改成“verification 未覆盖关联测试”；**Wave 3** 做 task-scoped 事件契约 + silent/stalled 检测；而 `RV-5`、完整 schema contract matching、复杂语义推断继续后移。这样改之后，Ralph 会更像一个“高精度计划守门员 + 审查路由器”，而不是一个靠 warning 堆出来的风格检查器。
+
+如果你愿意，我下一条可以直接把这些意见整理成一版“可回贴到文档里的审查意见”，按“建议保留 / 建议修改 / 建议延期”三栏输出。

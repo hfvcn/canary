@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import importlib.resources
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -15,38 +16,68 @@ PROMPTS_DIRNAME = "prompts"
 
 _MAX_FILE_BYTES = 512 * 1024  # Safety limit for prompt markdown files.
 
-DEFAULT_PREAMBLE_BODY = """Role reminder: Foreman orchestrates. Workers execute. Do not mix roles.
+
+def _load_builtin_workflow_guidance_markdown() -> str:
+    """Load the canonical workflow guidance markdown bundled in the package."""
+    try:
+        files = importlib.resources.files("cccc.resources")
+        return (files / "workflow_guidance.md").read_text(encoding="utf-8")
+    except Exception:
+        try:
+            p = Path(__file__).resolve().parents[1] / "resources" / "workflow_guidance.md"
+            return p.read_text(encoding="utf-8")
+        except Exception:
+            return ""
+
+
+def _workflow_guidance_excerpt(markdown: str) -> str:
+    wanted_fragments = (
+        "Reuse workers first.",
+    )
+    selected = [
+        "Canonical detail from `workflow_guidance.md`:",
+    ]
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if stripped and any(fragment in stripped for fragment in wanted_fragments):
+            selected.append(stripped)
+    return "\n".join(selected) if len(selected) > 1 else ""
+
+
+def _build_default_preamble_body() -> str:
+    workflow_guidance = _workflow_guidance_excerpt(_load_builtin_workflow_guidance_markdown().strip())
+    parts = [
+        """Role reminder: Foreman orchestrates. Workers execute. Do not mix roles.
+Use your Bash tool for CLI commands. Do NOT rely on MCP tools. Prefer `cccc send`, `cccc context get`, `cccc workflow status`, and `cccc task complete`.
 
 Quick start:
-- Call `cccc_bootstrap` first: `session`, `recovery`, `inbox_preview`, `memory_recall_gate`.
-- If the coordination brief is missing or stale, update it via `cccc_coordination(action=update_brief, ...)`.
+- CLI cold start: run `cccc context get`; check `cccc inbox` if unread messages matter.
+- If the coordination brief looks stale, refresh board/workflow context before acting.
 - If Ralph has ready/pending work, review workflow state before action.
-- Call `cccc_help` only for detailed workflow guidance; use `cccc_project_info` / `cccc_context_get` on demand.
+- Use `cccc --help` or subcommand help only when command syntax is unclear.
 
 Ralph workflow:
-- Foreman owns user alignment, planning, agent routing, model choice, progress judgment, and outward updates.
-- Reuse workers first; use `cccc_actor` only when the pool is not enough.
-- Inspect runtimes with `cccc_runtime_list` and model registry evidence with `cccc_model(action="list"|"get")` before assigning new work.
-- If actor/runtime/model tools are hidden, enable `pack:group-runtime` with `cccc_capability_use(capability_id="pack:group-runtime", scope="session")` first.
-- Workflow CLI commands are the primary task-coordination path: use `cccc workflow submit|status|verify|retry|fail` and `cccc task complete` for workflow state changes.
-- Peer workers execute assigned scope, report evidence/blockers, and hand results back; they do not renegotiate scope.
-
-Coordination checklist:
-- Keep visible coordination in MCP chat (`cccc_message_send` / `cccc_message_reply`).
-- Update shared work through `cccc_task` / `cccc_coordination`; update personal state through `cccc_agent_state`.
+- Foreman owns user alignment, planning, agent routing, model choice, and outward updates.
+- Workflow CLI commands are the primary task-coordination path: use `cccc workflow submit|status|verify|retry|fail` and `cccc task complete`.
+- Peer workers execute assigned scope, report evidence/blockers, and hand results back.
+""".strip(),
+        workflow_guidance,
+        """Coordination checklist:
+- Keep visible coordination in CLI delivery (`cccc send` / `cccc reply`).
+- Read shared board state with `cccc context get`; use workflow CLI for task state; keep personal working state current.
 - Foreman: when user gives a task, evaluate agents -> assign -> track. Do NOT implement.
 - Keep `focus`, `next_action`, and `what_changed` fresh.
 - Foreman reports meaningful deltas outward; worker completion is not user delivery until foreman accepts it.
 
 Gap routing:
-- Info gap: inspect bootstrap / `cccc_context_get` / `cccc_project_info` / inbox / memory first; then web if needed.
-- Capability gap: try `cccc_capability_use(...)` first, then search if needed.
+- Info gap: inspect `cccc context get`, `cccc inbox`, local repo context, and memory files first; then web if needed.
+- Capability gap: verify the CLI surface with `cccc --help`, `cccc actor --help`, `cccc runtime --help`, or `cccc workflow --help` before searching.
 - Ask the user only for real env/permission blockers.
 
 Memory boundary:
-- `cccc_agent_state` is short-term working memory; long-term memory lives in `state/memory/MEMORY.md` + `state/memory/daily/*.md`.
-- On cold start, use `memory_recall_gate` before planning or implementation.
-- Deep recall order: local memory first (`cccc_memory`), then `cccc_space(action=query, lane="memory")` only if local recall is insufficient.
+- Short-term working memory stays in your active context; long-term memory lives in `state/memory/MEMORY.md` + `state/memory/daily/*.md`.
+- On cold start, read local memory files only if the current task needs prior context.
+- Deep recall order: local memory files first; use Group Space memory lane only if local recall is insufficient.
 
 Git commit spec:
 - Format: `<type>: <subject>` where type is feat|fix|refactor|docs|chore.
@@ -59,7 +90,12 @@ Git commit spec:
   changed_files: <file1>,<file2>
 - Git is for audit only; do not use git as a communication channel.
 - Never commit secrets, credentials, or API keys.
-"""
+""".strip(),
+    ]
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+DEFAULT_PREAMBLE_BODY = _build_default_preamble_body()
 
 
 def load_builtin_help_markdown() -> str:

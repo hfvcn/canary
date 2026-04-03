@@ -1,0 +1,136 @@
+# Wave 1: Foundation — 模型统一 + 纯结构规则补齐
+# 目标：统一 verification 真相源、修 root 解析、补齐 covers 图规则
+# 前置：v4 已归档，Ralph 12 类结构规则运行中
+# 修订：经 Codex 审查修复 6 个 BLOCK 问题
+
+tasks:
+  - id: T1
+    title: "统一 verification 字段为单一真相源"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+      - "src/cccc/daemon/foreman/ralph_service.py"
+      - "tests/test_ralph_ipc.py"
+    depends_on: []
+    goal_behavior: >
+      TaskRef 增加结构化 verification 字段（Optional[VerificationSpec]），
+      VerificationSpec 定义在 contracts 层（不从 ralph.models 导入，避免反向依赖）。
+      verify_completion() 优先从结构化字段读取 command，
+      verification_command 保留为兼容别名但标记 deprecated。
+    acceptance_criteria: >
+      1. TaskRef 有 verification: Optional[VerificationSpec] 字段（VerificationSpec 定义在 contracts 层）
+      2. verify_completion() 优先读 task_ref.verification.command
+      3. 当 verification 和 verification_command 同时存在时，verification 优先
+      4. model_dump() / model_validate() round-trip 测试通过
+      5. 现有使用 verification_command 的代码不报错
+    verification:
+      level: unit
+      command: "pytest tests/test_ralph_ipc.py -q"
+      covers:
+        tasks: ["T1"]
+    provides:
+      - name: unified_verification_field
+        kind: runtime_capability
+
+  - id: T2
+    title: "为 validate 子命令添加 --project-root 并实现解析链"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/cli.py"
+      - "tests/ralph/test_ralph_standalone.py"
+    depends_on: []
+    goal_behavior: >
+      当前 validate 子命令不接受 --project-root，只有 verify 有。
+      需要为 validate 也添加 --project-root 参数。
+      解析优先级：CLI explicit > git root > plan dir > cwd。
+      "config" 步骤在 v5 跳过（Ralph 无 config 读取机制）。
+      输出 resolved root 时使用 stderr 或 metadata 字段，不破坏 stdout JSON 契约。
+    acceptance_criteria: >
+      1. ralph validate plan.yaml --project-root /path 可用
+      2. 未指定时尝试 git rev-parse --show-toplevel（失败时 graceful fallback）
+      3. 非 git 目录 fallback 到 plan 文件所在目录
+      4. 最终 fallback 到 cwd
+      5. text 模式在 stderr 显示 resolved root
+      6. json 模式在 metadata 字段返回 root（不影响现有 valid/errors/warnings 结构）
+      7. 新增至少 2 个测试用例覆盖 root 解析
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k 'project_root or resolve_root'"
+      covers:
+        tasks: ["T2"]
+
+  - id: T3
+    title: "新增 covers.tasks 图结构规则 + 测试 fixture"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/validator.py"
+      - "tests/ralph/test_ralph_standalone.py"
+      - "tests/ralph/sample_bad_covers_plan.yaml"
+    depends_on: []
+    goal_behavior: >
+      在 validator.py 中新增 _check_covers_graph() 函数。
+      检查 E_COVERS_UNKNOWN_TASK 和 E_COVERS_WITHOUT_DEP_ORDER。
+      空 covers.tasks 允许（covers 可以只覆盖 paths/flows）。
+      新增 sample_bad_covers_plan.yaml 作为测试 fixture。
+    acceptance_criteria: >
+      1. covers.tasks 引用不存在的 task 时报 E_COVERS_UNKNOWN_TASK (error)
+      2. covers.tasks 目标不在自反传递依赖闭包内时报 E_COVERS_WITHOUT_DEP_ORDER (error)
+      3. 任务覆盖自己不报错
+      4. 空 covers.tasks 不报错
+      5. sample_good_plan.yaml 继续通过
+      6. sample_bad_covers_plan.yaml 报出新的 covers 错误
+      7. validate() 调用链中包含 _check_covers_graph
+      8. 至少 3 个单元测试覆盖新规则
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k 'covers'"
+      covers:
+        tasks: ["T3"]
+    provides:
+      - name: covers_graph_rules
+        kind: validation_rule
+
+  - id: T4
+    title: "Wave 1 集成验证 — 统一字段 + root 解析 + covers 规则交互"
+    role: integration
+    claimed_paths:
+      - "tests/ralph/test_wave1_integration.py"
+    depends_on: ["T1", "T2", "T3"]
+    goal_behavior: >
+      专门的集成测试文件，验证三项变更协同工作：
+      1. 带结构化 verification 的 TaskRef 能正确传入 validate()
+      2. ralph validate 带 --project-root 不影响 covers 图检查
+      3. 假覆盖声明被 covers 图规则拦截
+      区别于 T2/T3 的单元测试：这里测试 CLI 端到端流程。
+    acceptance_criteria: >
+      1. CLI ralph validate 加载带结构化 verification 的 plan → 通过
+      2. CLI ralph validate 加载 sample_bad_covers_plan.yaml → 报 E_COVERS_WITHOUT_DEP_ORDER
+      3. CLI ralph validate --project-root . plan.yaml → 正常工作
+      4. 至少 3 个集成测试用例
+    verification:
+      level: integration
+      command: "pytest tests/ralph/test_wave1_integration.py -q"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4"]
+        flows: ["validate_covers_graph"]
+    consumes:
+      - name: unified_verification_field
+        from: T1
+      - name: covers_graph_rules
+        from: T3
+
+critical_entrypoints:
+  - "src/cccc/ralph/validator.py"
+  - "src/cccc/contracts/v1/ralph_ipc.py"
+  - "src/cccc/ralph/cli.py"
+
+critical_flows:
+  - id: validate_covers_graph
+    description: "ralph validate 加载 plan → 运行 covers 图检查 → 报告未知/乱序 covers"
+    entrypoints: ["src/cccc/ralph/validator.py"]
+    required_verification_level: integration
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

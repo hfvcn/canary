@@ -1,0 +1,198 @@
+# Plan: RV-23/24/25 — verification hardening
+# Source: todo/问题清单-v5-ralph.md (v3 E2E 实战新发现)
+# Date: 2026-04-02
+# Scope: verify_completion shell execution, validate pre-check, suspicious duration
+# Codex review: needs-attention → 4 findings adopted (see below)
+
+# Suppress pre-existing critical entrypoint/flow errors unrelated to this plan's scope
+suppress_codes:
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+
+tasks:
+  # ── T1: RV-23 — shell-aware verification command execution ──────────
+  - id: T1
+    title: "RV-23: _run_verification_check supports shell operators"
+    role: leaf
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+    depends_on: []
+    addresses: ["RV-23"]
+    goal_behavior: >
+      In _run_verification_check(), use shlex.split(command) first.
+      Then check if any resulting TOKEN is a shell operator (&&, ||, |, ;).
+      This avoids false-positives from quoted operators like
+      'echo "a && b"' where && is inside quotes.
+      When a bare operator token is found, re-execute via
+      subprocess.run(["bash", "-c", command]) instead.
+      Keep shlex.split path for simple commands (safer, no shell injection).
+      [Codex finding #2 adopted: lexical-level detection, not substring]
+    acceptance_criteria: >
+      1. Simple commands (e.g., "pytest tests/ -q") still use shlex.split path.
+      2. Commands with bare && execute both sides through bash.
+      3. Commands with | (pipe) work correctly.
+      4. Quoted operators (e.g., 'echo "a && b"') do NOT trigger bash -c.
+      5. Timeout/FileNotFoundError handling works for both paths.
+      6. Command output (stdout/stderr) captured in both paths.
+      7. expected_exit_code != 0 works correctly in both paths.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k verify_shell"
+      covers:
+        tasks: ["T1"]
+        paths: ["src/cccc/daemon/foreman/ralph_service.py"]
+        flows:
+          - shell_command_execution
+          - shell_operators_silently_broken
+
+  # ── T2: RV-24 — self-verification target pre-check ─────────────────
+  - id: T2
+    title: "RV-24: _check_path_target distinguishes self-claimed from upstream"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/filesystem_validator.py
+    depends_on: []
+    addresses: ["RV-24"]
+    goal_behavior: >
+      DO NOT change projected_paths() — it's used by _projected_module_candidate()
+      and changing it would break module import hint semantics.
+      [Codex finding #3 adopted: targeted fix, not global semantic change]
+      Instead, modify _check_path_target() to accept a self_claimed parameter.
+      Compute upstream_projected = projected - set(self_claimed).
+      If file is covered by upstream_projected → "hint" (upstream will create).
+      If file is covered by projected but NOT upstream → "warning" (self-verification).
+      If file not covered at all → "warning" (missing).
+      Update callers of _check_path_target in _check_pycompile, _check_python_c,
+      _check_pytest to pass self_claimed=claimed_paths.
+    acceptance_criteria: >
+      1. File from upstream dep still gets "hint".
+      2. File from task's own claimed_paths gets "warning" with
+         self-verification message.
+      3. File not in any projected still gets "warning".
+      4. File in BOTH self and upstream gets "hint" (upstream creates it).
+      5. No regression in existing filesystem_validator tests.
+      6. _projected_module_candidate behavior unchanged.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_filesystem_validator.py -q -k self_verif"
+      covers:
+        tasks: ["T2"]
+        paths: ["src/cccc/ralph/filesystem_validator.py"]
+        flows:
+          - self_verification_detection
+          - self_verification_as_hint
+
+  # ── T3: RV-25 — suspicious duration threshold ──────────────────────
+  - id: T3
+    title: "RV-25: Flag suspiciously fast verification results"
+    role: leaf
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+    depends_on: ["T1"]
+    addresses: ["RV-25"]
+    goal_behavior: >
+      In _run_verification_check(), after execution completes with a
+      passing exit code, check if duration_ms < SUSPICIOUS_DURATION_THRESHOLD_MS
+      (50ms). If so, and the command base is not trivial (not in
+      _TRIVIAL_VERIFY_COMMANDS = {"true", ":", "echo", "printf"}),
+      keep outcome as "passed" but:
+      (a) Prepend message with "[SUSPICIOUS: completed in Xms]"
+      (b) Add "suspicious_duration": True to details dict.
+      Extract command base via shlex.split(command)[0] for trivial check.
+      [Codex finding #4 adopted: treat as heuristic, monkeypatch in tests,
+       add boundary tests for 49/50ms]
+    acceptance_criteria: >
+      1. Command completing in 7ms with exit 0 gets suspicious_duration flag.
+      2. Command completing in 100ms does NOT get flagged.
+      3. Command completing in exactly 50ms does NOT get flagged (threshold is <50).
+      4. Command completing in 49ms DOES get flagged.
+      5. Trivial commands ("echo done") completing in 1ms are NOT flagged.
+      6. outcome remains "passed" (not changed to "failed" or new type).
+      7. expected_exit_code != 0 matching actual exit code still checks duration.
+      8. details["suspicious_duration"] is True when flagged.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -k suspicious_duration"
+      covers:
+        tasks: ["T3"]
+        paths: ["src/cccc/daemon/foreman/ralph_service.py"]
+        flows: ["suspicious_verification"]
+
+  # ── T-int: Integration test ─────────────────────────────────────────
+  - id: T-int
+    title: "Integration: RV-23/24/25 verification hardening"
+    role: verification
+    claimed_paths:
+      - tests/ralph/test_ralph_standalone.py
+      - tests/ralph/test_filesystem_validator.py
+    depends_on: ["T1", "T2", "T3"]
+    addresses: ["RV-23", "RV-24", "RV-25"]
+    goal_behavior: >
+      Add test cases covering:
+      (a) RV-23 tests in test_ralph_standalone.py (shell operator handling)
+      (b) RV-24 tests in test_filesystem_validator.py (self-verification)
+      (c) RV-25 tests in test_ralph_standalone.py (suspicious duration)
+      [Codex finding #1 adopted: tests in appropriate existing files]
+    acceptance_criteria: >
+      1. All new test cases pass.
+      2. All existing tests still pass (no regression).
+      3. Tests cover positive and negative cases for each feature.
+    verification:
+      level: integration
+      command: "pytest tests/ralph/ -q"
+      covers:
+        tasks: ["T1", "T2", "T3", "T-int"]
+        flows:
+          - shell_command_execution
+          - self_verification_detection
+          - suspicious_verification
+          - shell_operators_silently_broken
+          - self_verification_as_hint
+
+# ── Critical flows ────────────────────────────────────────────────────
+critical_flows:
+  - id: shell_command_execution
+    description: >
+      Verification commands with shell operators (&&, ||, |) are executed
+      through bash -c, not shlex.split, so compound commands run correctly.
+    entrypoints:
+      - src/cccc/daemon/foreman/ralph_service.py
+    required_verification_level: unit
+
+  - id: self_verification_detection
+    description: >
+      Ralph validate detects when a task's verification references files
+      that only the task itself creates (self-verification paradox) and
+      reports it as warning, not hint.
+    entrypoints:
+      - src/cccc/ralph/filesystem_validator.py
+    required_verification_level: unit
+
+  - id: suspicious_verification
+    description: >
+      Verification results completing in under 50ms for non-trivial commands
+      are flagged with suspicious_duration in the result details.
+    entrypoints:
+      - src/cccc/daemon/foreman/ralph_service.py
+    required_verification_level: unit
+
+# ── Forbidden flows ───────────────────────────────────────────────────
+forbidden_flows:
+  - id: shell_operators_silently_broken
+    description: >
+      Shell operators (&&, ||, |) in verification commands must NOT be
+      passed to shlex.split, which treats them as literal arguments.
+    required_verification_level: unit
+
+  - id: self_verification_as_hint
+    description: >
+      A task referencing its own created files in verification must NOT
+      be severity "hint" — it must be "warning" to surface the paradox.
+    required_verification_level: unit
+
+# ── Required issues ───────────────────────────────────────────────────
+required_issues:
+  - "RV-23"
+  - "RV-24"
+  - "RV-25"

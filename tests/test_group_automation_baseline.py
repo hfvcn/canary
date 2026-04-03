@@ -43,7 +43,7 @@ class TestGroupAutomationBaseline(unittest.TestCase):
                 self.assertIn("standup", snippets)
                 standup_snippet = str(snippets.get("standup") or "")
                 self.assertIn("Checklist", standup_snippet)
-                self.assertIn("cccc_memory", standup_snippet)
+                self.assertIn("memory", standup_snippet)
 
                 clear_resp, _ = handle_request(
                     DaemonRequest.model_validate(

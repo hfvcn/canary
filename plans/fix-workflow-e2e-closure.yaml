@@ -1,0 +1,435 @@
+# Plan: Fix Workflow Execution Closure — WF-1 through WF-7
+#
+# Context: 问题清单 v3 (2026-04-02) identified 7 issues from E2E testing.
+#   Previous work (Phase 2, MCP→CLI migration) is complete.
+#   This plan addresses the remaining workflow execution loop gaps.
+#
+# Scope:
+#   - WF-1 (P0): plan→engine metadata passing — fields lost in IPC handler
+#   - WF-2 (P0): Engine auto-dispatch — worker receives minimal prompt
+#   - WF-3 (P0): Batch gating → DAG gating — ready tasks blocked by batch boundary
+#   - WF-4 (P1): plan.yaml ↔ implementation field alignment
+#   - WF-5 (P2): context.sync numbering collision
+#   - WF-6 (P1): Sub-agent creation / task attribution enforcement
+#   - WF-7 (P2): duration_seconds all zero
+#
+# Root cause analysis (from code exploration):
+#   WF-1: ralph_ipc_handler.py:143-149 extracts only 5 of 11 TaskRef fields.
+#         _build_task_prompt() only emits id/title/type to worker.
+#   WF-2: _start_assigned_agents() does send messages, but prompt is too thin.
+#         This is a consequence of WF-1 — once metadata flows, prompt can include it.
+#   WF-3: Orchestrator processes batches as atomic units. on_task_completed()
+#         calls _check_batch_completion() but never re-suggests remaining tasks.
+#   WF-4: TaskSpec (ralph/models.py) and TaskRef (contracts/ralph_ipc.py) have
+#         divergent field sets: role vs type, provides/consumes vs expected_input/output,
+#         nested Verification.covers vs flat covers_tasks/covers_paths/covers_flows.
+#   WF-5: context_ops.py:892 calls generate_task_id() which scans filesystem;
+#         concurrent syncs race on the same T00N counter.
+#   WF-6: check_completer_mismatch() at orchestrator.py:928 logs warning but
+#         does not emit a verification_warning event or block completion.
+#   WF-7: No started_at timestamp on TaskState. Duration is passed in externally
+#         but the caller has no reliable start time to compute from.
+#
+# Execution protocol: Dynamic DAG — after each task completes, update
+#   state.completed_task_ids and re-run `ralph suggest`.
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED    # Out of scope: auto-discovered entrypoints not in this plan
+  - E_CRITICAL_FLOW_UNCOVERED        # Out of scope: auto-discovered flows not in this plan
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED  # Out of scope: entrypoints of auto-discovered flows
+
+required_issues:
+  - "WF-1"   # plan→engine metadata passing
+  - "WF-2"   # engine auto-dispatch to workers
+  - "WF-3"   # batch gating → DAG gating
+  - "WF-4"   # plan.yaml ↔ implementation alignment
+  - "WF-5"   # context.sync numbering collision
+  - "WF-6"   # sub-agent task attribution enforcement
+  - "WF-7"   # duration_seconds tracking
+
+tasks:
+  # ── T1: Fix IPC handler metadata passthrough (WF-1 core) ──────────
+
+  - id: T1
+    title: Pass all TaskRef fields through IPC handler
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+      - "tests/test_ralph_ipc.py"
+    depends_on: []
+    addresses: ["WF-1"]
+    goal_behavior: >
+      In handle_ralph_batch_suggest() at ralph_ipc_handler.py:140-152, the
+      ReadyBatchSuggestion is constructed with only 5 fields (id, title, type,
+      depends_on, claimed_paths). The remaining TaskRef fields (goal_behavior,
+      acceptance_criteria, verification_command, verification, expected_input,
+      expected_output) are silently dropped. Fix: construct TaskRef objects
+      directly from the raw dicts using TaskRef(**t) or TaskRef.model_validate(t)
+      so all fields defined in the Pydantic model survive the IPC boundary.
+      The TaskRef model already has model_config=ConfigDict(extra="ignore")
+      so unknown fields are safely dropped.
+    acceptance_criteria: >
+      A JSON payload containing goal_behavior, acceptance_criteria, and
+      verification fields passes through handle_ralph_batch_suggest() and
+      appears in the resulting ReadyBatchSuggestion.tasks[0] intact.
+      Existing tests in test_ralph_ipc.py still pass.
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_ralph_ipc.py -q --tb=short"
+      checks:
+        - name: metadata-survives-ipc
+          command: >
+            python -c "
+            from cccc.contracts.v1.ralph_ipc import TaskRef, ReadyBatchSuggestion;
+            t = {'id':'T1','title':'test','type':'general','depends_on':[],'claimed_paths':['a.py'],
+                 'goal_behavior':'do X','acceptance_criteria':'X done',
+                 'verification':{'level':'unit','command':'pytest'}};
+            ref = TaskRef.model_validate(t);
+            assert ref.goal_behavior == 'do X', f'got {ref.goal_behavior}';
+            assert ref.verification is not None;
+            print('PASS: TaskRef preserves all fields')
+            "
+          required: true
+          expected_exit_code: 0
+      covers:
+        tasks: ["T1"]
+        paths: ["src/cccc/daemon/ralph_ipc_handler.py"]
+        flows: ["metadata-silent-drop"]
+    provides:
+      - name: full_metadata_in_engine
+        kind: runtime_capability
+        schema_hint: "TaskRef objects in engine contain goal_behavior, verification, etc."
+
+  # ── T2: Align TaskSpec ↔ TaskRef model fields (WF-4) ──────────────
+
+  - id: T2
+    title: Align TaskSpec and TaskRef model schemas
+    role: leaf
+    claimed_paths:
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+      - "src/cccc/ralph/models.py"
+    depends_on: []
+    addresses: ["WF-4"]
+    goal_behavior: >
+      TaskSpec (ralph/models.py) and TaskRef (contracts/ralph_ipc.py) have
+      divergent field sets that cause data loss during plan→engine conversion.
+      Fix by adding missing fields to each model:
+      (1) Add provides, consumes, addresses to TaskRef (from TaskSpec).
+      (2) Add type field to TaskSpec (currently only has role).
+      (3) Align Verification.covers (nested VerificationCovers with tasks/paths/flows)
+          with VerificationSpec flat covers_tasks/covers_paths/covers_flows — add a
+          to_spec()/from_spec() converter or unify field names.
+      Keep backward compatibility — all new fields should have defaults.
+    acceptance_criteria: >
+      TaskRef has provides, consumes, addresses fields.
+      TaskSpec has type field.
+      A TaskSpec can be converted to TaskRef preserving all plan fields.
+      Existing tests pass (test_ralph_standalone.py, test_ralph_ipc.py).
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_ralph_standalone.py tests/test_ralph_ipc.py -q --tb=short"
+      covers:
+        tasks: ["T2"]
+        paths: ["src/cccc/contracts/v1/ralph_ipc.py", "src/cccc/ralph/models.py"]
+    provides:
+      - name: aligned_task_models
+        kind: artifact
+        schema_hint: "TaskSpec and TaskRef share a common field set with converters"
+
+  # ── T3: Add --plan flag to workflow submit CLI (WF-1) ─────────────
+
+  - id: T3
+    title: Support cccc workflow submit --plan plan.yaml
+    role: leaf
+    claimed_paths:
+      - "src/cccc/cli/workflow_cmds.py"
+    depends_on: ["T2"]
+    addresses: ["WF-1"]
+    goal_behavior: >
+      Add --plan argument to cccc workflow submit that reads a plan.yaml file
+      directly (via ralph.plan_io.load_plan), converts TaskSpec list to TaskRef
+      dicts, and registers all tasks with the engine. CRITICAL: do NOT submit
+      the entire plan as a single ready batch — that bypasses dependency
+      checking and breaks DAG gating. Instead: (1) register all non-completed
+      tasks with the engine, (2) call ralph suggest to get the initial ready
+      subset, (3) only submit the ready subset as a batch. The plan's
+      state.completed_task_ids should be used to filter out already-completed
+      tasks. When --plan is given, --tasks is optional.
+    acceptance_criteria: >
+      `cccc workflow submit --plan plans/fix-workflow-e2e-closure.yaml --workflow-id test`
+      registers all tasks but only submits the ready subset (tasks with no
+      unmet depends_on) as the first batch. Tasks with unmet deps remain
+      PLANNED. --tasks and --plan are mutually exclusive (error if both given).
+    verification:
+      level: unit
+      command: >
+        python -c "
+        from cccc.cli.workflow_cmds import register_plan_args;
+        print('PASS: --plan argument registered')
+        "
+      covers:
+        tasks: ["T3"]
+        paths: ["src/cccc/cli/workflow_cmds.py"]
+    consumes:
+      - name: aligned_task_models
+        from: T2
+
+  # ── T4: Add started_at timestamp for duration tracking (WF-7) ─────
+
+  - id: T4
+    title: Track started_at timestamp in TaskState for duration computation
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    depends_on: []
+    addresses: ["WF-7"]
+    goal_behavior: >
+      Add started_at: Optional[float] = None to TaskState dataclass.
+      In report_worker_started(), record time.time() as started_at on the
+      TaskState AND write it into the KIND_TASK_STARTED ledger event data
+      so it survives replay. In _apply_task_started() (replay handler),
+      restore started_at from the event data. In report_worker_completion(),
+      compute duration_seconds = int(time.time() - state.started_at) if
+      started_at is set, include it in the completion event data, and return
+      it as the authoritative value. Callers (apply_task_event,
+      on_task_completed) should use the engine-computed duration instead of
+      the externally-provided value when available.
+    acceptance_criteria: >
+      After report_worker_started() + report_worker_completion(), the
+      task_reported_completed event data contains a non-zero duration_seconds
+      computed from the engine's own timestamps. After ledger replay, the
+      started_at is correctly restored from the task_started event.
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k 'duration or started'"
+      checks:
+        - name: duration-computed
+          command: >
+            python -c "
+            from cccc.kernel.workflow_state_types import TaskState;
+            import dataclasses;
+            fields = {f.name for f in dataclasses.fields(TaskState)};
+            assert 'started_at' in fields, f'missing started_at, got {fields}';
+            print('PASS: TaskState has started_at')
+            "
+          required: true
+          expected_exit_code: 0
+      covers:
+        tasks: ["T4"]
+        paths: ["src/cccc/kernel/workflow_state_types.py", "src/cccc/kernel/workflow_state_engine.py"]
+    provides:
+      - name: engine_duration_tracking
+        kind: runtime_capability
+
+  # ── T5: Fix context.sync numbering collision (WF-5) ───────────────
+
+  - id: T5
+    title: Use workflow task_id in context.sync instead of auto-increment
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/context/context_ops.py"
+    depends_on: []
+    addresses: ["WF-5"]
+    goal_behavior: >
+      In context_ops.py handle_context_sync(), when op is "task.create" and the
+      raw dict contains a "workflow_task_id" key, use that as the task ID prefix
+      instead of calling generate_task_id(). Format: if workflow_task_id is
+      "WF1-T3", generate "WF1-T3" as the context task ID. This prevents
+      collisions when multiple workflow batches sync concurrently, because
+      workflow task IDs are globally unique. Fall back to generate_task_id()
+      when workflow_task_id is absent (backward compatibility).
+    acceptance_criteria: >
+      When context_sync receives ops with workflow_task_id, the created tasks
+      use that ID instead of T001/T002. When workflow_task_id is absent,
+      behavior is unchanged.
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k context_sync"
+      checks:
+        - name: workflow-task-id-in-source
+          command: "grep -q workflow_task_id src/cccc/daemon/context/context_ops.py"
+          required: true
+          expected_exit_code: 0
+      covers:
+        tasks: ["T5"]
+        paths: ["src/cccc/daemon/context/context_ops.py"]
+
+  # ── T6: Orchestrator enhancements — prompt, sync, enforcement ─────
+  #    Groups WF-1 (prompt), WF-2 (auto-dispatch), WF-5 (sync-side),
+  #    WF-6 (agent enforcement) changes in workflow_orchestrator.py
+
+  - id: T6
+    title: "Enrich worker prompt + pass workflow task_id to sync + enforce agent_id match"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "tests/test_foreman_workflow.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    depends_on: ["T1", "T4", "T5"]
+    addresses: ["WF-1", "WF-2", "WF-5", "WF-6"]
+    goal_behavior: >
+      Four changes:
+      (A) _build_task_prompt() (line 731-768): Include task.goal_behavior,
+          task.acceptance_criteria, and verification info in the prompt sent
+          to workers. This gives workers the full context to execute and
+          self-verify. Also include claimed_paths so workers know their scope.
+      (B) _sync_batch_to_control_plane() (line 770+): Pass workflow task_id
+          as "workflow_task_id" in the task.create op dict, so context_ops
+          uses it instead of auto-incrementing (pairs with T5).
+      (C) Add KIND_VERIFICATION_WARNING to workflow_state_types.py. Add a
+          record_verification_warning() method to WorkflowEngine that appends
+          the new event kind, and a corresponding _apply handler for replay.
+      (D) on_task_completed() (line 928): When check_completer_mismatch()
+          returns an alert, call engine.record_verification_warning() to emit
+          the warning to the ledger. This makes agent mismatch visible in
+          workflow state, not just logs.
+    acceptance_criteria: >
+      (A) Worker prompt contains goal_behavior, acceptance_criteria, claimed_paths.
+      (B) context.sync ops include workflow_task_id.
+      (C) KIND_VERIFICATION_WARNING exists, engine can record and replay it.
+      (D) Mismatched agent completion emits verification_warning event in ledger.
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short"
+      covers:
+        tasks: ["T6"]
+        paths: ["src/cccc/daemon/foreman/workflow_orchestrator.py"]
+    consumes:
+      - name: full_metadata_in_engine
+        from: T1
+
+  # ── T7: DAG gating — per-task readiness on completion (WF-3) ──────
+
+  - id: T7
+    title: Replace batch gating with per-task DAG readiness
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/foreman/ralph_service.py"
+    depends_on: ["T6"]
+    addresses: ["WF-3"]
+    goal_behavior: >
+      When a task completes (on_task_completed), after _check_batch_completion(),
+      add a new step: call ralph_service.suggest_ready_batch() with all remaining
+      non-completed tasks AND the current workflow_id. CRITICAL: the resuggest
+      must propagate workflow_id into the new ReadyBatchSuggestion, because
+      register_task() requires a non-empty workflow_id. Modify
+      suggest_ready_batch() to accept and return workflow_id. If any
+      newly-ready tasks are returned (deps now satisfied), immediately assign
+      agents and start them — don't wait for the current batch to fully
+      complete. This is the core DAG gating change: tasks become ready as
+      soon as their individual depends_on are met, not when an arbitrary
+      batch boundary is crossed.
+      In _defer_batch_for_single_writer(), change from deferring the entire
+      batch when a global write claim exists to only deferring tasks that
+      actually conflict with the running write set.
+    acceptance_criteria: >
+      Given tasks A→B→C where A and B are in batch 1, C depends only on A:
+      when A completes, C becomes ready and starts immediately, without waiting
+      for B. B and C run in parallel if no claimed_paths conflict.
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k 'dag or ready'"
+      covers:
+        tasks: ["T7"]
+        paths:
+          - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+          - "src/cccc/daemon/foreman/ralph_service.py"
+        flows: ["task-completion-triggers-downstream", "batch-blocks-ready-task"]
+
+  # ── T8: Integration test (verification task) ──────────────────────
+
+  - id: T8
+    title: Integration test for metadata flow + DAG gating + duration
+    role: verification
+    claimed_paths:
+      - "tests/test_workflow_e2e_closure.py"
+    depends_on: ["T1", "T2", "T4", "T6", "T7"]
+    addresses: ["WF-1", "WF-2", "WF-3", "WF-7"]
+    goal_behavior: >
+      Write an integration test that exercises the full pipeline:
+      (1) Create a plan with goal_behavior, verification, provides/consumes.
+      (2) Submit via workflow submit (simulated IPC).
+      (3) Verify metadata survives to engine TaskState.
+      (4) Verify worker prompt includes goal_behavior + acceptance_criteria.
+      (5) Complete a task, verify duration_seconds is non-zero.
+      (6) Verify downstream task becomes ready immediately (DAG gating).
+      This test is the acceptance gate for the entire plan.
+    acceptance_criteria: >
+      pytest tests/test_workflow_e2e_closure.py passes with all assertions.
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_workflow_e2e_closure.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T2", "T4", "T6", "T7", "T8"]
+        paths:
+          - "src/cccc/daemon/ralph_ipc_handler.py"
+          - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+          - "src/cccc/kernel/workflow_state_engine.py"
+        flows: ["plan-submit-to-worker", "task-completion-triggers-downstream"]
+
+# ── Critical flows ───────────────────────────────────────────────────
+
+critical_flows:
+  - id: plan-submit-to-worker
+    description: >
+      plan.yaml → cccc workflow submit → IPC handler → engine registers task
+      with full metadata → orchestrator builds rich prompt → worker receives
+      goal_behavior + acceptance_criteria + verification info
+    entrypoints:
+      - "src/cccc/cli/workflow_cmds.py"
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+    required_verification_level: integration
+
+  - id: task-completion-triggers-downstream
+    description: >
+      Worker calls cccc task complete → engine transitions to VERIFYING →
+      verification runs → on_task_completed() → suggest_ready_batch() for
+      remaining tasks → downstream tasks with satisfied deps start immediately
+    entrypoints:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    required_verification_level: integration
+
+# ── Forbidden flows ──────────────────────────────────────────────────
+
+forbidden_flows:
+  - id: metadata-silent-drop
+    description: >
+      TaskRef fields present in CLI input (goal_behavior, verification, etc.)
+      must NOT be silently dropped at the IPC handler boundary. If a field
+      exists in the raw dict and in the TaskRef model, it must survive.
+    required_verification_level: unit
+
+  - id: batch-blocks-ready-task
+    description: >
+      A task whose depends_on are all COMPLETED must NOT be blocked solely
+      because other tasks in the same batch are still RUNNING. DAG readiness
+      is per-task, not per-batch.
+    required_verification_level: integration
+
+# ── Critical entrypoints ─────────────────────────────────────────────
+
+critical_entrypoints:
+  - "src/cccc/daemon/ralph_ipc_handler.py"
+  - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+  - "src/cccc/contracts/v1/ralph_ipc.py"
+  - "src/cccc/kernel/workflow_state_engine.py"
+
+# ── State ─────────────────────────────────────────────────────────────
+
+state:
+  completed_task_ids:
+    - T8
+    - T7
+    - T6
+    - T3
+    - T2
+    - T4
+    - T1
+    - T5
+  running_tasks: []
+  failed_task_ids: []

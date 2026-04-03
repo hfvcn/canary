@@ -1,0 +1,7 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Create task artifacts,DONE,Task directory with SPEC/TODO/PROGRESS exists,test -f .codex-tasks/20260401-ralph-block-fixes/TODO.csv,2026-04-01T00:00:00,0,Initialized taskmaster full single
+2,Fix BLOCK 1 in ralph_service and test,DONE,verify_completion respects structured expected_exit_code,pytest tests/test_ralph_ipc.py tests/test_ralph_verification.py -q,2026-04-01T00:00:00,0,Implemented verification result path and expected_exit_code propagation
+3,Fix BLOCK 2 in ralph cli and test,DONE,_resolve_project_root uses plan directory for git root resolution,pytest tests/ralph/test_ralph_standalone.py -q,2026-04-01T00:00:00,0,Added cwd-aware git root resolution test
+4,Fix BLOCK 3 in plan_io and test,DONE,Invalid .cccc/ralph.yaml emits warning instead of silent swallow,pytest tests/ralph/ -q,2026-04-01T00:00:00,0,Added warning coverage and Ralph suite passed
+5,Fix BLOCK 4 and workspace_index FLAG then test,DONE,Wrapper unwrap handles env/timeout correctly and workspace paths cannot escape project root,pytest tests/ralph/test_filesystem_validator.py tests/ralph/test_workspace_index.py -q,2026-04-01T00:00:00,0,Added wrapper edge-case and traversal tests
+6,Run final required regression suite,DONE,Required Ralph and foreman regression tests pass,pytest tests/ralph/ tests/test_ralph_ipc.py tests/test_foreman_workflow.py -q,2026-04-01T00:00:00,0,173 passed in 5.94s
