@@ -705,19 +705,18 @@ class TestWorkflowOrchestratorDaemonBridge:
         assert task_create_ops[0]["status"] in {"active", "blocked"}
         assert "ralph_batch=sug-test-001" in task_create_ops[0]["notes"]
 
-    def test_process_batch_suggestion_falls_back_to_group_peers(
+    def test_process_batch_suggestion_rejected_stays_rejected(
         self,
         temp_project_dir,
         sample_suggestion,
         monkeypatch,
     ):
-        """Rejected batches should reuse enabled peer actors from the group."""
+        """ARCH-2: Rejected batches must stay rejected — no silent fallback."""
         from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
 
         monkeypatch.setenv("CCCC_HOME", tempfile.mkdtemp())
         group_id = _create_group_with_foreman("lead")
         _add_group_actor(group_id, "peer1", title="Peer 1", runtime="codex")
-        _add_group_actor(group_id, "peer2", title="Peer 2", runtime="codex")
 
         orchestrator = WorkflowOrchestrator(
             project_root=temp_project_dir,
@@ -740,10 +739,10 @@ class TestWorkflowOrchestratorDaemonBridge:
             auto_start_agents=False,
         )
 
-        assert result.decision == "approved"
-        assert [task.id for task in result.approved_tasks] == ["T1", "T2", "T3"]
-        assert result.rejected_tasks == []
-        assert [assignment.agent_id for assignment in result.assignments] == ["peer1", "peer2", "peer1"]
+        # ARCH-2: rejected must stay rejected, no fallback override
+        assert result.decision == "rejected"
+        assert len(result.rejected_tasks) == 3
+        assert result.approved_tasks == []
 
     def test_on_task_completed_notifies_foreman_via_daemon_send(self, temp_project_dir, monkeypatch):
         """Task completion should notify foreman through daemon chat send."""

@@ -144,6 +144,7 @@ def handle_ralph_batch_suggest(args: Dict[str, Any], *, daemon_request_fn: Any =
         tasks=tasks,  # Pass raw dicts — Pydantic validates via TaskRef(extra="ignore")
         rationale=str(args.get("rationale", "")),
         estimated_parallelism=int(args.get("estimated_parallelism", len(tasks))),
+        assignments=dict(args.get("assignments") or {}),
     )
 
     _RALPH_STATE["pending_suggestions"][suggestion_id] = suggestion.model_dump()
@@ -203,6 +204,7 @@ def handle_ralph_register_and_suggest(
             rationale=str(args.get("rationale", "")),
             estimated_parallelism=int(args.get("estimated_parallelism", len(tasks))),
             auto_start_agents=bool(args.get("auto_start_agents", True)),
+            assignments=dict(args.get("assignments") or {}),
         )
         return _success(
             {
@@ -707,6 +709,7 @@ def handle_ralph_process_pending(args: Dict[str, Any], *, daemon_request_fn: Any
         tasks=suggestion_data["tasks"],
         rationale=suggestion_data.get("rationale", ""),
         estimated_parallelism=suggestion_data.get("estimated_parallelism", 1),
+        assignments=dict(suggestion_data.get("assignments") or {}),
     )
 
     try:
@@ -885,6 +888,10 @@ def handle_ralph_task_event(args: Dict[str, Any]) -> DaemonResponse:
     if not group_id:
         return _error("missing_group_id", "Missing group_id")
 
+    # ARCH-6: Extract assignment_id/actor_run_id from payload or args
+    assignment_id = str(payload.get("assignment_id") or args.get("assignment_id") or "").strip()
+    actor_run_id = str(payload.get("actor_run_id") or args.get("actor_run_id") or "").strip()
+
     if event_type == "completed":
         return _from_workflow_task_op(
             complete_task(
@@ -896,6 +903,8 @@ def handle_ralph_task_event(args: Dict[str, Any]) -> DaemonResponse:
                 workflow_id=workflow_id,
                 project_root=project_root,
                 daemon_request_fn=None,
+                assignment_id=assignment_id,
+                actor_run_id=actor_run_id,
             )
         )
     if event_type == "failed":
@@ -908,6 +917,8 @@ def handle_ralph_task_event(args: Dict[str, Any]) -> DaemonResponse:
                 workflow_id=workflow_id,
                 project_root=project_root,
                 daemon_request_fn=None,
+                assignment_id=assignment_id,
+                actor_run_id=actor_run_id,
             )
         )
     return _error("invalid_task_event", f"Unsupported task event: {event_type}")

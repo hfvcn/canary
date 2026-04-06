@@ -113,8 +113,8 @@ class TestMetadataFlowIntegration(unittest.TestCase):
 class TestPhasedSubmission(unittest.TestCase):
     """WF-3/FIX-6: phased submission uses atomic daemon-side gating."""
 
-    def test_register_and_suggest_resuggests_from_stored_task_refs(self):
-        """Downstream tasks are rebuilt from workflow task_ref after completion."""
+    def test_register_and_suggest_resuggests_notifies_foreman(self):
+        """ARCH-3: Downstream tasks trigger Foreman notification, not auto-process."""
         from cccc.daemon.foreman import workflow_orchestrator as orchestrator_module
         from cccc.daemon.foreman.workflow_orchestrator import (
             TASK_STATUS_COMPLETED,
@@ -125,10 +125,15 @@ class TestPhasedSubmission(unittest.TestCase):
         project_root = Path(tempfile.mkdtemp())
         orchestrator = WorkflowOrchestrator(project_root=project_root, group_id="test-group")
         captured_batches: list[list[str]] = []
+        foreman_notifications: list[dict] = []
 
         def fake_process_batch_suggestion(suggestion, *, auto_start_agents=True):
             captured_batches.append([task.id for task in suggestion.tasks])
-            return SimpleNamespace(suggestion=suggestion, approved_tasks=list(suggestion.tasks))
+            return SimpleNamespace(suggestion=suggestion, approved_tasks=list(suggestion.tasks), decision="approved")
+
+        def fake_notify(*, task_id, new_status, summary):
+            foreman_notifications.append({"task_id": task_id, "status": new_status, "summary": summary})
+            return True
 
         tasks = [
             {"id": "T1", "title": "Task 1", "type": "backend", "claimed_paths": ["src/a.py"]},
@@ -139,27 +144,26 @@ class TestPhasedSubmission(unittest.TestCase):
 
         orchestrator_module._ORCHESTRATORS["test-group"] = orchestrator
         try:
-            with patch.object(orchestrator, "process_batch_suggestion", side_effect=fake_process_batch_suggestion):
+            with patch.object(orchestrator, "process_batch_suggestion", side_effect=fake_process_batch_suggestion), \
+                 patch.object(orchestrator, "_notify_foreman_task_update", side_effect=fake_notify):
                 result = orchestrator.register_and_suggest(tasks, "wf-phased", auto_start_agents=False)
 
                 self.assertEqual(result["registered"], 4)
                 self.assertEqual(result["submitted"], 2)
                 self.assertEqual(captured_batches, [["T1", "T3"]])
-                self.assertEqual(
-                    orchestrator._active_workflows["wf-phased"]["tasks"]["T2"]["task_ref"].id,
-                    "T2",
-                )
 
                 tracked_tasks = orchestrator._active_workflows["wf-phased"]["tasks"]
                 tracked_tasks["T1"]["status"] = TASK_STATUS_COMPLETED
                 tracked_tasks["T3"]["status"] = TASK_STATUS_RUNNING
-                orchestrator._resuggest_ready_tasks("wf-phased")
-                self.assertEqual(captured_batches[-1], ["T2"])
 
-                tracked_tasks["T2"]["status"] = TASK_STATUS_COMPLETED
-                tracked_tasks["T3"]["status"] = TASK_STATUS_COMPLETED
+                # ARCH-3: resuggest should notify, not auto-process
                 orchestrator._resuggest_ready_tasks("wf-phased")
-                self.assertEqual(captured_batches[-1], ["T4"])
+                # No new batch should be auto-processed
+                self.assertEqual(len(captured_batches), 1, "resuggest should NOT auto-process")
+                # But Foreman should be notified
+                self.assertTrue(len(foreman_notifications) > 0, "Foreman should receive notification")
+                self.assertEqual(foreman_notifications[-1]["status"], "tasks_ready")
+                self.assertIn("T2", foreman_notifications[-1]["summary"])
         finally:
             orchestrator_module.clear_orchestrator("test-group")
 

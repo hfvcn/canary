@@ -106,7 +106,7 @@ def _build_verification_error(task_id: str, workflow_id: str, exc: Exception) ->
     )
 
 
-def complete_task(group_id, task_id, agent_id, changed_files, evidence, workflow_id, project_root, daemon_request_fn):
+def complete_task(group_id, task_id, agent_id, changed_files, evidence, workflow_id, project_root, daemon_request_fn, *, assignment_id="", actor_run_id=""):
     try:
         orchestrator = _get_orchestrator_or_raise(group_id, project_root, daemon_request_fn)
         _get_state_or_raise(orchestrator, task_id, workflow_id)
@@ -119,6 +119,8 @@ def complete_task(group_id, task_id, agent_id, changed_files, evidence, workflow
                 "duration_seconds": DEFAULT_DURATION_SECONDS,
                 "changed_files": _normalize_changed_files(changed_files),
                 "evidence": evidence,
+                "assignment_id": str(assignment_id or "").strip(),
+                "actor_run_id": str(actor_run_id or "").strip(),
             },
         )
         result = orchestrator.apply_task_event(event)
@@ -128,7 +130,7 @@ def complete_task(group_id, task_id, agent_id, changed_files, evidence, workflow
         return _classify_error(exc)
 
 
-def fail_task(group_id, task_id, agent_id, message, workflow_id, project_root, daemon_request_fn):
+def fail_task(group_id, task_id, agent_id, message, workflow_id, project_root, daemon_request_fn, *, assignment_id="", actor_run_id=""):
     try:
         orchestrator = _get_orchestrator_or_raise(group_id, project_root, daemon_request_fn)
         _get_state_or_raise(orchestrator, task_id, workflow_id)
@@ -141,6 +143,8 @@ def fail_task(group_id, task_id, agent_id, message, workflow_id, project_root, d
                 "agent_name": normalized_agent_id,
                 "workflow_id": _normalize_text("workflow_id", workflow_id),
                 "error_message": _normalize_text("message", message),
+                "assignment_id": str(assignment_id or "").strip(),
+                "actor_run_id": str(actor_run_id or "").strip(),
             },
         )
         result = orchestrator.apply_task_event(event)

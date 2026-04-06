@@ -201,6 +201,8 @@ def test_ipc_handler_delegates_to_canonical() -> None:
         workflow_id=WORKFLOW_ID,
         project_root="/tmp/project",
         daemon_request_fn=None,
+        assignment_id="",
+        actor_run_id="",
     )
 
 

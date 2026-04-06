@@ -115,6 +115,8 @@ class ReadyBatchSuggestion(BaseModel):
     rationale: str = ""  # Why these tasks are suggested together
     estimated_parallelism: int = 1  # Expected degree of parallelism
     created_at: str = Field(default_factory=utc_now_iso)
+    # ARCH-1: Foreman-explicit task→actor assignments (empty = agent pool decides)
+    assignments: Dict[str, str] = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="forbid")
 

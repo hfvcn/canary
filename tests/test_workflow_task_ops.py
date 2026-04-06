@@ -14,6 +14,8 @@ FUNCTION_SIGNATURES = {
         "workflow_id",
         "project_root",
         "daemon_request_fn",
+        "assignment_id",
+        "actor_run_id",
     ],
     "fail_task": [
         "group_id",
@@ -23,6 +25,8 @@ FUNCTION_SIGNATURES = {
         "workflow_id",
         "project_root",
         "daemon_request_fn",
+        "assignment_id",
+        "actor_run_id",
     ],
     "retry_task": [
         "group_id",

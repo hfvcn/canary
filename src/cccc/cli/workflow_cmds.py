@@ -144,8 +144,17 @@ def cmd_workflow_submit(args: argparse.Namespace) -> int:
     if not project_root:
         _print_json({"ok": False, "error": {"code": "missing_project_root", "message": "Group has no attached scope/project_root"}})
         return 2
+    # ARCH-1: Parse optional Foreman assignments
+    assignments_raw = str(getattr(args, "assignments", "") or "").strip()
+    assignments: dict[str, str] = {}
+    if assignments_raw:
+        try:
+            assignments = json.loads(assignments_raw)
+        except Exception as e:
+            _print_json({"ok": False, "error": {"code": "invalid_assignments", "message": f"Invalid --assignments JSON: {e}"}})
+            return 2
     op = "ralph_register_and_suggest" if plan_path else "ralph_batch_suggest"
-    payload = _build_task_request(op, workflow_id=workflow_id, tasks=tasks, rationale=str(getattr(args, "rationale", "") or "").strip(), estimated_parallelism=int(getattr(args, "parallelism", 1) or 1), auto_process=bool(getattr(args, "auto_process", True)), group_id=group_id, project_root=project_root, auto_start_agents=bool(getattr(args, "auto_start_agents", True)))
+    payload = _build_task_request(op, workflow_id=workflow_id, tasks=tasks, rationale=str(getattr(args, "rationale", "") or "").strip(), estimated_parallelism=int(getattr(args, "parallelism", 1) or 1), auto_process=bool(getattr(args, "auto_process", True)), group_id=group_id, project_root=project_root, auto_start_agents=bool(getattr(args, "auto_start_agents", True)), assignments=assignments)
     resp = call_daemon(payload)
     _print_json(resp)
     return 0 if resp.get("ok") else 1

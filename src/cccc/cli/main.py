@@ -563,6 +563,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Auto-start assigned agents (default: true)",
     )
     p_workflow_submit.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_workflow_submit.add_argument("--assignments", default="", help='Foreman explicit assignments JSON: {"task_id":"actor_id",...}')
     p_workflow_submit.set_defaults(func=cmd_workflow_submit)
 
     p_workflow_status = workflow_sub.add_parser("status", help="Show workflow progress snapshot")

@@ -1,0 +1,266 @@
+# Batch C: Assignment 协议闭环
+# 可验证结论: "所有任务分配都经过 Foreman，无例外"
+#
+# 对应问题清单: ARCH-6 (P0) + ARCH-1 (P0) + ARCH-2 (P0) + ARCH-3 (P1)
+# Finding 对照: #16(负向不变量) #17(失败必须暴露) #20(问题清单驱动压制设计矛盾)
+#
+# Codex 审查后重构：
+# - T3/T4/T5 合并为一个 orchestrator 任务（同文件写冲突不可并行）
+# - T2 扩展覆盖 ralph_ipc_handler 所有入口点
+# - assignment 校验移到 orchestrator 主路径
+# - provenance 标准降级（推迟到 Batch F engine 改造）
+# - 需要同步更新的测试文件纳入 claimed_paths
+
+tasks:
+  # === T1: 协议层 — submit 支持 assignment ===
+
+  - id: T1
+    title: "submit 协议支持 Foreman 显式 assignment"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+      - "src/cccc/cli/workflow_cmds.py"
+      - "src/cccc/ports/web/routes/workflow.py"
+    awareness_paths:
+      - "src/cccc/ralph/models.py"
+    depends_on: []
+    goal_behavior: >
+      1. 在 ReadyBatchSuggestion 中新增 assignments: Dict[str, str] = {}
+         （task_id → actor_id 映射，空表示由 agent pool 自动分配）。
+      2. 在 CLI workflow submit 中新增 --assignments 参数（JSON 格式）。
+      3. Web route batch/suggest 请求体新增可选 assignments 字段。
+      4. Web routes /task/completed 和 /task/failed：
+         确保 assignment_id 和 actor_run_id 从请求体传递到下游调用。
+      5. TaskRef 的 extra="ignore" 保持不变（assignment 不在 TaskRef 上，在 batch 级别）。
+    acceptance_criteria: >
+      ReadyBatchSuggestion 包含 assignments 字段且向后兼容（默认空 dict）；
+      CLI --assignments 能被正确解析并传递；
+      Web route 接受 assignments 字段；
+      /task/completed 和 /task/failed 透传 assignment_id；
+      不提供 assignments 时行为与现在完全一致。
+    verification:
+      level: unit
+      command: "python -m pytest tests/e2e/test_smoke_workflow.py tests/test_ralph_ipc.py -q --tb=short"
+      covers:
+        tasks: ["T1"]
+    provides:
+      - name: assignment_submit_protocol
+        kind: module
+        schema_hint: "ReadyBatchSuggestion.assignments + web route passthrough"
+    addresses: ["ARCH-1"]
+
+  # === T2: handler 管道透传 + 所有入口点 ===
+
+  - id: T2
+    title: "handler 管道全入口透传 assignment_id + 校验"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+      - "src/cccc/daemon/foreman/ralph_service.py"
+    awareness_paths:
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "tests/test_workflow_task_ops.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      1. ralph_ipc_handler.py handle_ralph_task_event()（~line 871）：
+         从 args 中提取 assignment_id 和 actor_run_id，传给 workflow_task_ops。
+      2. ralph_ipc_handler.py handle_ralph_batch_suggest()（~line 140）：
+         构造 ReadyBatchSuggestion 时传递 assignments 字段（从 args 提取）。
+      3. ralph_ipc_handler.py handle_ralph_register_and_suggest()（~line 199）：
+         同上，传递 assignments 字段。
+      4. ralph_ipc_handler.py ralph_process_pending（~line 703）：
+         重建 pending suggestion 时保留 assignments。
+      5. workflow_task_ops.py complete_task()/fail_task()（~line 109）：
+         接受 assignment_id 和 actor_run_id 参数，写入 TaskEvent payload。
+      6. ralph_service.py apply_task_event()（~line 237）：
+         实现实际的 assignment validity 检查（兑现 docstring 承诺）。
+         注意：ralph_service 是被 orchestrator 主路径调用的中间层，
+         如果不在主路径上，改为在 orchestrator.apply_task_event() 中做校验。
+    acceptance_criteria: >
+      所有入口（batch_suggest/register_and_suggest/process_pending/task_event）
+      都正确透传 assignment 相关字段；
+      assignment_id 不匹配时返回 accepted=false + reason；
+      不携带 assignment_id 时行为不变（向后兼容）。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_task_ops.py tests/test_ralph_verification.py tests/e2e/test_smoke_workflow.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T2"]
+    consumes:
+      - name: assignment_submit_protocol
+        from: T1
+    provides:
+      - name: assignment_pipeline_passthrough
+        kind: module
+        schema_hint: "全入口 assignment_id 透传 + 校验"
+    addresses: ["ARCH-6"]
+
+  # === T3: Orchestrator 三合一改造 (ARCH-2 + ARCH-3 + explicit assignment) ===
+
+  - id: T3
+    title: "Orchestrator 改造：显式 assignment + 删除 fallback + resuggest 通知"
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "tests/test_foreman_workflow.py"
+      - "tests/test_workflow_e2e_closure.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/agent_pool.py"
+      - "src/cccc/daemon/foreman/workflow.py"
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      三个改动合在一起做（同文件不可并行，且行为互相依赖）：
+
+      **ARCH-1 显式 assignment：**
+      1. 修改 process_batch_suggestion()：
+         如果 suggestion.assignments 非空，跳过 foreman.process_batch_suggestion()，
+         直接构建 TaskAssignment 列表，decision="approved"，
+         assignment_reason="foreman_explicit"。
+      2. 如果 assignments 为空，走现有 foreman 评估路径（向后兼容）。
+
+      **ARCH-2 删除 fallback + rejected 分支：**
+      3. 删除 _fallback_to_group_actors() 方法。
+      4. 删除 process_batch_suggestion() 中对它的调用。
+      5. 在 process_batch_suggestion() 中，当 result.decision == "rejected" 时：
+         - 不执行 engine.approve_batch()、_sync_batch_to_control_plane()、
+           reporter.on_batch_started()、_start_assigned_agents() 等副作用
+         - 通过 _notify_foreman_batch_rejected() 新方法向 Foreman 发送结构化通知
+           （扩展 _notify_foreman_task_update 为 batch 级别的通知）
+         - 提前 return result
+
+      **ARCH-3 resuggest 改通知：**
+      6. 修改 _resuggest_ready_tasks()：
+         保留 ralph.suggest_ready_batch() 调用。
+         删除对 process_batch_suggestion() 的直接调用。
+         改为向 Foreman 发送 "N downstream tasks ready: [ids]" 通知。
+      7. 同样修改 register_and_suggest()（line 389）：
+         如果 suggestion 有 tasks 但没有 assignments，只发通知不自动处理。
+         如果有 assignments，走正常 process_batch_suggestion()。
+
+      **测试同步：**
+      8. 更新 tests/test_foreman_workflow.py：
+         删除/修改断言 fallback 行为正确的测试（~line 708-746）。
+         新增断言 rejected batch 不被篡改的测试。
+      9. 更新 tests/test_workflow_e2e_closure.py：
+         修改断言 _resuggest_ready_tasks 自动提交的测试（~line 116-162）。
+         改为断言 Foreman 收到通知。
+    acceptance_criteria: >
+      _fallback_to_group_actors 方法不存在；
+      rejected batch 不触发 on_batch_started 等副作用；
+      Foreman 提供 assignments 时直接使用，不走 agent pool；
+      _resuggest_ready_tasks 只发通知不自动 process；
+      register_and_suggest 无 assignments 时只发通知；
+      所有被修改的测试通过。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py tests/test_workflow_e2e_closure.py tests/e2e/test_smoke_workflow.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T3"]
+        paths:
+          - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+        flows:
+          - "foreman_explicit_assignment"
+          - "batch_rejection_notifies_foreman"
+          - "resuggest_notifies_foreman"
+    consumes:
+      - name: assignment_submit_protocol
+        from: T1
+    provides:
+      - name: orchestrator_assignment_protocol
+        kind: runtime_capability
+        schema_hint: "explicit assignment + no fallback + resuggest notification"
+    addresses: ["ARCH-2", "ARCH-3", "ARCH-1"]
+
+  # === T4: E2E 验证 ===
+
+  - id: T4
+    title: "E2E 验证：全路径 assignment 闭环"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_assignment_protocol.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/foreman/ralph_service.py"
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+    depends_on: ["T2", "T3"]
+    goal_behavior: >
+      新建 tests/e2e/test_assignment_protocol.py：
+      1. test_foreman_explicit_assignment：
+         提交 batch 带 assignments={"T1":"actor-1"}，验证 T1 被分配给 actor-1，
+         不经过 agent pool 评估。
+      2. test_rejected_batch_stays_rejected：
+         提交 batch 不带 assignments（让 agent pool 评估），
+         agent pool 无匹配时 batch 保持 rejected，
+         验证没有 _fallback_to_group_actors 行为，
+         验证 rejected batch 不触发 on_batch_started 等副作用。
+      3. test_resuggest_notifies_instead_of_auto_process：
+         多步 DAG（T1→T2），T1 完成后验证 _resuggest_ready_tasks
+         发送通知而非自动 process。
+      4. test_assignment_id_mismatch_rejected：
+         任务完成时携带错误的 assignment_id，验证被拒绝。
+      5. test_backward_compatible_no_assignments：
+         不提供 assignments 时走旧路径，行为不变。
+    acceptance_criteria: >
+      5 个场景全部通过：显式 assignment 生效、rejected 不被篡改、
+      resuggest 走通知、assignment_id 校验、向后兼容。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/e2e/test_assignment_protocol.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4"]
+        flows:
+          - "foreman_explicit_assignment"
+          - "batch_rejection_notifies_foreman"
+          - "resuggest_notifies_foreman"
+          - "no_silent_fallback_override"
+          - "no_auto_assignment_on_resuggest"
+
+critical_entrypoints:
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - src/cccc/contracts/v1/ralph_ipc.py
+  - src/cccc/daemon/ralph_ipc_handler.py
+
+critical_flows:
+  - id: foreman_explicit_assignment
+    description: "Foreman submits batch with assignments → orchestrator uses them directly → agent starts"
+    entrypoints:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+    required_verification_level: e2e
+  - id: batch_rejection_notifies_foreman
+    description: "Agent pool rejects batch → orchestrator keeps rejected → notifies Foreman inbox → no side effects"
+    entrypoints:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    required_verification_level: integration
+  - id: resuggest_notifies_foreman
+    description: "Task completes → DAG unlocks downstream → orchestrator notifies Foreman instead of auto-processing"
+    entrypoints:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    required_verification_level: integration
+
+forbidden_flows:
+  - id: no_silent_fallback_override
+    description: "Batch rejected by agent pool MUST NOT be silently converted to approved"
+    required_verification_level: e2e
+  - id: no_auto_assignment_on_resuggest
+    description: "Downstream ready tasks MUST NOT be auto-processed without Foreman submit"
+    required_verification_level: e2e
+
+required_issues:
+  - "ARCH-1"
+  - "ARCH-2"
+  - "ARCH-3"
+  - "ARCH-6"
+
+suppress_codes:
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+
+state:
+  completed_task_ids: ["T1", "T2", "T3"]
+  running_tasks: []
+  failed_task_ids: []

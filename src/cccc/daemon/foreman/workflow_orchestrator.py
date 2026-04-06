@@ -306,16 +306,50 @@ class WorkflowOrchestrator:
             workflow_data["batches"].append(batch_id)
             return deferred_result
 
-        # Process through Foreman
-        result = self.foreman.process_batch_suggestion(
-            suggestion,
-            auto_approve=True,
-            notify_feishu=False,  # We handle Feishu through reporter
-        )
-        result = self._fallback_to_group_actors(result)
+        # ARCH-1: If Foreman provided explicit assignments, use them directly
+        if suggestion.assignments:
+            self._log(f"[orchestrator] Using Foreman explicit assignments for batch {batch_id}")
+            explicit_assignments = []
+            for task in suggestion.tasks:
+                actor_id = suggestion.assignments.get(task.id, "")
+                if actor_id:
+                    explicit_assignments.append(
+                        TaskAssignment(
+                            task=task,
+                            agent_id=actor_id,
+                            agent_name=actor_id,
+                            assignment_reason="foreman_explicit",
+                        )
+                    )
+            result = BatchEvaluationResult(
+                suggestion=suggestion,
+                decision="approved",
+                reason=f"Foreman explicit assignment for {len(explicit_assignments)} tasks",
+                assignments=explicit_assignments,
+                approved_tasks=list(suggestion.tasks),
+                rejected_tasks=[],
+            )
+        else:
+            # Process through Foreman agent pool evaluation
+            result = self.foreman.process_batch_suggestion(
+                suggestion,
+                auto_approve=True,
+                notify_feishu=False,
+            )
 
         # Track batch
         workflow_data["batches"].append(batch_id)
+
+        # ARCH-2: If rejected, notify Foreman and return immediately — no side effects
+        if result.decision == "rejected":
+            self._log(f"[orchestrator] Batch {batch_id} rejected: {result.reason}")
+            rejected_ids = [t.id for t in result.rejected_tasks]
+            self._notify_foreman_task_update(
+                task_id=batch_id,
+                new_status="batch_rejected",
+                summary=f"Batch rejected: {result.reason}. Tasks needing assignment: {rejected_ids}",
+            )
+            return result
 
         # Store assignment details for progress API
         for assignment in result.assignments:
@@ -386,6 +420,9 @@ class WorkflowOrchestrator:
                 suggestion.rationale = str(kwargs["rationale"])
             if kwargs.get("estimated_parallelism"):
                 suggestion.estimated_parallelism = int(kwargs["estimated_parallelism"])
+            # ARCH-1: Forward Foreman's explicit assignments to the suggestion
+            if kwargs.get("assignments"):
+                suggestion.assignments = dict(kwargs["assignments"])
             self.process_batch_suggestion(
                 suggestion,
                 auto_start_agents=bool(kwargs.get("auto_start_agents", True)),
@@ -397,46 +434,7 @@ class WorkflowOrchestrator:
             "ready_task_ids": ready_task_ids,
         }
 
-    def _fallback_to_group_actors(
-        self,
-        result: BatchEvaluationResult,
-    ) -> BatchEvaluationResult:
-        if result.decision != "rejected":
-            return result
-        if "No suitable agents" not in result.reason:
-            return result
-
-        peer_actors = self._load_enabled_peer_actors()
-        if not peer_actors:
-            return result
-
-        warning = "Agent pool empty, falling back to group actors"
-        logger.warning(warning)
-        self._log(f"[orchestrator] {warning}")
-
-        rejected_tasks = list(result.rejected_tasks) or list(result.suggestion.tasks)
-        fallback_assignments: List[TaskAssignment] = []
-        for index, task in enumerate(rejected_tasks):
-            actor = peer_actors[index % len(peer_actors)]
-            actor_id = str(actor.get("id") or "").strip()
-            actor_name = str(actor.get("title") or "").strip() or actor_id
-            fallback_assignments.append(
-                TaskAssignment(
-                    task=task,
-                    agent_id=actor_id,
-                    agent_name=actor_name,
-                    is_new_agent=False,
-                    assignment_reason="Fallback to group actor",
-                    model_runtime=str(actor.get("runtime") or "").strip(),
-                )
-            )
-
-        result.assignments = fallback_assignments
-        result.approved_tasks = rejected_tasks
-        result.rejected_tasks = []
-        result.decision = "approved"
-        result.reason = f"Approved all {len(rejected_tasks)} tasks via group actor fallback"
-        return result
+    # ARCH-2: _fallback_to_group_actors DELETED — rejected batches stay rejected
 
     def _load_enabled_peer_actors(self) -> List[Dict[str, Any]]:
         group = load_group(self.group_id) or self.group
@@ -1145,13 +1143,15 @@ class WorkflowOrchestrator:
         if not suggestion or not suggestion.tasks:
             return
 
-        self._log(f"[DAG gating] {len(suggestion.tasks)} downstream tasks now ready after completion")
+        ready_ids = [t.id for t in suggestion.tasks]
+        self._log(f"[DAG gating] {len(ready_ids)} downstream tasks now ready: {ready_ids}")
 
-        # Process the new batch through normal flow
-        try:
-            self.process_batch_suggestion(suggestion, auto_start_agents=True)
-        except Exception as e:
-            self._log(f"[DAG gating] Error processing re-suggested batch: {e}")
+        # ARCH-3: Notify Foreman instead of auto-processing
+        self._notify_foreman_task_update(
+            task_id=suggestion.suggestion_id,
+            new_status="tasks_ready",
+            summary=f"{len(ready_ids)} downstream tasks now ready for assignment: {ready_ids}. Please submit assignments via 'cccc workflow submit'.",
+        )
 
     def _record_violation(self, alert: MonitorAlert) -> None:
         """Record a monitor violation to the ledger (ARCH-9 observe-only mode)."""

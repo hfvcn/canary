@@ -63,6 +63,7 @@ class BatchSuggestRequest(BaseModel):
     auto_process: bool = True
     feishu_chat_id: Optional[str] = None
     auto_start_agents: bool = True
+    assignments: Dict[str, str] = {}  # ARCH-1: task_id → actor_id
 
 
 class ProcessPendingRequest(BaseModel):
@@ -162,6 +163,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                 "project_root": runtime_ctx["project_root"],
                 "feishu_chat_id": req.feishu_chat_id,
                 "auto_start_agents": req.auto_start_agents,
+                "assignments": req.assignments,
             },
         })
 
@@ -223,7 +225,7 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         runtime_ctx = await resolve_group_runtime_context(ctx, group_id)
         try:
             workflow_id = str(req.workflow_id or "").strip() or str(_require_task_state(group_id, runtime_ctx["project_root"], req.task_id).workflow_id or "").strip()
-            result = complete_task(group_id, req.task_id, req.agent_id, req.changed_files or [], {}, workflow_id, runtime_ctx["project_root"], None)
+            result = complete_task(group_id, req.task_id, req.agent_id, req.changed_files or [], {}, workflow_id, runtime_ctx["project_root"], None, assignment_id=req.assignment_id, actor_run_id=req.actor_run_id)
         except Exception as exc:
             result = {"ok": False, "result": {}, "error": {"message": str(exc)}}
         return _format_workflow_op(result, error_code="task_event_error", error_prefix="Failed to process task event", event_type="completed")
