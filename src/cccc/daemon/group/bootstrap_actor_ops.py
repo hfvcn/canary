@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from ...kernel.active import load_active
 from ...kernel.actors import list_actors
 from ...kernel.group import load_group
 from ...util.conv import coerce_bool
@@ -43,12 +44,27 @@ def autostart_running_groups(
     if not base.exists():
         return
 
+    active_group_id = ""
+    try:
+        active_doc = load_active()
+        active_group_id = str(active_doc.get("active_group_id") or "").strip()
+    except Exception:
+        logger.warning("Could not load active.json, will recover all running groups")
+
     for group_yaml in base.glob("*/group.yaml"):
         group_id = group_yaml.parent.name
         group = load_group(group_id)
         if group is None:
             continue
         if not coerce_bool(group.doc.get("running"), default=False):
+            continue
+        # FIX-11: Only recover active group's actors to avoid wasting resources
+        if active_group_id and group_id != active_group_id:
+            logger.info(
+                "Skipping non-active group %s (active: %s)",
+                group_id,
+                active_group_id,
+            )
             continue
 
         group_scope_key = str(group.doc.get("active_scope_key") or "").strip()

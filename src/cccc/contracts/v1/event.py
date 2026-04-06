@@ -40,6 +40,7 @@ EventKind = Literal[
     "system.notify_ack",
     "presentation.publish",
     "presentation.clear",
+    "workflow.monitor_violation",
 ]
 
 
@@ -211,6 +212,18 @@ class PresentationClearData(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class MonitorViolationData(BaseModel):
+    alert_type: str
+    severity: str
+    task_id: str
+    message: str
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    monitor_mode: str
+    invariant_id: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class Event(BaseModel):
     v: int = 1
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
@@ -252,6 +265,7 @@ _KIND_TO_MODEL = {
     "system.notify_ack": NotifyAckData,
     "presentation.publish": PresentationPublishData,
     "presentation.clear": PresentationClearData,
+    "workflow.monitor_violation": MonitorViolationData,
 }
 
 

@@ -551,5 +551,126 @@ class TestBootstrapActorOps(unittest.TestCase):
             cleanup()
 
 
+    def test_only_active_group_actors_recovered(self) -> None:
+        """FIX-11: daemon start only recovers actors for the active group."""
+        home, cleanup = self._with_home()
+        try:
+            from cccc.kernel.active import set_active_group_id
+            from cccc.kernel.group import load_group
+
+            # Create two groups
+            create1, _ = self._call("group_create", {"title": "active-grp", "topic": "", "by": "user"})
+            self.assertTrue(create1.ok)
+            active_gid = str((create1.result or {}).get("group_id") or "").strip()
+
+            create2, _ = self._call("group_create", {"title": "inactive-grp", "topic": "", "by": "user"})
+            self.assertTrue(create2.ok)
+            inactive_gid = str((create2.result or {}).get("group_id") or "").strip()
+
+            # Mark both as running with active scopes
+            for gid in (active_gid, inactive_gid):
+                attach, _ = self._call("attach", {"group_id": gid, "path": ".", "by": "user"})
+                self.assertTrue(attach.ok)
+                g = load_group(gid)
+                assert g is not None
+                g.doc["running"] = True
+                g.save()
+
+            # Set only one as the active group
+            set_active_group_id(active_gid)
+
+            started_groups: list[str] = []
+
+            orig_list_actors = __import__("cccc.kernel.actors", fromlist=["list_actors"]).list_actors
+
+            def _tracking_list_actors(group):
+                started_groups.append(group.group_id)
+                return []  # no actors to start
+
+            with patch("cccc.daemon.group.bootstrap_actor_ops.list_actors", side_effect=_tracking_list_actors):
+                autostart_running_groups(
+                    home,
+                    effective_runner_kind=lambda runner: runner,
+                    find_scope_url=lambda _group, _scope_key: str(Path(".").resolve()),
+                    supported_runtimes=("codex",),
+                    ensure_mcp_installed=lambda _runtime, _cwd: True,
+                    auto_mcp_runtimes=("codex",),
+                    pty_supported=lambda: True,
+                    merge_actor_env_with_private=lambda _gid, _aid, env: dict(env),
+                    inject_actor_context_env=lambda env, _gid, _aid: dict(env),
+                    prepare_pty_env=lambda env: dict(env),
+                    normalize_runtime_command=lambda _runtime, command: list(command),
+                    pty_backlog_bytes=lambda: 1024,
+                    write_headless_state=lambda _gid, _aid: None,
+                    write_pty_state=lambda _gid, _aid, _pid: None,
+                    clear_preamble_sent=lambda _group, _aid: None,
+                    throttle_reset_actor=lambda _gid, _aid: None,
+                    automation_on_resume=lambda _group: None,
+                    get_group_state=lambda _group: "idle",
+                )
+
+            # Only the active group should have been processed
+            self.assertIn(active_gid, started_groups, "Active group should be recovered")
+            self.assertNotIn(inactive_gid, started_groups, "Inactive group should be skipped")
+        finally:
+            cleanup()
+
+    def test_empty_active_group_recovers_all(self) -> None:
+        """FIX-11 fallback: when active_group_id is empty, recover all running groups."""
+        home, cleanup = self._with_home()
+        try:
+            from cccc.kernel.active import active_path
+            from cccc.kernel.group import load_group
+            from cccc.util.fs import atomic_write_json
+
+            # Create one running group
+            create, _ = self._call("group_create", {"title": "fallback-grp", "topic": "", "by": "user"})
+            self.assertTrue(create.ok)
+            gid = str((create.result or {}).get("group_id") or "").strip()
+
+            attach, _ = self._call("attach", {"group_id": gid, "path": ".", "by": "user"})
+            self.assertTrue(attach.ok)
+            g = load_group(gid)
+            assert g is not None
+            g.doc["running"] = True
+            g.save()
+
+            # Set empty active_group_id
+            atomic_write_json(active_path(), {"v": 1, "active_group_id": ""})
+
+            started_groups: list[str] = []
+
+            def _tracking_list_actors(group):
+                started_groups.append(group.group_id)
+                return []
+
+            with patch("cccc.daemon.group.bootstrap_actor_ops.list_actors", side_effect=_tracking_list_actors):
+                autostart_running_groups(
+                    home,
+                    effective_runner_kind=lambda runner: runner,
+                    find_scope_url=lambda _group, _scope_key: str(Path(".").resolve()),
+                    supported_runtimes=("codex",),
+                    ensure_mcp_installed=lambda _runtime, _cwd: True,
+                    auto_mcp_runtimes=("codex",),
+                    pty_supported=lambda: True,
+                    merge_actor_env_with_private=lambda _gid, _aid, env: dict(env),
+                    inject_actor_context_env=lambda env, _gid, _aid: dict(env),
+                    prepare_pty_env=lambda env: dict(env),
+                    normalize_runtime_command=lambda _runtime, command: list(command),
+                    pty_backlog_bytes=lambda: 1024,
+                    write_headless_state=lambda _gid, _aid: None,
+                    write_pty_state=lambda _gid, _aid, _pid: None,
+                    clear_preamble_sent=lambda _group, _aid: None,
+                    throttle_reset_actor=lambda _gid, _aid: None,
+                    automation_on_resume=lambda _group: None,
+                    get_group_state=lambda _group: "idle",
+                )
+
+            # Should recover all groups when active_group_id is empty
+            self.assertIn(gid, started_groups, "Should recover all when active_group_id is empty")
+        finally:
+            cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()

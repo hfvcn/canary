@@ -7,9 +7,35 @@ All functions are stateless and testable in isolation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Dict, List, Optional
 
 from cccc.ralph.core import _paths_overlap
+
+
+class MonitorMode(str, Enum):
+    OBSERVE = "observe"
+    WARN = "warn"
+    BLOCK = "block"
+
+
+@dataclass
+class MonitorConfig:
+    silent_agent: MonitorMode
+    path_deviation: MonitorMode
+    unauthorized_subagent: MonitorMode
+    completer_mismatch: MonitorMode
+    file_overstepping: MonitorMode
+
+
+def get_default_config() -> MonitorConfig:
+    return MonitorConfig(
+        silent_agent=MonitorMode.OBSERVE,
+        path_deviation=MonitorMode.OBSERVE,
+        unauthorized_subagent=MonitorMode.OBSERVE,
+        completer_mismatch=MonitorMode.OBSERVE,
+        file_overstepping=MonitorMode.OBSERVE,
+    )
 
 
 @dataclass
@@ -19,6 +45,7 @@ class MonitorAlert:
     task_id: str      # affected task (empty string when not task-scoped)
     message: str      # human-readable description
     evidence: Dict    # structured data for debugging
+    mode: MonitorMode = MonitorMode.OBSERVE
 
 
 # ---------------------------------------------------------------------------

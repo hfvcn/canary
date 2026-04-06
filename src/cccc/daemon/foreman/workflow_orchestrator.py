@@ -52,6 +52,8 @@ from .workflow_monitor import (
     check_silent_agent,
     check_unauthorized_subagent,
     MonitorAlert,
+    MonitorConfig,
+    get_default_config,
 )
 
 
@@ -182,6 +184,7 @@ class WorkflowOrchestrator:
         self._task_to_agent: Dict[str, str] = {}
         self._task_to_model: Dict[str, str] = {}  # task_id -> model_key
         self._context_store = ContextStore(self.project_root) if self.project_root else None
+        self._monitor_config: MonitorConfig = get_default_config()
 
     def _ensure_active_workflow(
         self,
@@ -1150,6 +1153,33 @@ class WorkflowOrchestrator:
         except Exception as e:
             self._log(f"[DAG gating] Error processing re-suggested batch: {e}")
 
+    def _record_violation(self, alert: MonitorAlert) -> None:
+        """Record a monitor violation to the ledger (ARCH-9 observe-only mode)."""
+        try:
+            from cccc.kernel.ledger import append_event
+            from cccc.kernel.workflow_state_types import KIND_MONITOR_VIOLATION
+            from cccc.contracts.v1.event import MonitorViolationData
+
+            scope_key = str(self.group.doc.get("active_scope_key") or "").strip()
+            append_event(
+                self.group.ledger_path,
+                kind=KIND_MONITOR_VIOLATION,
+                group_id=self.group.group_id,
+                scope_key=scope_key,
+                by="monitor",
+                data=MonitorViolationData(
+                    alert_type=alert.alert_type,
+                    severity=alert.severity,
+                    task_id=alert.task_id,
+                    message=alert.message,
+                    evidence=alert.evidence,
+                    monitor_mode=alert.mode.value,
+                    invariant_id=alert.alert_type,
+                ).model_dump(),
+            )
+        except Exception:
+            logger.debug("Failed to record monitor violation", exc_info=True)
+
     def monitor_incoming_event(self, task_id: str, event_type: str, event_payload: dict) -> None:
         """Check an incoming event for path deviation (direct messaging bypass). Called by daemon event handling layer when processing raw events."""
         try:
@@ -1161,6 +1191,7 @@ class WorkflowOrchestrator:
                     alert.message,
                     extra={"evidence": alert.evidence},
                 )
+                self._record_violation(alert)
         except Exception:
             logger.debug("Monitor check failed", exc_info=True)
 
@@ -1306,6 +1337,7 @@ class WorkflowOrchestrator:
                             alert.message,
                             extra={"evidence": alert.evidence},
                         )
+                        self._record_violation(alert)
                 except Exception:
                     logger.debug("Monitor check failed", exc_info=True)
         return stalled

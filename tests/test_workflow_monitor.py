@@ -9,11 +9,14 @@ import pytest
 
 from cccc.daemon.foreman.workflow_monitor import (
     MonitorAlert,
+    MonitorConfig,
+    MonitorMode,
     check_completer_mismatch,
     check_file_overstepping,
     check_path_deviation,
     check_silent_agent,
     check_unauthorized_subagent,
+    get_default_config,
 )
 
 
@@ -314,3 +317,61 @@ class TestCheckPathDeviation:
             event_payload={},
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# MonitorMode / MonitorConfig / MonitorAlert.mode  (T1 additions)
+# ---------------------------------------------------------------------------
+
+
+class TestMonitorMode:
+    def test_has_expected_values(self):
+        assert list(MonitorMode) == [
+            MonitorMode.OBSERVE,
+            MonitorMode.WARN,
+            MonitorMode.BLOCK,
+        ]
+
+
+class TestMonitorConfig:
+    def test_create_config(self):
+        config = MonitorConfig(
+            silent_agent=MonitorMode.WARN,
+            path_deviation=MonitorMode.BLOCK,
+            unauthorized_subagent=MonitorMode.OBSERVE,
+            completer_mismatch=MonitorMode.WARN,
+            file_overstepping=MonitorMode.BLOCK,
+        )
+        assert config.silent_agent == MonitorMode.WARN
+        assert config.path_deviation == MonitorMode.BLOCK
+
+    def test_get_default_config_returns_all_observe(self):
+        config = get_default_config()
+        assert config.silent_agent == MonitorMode.OBSERVE
+        assert config.path_deviation == MonitorMode.OBSERVE
+        assert config.unauthorized_subagent == MonitorMode.OBSERVE
+        assert config.completer_mismatch == MonitorMode.OBSERVE
+        assert config.file_overstepping == MonitorMode.OBSERVE
+
+
+class TestMonitorAlertMode:
+    def test_defaults_mode_to_observe(self):
+        alert = MonitorAlert(
+            alert_type="silent_agent",
+            severity="warning",
+            task_id="t1",
+            message="agent silent",
+            evidence={},
+        )
+        assert alert.mode == MonitorMode.OBSERVE
+
+    def test_accepts_explicit_mode(self):
+        alert = MonitorAlert(
+            alert_type="unauthorized_subagent",
+            severity="error",
+            task_id="t1",
+            message="blocked",
+            evidence={},
+            mode=MonitorMode.BLOCK,
+        )
+        assert alert.mode == MonitorMode.BLOCK

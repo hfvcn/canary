@@ -1,0 +1,238 @@
+# Batch A+B: 监控基础 + 日常改善
+# 可验证结论 A: "监控器在跑，violations 写入 ledger，不影响现有流程"
+# 可验证结论 B: "daemon start 只恢复 active group 的 actor"
+#
+# 对应问题清单: ARCH-9 (P0) + FIX-11 (P1)
+# Finding 对照: #1(编译≠可用) #9(先跑通一条路径) #16(负向不变量)
+
+tasks:
+  # === Batch A: ARCH-9 监控器 observe-only 基础 ===
+
+  - id: T1
+    title: "MonitorMode 枚举 + 每个不变量的模式配置"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    depends_on: []
+    goal_behavior: >
+      在 workflow_monitor.py 中新增 MonitorMode 枚举（observe / warn / block）
+      和 MonitorConfig dataclass，包含每个不变量的模式映射。
+      默认所有 5 个不变量为 observe 模式。
+      新增 get_default_config() 返回全 observe 配置。
+      MonitorAlert 新增 mode 字段，默认值为 MonitorMode.OBSERVE（不破坏现有构造调用）。
+      不改变现有 check_* 函数签名，只扩展返回的 MonitorAlert。
+      同步更新 tests/test_workflow_monitor.py 中的测试覆盖 MonitorMode 和 MonitorConfig。
+    acceptance_criteria: >
+      MonitorMode 枚举有 observe/warn/block 三个值；
+      MonitorConfig 包含 5 个不变量到 MonitorMode 的映射；
+      get_default_config() 返回全 observe；
+      MonitorAlert.mode 字段默认值为 MonitorMode.OBSERVE，现有构造不报错；
+      现有 check_* 函数行为不变；
+      tests/test_workflow_monitor.py 新增 MonitorMode/MonitorConfig 测试用例。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_monitor.py -q --tb=short"
+      covers:
+        tasks: ["T1"]
+    provides:
+      - name: monitor_mode_config
+        kind: module
+        schema_hint: "MonitorMode enum + MonitorConfig dataclass + get_default_config()"
+    addresses: ["ARCH-9"]
+
+  - id: T2
+    title: "violation ledger 事件类型注册"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/contracts/v1/event.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+    depends_on: []
+    awareness_paths:
+      - "tests/test_event_contract_internal_parity.py"
+      - "tests/test_event_kind_model_parity.py"
+    goal_behavior: >
+      在 EventKind 中新增 "workflow.monitor_violation"。
+      在 workflow_state_types.py 中新增 KIND_MONITOR_VIOLATION 常量。
+      在 event.py 中新增 MonitorViolationData(BaseModel) 包含:
+      alert_type, severity, task_id, message, evidence, monitor_mode, invariant_id。
+      在 _KIND_TO_MODEL 映射中注册 "workflow.monitor_violation" → MonitorViolationData。
+      在 normalize_event_data() 中注册该类型。
+      注意：test_event_contract_internal_parity.py 验证 EventKind 和 _KIND_TO_MODEL
+      双向一致，必须同时更新两处否则该测试会失败。
+    acceptance_criteria: >
+      EventKind 包含 "workflow.monitor_violation"；
+      KIND_MONITOR_VIOLATION = "workflow.monitor_violation"；
+      MonitorViolationData 模型字段完整且 extra="forbid"；
+      _KIND_TO_MODEL 包含 "workflow.monitor_violation" → MonitorViolationData 映射；
+      normalize_event_data 能处理该事件类型；
+      test_event_contract_internal_parity 和 test_event_kind_model_parity 通过。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_event_contract_internal_parity.py tests/test_event_kind_model_parity.py -q --tb=short"
+      covers:
+        tasks: ["T2"]
+    provides:
+      - name: violation_event_type
+        kind: module
+        schema_hint: "KIND_MONITOR_VIOLATION + MonitorViolationData"
+    addresses: ["ARCH-9"]
+
+  - id: T3
+    title: "Orchestrator 将 monitor violations 写入 ledger"
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+      - "src/cccc/kernel/ledger.py"
+      - "src/cccc/contracts/v1/event.py"
+    depends_on: ["T1", "T2"]
+    goal_behavior: >
+      修改 WorkflowOrchestrator：
+      1. __init__ 中加载 MonitorConfig（默认 get_default_config()）
+      2. 新增 _record_violation(alert: MonitorAlert) 方法：
+         调用 append_event(kind=KIND_MONITOR_VIOLATION, data=MonitorViolationData(...))
+      3. 只修改已有的两个 monitor 调用点：
+         - monitor_incoming_event() 中的 check_path_deviation 调用
+         - check_stalled_tasks() 中的 check_silent_agent 调用
+         在这两处调用 _record_violation 记录到 ledger。
+         不新增额外 monitor 调用（其余 3 个 check 函数的接入留给后续批次）。
+      4. 本批次只实现 observe 模式（只记录，不阻断，保持现有行为）。
+         warn/block 模式的枚举值已定义但不激活。
+      所有模式下，现有的 logger.warning() 保留不变。
+    acceptance_criteria: >
+      monitor 检测到 violation 时，ledger 中出现 workflow.monitor_violation 事件；
+      observe 模式下工作流正常完成不受影响；
+      violation 事件包含完整的 alert_type、severity、task_id、evidence、monitor_mode 信息。
+    verification:
+      level: integration
+      command: "python -m pytest tests/e2e/test_smoke_workflow.py tests/test_workflow_monitor.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T2", "T3"]
+        paths:
+          - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+          - "src/cccc/daemon/foreman/workflow_monitor.py"
+        flows: ["monitor_violation_to_ledger"]
+    consumes:
+      - name: monitor_mode_config
+        from: T1
+      - name: violation_event_type
+        from: T2
+    provides:
+      - name: violation_recording_capability
+        kind: runtime_capability
+        schema_hint: "Orchestrator records MonitorAlert → ledger via _record_violation()"
+    addresses: ["ARCH-9"]
+
+  # === Batch B: FIX-11 daemon 只恢复 active group ===
+
+  - id: T4
+    title: "daemon autostart 只恢复 active group 的 actor"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/group/bootstrap_actor_ops.py"
+    awareness_paths:
+      - "src/cccc/kernel/active.py"
+      - "src/cccc/daemon/server.py"
+    depends_on: []
+    goal_behavior: >
+      修改 autostart_running_groups()：
+      1. 在遍历 groups 之前，调用 load_active() 获取 active_group_id
+      2. 安全回退：如果 active.json 不存在、读取失败、或 active_group_id 为空字符串，
+         则回退到现有行为（恢复所有 running group 的 actor），并 logger.warning 提示
+      3. 正常情况：遍历时，如果 group_id != active_group_id，跳过该 group（不恢复其 actor）
+      4. 非 active group 保持 running=True 不变（不改其持久化状态），
+         只是本次启动不恢复其 actor。当用户 cccc use 切换到该 group 时，
+         或 cccc group start 显式启动时，才恢复。
+      5. 添加 logger.info 记录跳过了哪些非 active group。
+    acceptance_criteria: >
+      daemon start 后只有 active group（cccc use 选中的）的 actor 启动；
+      非 active group 的 actor 不启动，不浪费 claude 进程；
+      切换 cccc use 到另一个 group 后，daemon restart 恢复新 active group 的 actor；
+      当 active.json 不存在或 active_group_id 为空时，回退到恢复所有 running group（不回归）。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_bootstrap_actor_ops.py -q --tb=short"
+      covers:
+        tasks: ["T4"]
+    addresses: ["FIX-11"]
+
+  # === 集成验证 ===
+
+  - id: T5
+    title: "E2E 验证：violation ledger + selective recovery"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_monitor_violation_ledger.py"
+      - "tests/test_bootstrap_actor_ops.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/group/bootstrap_actor_ops.py"
+      - "src/cccc/kernel/ledger.py"
+    depends_on: ["T3", "T4"]
+    goal_behavior: >
+      1. 新建 tests/e2e/test_monitor_violation_ledger.py：
+         - 构造一个会触发 monitor violation 的场景（如 completer_mismatch）
+         - 验证 ledger 中出现 workflow.monitor_violation 事件
+         - 验证事件包含正确的 alert_type、task_id、monitor_mode="observe"
+         - 验证工作流正常完成（observe 模式不阻断）
+      2. 扩展 tests/test_bootstrap_actor_ops.py：
+         - 构造多个 group（2个 running），设置 active.json 指向其中一个
+         - 调用 autostart_running_groups
+         - 验证只有 active group 的 actor 被启动
+    acceptance_criteria: >
+      test_monitor_violation_ledger.py 全部通过：violation 事件存在且完整，workflow 不中断；
+      test_bootstrap_actor_ops.py 全部通过：只有 active group 的 actor 启动。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/e2e/test_monitor_violation_ledger.py tests/test_bootstrap_actor_ops.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5"]
+        flows:
+          - "monitor_violation_to_ledger"
+          - "daemon_selective_recovery"
+          - "monitor_blocks_in_observe_mode"
+          - "daemon_recovers_inactive_groups"
+
+critical_entrypoints:
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - src/cccc/daemon/group/bootstrap_actor_ops.py
+  - src/cccc/contracts/v1/event.py
+
+critical_flows:
+  - id: monitor_violation_to_ledger
+    description: "Monitor check detects anomaly → MonitorAlert → _record_violation → ledger event (workflow.monitor_violation)"
+    entrypoints:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    required_verification_level: integration
+  - id: daemon_selective_recovery
+    description: "daemon start → load_active() → filter groups by active_group_id → only recover active group actors"
+    entrypoints:
+      - "src/cccc/daemon/group/bootstrap_actor_ops.py"
+    required_verification_level: unit
+
+forbidden_flows:
+  - id: monitor_blocks_in_observe_mode
+    description: "Monitor in observe mode MUST NOT block or reject any state transition"
+    required_verification_level: integration
+  - id: daemon_recovers_inactive_groups
+    description: "daemon start MUST NOT recover actors for non-active groups"
+    required_verification_level: unit
+
+required_issues:
+  - "ARCH-9"
+  - "FIX-11"
+
+# Suppress global critical entrypoints/flows that Ralph auto-detects from project
+# but are out of scope for this focused batch (we don't touch ralph_ipc_handler, cli, etc.)
+suppress_codes:
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+
+state:
+  completed_task_ids: ["T1", "T2", "T3", "T4", "T5"]
+  running_tasks: []
+  failed_task_ids: []
