@@ -23,9 +23,12 @@ Usage:
 from __future__ import annotations
 
 import hashlib
+import json as _json
 import logging
+import os
 import posixpath
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -74,6 +77,229 @@ TASK_STATUS_DEFERRED = "deferred"
 SINGLE_WRITER_REASON = "single_writer_active"
 ORCHESTRATOR_SERVICE_ACTOR = "service:workflow_orchestrator"
 GLOBAL_WRITE_CLAIM = "/"
+
+
+# ---------------------------------------------------------------------------
+# PromptBudget — W3-10
+# ---------------------------------------------------------------------------
+
+DEFAULT_PROMPT_TOKEN_BUDGET = 12_000
+PROMPT_BUDGET_ENV_VAR = "CCCC_PROMPT_TOKEN_BUDGET"
+MANDATORY_RATIO_LIMIT = 0.40
+CONTEXT_DEGRADED_MARKER = "[CONTEXT DEGRADED]"
+
+
+class PromptMinimaOverflow(ValueError):
+    """Raised when mandatory sections exceed 40% of the budget (E_PROMPT_MINIMA_OVERFLOW)."""
+
+    code = "E_PROMPT_MINIMA_OVERFLOW"
+
+
+def _estimate_tokens(text: str) -> int:
+    """Approximate token count (len / 4 fallback)."""
+    return max(1, len(text) // 4) if text else 0
+
+
+@dataclass
+class _PromptSection:
+    """A named section of the task prompt with its text."""
+    name: str
+    text: str
+    mandatory: bool = False
+    priority: int = 99  # Lower = higher priority
+
+
+@dataclass
+class _OmissionEntry:
+    """Record of what happened to a section during budgeting."""
+    section: str
+    original_tokens: int
+    included_tokens: int
+    strategy: str  # "kept", "condensed", "truncated", "omitted"
+
+
+@dataclass
+class PromptBudgetResult:
+    """Result of applying PromptBudget to a set of sections."""
+    text: str
+    omission_manifest: List[Dict[str, Any]] = field(default_factory=list)
+    total_tokens: int = 0
+    budget: int = 0
+
+
+class PromptBudget:
+    """Token-budget-aware prompt assembler.
+
+    Mandatory sections (Task ID, Title, Goal Behavior, Acceptance Criteria,
+    Verification Command, Do-Not-Ignore Issues, Recommended Tests, Forbidden
+    Actions) are never truncated.  If they exceed 40% of the budget the class
+    raises ``PromptMinimaOverflow`` (code ``E_PROMPT_MINIMA_OVERFLOW``).
+
+    Remaining sections are included in priority order:
+        contract > blockers > verification_command > recommended_tests
+        > condensed_semantic_focus > raw_semantic_context > context_store
+
+    When a section does not fit it is first condensed (symbol signatures only),
+    then truncated with a ``[CONTEXT DEGRADED]`` marker.
+    """
+
+    # Priority mapping — lower = higher priority
+    PRIORITY_MAP: Dict[str, int] = {
+        "contract": 10,
+        "blockers": 20,
+        "verification_command": 30,
+        "recommended_tests": 40,
+        "condensed_semantic_focus": 50,
+        "raw_semantic_context": 60,
+        "context_store": 70,
+    }
+
+    # Sections that are mandatory (never truncated)
+    MANDATORY_SECTIONS = frozenset({
+        "task_id",
+        "title",
+        "goal_behavior",
+        "acceptance_criteria",
+        "verification_command",
+        "do_not_ignore_issues",
+        "recommended_tests",
+        "forbidden_actions",
+    })
+
+    def __init__(self, budget: Optional[int] = None):
+        raw = budget
+        if raw is None:
+            env_val = os.environ.get(PROMPT_BUDGET_ENV_VAR, "")
+            if env_val.strip().isdigit():
+                raw = int(env_val.strip())
+        self.budget = raw if raw is not None else DEFAULT_PROMPT_TOKEN_BUDGET
+
+    @staticmethod
+    def condense(text: str) -> str:
+        """Condense text to symbol signatures only (first line of each def/class)."""
+        lines = text.splitlines()
+        condensed: List[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if (
+                stripped.startswith("def ")
+                or stripped.startswith("class ")
+                or stripped.startswith("async def ")
+                or stripped.startswith("# ")
+                or stripped.startswith("## ")
+            ):
+                condensed.append(line)
+        if not condensed:
+            # Fallback: take first 3 lines
+            condensed = lines[:3]
+        return "\n".join(condensed)
+
+    def apply(self, sections: List[_PromptSection]) -> PromptBudgetResult:
+        """Assemble prompt text respecting the token budget.
+
+        Returns a ``PromptBudgetResult`` with the final text, omission manifest,
+        and budget accounting.
+        """
+        manifest: List[_OmissionEntry] = []
+        budget = self.budget
+
+        # --- Phase 1: mandatory sections ---
+        mandatory = [s for s in sections if s.mandatory]
+        optional = sorted(
+            [s for s in sections if not s.mandatory],
+            key=lambda s: s.priority,
+        )
+
+        mandatory_tokens = sum(_estimate_tokens(s.text) for s in mandatory)
+        if mandatory_tokens > int(budget * MANDATORY_RATIO_LIMIT):
+            raise PromptMinimaOverflow(
+                f"Mandatory sections use {mandatory_tokens} tokens "
+                f"(>{int(budget * MANDATORY_RATIO_LIMIT)} = 40% of {budget}). "
+                f"Reduce mandatory content or increase CCCC_PROMPT_TOKEN_BUDGET."
+            )
+
+        # All mandatory sections are included verbatim
+        included_parts: List[str] = []
+        used_tokens = 0
+        for s in mandatory:
+            tok = _estimate_tokens(s.text)
+            included_parts.append(s.text)
+            used_tokens += tok
+            manifest.append(_OmissionEntry(
+                section=s.name,
+                original_tokens=tok,
+                included_tokens=tok,
+                strategy="kept",
+            ))
+
+        # --- Phase 2: optional sections in priority order ---
+        remaining = budget - used_tokens
+        for s in optional:
+            orig_tokens = _estimate_tokens(s.text)
+            if orig_tokens <= remaining:
+                # Fits entirely
+                included_parts.append(s.text)
+                used_tokens += orig_tokens
+                remaining -= orig_tokens
+                manifest.append(_OmissionEntry(
+                    section=s.name,
+                    original_tokens=orig_tokens,
+                    included_tokens=orig_tokens,
+                    strategy="kept",
+                ))
+            elif remaining > 0:
+                # Try condensing first
+                condensed = self.condense(s.text)
+                condensed_tokens = _estimate_tokens(condensed)
+                if condensed_tokens <= remaining:
+                    included_parts.append(condensed)
+                    used_tokens += condensed_tokens
+                    remaining -= condensed_tokens
+                    manifest.append(_OmissionEntry(
+                        section=s.name,
+                        original_tokens=orig_tokens,
+                        included_tokens=condensed_tokens,
+                        strategy="condensed",
+                    ))
+                else:
+                    # Truncate to remaining budget
+                    char_limit = remaining * 4  # inverse of token estimate
+                    truncated = s.text[:char_limit]
+                    trunc_tokens = _estimate_tokens(truncated)
+                    included_parts.append(truncated + f"\n{CONTEXT_DEGRADED_MARKER}")
+                    used_tokens += trunc_tokens
+                    remaining -= trunc_tokens
+                    manifest.append(_OmissionEntry(
+                        section=s.name,
+                        original_tokens=orig_tokens,
+                        included_tokens=trunc_tokens,
+                        strategy="truncated",
+                    ))
+            else:
+                # No budget left — omit entirely
+                manifest.append(_OmissionEntry(
+                    section=s.name,
+                    original_tokens=orig_tokens,
+                    included_tokens=0,
+                    strategy="omitted",
+                ))
+
+        text = "\n\n".join(part for part in included_parts if part)
+        manifest_dicts = [
+            {
+                "section": m.section,
+                "original_tokens": m.original_tokens,
+                "included_tokens": m.included_tokens,
+                "strategy": m.strategy,
+            }
+            for m in manifest
+        ]
+        return PromptBudgetResult(
+            text=text,
+            omission_manifest=manifest_dicts,
+            total_tokens=used_tokens,
+            budget=budget,
+        )
 
 
 class FeishuAdapterWrapper:
@@ -1033,46 +1259,129 @@ class WorkflowOrchestrator:
         worker_prompt: str = "",
         runtime: str = "",
     ) -> str:
-        """Build the task prompt to send to an agent."""
-        # Build rich assignment with metadata (WF-1/WF-2)
-        header_lines = [
-            "[Foreman Assignment]",
-            f"Task ID: {task.id}",
-            f"Title: {task.title}",
-            f"Type: {task.type}",
-        ]
+        """Build the task prompt to send to an agent.
+
+        Wraps all content through :class:`PromptBudget` so the resulting text
+        stays within the configured token budget.  Mandatory sections (task ID,
+        title, goal, acceptance criteria, verification command, forbidden
+        actions) are never truncated.  Lower-priority context is condensed or
+        omitted when space is limited.
+        """
+        sections: List[_PromptSection] = []
+
+        # --- Mandatory sections (never truncated) ---
+        sections.append(_PromptSection(
+            name="task_id",
+            text=f"[Foreman Assignment]\nTask ID: {task.id}\nType: {task.type}",
+            mandatory=True,
+        ))
+        sections.append(_PromptSection(
+            name="title",
+            text=f"Title: {task.title}",
+            mandatory=True,
+        ))
         if task.goal_behavior:
-            header_lines.append(f"\nGoal: {task.goal_behavior}")
+            sections.append(_PromptSection(
+                name="goal_behavior",
+                text=f"Goal: {task.goal_behavior}",
+                mandatory=True,
+            ))
         if task.acceptance_criteria:
-            header_lines.append(f"\nAcceptance Criteria: {task.acceptance_criteria}")
-        if task.claimed_paths:
-            header_lines.append(f"\nScope (claimed files): {', '.join(task.claimed_paths)}")
+            sections.append(_PromptSection(
+                name="acceptance_criteria",
+                text=f"Acceptance Criteria: {task.acceptance_criteria}",
+                mandatory=True,
+            ))
         if task.verification and task.verification.command:
-            header_lines.append(f"\nVerification Command: {task.verification.command}")
-        header_lines.append("\nAssigned by Foreman inside the Ralph workflow.")
-        header_lines.append("Execute this task only.")
-        header_lines.append("Do not contact the user to renegotiate scope.")
-        sections = ["\n".join(header_lines)]
+            sections.append(_PromptSection(
+                name="verification_command",
+                text=f"Verification Command: {task.verification.command}",
+                mandatory=True,
+                priority=PromptBudget.PRIORITY_MAP.get("verification_command", 30),
+            ))
+        # Do-not-ignore issues (placeholder — populated by validator when present)
+        do_not_ignore = getattr(task, "do_not_ignore_issues", None)
+        if do_not_ignore:
+            sections.append(_PromptSection(
+                name="do_not_ignore_issues",
+                text=f"Do-Not-Ignore Issues:\n{do_not_ignore}",
+                mandatory=True,
+            ))
+        # Recommended tests
+        recommended_tests = getattr(task, "recommended_tests", None)
+        if recommended_tests:
+            sections.append(_PromptSection(
+                name="recommended_tests",
+                text=f"Recommended Tests:\n{recommended_tests}",
+                mandatory=True,
+                priority=PromptBudget.PRIORITY_MAP.get("recommended_tests", 40),
+            ))
+        # Forbidden actions
+        forbidden_text = (
+            "Assigned by Foreman inside the Ralph workflow.\n"
+            "Execute this task only.\n"
+            "Do not contact the user to renegotiate scope."
+        )
+        sections.append(_PromptSection(
+            name="forbidden_actions",
+            text=forbidden_text,
+            mandatory=True,
+        ))
+
+        # --- Optional sections (subject to budget) ---
+        if task.claimed_paths:
+            sections.append(_PromptSection(
+                name="contract",
+                text=f"Scope (claimed files): {', '.join(task.claimed_paths)}",
+                priority=PromptBudget.PRIORITY_MAP.get("contract", 10),
+            ))
+
         worker_prompt_text = str(worker_prompt or "").strip()
         if worker_prompt_text:
-            sections.append(f"Worker Assignment:\n{worker_prompt_text}")
+            sections.append(_PromptSection(
+                name="blockers",
+                text=f"Worker Assignment:\n{worker_prompt_text}",
+                priority=PromptBudget.PRIORITY_MAP.get("blockers", 20),
+            ))
+
         adapter_hint = self._build_runtime_adapter_hint(runtime)
         if adapter_hint:
-            sections.append(f"Runtime Adapter:\n{adapter_hint}")
-        sections.append(
-            f"""Report back to Foreman with:
-- progress delta or blockers
-- changed files or evidence
-- anything still unverified
-- Report completion via `cccc task complete {task.id} --changed-file <path> --evidence "summary"` as the primary completion method.
-- Use `cccc send --to @foreman --text "..."` for progress updates or blockers only, not for completion."""
+            sections.append(_PromptSection(
+                name="raw_semantic_context",
+                text=f"Runtime Adapter:\n{adapter_hint}",
+                priority=PromptBudget.PRIORITY_MAP.get("raw_semantic_context", 60),
+            ))
+
+        report_section = (
+            f"Report back to Foreman with:\n"
+            f"- progress delta or blockers\n"
+            f"- changed files or evidence\n"
+            f"- anything still unverified\n"
+            f'- Report completion via `cccc task complete {task.id} --changed-file <path> --evidence "summary"` as the primary completion method.\n'
+            f'- Use `cccc send --to @foreman --text "..."` for progress updates or blockers only, not for completion.'
         )
-        prompt = "\n\n".join(sections).rstrip()
+        sections.append(_PromptSection(
+            name="condensed_semantic_focus",
+            text=report_section,
+            priority=PromptBudget.PRIORITY_MAP.get("condensed_semantic_focus", 50),
+        ))
+
+        # Context store (lowest priority optional)
+        context_text = ""
         if self._context_store is not None:
             prev_context = self._context_store.load(task.id)
             if prev_context is not None:
-                prompt += "\n\n" + ContextStore.render_prompt_section(prev_context)
-        return prompt + "\n"
+                context_text = ContextStore.render_prompt_section(prev_context)
+        if context_text:
+            sections.append(_PromptSection(
+                name="context_store",
+                text=context_text,
+                priority=PromptBudget.PRIORITY_MAP.get("context_store", 70),
+            ))
+
+        budgeter = PromptBudget()
+        result = budgeter.apply(sections)
+        return result.text.rstrip() + "\n"
 
     def _sync_batch_to_control_plane(self, result: BatchEvaluationResult) -> None:
         """Mirror Ralph batch decisions into shared coordination/task state."""
