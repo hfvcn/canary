@@ -26,6 +26,57 @@ from .models import (
 )
 from .workspace_index import WorkspaceIndex
 
+
+# ---------------------------------------------------------------------------
+# Daemon-friendly model scan cache keyed by (path, st_size, st_mtime_ns)
+# ---------------------------------------------------------------------------
+
+_extra_forbid_cache: Dict[Tuple[str, int, int], List[str]] = {}
+_extra_forbid_path_to_key: Dict[str, Tuple[str, int, int]] = {}
+
+
+def _stat_key(path: Path) -> Tuple[str, int, int]:
+    """Return a cache key tuple ``(str(path), st_size, st_mtime_ns)``."""
+    st = path.stat()
+    return (str(path), st.st_size, st.st_mtime_ns)
+
+
+def _scan_extra_forbid_models_cached(path: Path) -> List[str]:
+    """Scan *path* for pydantic models with ``extra = "forbid"`` and cache the result."""
+    try:
+        key = _stat_key(path)
+    except (OSError, ValueError):
+        return []
+    path_str = str(path)
+    cached = _extra_forbid_cache.get(key)
+    if cached is not None:
+        return cached
+    old_key = _extra_forbid_path_to_key.get(path_str)
+    if old_key is not None and old_key != key:
+        _extra_forbid_cache.pop(old_key, None)
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, UnicodeDecodeError):
+        return []
+    names: List[str] = []
+    if "extra" in source and "forbid" in source:
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("class ") and "(" in stripped:
+                class_name = stripped.split("(")[0].replace("class ", "").strip()
+                if class_name:
+                    names.append(class_name)
+    _extra_forbid_cache[key] = names
+    _extra_forbid_path_to_key[path_str] = key
+    return names
+
+
+def clear_extra_forbid_cache() -> None:
+    """Reset the module-level extra-forbid model cache (useful in tests)."""
+    _extra_forbid_cache.clear()
+    _extra_forbid_path_to_key.clear()
+
+
 # Ordered levels for comparison
 _LEVEL_ORDER: Dict[str, int] = {"compile": 0, "unit": 1, "integration": 2, "e2e": 3}
 FATAL_STRUCTURAL_CODES = {"E_DUPLICATE_TASK_ID", "E_DEP_UNKNOWN", "E_DEP_SELF", "E_DEP_CYCLE"}

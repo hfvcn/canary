@@ -5,18 +5,42 @@ from __future__ import annotations
 import ast
 import importlib.util
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, Tuple
 
 from .models import Plan
 
+MISSING_PATH_STAT = -1
+
+
+def _stat_key(full_path: Path) -> Tuple[str, int, int]:
+    """Return ``(str(path), st_size, st_mtime_ns)`` for cache keying."""
+    st = full_path.stat()
+    return (str(full_path), st.st_size, st.st_mtime_ns)
+
+
+def _path_exists_key(full_path: Path, rel_path: str) -> Tuple[str, int, int]:
+    """Return ``(rel_path, st_size, st_mtime_ns)`` for existence caching."""
+    try:
+        st = full_path.stat()
+    except (OSError, ValueError):
+        return (rel_path, MISSING_PATH_STAT, MISSING_PATH_STAT)
+    return (rel_path, st.st_size, st.st_mtime_ns)
+
 
 class WorkspaceIndex:
-    """Cached filesystem queries for plan validation against a project directory."""
+    """Cached filesystem queries for plan validation against a project directory.
+
+    Internal caches are keyed by ``(path, st_size, st_mtime_ns)`` so that
+    daemon-resident instances automatically invalidate when a file is
+    modified between successive validation runs.
+    """
 
     def __init__(self, project_root: Path):
         self.project_root = project_root.resolve()
-        self._path_cache: Dict[str, bool] = {}
-        self._ast_cache: Dict[str, Optional[ast.Module]] = {}
+        self._path_cache: Dict[Tuple[str, int, int], bool] = {}
+        self._path_to_key: Dict[str, Tuple[str, int, int]] = {}
+        self._ast_cache: Dict[Tuple[str, int, int], Optional[ast.Module]] = {}
+        self._ast_path_to_key: Dict[str, Tuple[str, int, int]] = {}
         self._src_dir = self.project_root / "src"
         if not self._src_dir.is_dir():
             self._src_dir = self.project_root
@@ -31,10 +55,20 @@ class WorkspaceIndex:
         return full_path
 
     def path_exists(self, rel_path: str) -> bool:
-        if rel_path not in self._path_cache:
-            full_path = self._safe_path(rel_path)
-            self._path_cache[rel_path] = full_path.exists() if full_path is not None else False
-        return self._path_cache[rel_path]
+        full_path = self._safe_path(rel_path)
+        if full_path is None:
+            return False
+        key = _path_exists_key(full_path, rel_path)
+        cached = self._path_cache.get(key)
+        if cached is not None:
+            return cached
+        old_key = self._path_to_key.get(rel_path)
+        if old_key is not None and old_key != key:
+            self._path_cache.pop(old_key, None)
+        result = key[1] != MISSING_PATH_STAT
+        self._path_cache[key] = result
+        self._path_to_key[rel_path] = key
+        return result
 
     def resolve_module(self, dotted_name: str) -> Optional[Path]:
         """Resolve a local dotted module name to a file path."""
@@ -66,17 +100,26 @@ class WorkspaceIndex:
         return spec is not None
 
     def ast_parse(self, rel_path: str) -> Optional[ast.Module]:
-        if rel_path not in self._ast_cache:
-            full_path = self._safe_path(rel_path)
-            if full_path is None:
-                self._ast_cache[rel_path] = None
-            else:
-                try:
-                    source = full_path.read_text(encoding="utf-8")
-                    self._ast_cache[rel_path] = ast.parse(source)
-                except (FileNotFoundError, SyntaxError, UnicodeDecodeError):
-                    self._ast_cache[rel_path] = None
-        return self._ast_cache[rel_path]
+        full_path = self._safe_path(rel_path)
+        if full_path is None:
+            return None
+        try:
+            key = _stat_key(full_path)
+        except (OSError, ValueError):
+            return None
+        if key in self._ast_cache:
+            return self._ast_cache[key]
+        old_key = self._ast_path_to_key.get(rel_path)
+        if old_key is not None and old_key != key:
+            self._ast_cache.pop(old_key, None)
+        try:
+            source = full_path.read_text(encoding="utf-8")
+            result = ast.parse(source)
+        except (FileNotFoundError, SyntaxError, UnicodeDecodeError):
+            result = None
+        self._ast_cache[key] = result
+        self._ast_path_to_key[rel_path] = key
+        return result
 
     def projected_paths(
         self, plan: Plan, task_id: str, *, include_self: bool = True,

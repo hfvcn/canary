@@ -5,11 +5,55 @@ from __future__ import annotations
 import ast
 import shlex
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from .graph_utils import transitive_deps
 from .models import Plan, TaskSpec, ValidationIssue
 from .workspace_index import WorkspaceIndex
+
+
+# ---------------------------------------------------------------------------
+# Daemon-friendly file content cache keyed by (path, st_size, st_mtime_ns)
+# ---------------------------------------------------------------------------
+
+_issue_file_map_cache: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+_issue_file_map_path_to_key: Dict[str, Tuple[str, int, int]] = {}
+
+
+def _stat_key(path: Path) -> Tuple[str, int, int]:
+    """Return a cache key tuple ``(str(path), st_size, st_mtime_ns)``."""
+    st = path.stat()
+    return (str(path), st.st_size, st.st_mtime_ns)
+
+
+def _load_issue_file_map_cached(path: Path) -> Dict[str, Any]:
+    """Load and cache a file's parsed content, invalidating on size/mtime change."""
+    try:
+        key = _stat_key(path)
+    except (OSError, ValueError):
+        return {}
+    path_str = str(path)
+    cached = _issue_file_map_cache.get(key)
+    if cached is not None:
+        return cached
+    old_key = _issue_file_map_path_to_key.get(path_str)
+    if old_key is not None and old_key != key:
+        _issue_file_map_cache.pop(old_key, None)
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, UnicodeDecodeError):
+        return {}
+    result: Dict[str, Any] = {"_raw": source}
+    _issue_file_map_cache[key] = result
+    _issue_file_map_path_to_key[path_str] = key
+    return result
+
+
+def clear_issue_file_map_cache() -> None:
+    """Reset the module-level issue file map cache (useful in tests)."""
+    _issue_file_map_cache.clear()
+    _issue_file_map_path_to_key.clear()
+
 
 _TRIVIAL_COMMANDS = {"true", ":", "echo", "printf"}
 _SHELL_OPERATORS = {"&&", "||", ";", "|", ">", ">>", "<", "2>", "2>>", "&"}
@@ -302,9 +346,9 @@ def _grep_test_candidates(
 
 
 def _file_contains_any(path: Path, needles: set[str]) -> bool:
-    try:
-        source = path.read_text(encoding="utf-8")
-    except (FileNotFoundError, UnicodeDecodeError):
+    cached = _load_issue_file_map_cached(path)
+    source = cached.get("_raw")
+    if source is None:
         return False
     return any(needle in source for needle in needles)
 
