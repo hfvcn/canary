@@ -210,6 +210,96 @@ class TestProdImportLayer:
         _ = _kernel_events
         assert result.returncode == 0
 
+    def test_dotted_import_used_passes(self, tmp_path: Path) -> None:
+        """(h2) ``import cccc.ralph.models`` used as ``cccc.ralph.models.Plan(...)`` -> exit 0."""
+        result = _run_guard(tmp_path, """\
+            import cccc.ralph.models
+
+            def test_plan_creation():
+                p = cccc.ralph.models.Plan(name="x")
+                assert p is not None
+        """)
+        _ = _kernel_events
+        assert result.returncode == 0
+
+
+# -----------------------------------------------------------------------
+# Layer 2 -- pytest assertion helpers
+# -----------------------------------------------------------------------
+
+class TestPytestAssertionHelpers:
+    """pytest.raises, pytest.fail, and pytest.xfail each count as assertions."""
+
+    def test_pytest_raises_counts_as_assertion(self, tmp_path: Path) -> None:
+        """pytest.raises(...) should count as an assertion for Layer 2."""
+        result = _run_guard(tmp_path, """\
+            import pytest
+            from cccc.kernel import events
+
+            def test_raises():
+                _ = events
+                with pytest.raises(ValueError):
+                    raise ValueError("boom")
+        """)
+        _ = _kernel_events
+        assert result.returncode == 0
+
+    def test_pytest_fail_counts_as_assertion(self, tmp_path: Path) -> None:
+        """pytest.fail(...) should count as an assertion for Layer 2."""
+        result = _run_guard(tmp_path, """\
+            import pytest
+            from cccc.kernel import events
+
+            def test_fail_branch():
+                _ = events
+                if False:
+                    pytest.fail("should not reach here")
+                assert True
+        """)
+        _ = _kernel_events
+        assert result.returncode == 0
+
+    def test_pytest_xfail_counts_as_assertion(self, tmp_path: Path) -> None:
+        """pytest.xfail(...) should count as an assertion for Layer 2."""
+        result = _run_guard(tmp_path, """\
+            import pytest
+            from cccc.kernel import events
+
+            def test_expected_failure():
+                _ = events
+                pytest.xfail("known issue")
+        """)
+        _ = _kernel_events
+        assert result.returncode == 0
+
+
+# -----------------------------------------------------------------------
+# Stderr JSON contract
+# -----------------------------------------------------------------------
+
+class TestStderrJsonContract:
+    """On violation, stderr must contain valid JSON with required fields; stdout is empty."""
+
+    def test_stderr_json_structure(self, tmp_path: Path) -> None:
+        """Violation emits JSON lines to stderr with {path, layer, error_code, details}; stdout is empty."""
+        result = _run_guard(tmp_path, """\
+            def test_something():
+                assert True
+        """)
+        _ = _kernel_events
+        assert result.returncode != 0
+        # stdout must be empty
+        assert result.stdout.strip() == ""
+        # stderr must contain at least one valid JSON line
+        lines = [l.strip() for l in result.stderr.splitlines() if l.strip()]
+        assert len(lines) >= 1
+        for line in lines:
+            obj = json.loads(line)
+            assert "path" in obj, f"Missing 'path' key in {obj}"
+            assert "layer" in obj, f"Missing 'layer' key in {obj}"
+            assert "error_code" in obj, f"Missing 'error_code' key in {obj}"
+            assert "details" in obj, f"Missing 'details' key in {obj}"
+
 
 # -----------------------------------------------------------------------
 # Composite happy-path

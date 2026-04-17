@@ -228,7 +228,20 @@ def check_file(filepath: str) -> Sequence[_Failure]:
     for func in non_skipped:
         all_body_names |= _names_in_body(func.body)
 
-    used = any(name in all_body_names for name in imported_names)
+    def _is_referenced(name: str) -> bool:
+        """Check if *name* (possibly dotted) is referenced in body names.
+
+        For dotted imports like ``import cccc.foo.bar``, the AST represents
+        usage ``cccc.foo.bar.thing`` as an Attribute chain rooted at
+        Name("cccc").  So we also check whether the root segment of the
+        dotted name appears in the collected body names.
+        """
+        if name in all_body_names:
+            return True
+        root = name.split(".")[0]
+        return root in all_body_names
+
+    used = any(_is_referenced(name) for name in imported_names)
     if not used:
         failures.append(
             _Failure(
