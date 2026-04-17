@@ -24,7 +24,6 @@ from cccc.ralph.agent import (
     RULE_ERROR_REGISTRY,
     build_error_envelope,
     _is_debug_traceback_enabled,
-    _stage_to_error_code,
 )
 
 
@@ -39,12 +38,9 @@ class TestRalphStages:
         assert RALPH_STAGES == expected
 
     def test_registry_stages_are_valid(self):
-        for code, entry in RULE_ERROR_REGISTRY.items():
-            assert entry["stage"] in RALPH_STAGES, f"{code} has invalid stage: {entry['stage']}"
-
-    def test_stage_to_error_code(self):
-        assert _stage_to_error_code("load") == "E_INTERNAL_LOAD"
-        assert _stage_to_error_code("semantic") == "E_INTERNAL_SEMANTIC"
+        for stage, code in RULE_ERROR_REGISTRY.items():
+            assert stage in RALPH_STAGES, f"{stage} is not a valid Ralph stage"
+            assert code.startswith("E_INTERNAL_"), f"{stage} has invalid code: {code}"
 
 
 class TestBuildErrorEnvelope:
@@ -65,6 +61,12 @@ class TestBuildErrorEnvelope:
             internal_error_code="E_CUSTOM_CODE",
         )
         assert envelope["internal_error_code"] == "E_CUSTOM_CODE"
+
+    def test_registry_controls_default_error_code(self, monkeypatch):
+        monkeypatch.setitem(RULE_ERROR_REGISTRY, "load", "E_INTERNAL_PATCHED_LOAD")
+        exc = ValueError("test error message")
+        envelope = build_error_envelope(stage="load", exception=exc)
+        assert envelope["internal_error_code"] == "E_INTERNAL_PATCHED_LOAD"
 
     def test_debug_traceback(self, monkeypatch):
         monkeypatch.setenv("CCCC_DEBUG_TRACEBACK", "1")

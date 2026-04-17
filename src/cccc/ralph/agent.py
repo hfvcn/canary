@@ -35,45 +35,16 @@ RALPH_STAGES = frozenset({
 # Internal error code registry — single canonical copy
 # ---------------------------------------------------------------------------
 
-RULE_ERROR_REGISTRY: Dict[str, Dict[str, str]] = {
-    "E_INTERNAL_LOAD": {
-        "stage": "load",
-        "description": "Failed to load or parse a plan file (YAML/JSON malformed, file not found, etc.)",
-    },
-    "E_INTERNAL_VALIDATE": {
-        "stage": "validate",
-        "description": "Internal failure during structural validation (not a plan-level validation error).",
-    },
-    "E_INTERNAL_SEMANTIC": {
-        "stage": "semantic",
-        "description": "Internal failure in the semantic provider (workspace index, AST analysis, etc.).",
-    },
-    "E_INTERNAL_IPC": {
-        "stage": "ipc",
-        "description": "Internal failure while handling an IPC request in the daemon ralph_service.",
-    },
-    "E_INTERNAL_COMPLETION": {
-        "stage": "completion",
-        "description": "Internal failure while processing a task-completion event.",
-    },
-    "E_INTERNAL_REGISTER": {
-        "stage": "register",
-        "description": "Internal failure during task registration.",
-    },
-    "E_INTERNAL_SUGGEST": {
-        "stage": "suggest",
-        "description": "Internal failure during batch suggestion.",
-    },
-    "E_INTERNAL_VERIFY": {
-        "stage": "verify",
-        "description": "Internal failure during verification execution.",
-    },
+RULE_ERROR_REGISTRY: Dict[str, str] = {
+    "load": "E_INTERNAL_LOAD",
+    "validate": "E_INTERNAL_VALIDATE",
+    "semantic": "E_INTERNAL_SEMANTIC",
+    "ipc": "E_INTERNAL_IPC",
+    "completion": "E_INTERNAL_COMPLETION",
+    "register": "E_INTERNAL_REGISTER",
+    "suggest": "E_INTERNAL_SUGGEST",
+    "verify": "E_INTERNAL_VERIFY",
 }
-
-
-def _stage_to_error_code(stage: str) -> str:
-    """Map a stage name to its canonical E_INTERNAL_* code."""
-    return f"E_INTERNAL_{stage.upper()}"
 
 
 def _is_debug_traceback_enabled() -> bool:
@@ -100,7 +71,7 @@ def build_error_envelope(
     exception:
         The caught exception.
     internal_error_code:
-        Explicit error code.  Derived from *stage* when omitted.
+        Explicit error code. Derived from *stage* via RULE_ERROR_REGISTRY when omitted.
     extra:
         Additional key-value pairs merged into the envelope.
 
@@ -109,7 +80,7 @@ def build_error_envelope(
     dict with keys: stage, internal_error_code, exception_type, message,
     and optionally traceback_truncated (only when CCCC_DEBUG_TRACEBACK=1).
     """
-    code = internal_error_code or _stage_to_error_code(stage)
+    code = internal_error_code or RULE_ERROR_REGISTRY.get(stage, "E_INTERNAL_UNKNOWN")
     envelope: Dict[str, Any] = {
         "stage": stage,
         "internal_error_code": code,
