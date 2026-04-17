@@ -19,6 +19,7 @@ from .models import (
     Plan,
     PlanState,
     TaskSpec,
+    ValidationIssue,
     Verification,
 )
 
@@ -324,3 +325,80 @@ def _run_check(
             "duration_ms": int((time.monotonic() - start) * 1000),
             "message": str(e),
         }
+
+
+# ---------------------------------------------------------------------------
+# Semantic inconsistency check (W5-5)
+# ---------------------------------------------------------------------------
+
+W_VERIFY_PASSED_BUT_SEMANTIC_INCONSISTENT = "W_VERIFY_PASSED_BUT_SEMANTIC_INCONSISTENT"
+
+
+def check_semantic_inconsistency(
+    consistency_report: Any,
+) -> Optional[ValidationIssue]:
+    """Emit an issue when verification passed but post-change semantic state is inconsistent.
+
+    Rules:
+    - overall=="inconsistent" + at least one stale_reference with confidence=="exact"
+      -> warning W_VERIFY_PASSED_BUT_SEMANTIC_INCONSISTENT
+    - overall=="inconsistent" + all stale_references are best_effort
+      -> hint (advisory only)
+    - overall=="inconclusive" -> hint with provider_degraded note
+    - overall=="consistent" -> no issue
+    """
+    overall = getattr(consistency_report, "overall", "consistent")
+
+    if overall == "consistent":
+        return None
+
+    stale_refs = getattr(consistency_report, "stale_references", [])
+    task_id = getattr(consistency_report, "task_id", "")
+
+    if overall == "inconclusive":
+        return ValidationIssue(
+            code=W_VERIFY_PASSED_BUT_SEMANTIC_INCONSISTENT,
+            severity="hint",
+            message=f"task '{task_id}' passed verification but semantic consistency is inconclusive (provider_degraded)",
+            task_ids=[task_id] if task_id else [],
+            evidence={
+                "overall": overall,
+                "stale_ref_count": len(stale_refs),
+                "provider_degraded": True,
+            },
+        )
+
+    if overall == "inconsistent":
+        has_exact = any(
+            getattr(ref, "confidence", "opaque") == "exact"
+            for ref in stale_refs
+        )
+        if has_exact:
+            return ValidationIssue(
+                code=W_VERIFY_PASSED_BUT_SEMANTIC_INCONSISTENT,
+                severity="warning",
+                message=f"task '{task_id}' passed verification but semantic state is inconsistent "
+                        f"({len(stale_refs)} stale reference(s) with exact confidence)",
+                task_ids=[task_id] if task_id else [],
+                evidence={
+                    "overall": overall,
+                    "stale_ref_count": len(stale_refs),
+                    "has_exact": True,
+                },
+            )
+        else:
+            # All best_effort — hint only
+            return ValidationIssue(
+                code=W_VERIFY_PASSED_BUT_SEMANTIC_INCONSISTENT,
+                severity="hint",
+                message=f"task '{task_id}' passed verification but semantic state is inconsistent "
+                        f"({len(stale_refs)} stale reference(s), best_effort confidence only)",
+                task_ids=[task_id] if task_id else [],
+                evidence={
+                    "overall": overall,
+                    "stale_ref_count": len(stale_refs),
+                    "has_exact": False,
+                },
+            )
+
+    return None

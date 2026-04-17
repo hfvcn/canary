@@ -247,6 +247,32 @@ class IpcValidationError(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+# ---------------------------------------------------------------------------
+# Semantic summary for IPC (W5-3)
+# ---------------------------------------------------------------------------
+
+class TaskSemanticSummary(BaseModel):
+    """Per-task semantic summary — bounded, serializable."""
+
+    risk_level: Literal["low", "medium", "high"] = "low"
+    total_fanout: int = 0
+    touched_symbol_count: int = 0
+    suggested_deps_count: int = 0
+    suggested_deps_digest: str = ""  # sha256[:12]
+    confidence: Literal["exact", "best_effort", "opaque"] = "opaque"
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class SemanticSummary(BaseModel):
+    """Bounded semantic summary transmitted over IPC."""
+
+    version: int = 1
+    per_task: Dict[str, TaskSemanticSummary] = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="ignore")
+
+
 # Ledger event kind for plan validation failures
 WORKFLOW_PLAN_VALIDATION_FAILED = "workflow.plan_validation_failed"
 

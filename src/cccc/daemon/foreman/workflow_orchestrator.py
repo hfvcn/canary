@@ -1264,6 +1264,43 @@ class WorkflowOrchestrator:
         }
 
     @staticmethod
+    def _serialize_validation_report(
+        report: "Any",
+        *,
+        semantic_summary: "Any | None" = None,
+    ) -> Dict[str, Any]:
+        """Serialize a ValidationReport to a dict suitable for IPC transmission.
+
+        Includes the optional ``semantic_summary`` (W5-3) when provided.
+        """
+        from ...contracts.v1.ralph_ipc import SemanticSummary
+
+        all_issues = list(report.errors) + list(report.warnings) + list(report.hints)
+        result: Dict[str, Any] = {
+            "valid": report.valid,
+            "errors": [
+                WorkflowOrchestrator._serialize_validation_issue(i)
+                for i in report.errors
+            ],
+            "warnings": [
+                WorkflowOrchestrator._serialize_validation_issue(i)
+                for i in report.warnings
+            ],
+            "hints": [
+                WorkflowOrchestrator._serialize_validation_issue(i)
+                for i in report.hints
+            ],
+        }
+        if semantic_summary is not None:
+            if isinstance(semantic_summary, SemanticSummary):
+                result["semantic_summary"] = semantic_summary.model_dump()
+            elif isinstance(semantic_summary, dict):
+                result["semantic_summary"] = semantic_summary
+            else:
+                result["semantic_summary"] = semantic_summary
+        return result
+
+    @staticmethod
     def _build_issue_digest(issues: "List[Any]") -> str:
         """Build a compact issue digest for worker prompt injection.
 

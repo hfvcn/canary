@@ -4,15 +4,24 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
+from typing import Any, Dict
 
 import yaml
-
 from .models import CriticalFlow, Plan, RegistrationInvariant
 
+# ---------------------------------------------------------------------------
+# Legacy-schema stderr banner
+# ---------------------------------------------------------------------------
+_LEGACY_BANNER = (
+    "WARNING: legacy schema parsing active \u2014 plan.schema_version not declared. "
+    "Future Ralph versions may require it by 2026-07-17."
+)
 
-def load_plan(path: Path) -> Plan:
-    """Load a plan from a YAML or JSON file."""
+
+def _parse_raw_data(path: Path) -> Dict[str, Any]:
+    """Read a plan file and return the raw dict."""
     text = path.read_text(encoding="utf-8")
     suffix = path.suffix.lower()
 
@@ -29,10 +38,88 @@ def load_plan(path: Path) -> Plan:
 
     if data is None:
         data = {}
+    return data
 
-    plan = Plan.model_validate(data)
+
+def _known_fields(model_cls: type) -> set[str]:
+    """Return the set of known field names for a pydantic model class."""
+    return set(model_cls.model_fields.keys())
+
+
+_PLAN_FIELDS: set[str] | None = None
+_TASK_FIELDS: set[str] | None = None
+
+
+def _get_plan_fields() -> set[str]:
+    global _PLAN_FIELDS
+    if _PLAN_FIELDS is None:
+        _PLAN_FIELDS = _known_fields(Plan)
+    return _PLAN_FIELDS
+
+
+def _get_task_fields() -> set[str]:
+    global _TASK_FIELDS
+    if _TASK_FIELDS is None:
+        from .models import TaskSpec
+        _TASK_FIELDS = _known_fields(TaskSpec)
+    return _TASK_FIELDS
+
+
+def _check_strict_extra_fields(data: Dict[str, Any]) -> list[str]:
+    """Return a list of human-readable error strings for unknown fields.
+
+    Checks the top-level plan dict and each task dict against the known
+    model fields.  Returns an empty list when everything is clean.
+    """
+    errors: list[str] = []
+    plan_fields = _get_plan_fields()
+    task_fields = _get_task_fields()
+
+    for key in data:
+        if key not in plan_fields:
+            errors.append(f"{key}: Extra inputs are not permitted")
+
+    for idx, task_data in enumerate(data.get("tasks", []) or []):
+        if not isinstance(task_data, dict):
+            continue
+        for key in task_data:
+            if key not in task_fields:
+                errors.append(f"tasks.{idx}.{key}: Extra inputs are not permitted")
+
+    return errors
+
+
+def load_plan(path: Path) -> Plan:
+    """Load a plan from a YAML or JSON file."""
+    data = _parse_raw_data(path)
+
+    has_schema_version = "schema_version" in data and data["schema_version"] is not None
+
+    if has_schema_version:
+        # Strict mode: unknown fields → SchemaUnknownFieldError
+        extra_errors = _check_strict_extra_fields(data)
+        if extra_errors:
+            raise SchemaUnknownFieldError("; ".join(extra_errors))
+        plan = Plan.model_validate(data)
+    else:
+        # Legacy mode: silently ignore unknown fields + emit banner
+        plan = Plan.model_validate(data)
+        print(_LEGACY_BANNER, file=sys.stderr)
+
     _tag_initial_plan_provenance(plan)
     return _merge_repo_defaults(plan, path)
+
+
+class SchemaUnknownFieldError(Exception):
+    """Raised when a plan with schema_version contains unknown fields."""
+
+    code = "E_SCHEMA_UNKNOWN_FIELD"
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
 
 
 def save_plan_state(path: Path, completed_task_id: str) -> None:

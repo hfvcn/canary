@@ -69,6 +69,31 @@ class Contract(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Semantic blocks
+# ---------------------------------------------------------------------------
+
+
+class SemanticTarget(BaseModel):
+    """A single symbol-level operation target."""
+
+    path: str
+    symbol: str
+    op: str = "modify_body"  # modify_body, modify_interface, rename, delete, create
+    inferred: bool = False
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class SemanticBlock(BaseModel):
+    """Per-task semantic annotation block."""
+
+    mode: str = "advisory"  # advisory, strict, off
+    targets: List[SemanticTarget] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="ignore")
+
+
+# ---------------------------------------------------------------------------
 # Task
 # ---------------------------------------------------------------------------
 
@@ -96,6 +121,10 @@ class TaskSpec(BaseModel):
 
     addresses: List[str] = Field(default_factory=list)  # issue IDs this task fixes
 
+    semantic: Optional[SemanticBlock] = None
+
+    # Default: extra="ignore" (legacy).  Switched to "forbid" by
+    # _apply_strict_schema() when Plan.schema_version is set.
     model_config = ConfigDict(extra="ignore")
 
     def to_task_ref(self) -> "TaskRef":
@@ -192,6 +221,8 @@ class PlanState(BaseModel):
 class Plan(BaseModel):
     """Top-level plan document — the file Ralph reads."""
 
+    schema_version: Optional[str] = None
+
     tasks: List[TaskSpec] = Field(default_factory=list)
     state: PlanState = Field(default_factory=PlanState)
 
@@ -202,8 +233,15 @@ class Plan(BaseModel):
 
     required_issues: List[str] = Field(default_factory=list)  # issue IDs that must be addressed
     suppress_codes: List[str] = Field(default_factory=list)
+
+    # Semantic validation config
+    semantic_mode: str = "off"  # advisory, strict, off
+    auto_infer: bool = False
+
     _provenance: Dict[str, str] = PrivateAttr(default_factory=dict)
 
+    # Default: extra="ignore" (legacy).  Switched to "forbid" by
+    # _apply_strict_schema() when schema_version is set.
     model_config = ConfigDict(extra="ignore")
 
     @property

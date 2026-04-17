@@ -5,6 +5,7 @@ Usage:
     ralph suggest plan.yaml [--format json|text]
     ralph verify plan.yaml --task T1 [--changed-files a.py b.py] [--project-root .]
     ralph explain plan.yaml --task T1
+    ralph explain --code E_DUPLICATE_TASK_ID
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import sys
 from pathlib import Path
 from typing import List
 
-from .agent import build_error_envelope, _is_debug_traceback_enabled
+from .agent import build_error_envelope, _is_debug_traceback_enabled, RULE_DOCS
 from .core import suggest, verify
 from .models import Plan, ValidationReport
 from .plan_io import load_plan, save_plan_state
@@ -48,6 +49,12 @@ def main(argv: List[str] | None = None) -> int:
         metavar="CODE",
         help="Suppress specific validation codes (e.g., E_CRITICAL_ENTRYPOINT_UNOWNED)",
     )
+    p_val.add_argument(
+        "--no-semantic",
+        action="store_true",
+        default=False,
+        help="Suppress Semantic Findings section in text output",
+    )
 
     # --- suggest ---
     p_sug = sub.add_parser("suggest", help="Show next ready batch")
@@ -69,9 +76,11 @@ def main(argv: List[str] | None = None) -> int:
     p_com.add_argument("--project-root", type=Path, help="Project root directory")
 
     # --- explain ---
-    p_exp = sub.add_parser("explain", help="Explain why a task is blocked")
-    p_exp.add_argument("plan", type=Path, help="Path to plan.yaml or plan.json")
-    p_exp.add_argument("--task", required=True, help="Task ID to explain")
+    p_exp = sub.add_parser("explain", help="Explain a task or a validation rule code")
+    p_exp.add_argument("plan", type=Path, nargs="?", default=None,
+                        help="Path to plan.yaml or plan.json (required with --task)")
+    p_exp.add_argument("--task", help="Task ID to explain")
+    p_exp.add_argument("--code", dest="rule_code", help="Validation rule code to explain")
 
     args = parser.parse_args(argv)
 
@@ -79,8 +88,25 @@ def main(argv: List[str] | None = None) -> int:
         parser.print_help()
         return 1
 
+    # ``explain --code`` does not require a plan file
+    if args.command == "explain" and getattr(args, "rule_code", None):
+        try:
+            return _cmd_explain_code(args.rule_code)
+        except Exception as exc:
+            _emit_error_envelope("validate", exc)
+            return _EXIT_INTERNAL_ERROR
+
+    if args.command == "explain" and not args.task:
+        print("error: explain requires --task or --code", file=sys.stderr)
+        return _EXIT_INTERNAL_ERROR
+
+    plan_path = getattr(args, "plan", None)
+    if plan_path is None:
+        print("error: plan path is required for this command", file=sys.stderr)
+        return _EXIT_INTERNAL_ERROR
+
     try:
-        plan = load_plan(args.plan)
+        plan = load_plan(plan_path)
     except FileNotFoundError as exc:
         _emit_error_envelope("load", exc)
         return _EXIT_INTERNAL_ERROR
@@ -125,13 +151,15 @@ def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
         _emit_error_envelope("semantic", exc)
         return _EXIT_INTERNAL_ERROR
 
+    show_semantic = not getattr(args, "no_semantic", False)
+
     if args.format == "json":
         payload = report.model_dump()
         payload["metadata"] = {"project_root": str(project_root)}
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         print(f"Resolved project root: {project_root}", file=sys.stderr)
-        _print_validation_text(report)
+        _print_validation_text(report, show_semantic=show_semantic)
 
     return _EXIT_OK if report.valid else _EXIT_VALIDATION_FAILURE
 
@@ -281,16 +309,71 @@ def _cmd_explain(plan: Plan, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_explain_code(code: str) -> int:
+    """Print a 4-section documentation block for a known validation rule code."""
+    doc = RULE_DOCS.get(code)
+    if doc is None:
+        envelope = {
+            "error": {
+                "stage": "validate",
+                "internal_error_code": "E_UNKNOWN_RULE_CODE",
+                "exception_type": "ValueError",
+                "message": f"unknown rule code: {code}",
+            }
+        }
+        print(json.dumps(envelope, indent=2, ensure_ascii=False), file=sys.stderr)
+        return _EXIT_INTERNAL_ERROR
+
+    print(f"--- {code} ---\n")
+    print(f"Description:\n  {doc.description}\n")
+    print(f"Why it matters:\n  {doc.why_it_matters}\n")
+    print(f"Fix template:\n  {doc.fix_template}\n")
+    print(f"Suppress:\n  {doc.suppress_hint}")
+    return _EXIT_OK
+
+
 # ---------------------------------------------------------------------------
 # Text formatters
 # ---------------------------------------------------------------------------
 
-def _print_validation_text(report: ValidationReport) -> None:
+def _format_summary_banner(report: ValidationReport) -> str:
+    """Build the one-line summary banner for text output."""
+    n_errors = len(report.errors)
+    n_warnings = len(report.warnings)
+    n_hints = len(report.hints)
+
+    all_issues = list(report.errors) + list(report.warnings) + list(report.hints)
+    n_semantic = sum(1 for i in all_issues if i.code.startswith("S_"))
+
+    if n_errors > 0:
+        status = "FAILED"
+    elif n_warnings > 0:
+        status = "PASSED_WITH_WARNINGS"
+    else:
+        status = "PASSED"
+
+    return (
+        f"Validation: {status} "
+        f"(errors={n_errors} warnings={n_warnings} "
+        f"hints={n_hints} semantic={n_semantic})"
+    )
+
+
+def _print_validation_text(
+    report: ValidationReport,
+    *,
+    show_semantic: bool = True,
+) -> None:
+    # Summary banner — always first non-blank line
+    print(_format_summary_banner(report))
+
     total = len(report.errors) + len(report.warnings) + len(report.hints)
 
     if report.valid and total == 0:
         print("Plan is valid. No issues found.")
         return
+
+    print()  # blank line after banner
 
     if report.errors:
         print(f"Errors ({len(report.errors)}):")
@@ -307,8 +390,36 @@ def _print_validation_text(report: ValidationReport) -> None:
         for issue in report.hints:
             _print_issue(issue)
 
+    # Semantic Findings section (default-on, suppressed by --no-semantic)
+    if show_semantic:
+        _print_semantic_findings(report)
+
     status = "INVALID" if not report.valid else "valid (with warnings)"
     print(f"\n{status}: {len(report.errors)} error(s), {len(report.warnings)} warning(s), {len(report.hints)} hint(s)")
+
+
+def _print_semantic_findings(report: ValidationReport) -> None:
+    """Print Semantic Findings section with S_* issues + Fingerprints per task."""
+    all_issues = list(report.errors) + list(report.warnings) + list(report.hints)
+    semantic_issues = [i for i in all_issues if i.code.startswith("S_")]
+    if not semantic_issues:
+        return
+
+    print(f"\nSemantic Findings ({len(semantic_issues)}):")
+    for issue in semantic_issues:
+        _print_issue(issue)
+
+    # Fingerprints line per task
+    task_fingerprints: dict[str, list[str]] = {}
+    for issue in semantic_issues:
+        for tid in issue.task_ids:
+            task_fingerprints.setdefault(tid, []).append(issue.code)
+
+    if task_fingerprints:
+        print("\n  Fingerprints:")
+        for tid in sorted(task_fingerprints):
+            codes = sorted(set(task_fingerprints[tid]))
+            print(f"    {tid}: {', '.join(codes)}")
 
 
 def _print_issue(issue) -> None:

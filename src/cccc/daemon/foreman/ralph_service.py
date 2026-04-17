@@ -107,6 +107,7 @@ class RalphService:
         self._task_refs: Dict[str, TaskRef] = {}
         self._task_statuses: Dict[str, str] = {}
         self._processed_keys: set[str] = set()
+        self._semantic_gate_cache: Dict[tuple, str] = {}
 
     def get_changed_files(self, since_ref: str = "HEAD~1") -> List[str]:
         """Get list of files changed since a git ref."""
@@ -722,6 +723,78 @@ class RalphService:
                 registered_digest[:12],
                 plan_path,
             )
+
+    def _get_metrics_mtime_ns(self) -> int:
+        """Return mtime_ns of the metrics file, or 0 if missing/unreadable."""
+        from ...ralph.semantic_metrics import resolve_metrics_path
+
+        metrics_path = resolve_metrics_path(project_root=self.project_root)
+        try:
+            return metrics_path.stat().st_mtime_ns
+        except (OSError, ValueError):
+            return 0
+
+    @staticmethod
+    def _provider_capability_hash(provider: Any) -> str:
+        """Hash provider.capabilities() if available, else return 'noop'."""
+        caps_fn = getattr(provider, "capabilities", None)
+        if not callable(caps_fn):
+            return "noop"
+        try:
+            caps = caps_fn()
+        except Exception:
+            return "noop"
+        return hashlib.sha256(repr(sorted(caps.items()) if isinstance(caps, dict) else repr(caps)).encode()).hexdigest()
+
+    def _resolve_auto_gate(
+        self,
+        workflow_id: str,
+        provider: Any,
+    ) -> str:
+        """Resolve semantic gate mode for a workflow.
+
+        Returns ``"off"`` / ``"advisory"`` / ``"hard"`` based on metrics
+        gate readiness.  Results are cached per
+        ``(workflow_id, id(provider), metrics_file_mtime_ns,
+        provider_capability_hash)`` so that a change in any component
+        causes recomputation.
+        """
+        if provider is None:
+            return "off"
+
+        mtime_ns = self._get_metrics_mtime_ns()
+        cap_hash = self._provider_capability_hash(provider)
+        cache_key = (workflow_id, id(provider), mtime_ns, cap_hash)
+
+        _logger.debug(
+            "semantic gate cache key: workflow_id=%s provider_id=%s "
+            "mtime_ns=%s cap_hash=%s",
+            workflow_id,
+            id(provider),
+            mtime_ns,
+            cap_hash,
+        )
+
+        cached = self._semantic_gate_cache.get(cache_key)
+        if cached is not None:
+            _logger.debug("semantic gate cache HIT → %s", cached)
+            return cached
+
+        _logger.debug("semantic gate cache MISS — computing gate readiness")
+
+        from ...ralph.semantic_metrics import compute_gate_readiness
+
+        readiness = compute_gate_readiness(
+            "S_SUGGEST_CONFLICT",
+            0.05,
+            confidence_filter="exact",
+            project_root=self.project_root,
+        )
+        gate = "hard" if readiness.gate_ready else "advisory"
+
+        self._semantic_gate_cache[cache_key] = gate
+        _logger.debug("semantic gate resolved → %s (gate_ready=%s)", gate, readiness.gate_ready)
+        return gate
 
     def _conflicts_with_any(
         self,

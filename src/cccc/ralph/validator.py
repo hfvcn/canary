@@ -172,6 +172,17 @@ def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
     if not _has_issue_codes(graph_issues, FATAL_STRUCTURAL_CODES):
         issues.extend(_check_early_integration_checkpoint(plan))
 
+    # Completeness rules (CMP bundle)
+    issues.extend(_check_covers_unknown_flow(plan))
+    issues.extend(_check_state_unknown_task_ref(plan))
+    issues.extend(_check_duplicate_ids(plan))
+    issues.extend(_check_critical_flow_no_entrypoints(plan))
+    issues.extend(_check_plan_scope_unused(plan))
+
+    # CMP-5: H_SUPPRESS_UNUSED runs last — needs the full issue code set
+    all_issue_codes = {i.code for i in issues}
+    issues.extend(_check_suppress_unused(plan, all_issue_codes))
+
     return issues
 
 
@@ -1460,6 +1471,218 @@ def _check_semantic_dependencies(plan: Plan, workspace: WorkspaceIndex) -> List[
                     task_ids=[task.id],
                     evidence={"referenced_path": candidate},
                 ))
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Completeness rules (CMP bundle)
+# ---------------------------------------------------------------------------
+
+def _covered_flow_summary(plan: Plan) -> Dict[str, Any]:
+    """Shared helper: gather covered flow IDs and best verification level per flow.
+
+    Returns ``{"covered_flow_ids": set[str], "best_level_by_flow": dict[str, int]}``.
+    """
+    covered_flow_ids: Set[str] = set()
+    best_level_by_flow: Dict[str, int] = {}
+    for task in plan.tasks:
+        v = task.verification
+        if v is None:
+            continue
+        level_num = _LEVEL_ORDER.get(v.level, 0)
+        for flow_id in v.covers.flows:
+            covered_flow_ids.add(flow_id)
+            if flow_id not in best_level_by_flow or level_num > best_level_by_flow[flow_id]:
+                best_level_by_flow[flow_id] = level_num
+    return {"covered_flow_ids": covered_flow_ids, "best_level_by_flow": best_level_by_flow}
+
+
+def _check_covers_unknown_flow(plan: Plan) -> List[ValidationIssue]:
+    """CMP-1: task.verification.covers.flows referencing an undeclared flow id."""
+    issues: List[ValidationIssue] = []
+    declared_flow_ids = {f.id for f in plan.critical_flows} | {f.id for f in plan.forbidden_flows}
+
+    for task in plan.tasks:
+        v = task.verification
+        if v is None:
+            continue
+        for flow_id in v.covers.flows:
+            if flow_id not in declared_flow_ids:
+                issues.append(ValidationIssue(
+                    code="E_COVERS_UNKNOWN_FLOW",
+                    severity="error",
+                    message=f"task '{task.id}' covers flow '{flow_id}' which is not declared "
+                            f"in critical_flows or forbidden_flows",
+                    task_ids=[task.id],
+                    evidence={"flow_id": flow_id},
+                    action_owner="author",
+                    worker_relevance="none",
+                ))
+    return issues
+
+
+def _check_state_unknown_task_ref(plan: Plan) -> List[ValidationIssue]:
+    """CMP-2: state.* lists contain unknown task ids."""
+    issues: List[ValidationIssue] = []
+    task_ids = {t.id for t in plan.tasks}
+
+    for tid in plan.state.completed_task_ids:
+        if tid not in task_ids:
+            issues.append(ValidationIssue(
+                code="W_STATE_UNKNOWN_TASK_REF",
+                severity="warning",
+                message=f"state.completed_task_ids references unknown task '{tid}'",
+                task_ids=[tid],
+                evidence={"list": "completed_task_ids", "unknown_id": tid},
+                action_owner="author",
+                worker_relevance="none",
+            ))
+
+    for tid in plan.state.failed_task_ids:
+        if tid not in task_ids:
+            issues.append(ValidationIssue(
+                code="W_STATE_UNKNOWN_TASK_REF",
+                severity="warning",
+                message=f"state.failed_task_ids references unknown task '{tid}'",
+                task_ids=[tid],
+                evidence={"list": "failed_task_ids", "unknown_id": tid},
+                action_owner="author",
+                worker_relevance="none",
+            ))
+
+    for rt in plan.state.running_tasks:
+        if rt.task_id not in task_ids:
+            issues.append(ValidationIssue(
+                code="W_STATE_UNKNOWN_TASK_REF",
+                severity="warning",
+                message=f"state.running_tasks references unknown task '{rt.task_id}'",
+                task_ids=[rt.task_id],
+                evidence={"list": "running_tasks", "unknown_id": rt.task_id},
+                action_owner="author",
+                worker_relevance="none",
+            ))
+
+    return issues
+
+
+def _check_duplicate_ids(plan: Plan) -> List[ValidationIssue]:
+    """CMP-3: duplicate flow IDs, forbidden flow IDs, and invariant names."""
+    issues: List[ValidationIssue] = []
+
+    # Duplicate critical flow IDs
+    seen_flow: Set[str] = set()
+    for flow in plan.critical_flows:
+        if flow.id in seen_flow:
+            issues.append(ValidationIssue(
+                code="E_DUPLICATE_FLOW_ID",
+                severity="error",
+                message=f"duplicate critical_flow id '{flow.id}'",
+                evidence={"flow_id": flow.id},
+                action_owner="author",
+                worker_relevance="none",
+            ))
+        seen_flow.add(flow.id)
+
+    # Duplicate forbidden flow IDs
+    seen_forbidden: Set[str] = set()
+    for flow in plan.forbidden_flows:
+        if flow.id in seen_forbidden:
+            issues.append(ValidationIssue(
+                code="E_DUPLICATE_FORBIDDEN_FLOW_ID",
+                severity="error",
+                message=f"duplicate forbidden_flow id '{flow.id}'",
+                evidence={"flow_id": flow.id},
+                action_owner="author",
+                worker_relevance="none",
+            ))
+        seen_forbidden.add(flow.id)
+
+    # Duplicate registration invariant names
+    seen_inv: Set[str] = set()
+    for inv in plan.registration_invariants:
+        if inv.name in seen_inv:
+            issues.append(ValidationIssue(
+                code="E_DUPLICATE_INVARIANT_NAME",
+                severity="error",
+                message=f"duplicate registration_invariant name '{inv.name}'",
+                evidence={"invariant_name": inv.name},
+                action_owner="author",
+                worker_relevance="none",
+            ))
+        seen_inv.add(inv.name)
+
+    return issues
+
+
+def _check_critical_flow_no_entrypoints(plan: Plan) -> List[ValidationIssue]:
+    """CMP-4: critical flow declared without any entrypoints."""
+    issues: List[ValidationIssue] = []
+    for flow in plan.critical_flows:
+        if not flow.entrypoints:
+            issues.append(ValidationIssue(
+                code="W_CRITICAL_FLOW_NO_ENTRYPOINTS",
+                severity="warning",
+                message=f"critical flow '{flow.id}' has no entrypoints declared",
+                evidence={"flow_id": flow.id},
+                action_owner="author",
+                worker_relevance="none",
+            ))
+    return issues
+
+
+def _check_suppress_unused(plan: Plan, all_issue_codes: Set[str]) -> List[ValidationIssue]:
+    """CMP-5: suppress_codes that don't match any emitted issue (runs last)."""
+    issues: List[ValidationIssue] = []
+    for code in plan.suppress_codes:
+        if code not in all_issue_codes:
+            issues.append(ValidationIssue(
+                code="H_SUPPRESS_UNUSED",
+                severity="hint",
+                message=f"suppress_codes entry '{code}' did not match any emitted issue",
+                evidence={"suppress_code": code},
+                action_owner="author",
+                worker_relevance="none",
+            ))
+    return issues
+
+
+def _check_plan_scope_unused(plan: Plan) -> List[ValidationIssue]:
+    """CMP-7: plan-level scope declarations that are never referenced by any task."""
+    issues: List[ValidationIssue] = []
+    summary = _covered_flow_summary(plan)
+    covered_flow_ids: Set[str] = summary["covered_flow_ids"]
+
+    # Critical flows never referenced by any task's covers.flows
+    for flow in plan.critical_flows:
+        if flow.id not in covered_flow_ids:
+            # Already caught by E_CRITICAL_FLOW_UNCOVERED — skip to avoid double-reporting
+            continue
+
+    # Required issues not addressed — already caught by E_UNCOVERED_REQUIRED_ISSUE
+
+    # Registration invariants: check if any invariant's registry_file is not
+    # covered by any task's claimed_paths
+    all_claimed: Set[str] = set()
+    for t in plan.tasks:
+        all_claimed.update(t.claimed_paths)
+
+    for inv in plan.registration_invariants:
+        if not inv.registry_file:
+            continue
+        owned = any(
+            _paths_overlap(inv.registry_file, cp) for cp in all_claimed
+        )
+        if not owned:
+            issues.append(ValidationIssue(
+                code="W_PLAN_SCOPE_UNUSED",
+                severity="warning",
+                message=f"registration invariant '{inv.name}' references '{inv.registry_file}' "
+                        f"which is not claimed by any task",
+                evidence={"invariant_name": inv.name, "registry_file": inv.registry_file},
+                action_owner="author",
+                worker_relevance="none",
+            ))
+
     return issues
 
 
