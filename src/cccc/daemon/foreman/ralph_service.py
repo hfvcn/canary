@@ -6,6 +6,8 @@ Not an external process; runs inside the daemon.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import posixpath
 import shlex
 import subprocess
@@ -13,6 +15,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+_logger = logging.getLogger("cccc.daemon.foreman.ralph_service")
 
 from ...contracts.v1.ralph_ipc import (
     ReadyBatchSuggestion,
@@ -693,6 +697,31 @@ class RalphService:
         if normalized in ("", "."):
             return GLOBAL_WRITE_CLAIM
         return normalized.removeprefix("./")
+
+    def _auto_sync_plan_state(self, plan_path: str, registered_digest: str) -> None:
+        """Defense-in-depth advisory: log a warning when the disk plan digest
+        differs from the registered digest.
+
+        This is a best-effort check called during plan-related operations to
+        surface stale plans early.  It does NOT block — the engine-level
+        pre-transition hook provides the hard gate.
+        """
+        if not plan_path or not registered_digest:
+            return
+        path = Path(plan_path)
+        if not path.exists():
+            return
+        try:
+            current_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except (OSError, ValueError):
+            return
+        if current_digest != registered_digest:
+            _logger.warning(
+                "Plan digest advisory: disk digest %s… differs from registered %s… for %s",
+                current_digest[:12],
+                registered_digest[:12],
+                plan_path,
+            )
 
     def _conflicts_with_any(
         self,

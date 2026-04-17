@@ -24,6 +24,8 @@ KIND_TASK_BLOCKED = "workflow.task_blocked"
 KIND_VERIFICATION_WARNING = "workflow.verification_warning"
 KIND_MONITOR_VIOLATION = "workflow.monitor_violation"
 KIND_RALPH_INTERNAL_ERROR = "workflow.ralph_internal_error"
+KIND_PLAN_DIGEST_DIVERGENCE = "workflow.plan_digest_divergence"
+KIND_PLAN_DIGEST_DIVERGENCE_POST_HOC = "workflow.plan_digest_divergence_post_hoc"
 
 
 class WorkflowTaskStatus(str, Enum):
@@ -36,6 +38,23 @@ class WorkflowTaskStatus(str, Enum):
     FAILED = "failed"
     BLOCKED = "blocked"
     ARCHIVED = "archived"
+
+
+class PreTransitionVetoed(RuntimeError):
+    """Raised by a pre-transition hook to block a state transition."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowMeta:
+    """Per-workflow metadata tracked by the engine."""
+
+    workflow_id: str
+    plan_path: str = ""
+    plan_digest: str = ""
 
 
 @dataclass(frozen=True, slots=True)

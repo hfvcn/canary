@@ -1,15 +1,30 @@
 from __future__ import annotations
 import json
+import logging
 import time
 from dataclasses import replace
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..contracts.v1.ralph_ipc import TaskRef, VerificationResult
 from .claimed_paths import detect_write_set_conflicts
 from .group import Group
 from .ledger import append_event
 from . import workflow_state_types as wt
-from .workflow_state_types import TaskState, WorkflowTaskStatus
+from .workflow_state_types import (
+    PreTransitionVetoed,
+    TaskState,
+    WorkflowMeta,
+    WorkflowTaskStatus,
+)
+
+logger = logging.getLogger("cccc.kernel.workflow_state_engine")
+
+# Type alias for pre-transition hook callables.
+# signature: (task_id: str, kind: str, hook_ctx: dict) -> None
+#   - raise PreTransitionVetoed to block the transition
+PreTransitionHook = Callable[[str, str, Dict[str, Any]], None]
+
+
 class WorkflowEngine:
     """Ledger-backed workflow state engine (in-memory projection + replay)."""
 
@@ -17,6 +32,53 @@ class WorkflowEngine:
         self._group = group
         self._tasks: Dict[str, TaskState] = {}
         self._processed_completion_keys: set[str] = set()
+        self._pre_transition_hooks: List[PreTransitionHook] = []
+        self._workflow_meta: Dict[str, WorkflowMeta] = {}
+        self._monitor_config: Any = None  # MonitorConfig, set externally
+        self._pending_hook_alerts: List[Dict[str, Any]] = []
+
+    # ------------------------------------------------------------------
+    # Pre-transition hook management
+    # ------------------------------------------------------------------
+
+    def register_pre_transition_hook(self, hook: PreTransitionHook) -> None:
+        """Register a callable invoked before state-changing transitions."""
+        self._pre_transition_hooks.append(hook)
+
+    def _run_pre_transition_hooks(
+        self,
+        task_id: str,
+        kind: str,
+        *,
+        hook_ctx: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Run all registered pre-transition hooks.
+
+        If any hook raises ``PreTransitionVetoed``, the caller must NOT write
+        the original transition event.  Instead a divergence event is written.
+        """
+        ctx = dict(hook_ctx or {})
+        for hook in self._pre_transition_hooks:
+            hook(task_id, kind, ctx)
+
+    # ------------------------------------------------------------------
+    # Workflow metadata helpers
+    # ------------------------------------------------------------------
+
+    def set_workflow_meta(self, workflow_id: str, *, plan_path: str = "", plan_digest: str = "") -> None:
+        """Store metadata for a workflow (plan_path, plan_digest)."""
+        self._workflow_meta[workflow_id] = WorkflowMeta(
+            workflow_id=workflow_id,
+            plan_path=plan_path,
+            plan_digest=plan_digest,
+        )
+
+    def get_workflow_meta(self, workflow_id: str) -> Optional[WorkflowMeta]:
+        return self._workflow_meta.get(workflow_id)
+
+    def get_monitor_config(self) -> Any:
+        """Return monitor config (may be None if not wired)."""
+        return self._monitor_config
 
     def register_task(self, task: TaskRef, workflow_id: str) -> None:
         wf = str(workflow_id or "").strip()
@@ -66,7 +128,7 @@ class WorkflowEngine:
                 raise ValueError(f"task not approvable: {a['task_id']} status={prev.status.value}")
             self._tasks[a["task_id"]] = replace(prev, status=WorkflowTaskStatus.ASSIGNED, batch_id=bid or prev.batch_id, agent_id=a["agent_id"])
 
-    def report_worker_started(self, task_id: str, agent_id: str) -> None:
+    def report_worker_started(self, task_id: str, agent_id: str, *, hook_ctx: Optional[Dict[str, Any]] = None) -> None:
         tid = str(task_id or "").strip()
         aid = str(agent_id or "").strip()
         if not tid:
@@ -75,6 +137,16 @@ class WorkflowEngine:
         if prev.status != WorkflowTaskStatus.ASSIGNED:
             raise ValueError(f"task not startable: {tid} status={prev.status.value}")
         now = time.time()
+        # Pre-transition hooks — may raise PreTransitionVetoed
+        try:
+            self._run_pre_transition_hooks(tid, wt.KIND_TASK_STARTED, hook_ctx=hook_ctx)
+        except PreTransitionVetoed as exc:
+            self._append(kind=wt.KIND_PLAN_DIGEST_DIVERGENCE, data={
+                "workflow_id": prev.workflow_id, "task_id": tid,
+                "vetoed_kind": wt.KIND_TASK_STARTED,
+                "code": exc.code, "message": str(exc),
+            })
+            raise
         self._append(kind=wt.KIND_TASK_STARTED, data={"workflow_id": prev.workflow_id, "task_id": tid, "agent_id": aid, "started_at": now})
         self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.RUNNING, agent_id=aid or prev.agent_id, started_at=now)
 
@@ -99,7 +171,7 @@ class WorkflowEngine:
         )
         self._tasks[tid] = replace(prev, last_heartbeat=heartbeat_at, progress_pct=progress)
 
-    def report_worker_completion(self, task_id: str, evidence: Dict[str, Any]) -> None:
+    def report_worker_completion(self, task_id: str, evidence: Dict[str, Any], *, hook_ctx: Optional[Dict[str, Any]] = None) -> None:
         tid = str(task_id or "").strip()
         if not tid:
             raise ValueError("task_id is required")
@@ -115,22 +187,42 @@ class WorkflowEngine:
         if prev.started_at is not None:
             duration_seconds = int(time.time() - prev.started_at)
         ev["duration_seconds"] = duration_seconds
+        # Pre-transition hooks — may raise PreTransitionVetoed
+        try:
+            self._run_pre_transition_hooks(tid, wt.KIND_TASK_REPORTED_COMPLETED, hook_ctx=hook_ctx)
+        except PreTransitionVetoed as exc:
+            self._append(kind=wt.KIND_PLAN_DIGEST_DIVERGENCE, data={
+                "workflow_id": prev.workflow_id, "task_id": tid,
+                "vetoed_kind": wt.KIND_TASK_REPORTED_COMPLETED,
+                "code": exc.code, "message": str(exc),
+            })
+            raise
         self._append(kind=wt.KIND_TASK_REPORTED_COMPLETED, data={"workflow_id": prev.workflow_id, "task_id": tid, "idempotency_key": idem, "evidence": ev})
         if idem:
             self._processed_completion_keys.add(idem)
         self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.VERIFYING, last_completion_idempotency_key=idem)
 
-    def report_worker_failed(self, task_id: str, error: Dict[str, Any]) -> None:
+    def report_worker_failed(self, task_id: str, error: Dict[str, Any], *, hook_ctx: Optional[Dict[str, Any]] = None) -> None:
         tid = str(task_id or "").strip()
         if not tid:
             raise ValueError("task_id is required")
         prev = self._require_task(tid)
         if prev.status != WorkflowTaskStatus.RUNNING:
             raise ValueError(f"task not fail-able: {tid} status={prev.status.value}")
+        # Pre-transition hooks — may raise PreTransitionVetoed
+        try:
+            self._run_pre_transition_hooks(tid, wt.KIND_TASK_FAILED, hook_ctx=hook_ctx)
+        except PreTransitionVetoed as exc:
+            self._append(kind=wt.KIND_PLAN_DIGEST_DIVERGENCE, data={
+                "workflow_id": prev.workflow_id, "task_id": tid,
+                "vetoed_kind": wt.KIND_TASK_FAILED,
+                "code": exc.code, "message": str(exc),
+            })
+            raise
         self._append(kind=wt.KIND_TASK_FAILED, data={"workflow_id": prev.workflow_id, "task_id": tid, "error": dict(error or {})})
         self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.FAILED)
 
-    def record_verification_result(self, task_id: str, result: VerificationResult) -> None:
+    def record_verification_result(self, task_id: str, result: VerificationResult, *, hook_ctx: Optional[Dict[str, Any]] = None) -> None:
         tid = str(task_id or "").strip()
         if not tid:
             raise ValueError("task_id is required")
@@ -140,13 +232,40 @@ class WorkflowEngine:
         outcome = str(getattr(result, "overall_outcome", "") or "").strip()
         data = {"workflow_id": prev.workflow_id, "task_id": tid, "verification": result.model_dump()}
         if outcome == "passed":
+            try:
+                self._run_pre_transition_hooks(tid, wt.KIND_VERIFICATION_PASSED, hook_ctx=hook_ctx)
+            except PreTransitionVetoed as exc:
+                self._append(kind=wt.KIND_PLAN_DIGEST_DIVERGENCE, data={
+                    "workflow_id": prev.workflow_id, "task_id": tid,
+                    "vetoed_kind": wt.KIND_VERIFICATION_PASSED,
+                    "code": exc.code, "message": str(exc),
+                })
+                raise
             self._append(kind=wt.KIND_VERIFICATION_PASSED, data=data)
             self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.COMPLETED, last_verification=data["verification"])
             return
         if outcome == "skipped":
+            try:
+                self._run_pre_transition_hooks(tid, wt.KIND_VERIFICATION_SKIPPED, hook_ctx=hook_ctx)
+            except PreTransitionVetoed as exc:
+                self._append(kind=wt.KIND_PLAN_DIGEST_DIVERGENCE, data={
+                    "workflow_id": prev.workflow_id, "task_id": tid,
+                    "vetoed_kind": wt.KIND_VERIFICATION_SKIPPED,
+                    "code": exc.code, "message": str(exc),
+                })
+                raise
             self._append(kind=wt.KIND_VERIFICATION_SKIPPED, data=data)
             self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.COMPLETED, last_verification=data["verification"])
             return
+        try:
+            self._run_pre_transition_hooks(tid, wt.KIND_VERIFICATION_FAILED, hook_ctx=hook_ctx)
+        except PreTransitionVetoed as exc:
+            self._append(kind=wt.KIND_PLAN_DIGEST_DIVERGENCE, data={
+                "workflow_id": prev.workflow_id, "task_id": tid,
+                "vetoed_kind": wt.KIND_VERIFICATION_FAILED,
+                "code": exc.code, "message": str(exc),
+            })
+            raise
         self._append(kind=wt.KIND_VERIFICATION_FAILED, data=data)
         self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.FAILED, last_verification=data["verification"])
 
@@ -250,6 +369,8 @@ class WorkflowEngine:
             wt.KIND_RETRY_REQUESTED: self._apply_retry_requested,
             wt.KIND_TASK_BLOCKED: self._apply_task_blocked,
             wt.KIND_VERIFICATION_WARNING: self._apply_verification_warning,
+            wt.KIND_PLAN_DIGEST_DIVERGENCE: self._apply_plan_digest_divergence,
+            wt.KIND_PLAN_DIGEST_DIVERGENCE_POST_HOC: self._apply_plan_digest_divergence,
         }
         handler = handlers.get(kind)
         if handler is not None:
@@ -344,6 +465,10 @@ class WorkflowEngine:
     def _apply_verification_warning(self, data: Dict[str, Any]) -> None:
         """Replay handler for verification warnings — no state change, just ack."""
         pass  # Warnings are informational; no state mutation needed during replay
+
+    def _apply_plan_digest_divergence(self, data: Dict[str, Any]) -> None:
+        """Replay handler for plan-digest divergence events — informational, no state change."""
+        pass
 
     def _require_task(self, task_id: str) -> TaskState:
         tid = str(task_id or "").strip()

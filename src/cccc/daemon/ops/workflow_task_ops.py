@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict
 from cccc.contracts.v1.ralph_ipc import TaskEvent, VerificationResult
 from cccc.daemon.foreman.workflow_orchestrator import get_orchestrator
 from cccc.kernel.workflow_state import WorkflowTaskStatus
+from cccc.kernel.workflow_state_types import PreTransitionVetoed
 from cccc.ralph.agent import build_error_envelope
 
 ResultDict = Dict[str, Any]
@@ -37,6 +38,8 @@ def _normalize_changed_files(changed_files: Any) -> list[str]:
 
 
 def _classify_error(exc: Exception) -> ResultDict:
+    if isinstance(exc, PreTransitionVetoed):
+        return _failure(exc.code or "plan_digest_divergence", str(exc))
     message = str(exc).strip() or exc.__class__.__name__
     if message.startswith("task not found:"):
         return _failure("task_not_found", message)
@@ -109,7 +112,7 @@ def _build_verification_error(task_id: str, workflow_id: str, exc: Exception) ->
     )
 
 
-def complete_task(group_id, task_id, agent_id, changed_files, evidence, workflow_id, project_root, daemon_request_fn, *, assignment_id="", actor_run_id=""):
+def complete_task(group_id, task_id, agent_id, changed_files, evidence, workflow_id, project_root, daemon_request_fn, *, assignment_id="", actor_run_id="", override_stale_digest=False):
     try:
         orchestrator = _get_orchestrator_or_raise(group_id, project_root, daemon_request_fn)
         _get_state_or_raise(orchestrator, task_id, workflow_id)
@@ -126,7 +129,7 @@ def complete_task(group_id, task_id, agent_id, changed_files, evidence, workflow
                 "actor_run_id": str(actor_run_id or "").strip(),
             },
         )
-        result = orchestrator.apply_task_event(event)
+        result = orchestrator.apply_task_event(event, override_stale_digest=bool(override_stale_digest))
         result["workflow_id"] = _normalize_text("workflow_id", workflow_id)
         return _wrap_event_result(result)
     except Exception as exc:

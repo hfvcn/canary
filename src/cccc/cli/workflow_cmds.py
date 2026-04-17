@@ -263,6 +263,7 @@ def cmd_task_complete(args: argparse.Namespace) -> int:
     changed_files = list(getattr(args, "changed_file", []) or [])
     evidence = _parse_json_object_arg(getattr(args, "evidence", "") or "", field="--evidence") if hasattr(args, "evidence") else {}
     workflow_id = _resolve_task_workflow_id(group_id, project_root, task_id, str(getattr(args, "workflow_id", "") or "").strip())
+    force_stale_complete = bool(getattr(args, "force_stale_complete", False))
     resp = call_daemon(
         _build_task_event_request(
             group_id=group_id,
@@ -284,6 +285,7 @@ def cmd_task_complete(args: argparse.Namespace) -> int:
                 "agent_id": agent_id,
                 "changed_files": changed_files,
                 "evidence": evidence,
+                "override_stale_digest": force_stale_complete,
             },
         )
     )

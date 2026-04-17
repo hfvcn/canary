@@ -22,6 +22,7 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import posixpath
 import time
@@ -32,6 +33,11 @@ from ...contracts.v1 import DaemonRequest, DaemonResponse
 from ...kernel.actors import find_actor, find_foreman, get_effective_role, list_actors
 from ...kernel.group import Group, load_group
 from ...kernel.workflow_state import WorkflowEngine, WorkflowTaskStatus
+from ...kernel.workflow_state_types import (
+    KIND_PLAN_DIGEST_DIVERGENCE,
+    KIND_PLAN_DIGEST_DIVERGENCE_POST_HOC,
+    PreTransitionVetoed,
+)
 from ...util.conv import coerce_bool
 from ..ops.agent_ops import get_agent
 from ...contracts.v1.ralph_ipc import (
@@ -186,6 +192,137 @@ class WorkflowOrchestrator:
         self._task_to_model: Dict[str, str] = {}  # task_id -> model_key
         self._context_store = ContextStore(self.project_root) if self.project_root else None
         self._monitor_config: MonitorConfig = get_default_config()
+
+        # Register plan digest freshness guard hook
+        self.engine.register_pre_transition_hook(self._create_plan_digest_freshness_hook())
+
+    # ------------------------------------------------------------------
+    # Plan digest freshness guard
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_file_digest(path: Path) -> str:
+        """Compute sha256 hex digest of a file's contents."""
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except (OSError, ValueError):
+            return ""
+
+    def _create_plan_digest_freshness_hook(self) -> "Callable[[str, str, Dict[str, Any]], None]":
+        """Return a pre-transition hook that checks plan file freshness.
+
+        If the plan file on disk has a different digest from the one recorded
+        at registration time, the hook raises ``PreTransitionVetoed`` unless
+        ``hook_ctx["override_stale_digest"]`` is truthy.
+        """
+        orchestrator = self
+
+        def _plan_digest_freshness_hook(
+            task_id: str,
+            kind: str,
+            hook_ctx: Dict[str, Any],
+        ) -> None:
+            # Look up which workflow this task belongs to
+            state = orchestrator.engine.get_task(task_id)
+            if state is None:
+                return
+            meta = orchestrator.engine.get_workflow_meta(state.workflow_id)
+            if meta is None or not meta.plan_path or not meta.plan_digest:
+                return  # No registered plan — nothing to check
+
+            plan_path = Path(meta.plan_path)
+            if not plan_path.exists():
+                return  # Plan file removed — allow (avoid false block)
+
+            current_digest = WorkflowOrchestrator._compute_file_digest(plan_path)
+            if not current_digest:
+                return  # Cannot read — allow
+
+            if current_digest == meta.plan_digest:
+                return  # Fresh — allow
+
+            override = bool(hook_ctx.get("override_stale_digest", False))
+            if override:
+                logger.warning(
+                    "Plan digest divergence detected for task %s but override_stale_digest=True; allowing",
+                    task_id,
+                )
+                # Record an advisory divergence event even when overridden
+                try:
+                    from ...kernel.ledger import append_event as _append_event
+
+                    scope_key = str(orchestrator.group.doc.get("active_scope_key") or "").strip()
+                    _append_event(
+                        orchestrator.group.ledger_path,
+                        kind=KIND_PLAN_DIGEST_DIVERGENCE,
+                        group_id=orchestrator.group.group_id,
+                        scope_key=scope_key,
+                        by="orchestrator",
+                        data={
+                            "workflow_id": state.workflow_id,
+                            "task_id": task_id,
+                            "vetoed_kind": kind,
+                            "code": "plan_digest_divergence",
+                            "message": "plan digest divergence detected (override used)",
+                            "registered_digest": meta.plan_digest,
+                            "current_digest": current_digest,
+                            "plan_path": str(plan_path),
+                            "override_used": True,
+                        },
+                    )
+                except Exception:
+                    logger.debug("Failed to emit override divergence event", exc_info=True)
+                return  # Allow the transition
+
+            raise PreTransitionVetoed(
+                code="plan_digest_divergence",
+                message=(
+                    f"Plan file '{plan_path}' was modified after registration "
+                    f"(registered={meta.plan_digest[:12]}… current={current_digest[:12]}…). "
+                    f"Re-register the plan or use --force-stale-complete to override."
+                ),
+            )
+
+        return _plan_digest_freshness_hook
+
+    def _post_hoc_plan_digest_check(self, task_id: str, workflow_id: str) -> None:
+        """Defense-in-depth: advisory post-hoc check after task completion.
+
+        Emits a ``KIND_PLAN_DIGEST_DIVERGENCE_POST_HOC`` ledger event if the
+        plan digest has changed since registration.  Does NOT block.
+        """
+        meta = self.engine.get_workflow_meta(workflow_id)
+        if meta is None or not meta.plan_path or not meta.plan_digest:
+            return
+        plan_path = Path(meta.plan_path)
+        if not plan_path.exists():
+            return
+        current_digest = self._compute_file_digest(plan_path)
+        if not current_digest or current_digest == meta.plan_digest:
+            return
+        try:
+            from ...kernel.ledger import append_event as _append_event
+
+            scope_key = str(self.group.doc.get("active_scope_key") or "").strip()
+            _append_event(
+                self.group.ledger_path,
+                kind=KIND_PLAN_DIGEST_DIVERGENCE_POST_HOC,
+                group_id=self.group.group_id,
+                scope_key=scope_key,
+                by="orchestrator",
+                data={
+                    "workflow_id": workflow_id,
+                    "task_id": task_id,
+                    "code": "plan_digest_divergence_post_hoc",
+                    "message": "post-hoc advisory: plan digest changed since registration",
+                    "registered_digest": meta.plan_digest,
+                    "current_digest": current_digest,
+                    "plan_path": str(plan_path),
+                    "override_used": False,
+                },
+            )
+        except Exception:
+            logger.debug("Failed to emit post-hoc divergence event", exc_info=True)
 
     def _ensure_active_workflow(
         self,
@@ -1062,6 +1199,12 @@ class WorkflowOrchestrator:
 
         agent_name = agent_id
 
+        # Defense-in-depth: post-hoc plan digest advisory
+        try:
+            self._post_hoc_plan_digest_check(task_id, wf_id or "")
+        except Exception:
+            logger.debug("Post-hoc plan digest check failed", exc_info=True)
+
         # Release agent in pool
         self.foreman.release_completed_task(task_id, agent_id)
 
@@ -1590,14 +1733,22 @@ class WorkflowOrchestrator:
         except Exception:
             logger.debug("Failed to emit workflow.ralph_internal_error", exc_info=True)
 
-    def apply_task_event(self, event) -> Dict[str, Any]:
+    def apply_task_event(self, event, *, override_stale_digest: bool = False) -> Dict[str, Any]:
         """Process a unified task event with a verification gate (ledger-backed).
 
         Internal failures are caught and emitted as ``workflow.ralph_internal_error``
         ledger events with stable stage + internal_error_code + exception_type fields.
         """
         try:
-            return self._apply_task_event_inner(event)
+            return self._apply_task_event_inner(event, override_stale_digest=override_stale_digest)
+        except PreTransitionVetoed as exc:
+            return {
+                "accepted": False,
+                "task_id": str(getattr(event, "task_id", "") or ""),
+                "event_type": str(getattr(event, "event_type", "") or ""),
+                "reason": f"plan_digest_divergence: {exc}",
+                "code": exc.code,
+            }
         except Exception as exc:
             self._emit_ralph_internal_error(
                 stage="completion",
@@ -1606,7 +1757,7 @@ class WorkflowOrchestrator:
             )
             raise
 
-    def _apply_task_event_inner(self, event) -> Dict[str, Any]:
+    def _apply_task_event_inner(self, event, *, override_stale_digest: bool = False) -> Dict[str, Any]:
         """Core apply_task_event logic (unwrapped)."""
         payload = event.payload or {}
         task_id = str(getattr(event, "task_id", "") or "").strip()
@@ -1620,6 +1771,7 @@ class WorkflowOrchestrator:
 
         result: Dict[str, Any] = {"accepted": True, "task_id": task_id, "event_type": event_type}
         agent_id = str(payload.get("agent_id") or "").strip() or str(getattr(state, "agent_id", "") or "").strip()
+        _hook_ctx: Dict[str, Any] = {"override_stale_digest": override_stale_digest}
 
         if event_type == "heartbeat":
             if state.status != WorkflowTaskStatus.RUNNING:
@@ -1658,7 +1810,7 @@ class WorkflowOrchestrator:
                 return result
 
             if state.status == WorkflowTaskStatus.ASSIGNED:
-                self.engine.report_worker_started(task_id, agent_id)
+                self.engine.report_worker_started(task_id, agent_id, hook_ctx=_hook_ctx)
                 state = self.engine.get_task(task_id) or state
 
             if state.status != WorkflowTaskStatus.RUNNING:
@@ -1674,6 +1826,7 @@ class WorkflowOrchestrator:
                     "changed_files": list(changed_files),
                     "idempotency_key": str(getattr(event, "idempotency_key", "") or "").strip(),
                 },
+                hook_ctx=_hook_ctx,
             )
 
             try:
@@ -1693,7 +1846,7 @@ class WorkflowOrchestrator:
                     summary=f"verification_error: {e}",
                 )
 
-            self.engine.record_verification_result(task_id, verification)
+            self.engine.record_verification_result(task_id, verification, hook_ctx=_hook_ctx)
             result["verification_outcome"] = verification.overall_outcome
 
             if verification.overall_outcome in ("passed", "skipped"):
@@ -1745,12 +1898,13 @@ class WorkflowOrchestrator:
             agent_name = str(payload.get("agent_name") or "").strip() or agent_id
             changed_files = payload.get("changed_files") if isinstance(payload.get("changed_files"), list) else []
             if state.status == WorkflowTaskStatus.ASSIGNED:
-                self.engine.report_worker_started(task_id, agent_id)
+                self.engine.report_worker_started(task_id, agent_id, hook_ctx=_hook_ctx)
                 state = self.engine.get_task(task_id) or state
             if state.status == WorkflowTaskStatus.RUNNING:
                 self.engine.report_worker_failed(
                     task_id,
                     {"error_message": error_message, "suggestion": suggestion, "agent_name": agent_name},
+                    hook_ctx=_hook_ctx,
                 )
             self.on_task_failed(
                 task_id=task_id,

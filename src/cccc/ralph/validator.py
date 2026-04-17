@@ -6,10 +6,11 @@ The validator reads the Plan and produces a ValidationReport without side effect
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .core import _normalize_write_set, _paths_overlap
 from .filesystem_validator import validate_filesystem
@@ -1443,3 +1444,38 @@ def _check_semantic_dependencies(plan: Plan, workspace: WorkspaceIndex) -> List[
                     evidence={"referenced_path": candidate},
                 ))
     return issues
+
+
+# ---------------------------------------------------------------------------
+# Plan digest freshness check
+# ---------------------------------------------------------------------------
+
+def check_plan_digest_freshness(
+    plan_path: Path,
+    registered_digest: str,
+) -> Optional[ValidationIssue]:
+    """Return a W_REGISTERED_PLAN_STALE warning when the disk digest differs from registered.
+
+    Returns ``None`` when the digests match or the file cannot be read.
+    """
+    if not registered_digest:
+        return None
+    try:
+        current_digest = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        return None
+    if current_digest == registered_digest:
+        return None
+    return ValidationIssue(
+        code="W_REGISTERED_PLAN_STALE",
+        severity="warning",
+        message=(
+            f"plan file '{plan_path}' has been modified since registration "
+            f"(registered={registered_digest[:12]}… current={current_digest[:12]}…)"
+        ),
+        evidence={
+            "plan_path": str(plan_path),
+            "registered_digest": registered_digest,
+            "current_digest": current_digest,
+        },
+    )

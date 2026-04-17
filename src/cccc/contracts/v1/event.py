@@ -42,6 +42,8 @@ EventKind = Literal[
     "presentation.clear",
     "workflow.monitor_violation",
     "workflow.ralph_internal_error",
+    "workflow.plan_digest_divergence",
+    "workflow.plan_digest_divergence_post_hoc",
 ]
 
 KIND_RALPH_INTERNAL_ERROR = "workflow.ralph_internal_error"
@@ -241,6 +243,22 @@ class RalphInternalErrorData(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class PlanDigestDivergenceData(BaseModel):
+    """Emitted when a plan digest mismatch blocks a state transition."""
+
+    workflow_id: str = ""
+    task_id: str = ""
+    vetoed_kind: str = ""
+    code: str = ""
+    message: str = ""
+    registered_digest: str = ""
+    current_digest: str = ""
+    plan_path: str = ""
+    override_used: bool = False
+
+    model_config = ConfigDict(extra="allow")
+
+
 class Event(BaseModel):
     v: int = 1
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
@@ -284,6 +302,8 @@ _KIND_TO_MODEL = {
     "presentation.clear": PresentationClearData,
     "workflow.monitor_violation": MonitorViolationData,
     KIND_RALPH_INTERNAL_ERROR: RalphInternalErrorData,
+    "workflow.plan_digest_divergence": PlanDigestDivergenceData,
+    "workflow.plan_digest_divergence_post_hoc": PlanDigestDivergenceData,
 }
 
 
