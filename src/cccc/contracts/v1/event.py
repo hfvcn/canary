@@ -41,6 +41,7 @@ EventKind = Literal[
     "presentation.publish",
     "presentation.clear",
     "workflow.monitor_violation",
+    "workflow.ralph_internal_error",
 ]
 
 
@@ -224,6 +225,20 @@ class MonitorViolationData(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class RalphInternalErrorData(BaseModel):
+    """Structured internal failure envelope emitted by the orchestrator."""
+
+    stage: str
+    internal_error_code: str
+    exception_type: str
+    message: str
+    traceback_truncated: str = ""
+    task_id: str = ""
+    workflow_id: str = ""
+
+    model_config = ConfigDict(extra="allow")
+
+
 class Event(BaseModel):
     v: int = 1
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
@@ -266,6 +281,7 @@ _KIND_TO_MODEL = {
     "presentation.publish": PresentationPublishData,
     "presentation.clear": PresentationClearData,
     "workflow.monitor_violation": MonitorViolationData,
+    "workflow.ralph_internal_error": RalphInternalErrorData,
 }
 
 

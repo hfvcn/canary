@@ -23,6 +23,7 @@ KIND_RETRY_REQUESTED = "workflow.retry_requested"
 KIND_TASK_BLOCKED = "workflow.task_blocked"
 KIND_VERIFICATION_WARNING = "workflow.verification_warning"
 KIND_MONITOR_VIOLATION = "workflow.monitor_violation"
+KIND_RALPH_INTERNAL_ERROR = "workflow.ralph_internal_error"
 
 
 class WorkflowTaskStatus(str, Enum):

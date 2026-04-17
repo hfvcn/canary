@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict
 from cccc.contracts.v1.ralph_ipc import TaskEvent, VerificationResult
 from cccc.daemon.foreman.workflow_orchestrator import get_orchestrator
 from cccc.kernel.workflow_state import WorkflowTaskStatus
+from cccc.ralph.agent import build_error_envelope
 
 ResultDict = Dict[str, Any]
 
@@ -47,7 +48,9 @@ def _classify_error(exc: Exception) -> ResultDict:
         return _failure("invalid_state_transition", message)
     if message.startswith("orchestrator not found"):
         return _failure("orchestrator_not_found", message)
-    return _failure("workflow_task_op_error", message)
+    result = _failure("workflow_task_op_error", message)
+    result["error"] = build_error_envelope(stage="ipc", exception=exc)
+    return result
 
 
 def _wrap_event_result(result: ResultDict) -> ResultDict:

@@ -41,6 +41,7 @@ from ...contracts.v1.ralph_ipc import (
     TaskRef,
     VerificationResult,
 )
+from ...ralph.agent import build_error_envelope
 from .context_store import ContextStore, TaskContext
 from .workflow import ForemanWorkflow, BatchEvaluationResult
 from .progress_report import ProgressReporter, FeishuSender
@@ -396,6 +397,26 @@ class WorkflowOrchestrator:
         return result
 
     def register_and_suggest(
+        self,
+        task_dicts: List[Dict[str, Any]],
+        workflow_id: str,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Register tasks and suggest a batch.
+
+        Internal failures emit ``workflow.ralph_internal_error`` ledger events.
+        """
+        try:
+            return self._register_and_suggest_inner(task_dicts, workflow_id, **kwargs)
+        except Exception as exc:
+            self._emit_ralph_internal_error(
+                stage="register",
+                exception=exc,
+                extra={"workflow_id": workflow_id},
+            )
+            raise
+
+    def _register_and_suggest_inner(
         self,
         task_dicts: List[Dict[str, Any]],
         workflow_id: str,
@@ -998,7 +1019,31 @@ class WorkflowOrchestrator:
 
         Called when an agent completes a task successfully.
         Records model usage for later evaluation when user requests it.
+        Internal failures emit ``workflow.ralph_internal_error`` ledger events.
         """
+        try:
+            return self._on_task_completed_inner(
+                task_id, agent_id, duration_seconds, changed_files,
+                workflow_id=workflow_id, verification=verification,
+            )
+        except Exception as exc:
+            self._emit_ralph_internal_error(
+                stage="completion",
+                exception=exc,
+                extra={"task_id": task_id},
+            )
+            raise
+
+    def _on_task_completed_inner(
+        self,
+        task_id: str,
+        agent_id: str,
+        duration_seconds: int,
+        changed_files: List[str],
+        *,
+        workflow_id: Optional[str] = None,
+        verification: Optional[VerificationResult] = None,
+    ) -> bool:
         # Find workflow
         wf_id = workflow_id
         if not wf_id:
@@ -1521,8 +1566,48 @@ class WorkflowOrchestrator:
         except Exception as e:
             self._log(f"[orchestrator] Failed to save task context for {task_id}: {e}")
 
+    def _emit_ralph_internal_error(
+        self,
+        *,
+        stage: str,
+        exception: Exception,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Emit a ``workflow.ralph_internal_error`` ledger event (best-effort)."""
+        try:
+            from cccc.kernel.ledger import append_event
+
+            envelope = build_error_envelope(stage=stage, exception=exception, extra=extra)
+            scope_key = str(self.group.doc.get("active_scope_key") or "").strip()
+            append_event(
+                self.group.ledger_path,
+                kind="workflow.ralph_internal_error",
+                group_id=self.group.group_id,
+                scope_key=scope_key,
+                by="orchestrator",
+                data=envelope,
+            )
+        except Exception:
+            logger.debug("Failed to emit workflow.ralph_internal_error", exc_info=True)
+
     def apply_task_event(self, event) -> Dict[str, Any]:
-        """Process a unified task event with a verification gate (ledger-backed)."""
+        """Process a unified task event with a verification gate (ledger-backed).
+
+        Internal failures are caught and emitted as ``workflow.ralph_internal_error``
+        ledger events with stable stage + internal_error_code + exception_type fields.
+        """
+        try:
+            return self._apply_task_event_inner(event)
+        except Exception as exc:
+            self._emit_ralph_internal_error(
+                stage="completion",
+                exception=exc,
+                extra={"task_id": str(getattr(event, "task_id", "") or "")},
+            )
+            raise
+
+    def _apply_task_event_inner(self, event) -> Dict[str, Any]:
+        """Core apply_task_event logic (unwrapped)."""
         payload = event.payload or {}
         task_id = str(getattr(event, "task_id", "") or "").strip()
         event_type = str(getattr(event, "event_type", "") or "").strip()

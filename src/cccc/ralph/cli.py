@@ -16,10 +16,17 @@ import sys
 from pathlib import Path
 from typing import List
 
+from .agent import build_error_envelope, _is_debug_traceback_enabled
 from .core import suggest, verify
 from .models import Plan, ValidationReport
 from .plan_io import load_plan, save_plan_state
 from .validator import validate, validate_with_project
+
+
+# Exit codes
+_EXIT_OK = 0
+_EXIT_VALIDATION_FAILURE = 1  # Plan-level validation failures
+_EXIT_INTERNAL_ERROR = 2       # Internal errors (load failures, crashes, etc.)
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -74,23 +81,28 @@ def main(argv: List[str] | None = None) -> int:
 
     try:
         plan = load_plan(args.plan)
-    except FileNotFoundError:
-        print(f"error: file not found: {args.plan}", file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(f"error: failed to load plan: {e}", file=sys.stderr)
-        return 1
+    except FileNotFoundError as exc:
+        _emit_error_envelope("load", exc)
+        return _EXIT_INTERNAL_ERROR
+    except Exception as exc:
+        _emit_error_envelope("load", exc)
+        return _EXIT_INTERNAL_ERROR
 
-    if args.command == "validate":
-        return _cmd_validate(plan, args)
-    elif args.command == "suggest":
-        return _cmd_suggest(plan, args)
-    elif args.command == "verify":
-        return _cmd_verify(plan, args)
-    elif args.command == "complete":
-        return _cmd_complete(plan, args)
-    elif args.command == "explain":
-        return _cmd_explain(plan, args)
+    try:
+        if args.command == "validate":
+            return _cmd_validate(plan, args)
+        elif args.command == "suggest":
+            return _cmd_suggest(plan, args)
+        elif args.command == "verify":
+            return _cmd_verify(plan, args)
+        elif args.command == "complete":
+            return _cmd_complete(plan, args)
+        elif args.command == "explain":
+            return _cmd_explain(plan, args)
+    except Exception as exc:
+        stage = _command_to_stage(args.command)
+        _emit_error_envelope(stage, exc)
+        return _EXIT_INTERNAL_ERROR
 
     return 1
 
@@ -106,7 +118,12 @@ def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
     )
     if args.suppress:
         plan.suppress_codes = list(set(plan.suppress_codes) | set(args.suppress))
-    report = validate_with_project(plan, project_root=project_root)
+
+    try:
+        report = validate_with_project(plan, project_root=project_root)
+    except Exception as exc:
+        _emit_error_envelope("semantic", exc)
+        return _EXIT_INTERNAL_ERROR
 
     if args.format == "json":
         payload = report.model_dump()
@@ -116,7 +133,7 @@ def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
         print(f"Resolved project root: {project_root}", file=sys.stderr)
         _print_validation_text(report)
 
-    return 0 if report.valid else 1
+    return _EXIT_OK if report.valid else _EXIT_VALIDATION_FAILURE
 
 
 def _cmd_suggest(plan: Plan, args: argparse.Namespace) -> int:
@@ -297,6 +314,32 @@ def _print_validation_text(report: ValidationReport) -> None:
 def _print_issue(issue) -> None:
     tasks = f" [{', '.join(issue.task_ids)}]" if issue.task_ids else ""
     print(f"  {issue.code}{tasks}: {issue.message}")
+
+
+# ---------------------------------------------------------------------------
+# Error envelope helpers
+# ---------------------------------------------------------------------------
+
+def _command_to_stage(command: str) -> str:
+    """Map CLI command names to error envelope stages."""
+    mapping = {
+        "validate": "validate",
+        "suggest": "suggest",
+        "verify": "verify",
+        "complete": "completion",
+        "explain": "validate",
+    }
+    return mapping.get(command or "", "validate")
+
+
+def _emit_error_envelope(stage: str, exc: BaseException) -> None:
+    """Print structured error JSON to stderr; suppress raw traceback unless debug."""
+    envelope = build_error_envelope(stage=stage, exception=exc)
+    error_output = {"error": envelope}
+    print(json.dumps(error_output, indent=2, ensure_ascii=False), file=sys.stderr)
+    if not _is_debug_traceback_enabled():
+        # Brief human-readable summary (no traceback)
+        pass  # JSON on stderr is sufficient
 
 
 if __name__ == "__main__":
