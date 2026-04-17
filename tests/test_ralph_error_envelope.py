@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cccc.contracts.v1.event import KIND_RALPH_INTERNAL_ERROR, normalize_event_data
 from cccc.ralph.agent import (
     RALPH_STAGES,
     RULE_ERROR_REGISTRY,
@@ -63,10 +64,15 @@ class TestBuildErrorEnvelope:
         assert envelope["internal_error_code"] == "E_CUSTOM_CODE"
 
     def test_registry_controls_default_error_code(self, monkeypatch):
-        monkeypatch.setitem(RULE_ERROR_REGISTRY, "load", "E_INTERNAL_PATCHED_LOAD")
+        monkeypatch.setitem(RULE_ERROR_REGISTRY, "load", "E_LOOKUP_COMES_FROM_REGISTRY")
         exc = ValueError("test error message")
         envelope = build_error_envelope(stage="load", exception=exc)
-        assert envelope["internal_error_code"] == "E_INTERNAL_PATCHED_LOAD"
+        assert envelope["internal_error_code"] == "E_LOOKUP_COMES_FROM_REGISTRY"
+
+    def test_unknown_stage_falls_back_to_internal_unknown(self):
+        exc = RuntimeError("unknown stage boom")
+        envelope = build_error_envelope(stage="not-registered", exception=exc)
+        assert envelope["internal_error_code"] == "E_INTERNAL_UNKNOWN"
 
     def test_debug_traceback(self, monkeypatch):
         monkeypatch.setenv("CCCC_DEBUG_TRACEBACK", "1")
@@ -87,6 +93,24 @@ class TestBuildErrorEnvelope:
         exc = ValueError("x")
         envelope = build_error_envelope(stage="ipc", exception=exc, extra={"task_id": "T1"})
         assert envelope["task_id"] == "T1"
+
+
+class TestRalphInternalErrorEventContract:
+    def test_kind_constant_available_in_event_contract(self):
+        assert KIND_RALPH_INTERNAL_ERROR == "workflow.ralph_internal_error"
+
+    def test_normalize_event_data_omits_empty_traceback(self):
+        payload = normalize_event_data(
+            KIND_RALPH_INTERNAL_ERROR,
+            {
+                "stage": "ipc",
+                "internal_error_code": "E_INTERNAL_IPC",
+                "exception_type": "RuntimeError",
+                "message": "boom",
+                "traceback_truncated": None,
+            },
+        )
+        assert "traceback_truncated" not in payload
 
 
 # ---------------------------------------------------------------------------

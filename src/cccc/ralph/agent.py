@@ -46,6 +46,8 @@ RULE_ERROR_REGISTRY: Dict[str, str] = {
     "verify": "E_INTERNAL_VERIFY",
 }
 
+UNKNOWN_INTERNAL_ERROR_CODE = "E_INTERNAL_UNKNOWN"
+
 
 def _is_debug_traceback_enabled() -> bool:
     """Check whether raw traceback output is enabled via environment variable."""
@@ -80,7 +82,10 @@ def build_error_envelope(
     dict with keys: stage, internal_error_code, exception_type, message,
     and optionally traceback_truncated (only when CCCC_DEBUG_TRACEBACK=1).
     """
-    code = internal_error_code or RULE_ERROR_REGISTRY.get(stage, "E_INTERNAL_UNKNOWN")
+    if internal_error_code is None:
+        code = RULE_ERROR_REGISTRY.get(stage, UNKNOWN_INTERNAL_ERROR_CODE)
+    else:
+        code = internal_error_code
     envelope: Dict[str, Any] = {
         "stage": stage,
         "internal_error_code": code,
