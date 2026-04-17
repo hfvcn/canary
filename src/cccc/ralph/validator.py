@@ -6,6 +6,7 @@ The validator reads the Plan and produces a ValidationReport without side effect
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
@@ -28,6 +29,33 @@ from .workspace_index import WorkspaceIndex
 # Ordered levels for comparison
 _LEVEL_ORDER: Dict[str, int] = {"compile": 0, "unit": 1, "integration": 2, "e2e": 3}
 FATAL_STRUCTURAL_CODES = {"E_DUPLICATE_TASK_ID", "E_DEP_UNKNOWN", "E_DEP_SELF", "E_DEP_CYCLE"}
+# Severity rank for deterministic ordering: error (0) sorts before warning (1) before hint (2)
+_SEVERITY_RANK: Dict[str, int] = {"error": 0, "warning": 1, "hint": 2}
+
+
+def _issue_sort_key(issue: ValidationIssue) -> tuple:
+    """Deterministic four-part sort key for ValidationIssue.
+
+    Key = (severity_rank asc [error first], code asc,
+           tuple(sorted(task_ids)) asc,
+           canonical_evidence_json asc).
+
+    Using sorted(task_ids) prevents flapping when multi-task issues swap order.
+    Using json.dumps(sort_keys=True) prevents flapping from dict iteration order.
+    """
+    severity_rank = _SEVERITY_RANK.get(issue.severity, 9)
+    sorted_task_ids = tuple(sorted(issue.task_ids))
+    canonical_evidence = json.dumps(
+        issue.evidence, sort_keys=True, ensure_ascii=False,
+    )
+    return (severity_rank, issue.code, sorted_task_ids, canonical_evidence)
+
+
+def _sort_issues(issues: List[ValidationIssue]) -> List[ValidationIssue]:
+    """Return a new list of issues sorted by the deterministic sort key."""
+    return sorted(issues, key=_issue_sort_key)
+
+
 SCHEMA_TYPE_KEY = "type"
 SCHEMA_FORMAT_KEY = "format"
 SCHEMA_PROPERTIES_KEY = "properties"
@@ -107,9 +135,9 @@ def validate(plan: Plan) -> ValidationReport:
 
     return ValidationReport(
         valid=len(errors) == 0,
-        errors=errors,
-        warnings=warnings,
-        hints=hints,
+        errors=_sort_issues(errors),
+        warnings=_sort_issues(warnings),
+        hints=_sort_issues(hints),
     )
 
 
@@ -126,9 +154,9 @@ def validate_with_project(plan: Plan, *, project_root: Path) -> ValidationReport
         hints = [i for i in kept_issues if i.severity == "hint"] + suppressed_hints
         return ValidationReport(
             valid=len(errors) == 0,
-            errors=errors,
-            warnings=warnings,
-            hints=hints,
+            errors=_sort_issues(errors),
+            warnings=_sort_issues(warnings),
+            hints=_sort_issues(hints),
         )
 
     workspace = WorkspaceIndex(project_root)
@@ -144,9 +172,9 @@ def validate_with_project(plan: Plan, *, project_root: Path) -> ValidationReport
     hints = [issue for issue in kept_issues if issue.severity == "hint"] + suppressed_hints
     return ValidationReport(
         valid=len(errors) == 0,
-        errors=errors,
-        warnings=warnings,
-        hints=hints,
+        errors=_sort_issues(errors),
+        warnings=_sort_issues(warnings),
+        hints=_sort_issues(hints),
     )
 
 
