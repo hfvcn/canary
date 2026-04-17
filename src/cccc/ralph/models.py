@@ -246,6 +246,45 @@ class ValidationIssue(BaseModel):
     task_ids: List[str] = Field(default_factory=list)
     evidence: Dict[str, Any] = Field(default_factory=dict)
 
+    # W4 finding metadata — classification fields for downstream consumers
+    confidence: Literal["exact", "best_effort", "opaque"] = "opaque"
+    source: str = ""
+    action_owner: Literal["author", "worker", "shared", "unknown"] = "unknown"
+    worker_relevance: Literal["blocking", "execution_risk", "verification_risk", "none"] = "none"
+
+
+def classify_issue_metadata(issue: "ValidationIssue") -> "ValidationIssue":
+    """Populate W4 finding-metadata fields based on the issue code prefix.
+
+    Classification rules:
+    - E_* / W_* (non-verification) structural rules → author, exact
+    - S_* semantic rules → confidence from evidence if available, else best_effort
+    - W_VERIFICATION_* → shared, verification_risk
+    """
+    code = issue.code
+
+    if code.startswith("W_VERIFICATION_"):
+        issue.action_owner = "shared"
+        issue.confidence = "exact"
+        issue.worker_relevance = "verification_risk"
+        issue.source = "filesystem_validator"
+    elif code.startswith("S_"):
+        # Semantic rules — confidence from provider evidence if available
+        provider_confidence = str(issue.evidence.get("confidence", "")).strip()
+        if provider_confidence in ("exact", "best_effort", "opaque"):
+            issue.confidence = provider_confidence  # type: ignore[assignment]
+        else:
+            issue.confidence = "best_effort"
+        issue.action_owner = "author"
+        issue.source = "semantic_validator"
+    else:
+        # Structural rules (E_*, W_* non-verification)
+        issue.action_owner = "author"
+        issue.confidence = "exact"
+        issue.source = "validator"
+
+    return issue
+
 
 class ValidationReport(BaseModel):
     """Output of ralph validate."""

@@ -24,6 +24,7 @@ from .models import (
     VerificationLevel,
     ValidationIssue,
     ValidationReport,
+    classify_issue_metadata,
 )
 from .workspace_index import WorkspaceIndex
 
@@ -181,6 +182,12 @@ def validate(plan: Plan) -> ValidationReport:
     # Apply suppression before bucketing
     kept_issues, suppressed_hints = _apply_suppression(issues, plan.suppress_codes)
 
+    # W4: classify finding metadata
+    for issue in kept_issues:
+        classify_issue_metadata(issue)
+    for issue in suppressed_hints:
+        classify_issue_metadata(issue)
+
     errors = [i for i in kept_issues if i.severity == "error"]
     warnings = [i for i in kept_issues if i.severity == "warning"]
     hints = [i for i in kept_issues if i.severity == "hint"] + suppressed_hints
@@ -201,6 +208,10 @@ def validate_with_project(plan: Plan, *, project_root: Path) -> ValidationReport
     if fatal_structural & FATAL_STRUCTURAL_CODES:
         # Return a report from the raw structural issues with suppression applied
         kept_issues, suppressed_hints = _apply_suppression(structural_issues, plan.suppress_codes)
+        for issue in kept_issues:
+            classify_issue_metadata(issue)
+        for issue in suppressed_hints:
+            classify_issue_metadata(issue)
         errors = [i for i in kept_issues if i.severity == "error"]
         warnings = [i for i in kept_issues if i.severity == "warning"]
         hints = [i for i in kept_issues if i.severity == "hint"] + suppressed_hints
@@ -218,6 +229,12 @@ def validate_with_project(plan: Plan, *, project_root: Path) -> ValidationReport
 
     # Apply suppression after combining structural + filesystem issues
     kept_issues, suppressed_hints = _apply_suppression(all_issues, plan.suppress_codes)
+
+    # W4: classify finding metadata
+    for issue in kept_issues:
+        classify_issue_metadata(issue)
+    for issue in suppressed_hints:
+        classify_issue_metadata(issue)
 
     errors = [issue for issue in kept_issues if issue.severity == "error"]
     warnings = [issue for issue in kept_issues if issue.severity == "warning"]

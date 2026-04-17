@@ -221,6 +221,57 @@ class TaskEvent(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 
+# ---------------------------------------------------------------------------
+# Validation issue IPC contract (W4 finding metadata)
+# ---------------------------------------------------------------------------
+
+class IpcValidationError(BaseModel):
+    """IPC-layer mirror of ralph.models.ValidationIssue.
+
+    Carries the same finding-metadata fields so downstream consumers
+    (Foreman prompt injection, UI, etc.) can filter and display issues
+    without accessing Ralph internals.
+    """
+    code: str
+    severity: Literal["error", "warning", "hint"]
+    message: str
+    task_ids: List[str] = Field(default_factory=list)
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+
+    # W4 finding metadata
+    confidence: Literal["exact", "best_effort", "opaque"] = "opaque"
+    source: str = ""
+    action_owner: Literal["author", "worker", "shared", "unknown"] = "unknown"
+    worker_relevance: Literal["blocking", "execution_risk", "verification_risk", "none"] = "none"
+
+    model_config = ConfigDict(extra="ignore")
+
+
+# Ledger event kind for plan validation failures
+WORKFLOW_PLAN_VALIDATION_FAILED = "workflow.plan_validation_failed"
+
+# IPC validation codes that are considered fatal (block workflow registration)
+FATAL_IPC_VALIDATION_CODES = frozenset({
+    "E_DEP_CYCLE",
+    "E_DUPLICATE_TASK_ID",
+    "E_SEMANTIC_PROVIDER_UNAVAILABLE",
+})
+
+
+class RalphRegisterResponse(BaseModel):
+    """Response from ralph_register_and_suggest daemon op."""
+    workflow_id: str
+    registered_count: int = 0
+    submitted_count: int = 0
+    ready_task_ids: List[str] = Field(default_factory=list)
+    validation_errors: List[IpcValidationError] = Field(default_factory=list)
+    validation_warnings: List[IpcValidationError] = Field(default_factory=list)
+    validation_hints: List[IpcValidationError] = Field(default_factory=list)
+    plan_validation_failed_event_emitted: bool = False
+
+    model_config = ConfigDict(extra="ignore")
+
+
 # Union type for all Ralph IPC messages
 RalphIPCMessage = (
     ReadyBatchSuggestion

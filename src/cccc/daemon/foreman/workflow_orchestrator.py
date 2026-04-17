@@ -1243,6 +1243,71 @@ class WorkflowOrchestrator:
             self._log(f"[orchestrator] Error registering agent {agent_id} as actor: {e}")
             return False
 
+    @staticmethod
+    def _serialize_validation_issue(issue: "ValidationIssue") -> Dict[str, Any]:
+        """Serialize a ValidationIssue to a dict suitable for IPC transmission.
+
+        Includes the W4 finding-metadata fields (confidence, source,
+        action_owner, worker_relevance) so downstream consumers can
+        filter and display issues.
+        """
+        return {
+            "code": issue.code,
+            "severity": issue.severity,
+            "message": issue.message,
+            "task_ids": list(issue.task_ids),
+            "evidence": dict(issue.evidence),
+            "confidence": issue.confidence,
+            "source": issue.source,
+            "action_owner": issue.action_owner,
+            "worker_relevance": issue.worker_relevance,
+        }
+
+    @staticmethod
+    def _build_issue_digest(issues: "List[Any]") -> str:
+        """Build a compact issue digest for worker prompt injection.
+
+        Filters issues to action_owner in {worker, shared} and selects up to
+        1 blocking + 1 execution_risk + 1 verification_risk entry.  Each entry
+        is a single-line action verb + brief evidence.
+        """
+        filtered = [
+            i for i in issues
+            if getattr(i, "action_owner", "unknown") in ("worker", "shared")
+        ]
+        if not filtered:
+            return ""
+
+        # Bucket by worker_relevance — keep first match per bucket
+        buckets: Dict[str, Any] = {}
+        for relevance in ("blocking", "execution_risk", "verification_risk"):
+            for issue in filtered:
+                if getattr(issue, "worker_relevance", "none") == relevance:
+                    buckets[relevance] = issue
+                    break
+
+        if not buckets:
+            return ""
+
+        lines: List[str] = []
+        for relevance, issue in buckets.items():
+            code = str(getattr(issue, "code", ""))
+            msg = str(getattr(issue, "message", "")).strip()
+            evidence = getattr(issue, "evidence", {})
+            evidence_brief = ""
+            if isinstance(evidence, dict):
+                for key in ("path", "summary", "detail", "message"):
+                    val = str(evidence.get(key, "")).strip()
+                    if val:
+                        evidence_brief = val
+                        break
+            line = f"[{relevance.upper()}] {code}: {msg}"
+            if evidence_brief:
+                line += f" ({evidence_brief})"
+            lines.append(line)
+
+        return "\n".join(lines)
+
     def _build_runtime_adapter_hint(self, runtime: str) -> str:
         runtime_name = str(runtime or "").strip().lower()
         runtime_hints = {
@@ -1258,6 +1323,9 @@ class WorkflowOrchestrator:
         *,
         worker_prompt: str = "",
         runtime: str = "",
+        issues: Optional[List[Any]] = None,
+        recommended_tests: Optional[List[str]] = None,
+        forbidden_flows: Optional[List[Any]] = None,
     ) -> str:
         """Build the task prompt to send to an agent.
 
@@ -1266,6 +1334,15 @@ class WorkflowOrchestrator:
         title, goal, acceptance criteria, verification command, forbidden
         actions) are never truncated.  Lower-priority context is condensed or
         omitted when space is limited.
+
+        Args:
+            issues: Optional list of ValidationIssue objects for this task.
+                Filtered to worker/shared action_owner and injected as
+                "Do-Not-Ignore Issues" mandatory section.
+            recommended_tests: Optional list of test selector strings to inject
+                as "Recommended Tests" mandatory section.
+            forbidden_flows: Optional list of ForbiddenFlow objects to inject
+                as "Forbidden Actions" mandatory section entries.
         """
         sections: List[_PromptSection] = []
 
@@ -1299,29 +1376,42 @@ class WorkflowOrchestrator:
                 mandatory=True,
                 priority=PromptBudget.PRIORITY_MAP.get("verification_command", 30),
             ))
-        # Do-not-ignore issues (placeholder — populated by validator when present)
+        # Do-not-ignore issues — from task attribute or computed from issues list
         do_not_ignore = getattr(task, "do_not_ignore_issues", None)
+        if not do_not_ignore and issues:
+            do_not_ignore = self._build_issue_digest(issues)
         if do_not_ignore:
             sections.append(_PromptSection(
                 name="do_not_ignore_issues",
                 text=f"Do-Not-Ignore Issues:\n{do_not_ignore}",
                 mandatory=True,
             ))
-        # Recommended tests
-        recommended_tests = getattr(task, "recommended_tests", None)
+        # Recommended tests — from parameter or task attribute
+        rec_tests_text = ""
         if recommended_tests:
+            rec_tests_text = "\n".join(recommended_tests)
+        elif getattr(task, "recommended_tests", None):
+            rec_tests_text = str(task.recommended_tests)  # type: ignore[union-attr]
+        if rec_tests_text:
             sections.append(_PromptSection(
                 name="recommended_tests",
-                text=f"Recommended Tests:\n{recommended_tests}",
+                text=f"Recommended Tests:\n{rec_tests_text}",
                 mandatory=True,
                 priority=PromptBudget.PRIORITY_MAP.get("recommended_tests", 40),
             ))
-        # Forbidden actions
-        forbidden_text = (
-            "Assigned by Foreman inside the Ralph workflow.\n"
-            "Execute this task only.\n"
-            "Do not contact the user to renegotiate scope."
-        )
+        # Forbidden actions — base text + project forbidden_flows
+        forbidden_lines = [
+            "Assigned by Foreman inside the Ralph workflow.",
+            "Execute this task only.",
+            "Do not contact the user to renegotiate scope.",
+        ]
+        if forbidden_flows:
+            for flow in forbidden_flows:
+                flow_id = str(getattr(flow, "id", "")).strip()
+                flow_desc = str(getattr(flow, "description", "")).strip()
+                if flow_id:
+                    forbidden_lines.append(f"[FORBIDDEN] {flow_id}: {flow_desc}")
+        forbidden_text = "\n".join(forbidden_lines)
         sections.append(_PromptSection(
             name="forbidden_actions",
             text=forbidden_text,
