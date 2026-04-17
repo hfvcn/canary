@@ -41,7 +41,10 @@ EventKind = Literal[
     "presentation.publish",
     "presentation.clear",
     "workflow.monitor_violation",
+    "workflow.ralph_internal_error",
 ]
+
+KIND_RALPH_INTERNAL_ERROR = "workflow.ralph_internal_error"
 
 
 class GroupCreateData(BaseModel):
@@ -224,6 +227,20 @@ class MonitorViolationData(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class RalphInternalErrorData(BaseModel):
+    """Structured internal failure envelope emitted by the orchestrator."""
+
+    stage: str
+    internal_error_code: str
+    exception_type: str
+    message: str
+    traceback_truncated: Optional[str] = None
+    task_id: str = ""
+    workflow_id: str = ""
+
+    model_config = ConfigDict(extra="allow")
+
+
 class Event(BaseModel):
     v: int = 1
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
@@ -266,6 +283,7 @@ _KIND_TO_MODEL = {
     "presentation.publish": PresentationPublishData,
     "presentation.clear": PresentationClearData,
     "workflow.monitor_violation": MonitorViolationData,
+    KIND_RALPH_INTERNAL_ERROR: RalphInternalErrorData,
 }
 
 
@@ -277,7 +295,10 @@ def normalize_event_data(kind: str, data: Any) -> Dict[str, Any]:
         # Unknown event kind: keep the envelope stable, keep data as a dict.
         return dict(data)
     parsed = model.model_validate(data)
-    payload = parsed.model_dump()
+    if kind == KIND_RALPH_INTERNAL_ERROR:
+        payload = parsed.model_dump(exclude_none=True)
+    else:
+        payload = parsed.model_dump()
     if kind == "group.update":
         patch = payload.get("patch") if isinstance(payload, dict) else None
         if isinstance(patch, dict) and not any(patch.get(k) is not None for k in ("title", "topic")):

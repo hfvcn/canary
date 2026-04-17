@@ -22,6 +22,7 @@ from ...contracts.v1.ralph_ipc import (
     VerificationCheckSpec,
     VerificationResult,
 )
+from ...ralph.agent import build_error_envelope
 
 GLOBAL_WRITE_CLAIM = "/"
 READY_BATCH_ID_HEX_LEN = 12
@@ -239,7 +240,19 @@ class RalphService:
         4. Snapshot rebuild
 
         Returns dict with {accepted: bool, reason: str, ...}
+        Internal exceptions are caught and returned as structured error dicts
+        (never raised through the wire).
         """
+        try:
+            return self._apply_task_event_inner(event)
+        except Exception as exc:
+            return self._ipc_error_response(
+                stage="ipc",
+                exception=exc,
+                task_id=event.task_id,
+            )
+
+    def _apply_task_event_inner(self, event: TaskEvent) -> Dict[str, Any]:
         if event.idempotency_key:
             if event.idempotency_key in self._processed_keys:
                 return {
@@ -251,6 +264,22 @@ class RalphService:
 
         self._task_statuses[event.task_id] = event.event_type
         return {"accepted": True, "event_type": event.event_type, "task_id": event.task_id}
+
+    def _ipc_error_response(
+        self,
+        *,
+        stage: str,
+        exception: Exception,
+        task_id: str = "",
+    ) -> Dict[str, Any]:
+        """Build a structured IPC error response (no traceback leak)."""
+        envelope = build_error_envelope(stage=stage, exception=exception)
+        return {
+            "accepted": False,
+            "reason": "internal_error",
+            "task_id": task_id,
+            "error": envelope,
+        }
 
     def get_snapshot(self) -> Dict[str, Any]:
         """Return workflow snapshot in kind + reason_code + snapshot format.
