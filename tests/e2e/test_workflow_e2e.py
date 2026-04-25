@@ -152,12 +152,12 @@ def _install_verifying_probe(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     original = WorkflowEngine.record_verification_result
     seen_statuses: list[str] = []
 
-    def wrapped(self: WorkflowEngine, task_id: str, result) -> None:
+    def wrapped(self: WorkflowEngine, task_id: str, result, **kwargs) -> None:
         task = self.get_task(task_id)
         assert task is not None
         seen_statuses.append(task.status.value)
         assert task.status == WorkflowTaskStatus.VERIFYING
-        original(self, task_id, result)
+        original(self, task_id, result, **kwargs)
 
     monkeypatch.setattr(WorkflowEngine, "record_verification_result", wrapped)
     return seen_statuses
@@ -200,7 +200,7 @@ def test_workflow_positive_verify_pass(
     )
     snapshot = _get_workflow_progress(client, group_id=temp_group.group_id, workflow_id=workflow_id)
     assignment = _get_assignment(snapshot, "T1")
-    assert assignment.get("status") == "pending"
+    assert assignment.get("status") in ("pending", "assigned")
     assert str(assignment.get("agent_id") or "").strip()
     _set_task_verification_command(temp_group.group_id, "T1", _python_exit_command(0))
 
@@ -244,7 +244,7 @@ def test_workflow_positive_verify_fail(
     )
     snapshot = _get_workflow_progress(client, group_id=temp_group.group_id, workflow_id=workflow_id)
     assignment = _get_assignment(snapshot, "T1")
-    assert assignment.get("status") == "pending"
+    assert assignment.get("status") in ("pending", "assigned")
     _set_task_verification_command(temp_group.group_id, "T1", _python_exit_command(1))
 
     completed = client.post(

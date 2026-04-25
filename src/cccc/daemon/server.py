@@ -831,6 +831,11 @@ def serve_forever(paths: Optional[DaemonPaths] = None) -> int:
 
     def _on_session_exit(session: pty_runner.PtySession) -> None:
         _remove_pty_state_if_pid(session.group_id, session.actor_id, pid=session.pid)
+        try:
+            from .actors.actor_lifecycle_ops import _mark_actor_stopped_on_exit
+            _mark_actor_stopped_on_exit(session.group_id, session.actor_id)
+        except Exception:
+            pass
 
     try:
         pty_runner.SUPERVISOR.set_exit_hook(_on_session_exit)

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import posixpath
 import shlex
 import subprocess
 import time
@@ -27,8 +26,13 @@ from ...contracts.v1.ralph_ipc import (
     VerificationResult,
 )
 from ...ralph.agent import build_error_envelope
-
-GLOBAL_WRITE_CLAIM = "/"
+from ...kernel.claimed_paths import (
+    GLOBAL_WRITE_CLAIM,
+    conflicts_with_any as _conflicts_with_any_fn,
+    normalize_write_set as _normalize_write_set_fn,
+    paths_overlap as _paths_overlap,
+    write_sets_conflict as _write_sets_conflict_fn,
+)
 READY_BATCH_ID_HEX_LEN = 12
 TASK_STATUS_COMPLETED = "completed"
 TASK_STATUS_RUNNING = "running"
@@ -40,6 +44,8 @@ VERIFICATION_COMMAND_TIMEOUT_SECONDS = 60
 SUSPICIOUS_DURATION_THRESHOLD_MS = 50
 _SHELL_OPERATOR_TOKENS = {"&&", "||", "|", ";"}
 _TRIVIAL_VERIFY_COMMANDS = {"true", ":", "echo", "printf"}
+WORKER_SCOPE_WARNING_CODE = "W_WORKER_EXCEEDED_SCOPE"
+MAX_SCOPE_WARNING_FILES = 5
 
 
 def _has_shell_operators(command: str) -> bool:
@@ -93,7 +99,13 @@ def _is_trivial_command(command: str) -> bool:
 
 
 class RalphService:
-    """Observation layer service for workflow scheduling."""
+    """Observation layer service for workflow scheduling.
+
+    Three roles:
+    1. CLI static validation (``ralph validate``)
+    2. Daemon-internal verify gate (``verify_completion``)
+    3. Future: optional Agent review (RA-1)
+    """
 
     def __init__(
         self,
@@ -105,7 +117,9 @@ class RalphService:
         self.group_id = group_id
         self.workflow_engine = workflow_engine
         self._task_refs: Dict[str, TaskRef] = {}
-        self._task_statuses: Dict[str, str] = {}
+        # RO-26: _task_statuses removed — use engine as single truth source.
+        # Legacy callers of apply_task_event / get_snapshot still work via
+        # engine delegation (see _get_task_status_from_engine).
         self._processed_keys: set[str] = set()
         self._semantic_gate_cache: Dict[tuple, str] = {}
 
@@ -145,10 +159,6 @@ class RalphService:
         except Exception:
             return None
         return worktree_path if result.returncode == 0 else None
-
-    def merge_worktree(self, worktree_path: Path, target_branch: str = "main") -> bool:
-        """Merge a completed worktree back to the target branch."""
-        return False
 
     def cleanup_worktree(self, worktree_path: Path) -> bool:
         """Remove a git worktree."""
@@ -267,7 +277,9 @@ class RalphService:
                 }
             self._processed_keys.add(event.idempotency_key)
 
-        self._task_statuses[event.task_id] = event.event_type
+        # RO-26: no longer writing to _task_statuses — engine is the truth source.
+        # The event is accepted; the orchestrator's apply_task_event drives engine
+        # state transitions.
         return {"accepted": True, "event_type": event.event_type, "task_id": event.task_id}
 
     def _ipc_error_response(
@@ -289,17 +301,12 @@ class RalphService:
     def get_snapshot(self) -> Dict[str, Any]:
         """Return workflow snapshot in kind + reason_code + snapshot format.
 
-        Uses local ``_task_statuses`` (maintained by :meth:`apply_task_event`)
-        to derive real task counts.  For full orchestrator-level progress
-        (batches, duration, assignments) use ``orchestrator.get_workflow_state()``
-        via the ``ralph_workflow_progress`` IPC op instead.
+        RO-26: derives counts from the workflow engine (single truth source).
+        For full orchestrator-level progress (batches, duration, assignments)
+        use ``orchestrator.get_workflow_state()`` via the
+        ``ralph_workflow_progress`` IPC op instead.
         """
-        running_statuses = {TASK_STATUS_RUNNING, "started", "heartbeat"}
-        total = len(self._task_statuses)
-        completed = sum(1 for s in self._task_statuses.values() if s == TASK_STATUS_COMPLETED)
-        running = sum(1 for s in self._task_statuses.values() if s in running_statuses)
-        failed = sum(1 for s in self._task_statuses.values() if s == "failed")
-        pending = total - completed - running - failed
+        total, completed, running, failed, pending = self._compute_task_counts()
 
         kind = "idle" if total == 0 else "active"
 
@@ -322,6 +329,31 @@ class RalphService:
             "workflow_id": "",
             "active": total > 0,
         }
+
+    def _compute_task_counts(self) -> tuple[int, int, int, int, int]:
+        """Compute task status counts from the workflow engine (RO-26).
+
+        Returns (total, completed, running, failed, pending).
+        """
+        engine = self.workflow_engine
+        if engine is not None and hasattr(engine, "list_tasks"):
+            tasks = engine.list_tasks()
+            if tasks:
+                total = len(tasks)
+                completed = sum(1 for t in tasks if t.status.value == TASK_STATUS_COMPLETED)
+                running = sum(1 for t in tasks if t.status.value == TASK_STATUS_RUNNING)
+                failed = sum(1 for t in tasks if t.status.value == "failed")
+                pending = total - completed - running - failed
+                return total, completed, running, failed, pending
+
+        statuses = self._build_task_status_index()
+        running_statuses = {TASK_STATUS_RUNNING, "started", "heartbeat"}
+        total = len(statuses)
+        completed = sum(1 for s in statuses.values() if s == TASK_STATUS_COMPLETED)
+        running = sum(1 for s in statuses.values() if s in running_statuses)
+        failed = sum(1 for s in statuses.values() if s == "failed")
+        pending = total - completed - running - failed
+        return total, completed, running, failed, pending
 
     def check_dependencies(self, task_id: str) -> Dict[str, Any]:
         """Check if a task's prerequisites are satisfied."""
@@ -420,14 +452,6 @@ class RalphService:
                 )
         return results
 
-    def analyze_import_graph(self, file_path: str) -> List[str]:
-        """Analyze imports for a file and return impacted modules."""
-        return []
-
-    def detect_test_impact(self, changed_files: List[str]) -> List[str]:
-        """Detect tests that may be affected by a change set."""
-        return []
-
     def verify_completion(
         self,
         task_id: str,
@@ -437,8 +461,6 @@ class RalphService:
         task_ref: Optional[TaskRef] = None,
     ) -> VerificationResult:
         """Run task verification and return a structured verification result."""
-        del changed_files
-
         resolved_task = task_ref or self._find_task_ref(task_id)
         if resolved_task is None:
             return VerificationResult(
@@ -447,9 +469,24 @@ class RalphService:
                 task_id=task_id,
                 overall_outcome="failed",
                 checks=[],
+                warnings=[],
                 summary=f"verification failed: task '{task_id}' not found",
             )
 
+        # RA-3: route by verification_mode
+        mode = getattr(resolved_task, "verification_mode", "ralph") or "ralph"
+        if mode == "agent":
+            return VerificationResult(
+                verification_id=f"ver-{uuid.uuid4().hex[:READY_BATCH_ID_HEX_LEN]}",
+                workflow_id=workflow_id,
+                task_id=task_id,
+                overall_outcome="agent_pending",
+                checks=[],
+                warnings=[],
+                summary="Agent verification requested. Awaiting Ralph Agent review.",
+            )
+
+        warnings = self._build_scope_warnings(changed_files, resolved_task)
         specs = self._resolve_verification_specs(resolved_task)
         if not specs:
             return VerificationResult(
@@ -458,6 +495,7 @@ class RalphService:
                 task_id=task_id,
                 overall_outcome="skipped",
                 checks=[],
+                warnings=warnings,
                 summary="verification skipped: no command configured",
             )
 
@@ -469,8 +507,28 @@ class RalphService:
             task_id=task_id,
             overall_outcome=overall_outcome,
             checks=checks,
+            warnings=warnings,
             summary=summary,
         )
+
+    def _build_scope_warnings(
+        self,
+        changed_files: List[str],
+        task_ref: TaskRef,
+    ) -> List[str]:
+        claimed = getattr(task_ref, "claimed_paths", []) or []
+        exceeded = [
+            path
+            for path in changed_files
+            if not any(_paths_overlap(path, claimed_path) for claimed_path in claimed)
+        ]
+        if not exceeded:
+            return []
+        sample = ", ".join(sorted(exceeded)[:MAX_SCOPE_WARNING_FILES])
+        return [
+            f"{WORKER_SCOPE_WARNING_CODE}: modified {len(exceeded)} file(s) "
+            f"outside claimed_paths: {sample}"
+        ]
 
     def _resolve_verification_specs(
         self,
@@ -637,18 +695,16 @@ class RalphService:
         return get_orchestrator(self.group_id)
 
     def _build_task_status_index(self) -> Dict[str, str]:
-        statuses = dict(self._task_statuses)
-        orchestrator = self._get_cached_orchestrator()
-        if orchestrator is None:
-            return statuses
+        """Build a task-id → status index.
 
-        for workflow in getattr(orchestrator, "_active_workflows", {}).values():
-            for task_data in workflow.get("tasks", {}).values():
-                task_id = str(task_data.get("task_id") or "")
-                status = str(task_data.get("status") or "").strip()
-                if task_id and status:
-                    statuses[task_id] = status
-        return statuses
+        RO-26: engine state is the only task-status truth source.
+        """
+        engine = self.workflow_engine
+        if engine is not None and hasattr(engine, "list_tasks"):
+            tasks = engine.list_tasks()
+            if tasks:
+                return {t.task.id: t.status.value for t in tasks}
+        return {}
 
     def _is_task_completed(self, task_id: str) -> bool:
         """Check if a task is completed."""
@@ -682,22 +738,7 @@ class RalphService:
         return running_sets
 
     def _normalize_write_set(self, paths: List[str]) -> List[str]:
-        normalized: List[str] = []
-        for path in paths or [GLOBAL_WRITE_CLAIM]:
-            clean_path = self._normalize_claimed_path(path)
-            if clean_path not in normalized:
-                normalized.append(clean_path)
-        return normalized or [GLOBAL_WRITE_CLAIM]
-
-    def _normalize_claimed_path(self, path: str) -> str:
-        raw_path = str(path or "").strip().replace("\\", "/")
-        if not raw_path or raw_path == ".":
-            return GLOBAL_WRITE_CLAIM
-
-        normalized = posixpath.normpath(raw_path)
-        if normalized in ("", "."):
-            return GLOBAL_WRITE_CLAIM
-        return normalized.removeprefix("./")
+        return _normalize_write_set_fn(paths)
 
     def _auto_sync_plan_state(self, plan_path: str, registered_digest: str) -> None:
         """Defense-in-depth advisory: log a warning when the disk plan digest
@@ -801,17 +842,7 @@ class RalphService:
         candidate_write_set: List[str],
         existing_write_sets: List[List[str]],
     ) -> bool:
-        return any(
-            self._write_sets_conflict(candidate_write_set, existing_write_set)
-            for existing_write_set in existing_write_sets
-        )
+        return _conflicts_with_any_fn(candidate_write_set, existing_write_sets)
 
     def _write_sets_conflict(self, left: List[str], right: List[str]) -> bool:
-        return any(self._paths_overlap(a_path, b_path) for a_path in left for b_path in right)
-
-    def _paths_overlap(self, left: str, right: str) -> bool:
-        if left == GLOBAL_WRITE_CLAIM or right == GLOBAL_WRITE_CLAIM:
-            return True
-        if left == right:
-            return True
-        return left.startswith(f"{right}/") or right.startswith(f"{left}/")
+        return _write_sets_conflict_fn(left, right)

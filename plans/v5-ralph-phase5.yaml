@@ -1,0 +1,1020 @@
+# Plan: v5-ralph-phase5 — 问题清单 v5 全部未解决项
+# Source: todo/问题清单-v5-ralph.md (RVE-1~9, RA-1~4, RAC-1~2)
+# Date: 2026-04-17
+# Scope: 9 pure static rules (RVE-*), 4 Agent infrastructure items (RA-*),
+#         2 Agent coverage candidates (RAC-*), plus integration test
+# Blueprint: todo/工作流蓝图.md v0.3
+
+# Suppress pre-existing critical flow errors — this plan only modifies Ralph internals,
+# not the daemon startup or CLI workflow entrypoints.
+suppress_codes:
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+
+tasks:
+  # ═══════════════════════════════════════════════════════════════════════
+  # P1 — HIGH PRIORITY
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── T1: RVE-7 — W_INTEGRATION_TASK_SHALLOW_VERIFICATION ──────────────
+  - id: T1
+    title: "RVE-7: Warn when integration tasks have only grep/compile checks"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+      - tests/ralph/test_rve7_shallow_verification.py
+    awareness_paths:
+      - src/cccc/ralph/models.py
+    depends_on: []
+    addresses: ["RVE-7"]
+    goal_behavior: >
+      Add _check_integration_shallow_verification() to validator.py.
+      Called from _collect_structural_issues().
+
+      For each task where role == "integration" or role == "verification",
+      inspect verification.checks[]. A check is "shallow" if its command
+      matches only grep/rg/ag patterns, python -c with only import/hasattr,
+      or py_compile. If ALL checks are shallow and verification.level
+      is "integration" or "e2e", emit W_INTEGRATION_TASK_SHALLOW_VERIFICATION:
+      "task '{id}' has role={role} but all verification checks are shallow
+      (grep/compile only) — consider adding behavioral checks that verify
+      actual output or state changes".
+
+      Detection heuristics for "shallow" commands:
+      - Starts with grep/rg/ag/egrep/fgrep
+      - Is `python -m py_compile`
+      - Is `python -c` where the payload only contains import/hasattr/isinstance
+        (no assert on return values, no function calls with arguments)
+      - Starts with `test -f` or `[ -f`
+
+      Do NOT flag tasks where:
+      - role == "leaf" (leaf tasks may legitimately have simple checks)
+      - verification.checks is empty (already caught by W_VERIFICATION_NO_CHECKS)
+      - At least one check is non-shallow (behavioral)
+    acceptance_criteria: >
+      1. Plan with integration task having only `grep -q "def foo"` checks
+         triggers W_INTEGRATION_TASK_SHALLOW_VERIFICATION.
+      2. Same plan with one additional `pytest` check does NOT trigger.
+      3. Leaf task with only grep checks does NOT trigger.
+      4. Integration task with `python -c "import X; assert X.func(1)==2"` is
+         NOT flagged (has behavioral assertion).
+      5. Integration task with `python -c "import X"` IS flagged (import-only).
+    failure_path: >
+      If heuristic produces too many false positives, narrow the shallow
+      detection to only exact-match patterns (grep/py_compile) and skip
+      the python -c analysis.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_rve7_shallow_verification.py -q"
+      checks:
+        - name: shallow_grep_flagged
+          command: "pytest tests/ralph/test_rve7_shallow_verification.py -q -k test_integration_grep_only_flagged"
+          required: true
+        - name: behavioral_check_not_flagged
+          command: "pytest tests/ralph/test_rve7_shallow_verification.py -q -k test_integration_with_behavioral_not_flagged"
+          required: true
+        - name: leaf_not_flagged
+          command: "pytest tests/ralph/test_rve7_shallow_verification.py -q -k test_leaf_shallow_not_flagged"
+          required: true
+      covers:
+        tasks: ["T1"]
+        paths: ["src/cccc/ralph/validator.py"]
+    provides:
+      - name: shallow_verification_detection
+        kind: runtime_capability
+        schema_hint: "W_INTEGRATION_TASK_SHALLOW_VERIFICATION rule"
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # P2 — MEDIUM PRIORITY
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── T2: RVE-1 — E_VERIFICATION_TARGET_MISSING_FILE ───────────────────
+  - id: T2
+    title: "RVE-1: Check verification.command file path tokens exist on disk"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/cccc/ralph/filesystem_validator.py
+      - tests/ralph/test_rve1_missing_file.py
+    awareness_paths:
+      - src/cccc/ralph/workspace_index.py
+    depends_on: []
+    addresses: ["RVE-1"]
+    goal_behavior: >
+      In filesystem_validator.py, add a new check within validate_filesystem()
+      (or as a helper called from it).
+
+      For each task's verification.command and each verification.checks[].command:
+      1. Extract file path tokens using regex:
+         `(?:tests|scripts|src|bin|tools)(?:/[\w.\-]+)+\.py`
+      2. For each extracted token, check (project_root / token).exists()
+         via workspace.path_exists(token).
+      3. If the file does not exist, emit E_VERIFICATION_TARGET_MISSING_FILE
+         (error level): "task '{id}' verification references '{token}' but
+         the file does not exist in the project".
+
+      This is distinct from the existing W_VERIFICATION_TARGET_MISSING which
+      only checks if a task's own claimed_paths are verified. This new rule
+      checks literal file paths in command strings against the filesystem.
+
+      Edge cases:
+      - Paths inside quoted strings in python -c payloads should be extracted
+      - Paths with glob wildcards (*.py) should be skipped (not literal)
+      - pytest -k "expression" arguments are not file paths, skip them
+    acceptance_criteria: >
+      1. Command referencing `tests/cli/test_nonexistent.py` triggers
+         E_VERIFICATION_TARGET_MISSING_FILE.
+      2. Command referencing an existing test file does NOT trigger.
+      3. Glob patterns like `tests/*.py` are NOT flagged.
+      4. pytest -k "test_name" is NOT treated as a file path.
+      5. Paths in checks[].command are also validated, not just top-level command.
+    failure_path: >
+      If regex produces false positives on complex shell commands, restrict
+      extraction to the first token after pytest/python that looks like a path.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_rve1_missing_file.py -q"
+      checks:
+        - name: missing_file_detected
+          command: "pytest tests/ralph/test_rve1_missing_file.py -q -k test_missing_file_error"
+          required: true
+        - name: existing_file_ok
+          command: "pytest tests/ralph/test_rve1_missing_file.py -q -k test_existing_file_no_error"
+          required: true
+        - name: glob_not_flagged
+          command: "pytest tests/ralph/test_rve1_missing_file.py -q -k test_glob_pattern_skipped"
+          required: true
+      covers:
+        tasks: ["T2"]
+        paths: ["src/cccc/ralph/filesystem_validator.py"]
+
+  # ── T3: RVE-2 — suppress_flows field support ─────────────────────────
+  - id: T3
+    title: "RVE-2: Add suppress_flows for per-flow suppression of critical flow errors"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/validator.py
+      - tests/ralph/test_rve2_suppress_flows.py
+    awareness_paths:
+      - src/cccc/ralph/plan_io.py
+    depends_on: []
+    addresses: ["RVE-2"]
+    goal_behavior: >
+      1. In models.py Plan class, add field:
+         suppress_flows: List[str] = Field(default_factory=list)
+         This lists flow IDs whose E_CRITICAL_FLOW_UNCOVERED and
+         E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED errors should be suppressed.
+
+      2. In validator.py _check_critical_coverage(): before emitting
+         E_CRITICAL_FLOW_UNCOVERED for a flow, check if flow.id is in
+         plan.suppress_flows. If so, skip (or demote to hint with
+         "[suppress_flows] " prefix).
+
+      3. Same for _check_critical_flow_entrypoint_ownership() or wherever
+         E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED is emitted for a specific flow.
+
+      4. Validation: if suppress_flows contains an id that doesn't match
+         any critical_flow (including repo defaults), emit
+         W_SUPPRESS_FLOWS_UNKNOWN: "suppress_flows references unknown
+         flow '{id}'".
+
+      This allows plan authors to suppress irrelevant flows (e.g.
+      daemon_startup when the plan only touches Ralph internals) while
+      keeping detection active for the plan's own flows.
+    acceptance_criteria: >
+      1. Plan with suppress_flows: [daemon_startup] does NOT get
+         E_CRITICAL_FLOW_UNCOVERED for daemon_startup.
+      2. Same plan still gets E_CRITICAL_FLOW_UNCOVERED for other
+         uncovered flows (e.g. cli_workflow if not suppressed).
+      3. Plan's own declared flows are NOT affected by suppress_flows
+         unless explicitly listed.
+      4. Unknown flow ID in suppress_flows triggers W_SUPPRESS_FLOWS_UNKNOWN.
+      5. Empty suppress_flows has no effect (backward compatible).
+      6. Existing suppress_codes behavior unchanged.
+    failure_path: >
+      If the interaction between suppress_flows and suppress_codes is
+      confusing, document precedence: suppress_codes takes effect first
+      (global), suppress_flows is per-flow refinement.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_rve2_suppress_flows.py -q"
+      checks:
+        - name: flow_suppressed
+          command: "pytest tests/ralph/test_rve2_suppress_flows.py -q -k test_suppress_specific_flow"
+          required: true
+        - name: other_flows_active
+          command: "pytest tests/ralph/test_rve2_suppress_flows.py -q -k test_unsuppressed_flow_still_reported"
+          required: true
+        - name: unknown_flow_warning
+          command: "pytest tests/ralph/test_rve2_suppress_flows.py -q -k test_unknown_flow_warning"
+          required: true
+      covers:
+        tasks: ["T3"]
+        paths: ["src/cccc/ralph/models.py", "src/cccc/ralph/validator.py"]
+    provides:
+      - name: suppress_flows_mechanism
+        kind: runtime_capability
+        schema_hint: "Plan.suppress_flows: List[str] — per-flow suppression"
+
+  # ── T4: RVE-4 — W_COVERS_NOT_EXERCISED ──────────────────────────────
+  - id: T4
+    title: "RVE-4: Cross-check covers.tasks with actual check content"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+      - tests/ralph/test_rve4_covers_exercised.py
+    awareness_paths:
+      - src/cccc/ralph/models.py
+    depends_on: []
+    addresses: ["RVE-4"]
+    goal_behavior: >
+      Add _check_covers_exercised() to validator.py, called from
+      _collect_structural_issues().
+
+      For each task T that declares covers.tasks: [T_X, ...]:
+      1. Look up T_X in the plan to get its claimed_paths and provides[].name.
+      2. Scan T's checks[].command and goal_behavior text for references to
+         T_X's claimed_paths (file path substrings) or provides[].name
+         (symbol/artifact name substrings).
+      3. If NONE of T_X's claimed_paths or provides names appear in any of
+         T's checks or goal_behavior, emit W_COVERS_NOT_EXERCISED:
+         "task '{T.id}' declares covers.tasks: ['{T_X}'] but its checks
+         don't reference any of {T_X}'s claimed_paths or provides — the
+         coverage claim may be unfounded".
+
+      String matching: case-sensitive, substring match. For claimed_paths,
+      match the filename portion (e.g. "validator.py" matches
+      "src/cccc/ralph/validator.py"). For provides names, exact substring.
+    acceptance_criteria: >
+      1. T2 covers T1, T2's checks import T1's module name → no warning.
+      2. T2 covers T1, T2's checks don't mention any of T1's files or
+         provides → W_COVERS_NOT_EXERCISED.
+      3. Matching on filename portion works (not just full path).
+      4. Multiple covers.tasks — warning only for the unexercised ones.
+      5. Empty provides on T_X — only check claimed_paths.
+    failure_path: >
+      If substring matching produces false positives (e.g. common filenames
+      like "utils.py"), require at least the last two path segments to match.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_rve4_covers_exercised.py -q"
+      checks:
+        - name: unexercised_flagged
+          command: "pytest tests/ralph/test_rve4_covers_exercised.py -q -k test_covers_no_reference_flagged"
+          required: true
+        - name: exercised_ok
+          command: "pytest tests/ralph/test_rve4_covers_exercised.py -q -k test_covers_with_reference_ok"
+          required: true
+      covers:
+        tasks: ["T4"]
+        paths: ["src/cccc/ralph/validator.py"]
+
+  # ── T5: RVE-8 — W_GOAL_HARDCODED_WITHOUT_AWARENESS ──────────────────
+  - id: T5
+    title: "RVE-8: Detect hardcoded values in goal_behavior without awareness_paths backing"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/cccc/ralph/rules_advisory.py
+      - tests/ralph/test_rve8_hardcoded_awareness.py
+    awareness_paths:
+      - src/cccc/ralph/workspace_index.py
+    depends_on: []
+    addresses: ["RVE-8"]
+    goal_behavior: >
+      Add check_goal_hardcoded_awareness(plan, workspace) to rules_advisory.py.
+      Export it in __all__ and call it from validate_with_project() in
+      validator.py (add the call alongside existing advisory rule calls).
+
+      Detection logic:
+      1. For each task with non-empty awareness_paths, scan goal_behavior for
+         hardcoded patterns:
+         - Hex literals: `0x[0-9A-Fa-f]{2,}`
+         - Byte arrays: `\[0x[0-9A-Fa-f]+(?:\s*,\s*0x[0-9A-Fa-f]+)+\]`
+         - Magic numbers: standalone integers > 255 (not line numbers)
+         - API signatures with specific argument lists: `funcName(arg1, arg2, ...)`
+      2. For each detected hardcoded value, scan the content of files listed
+         in awareness_paths (via workspace) for the same value.
+      3. If the value is NOT found in any awareness_paths file, emit
+         W_GOAL_HARDCODED_WITHOUT_AWARENESS: "task '{id}' goal_behavior
+         contains hardcoded value '{value}' not found in awareness_paths
+         files — consider adding the source file to awareness_paths".
+
+      The workspace_index should provide file content reading. If it doesn't
+      already, use (project_root / path).read_text() with error handling.
+
+      Noise control: skip values that appear in claimed_paths files (the task
+      may be defining them). Only flag when awareness_paths is non-empty
+      (tasks without awareness_paths have a different problem).
+    acceptance_criteria: >
+      1. goal_behavior with `writes [0xAB]`, awareness_paths files don't
+         contain 0xAB → W_GOAL_HARDCODED_WITHOUT_AWARENESS.
+      2. Same but awareness_paths file contains `0xAB` definition → no warning.
+      3. Task with empty awareness_paths → no warning (different issue).
+      4. Hardcoded value appears in claimed_paths file → no warning.
+      5. Simple integers like line numbers (e.g. "line 42") not flagged.
+    failure_path: >
+      If reading awareness_paths files is too slow, limit to first 500 lines
+      of each file. If false positive rate is high, restrict to hex/byte
+      patterns only and skip magic numbers.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_rve8_hardcoded_awareness.py -q"
+      checks:
+        - name: hardcoded_not_in_awareness
+          command: "pytest tests/ralph/test_rve8_hardcoded_awareness.py -q -k test_hex_not_in_awareness_flagged"
+          required: true
+        - name: hardcoded_in_awareness_ok
+          command: "pytest tests/ralph/test_rve8_hardcoded_awareness.py -q -k test_hex_in_awareness_ok"
+          required: true
+      covers:
+        tasks: ["T5"]
+        paths: ["src/cccc/ralph/rules_advisory.py"]
+
+  # ── T6: RVE-9 — W_AWARENESS_COVERAGE_GAP (semantic) ─────────────────
+  - id: T6
+    title: "RVE-9: Detect goal_behavior symbol references outside awareness_paths scope"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/cccc/ralph/semantic_validator.py
+      - tests/ralph/test_rve9_awareness_gap.py
+    awareness_paths:
+      - src/cccc/ralph/semantic_provider.py
+      - src/cccc/ralph/models.py
+    depends_on: []
+    addresses: ["RVE-9"]
+    goal_behavior: >
+      Add awareness coverage check to semantic_validator.py, within
+      validate_semantic() or as a separate function called from it.
+
+      Logic (requires SemanticProvider):
+      1. For each task, extract symbol-like references from goal_behavior:
+         regex for PascalCase names (class names), snake_case with module
+         prefix (e.g. `calc.add`), and explicit function references
+         (e.g. `_sendControlCommand`).
+      2. For each candidate symbol, use provider.find_symbol() or
+         provider.symbol_exists() to locate its definition file.
+      3. Check if the definition file is in the task's claimed_paths ∪
+         awareness_paths.
+      4. If not, emit W_AWARENESS_COVERAGE_GAP: "task '{id}' goal_behavior
+         references '{symbol}' defined in '{file}' which is not in
+         claimed_paths or awareness_paths".
+
+      This only runs when --semantic is active (SemanticProvider available).
+      Findings are severity "warning".
+
+      Noise control:
+      - Skip stdlib/third-party symbols (provider returns None for these)
+      - Skip symbols already flagged by S_SYMBOL_TARGET_MISSING
+      - Skip very common names (< 4 chars) to avoid false matches
+    acceptance_criteria: >
+      1. goal_behavior references `_sendControlCommand`, symbol is in
+         ble_manager.dart not in awareness_paths → W_AWARENESS_COVERAGE_GAP.
+      2. Symbol is in claimed_paths → no warning.
+      3. Symbol is in awareness_paths → no warning.
+      4. Symbol not found by provider (third-party) → no warning.
+      5. Only triggers with --semantic flag.
+    failure_path: >
+      If symbol extraction from natural language text produces too many
+      false positives, restrict to backtick-quoted identifiers only
+      (e.g. `_sendControlCommand`).
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_rve9_awareness_gap.py -q"
+      checks:
+        - name: gap_detected
+          command: "pytest tests/ralph/test_rve9_awareness_gap.py -q -k test_symbol_outside_awareness_flagged"
+          required: true
+        - name: covered_symbol_ok
+          command: "pytest tests/ralph/test_rve9_awareness_gap.py -q -k test_symbol_in_awareness_ok"
+          required: true
+      covers:
+        tasks: ["T6"]
+        paths: ["src/cccc/ralph/semantic_validator.py"]
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # P3 — LOWER PRIORITY
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── T7: RVE-3 — H_VERIFICATION_COMMAND_DEAD ─────────────────────────
+  - id: T7
+    title: "RVE-3: Hint when verification.command is dead weight alongside complete checks"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+      - tests/ralph/test_rve3_dead_command.py
+    depends_on: []
+    addresses: ["RVE-3"]
+    goal_behavior: >
+      Add logic to _collect_structural_issues() in validator.py (or a new
+      helper _check_dead_verification_command()).
+
+      For each task where:
+      (a) verification.command is non-empty AND was skipped (complex shell,
+          detected by presence of W_VERIFICATION_COMPLEX_SHELL_SKIPPED in
+          existing checks — or re-detect: command contains && || ; | pipes)
+      (b) verification.checks is non-empty and has at least one required check
+
+      Emit H_VERIFICATION_COMMAND_DEAD (hint level): "task '{id}' has a
+      complex verification.command that is skipped, but checks[] provides
+      sufficient coverage — consider removing the dead command or moving
+      its logic into a check".
+
+      This is a hint, not a warning — purely advisory for plan hygiene.
+    acceptance_criteria: >
+      1. Task with `command: "cd x && pytest y && grep z"` plus 2 checks →
+         H_VERIFICATION_COMMAND_DEAD.
+      2. Task with simple command plus checks → no hint (command is usable).
+      3. Task with complex command but NO checks → no hint (command is the
+         only verification, already warned by other rules).
+      4. Task with empty command → no hint.
+    failure_path: >
+      If "complex shell" detection overlaps badly with existing
+      W_VERIFICATION_COMPLEX_SHELL_SKIPPED, reuse the same detection
+      logic instead of re-implementing.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_rve3_dead_command.py -q"
+      checks:
+        - name: dead_command_hint
+          command: "pytest tests/ralph/test_rve3_dead_command.py -q -k test_complex_command_with_checks_hints"
+          required: true
+        - name: simple_command_no_hint
+          command: "pytest tests/ralph/test_rve3_dead_command.py -q -k test_simple_command_no_hint"
+          required: true
+      covers:
+        tasks: ["T7"]
+        paths: ["src/cccc/ralph/validator.py"]
+
+  # ── T8: RVE-5 — H_INLINE_ASSERTIONS ─────────────────────────────────
+  - id: T8
+    title: "RVE-5: Hint when checks use python -c with inline assertions"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/cccc/ralph/rules_advisory.py
+      - tests/ralph/test_rve5_inline_assertions.py
+    depends_on: []
+    addresses: ["RVE-5"]
+    goal_behavior: >
+      Add check_inline_assertions(plan) to rules_advisory.py.
+      Export in __all__ and call from validate_with_project() in validator.py.
+
+      For each task's checks[].command, if the command matches pattern:
+      `python\s+-c\s+["'].*assert.*["']` (case-insensitive), emit
+      H_INLINE_ASSERTIONS (hint level): "task '{id}' check '{check.name}'
+      uses inline python -c assertions — consider moving to a test file
+      under tests/ for better visibility to coverage and AST tools".
+
+      Only flag checks that contain `assert` in the python -c payload.
+      Do NOT flag:
+      - python -c with only imports (no assert)
+      - pytest commands
+      - shell assert (bash `test` / `[`)
+    acceptance_criteria: >
+      1. Check with `python -c "import calc; assert calc.add(2,3)==5"` →
+         H_INLINE_ASSERTIONS.
+      2. Check with `python -c "import calc"` → no hint.
+      3. Check with `pytest tests/test_calc.py` → no hint.
+      4. Multiple checks in one task, only the assert ones flagged.
+    failure_path: >
+      If regex matching is unreliable with nested quotes, use shlex.split()
+      to extract the -c payload first, then check for assert.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_rve5_inline_assertions.py -q"
+      checks:
+        - name: inline_assert_flagged
+          command: "pytest tests/ralph/test_rve5_inline_assertions.py -q -k test_python_c_assert_flagged"
+          required: true
+        - name: import_only_ok
+          command: "pytest tests/ralph/test_rve5_inline_assertions.py -q -k test_python_c_import_only_ok"
+          required: true
+      covers:
+        tasks: ["T8"]
+        paths: ["src/cccc/ralph/rules_advisory.py"]
+
+  # ── T9: RVE-6 — semantic mode recommendation ────────────────────────
+  - id: T9
+    title: "RVE-6: Show unchecked symbol count when --semantic is not used"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/cli.py
+      - tests/ralph/test_rve6_semantic_recommendation.py
+    awareness_paths:
+      - src/cccc/ralph/models.py
+    depends_on: []
+    addresses: ["RVE-6"]
+    goal_behavior: >
+      Enhance the validate output when --semantic is NOT active but the
+      plan has tasks with provides[] or goal_behavior containing symbol
+      references.
+
+      1. In validator.py validate_with_project(): when semantic_provider
+         is None, count tasks that have provides[] with kind != "artifact"
+         or goal_behavior containing backtick-quoted identifiers.
+      2. If count > 0, add a hint H_SEMANTIC_UNCHECKED_SYMBOLS:
+         "{count} tasks reference {symbol_count} symbols in goal_behavior
+         or provides that were not semantically verified — run with
+         --semantic to check symbol existence and references".
+      3. In cli.py validate command output: show this hint prominently
+         in the summary section (after errors/warnings count).
+
+      This replaces the generic "run with --semantic" tip with specific,
+      actionable information about what was missed.
+    acceptance_criteria: >
+      1. Plan with provides[kind=runtime_capability] task, no --semantic →
+         H_SEMANTIC_UNCHECKED_SYMBOLS with correct count.
+      2. Plan with no provides and no symbol refs → no hint.
+      3. With --semantic → hint not emitted (symbols are being checked).
+      4. Hint message includes specific task and symbol counts.
+    failure_path: >
+      If symbol extraction from goal_behavior is unreliable, fall back
+      to only counting tasks with provides[] entries.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_rve6_semantic_recommendation.py -q"
+      checks:
+        - name: unchecked_hint_shown
+          command: "pytest tests/ralph/test_rve6_semantic_recommendation.py -q -k test_no_semantic_shows_hint"
+          required: true
+        - name: with_semantic_no_hint
+          command: "pytest tests/ralph/test_rve6_semantic_recommendation.py -q -k test_with_semantic_no_hint"
+          required: true
+      covers:
+        tasks: ["T9"]
+        paths: ["src/cccc/ralph/validator.py", "src/cccc/ralph/cli.py"]
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # P5 — BLUEPRINT AGENT INFRASTRUCTURE
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── T10: RA-2 — Beyond-scope checklist mechanism ────────────────────
+  - id: T10
+    title: "RA-2: Static beyond-scope checklist with beyond_scope flag in validate output"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/cli.py
+      - .cccc/beyond_scope.yaml
+      - tests/ralph/test_ra2_beyond_scope.py
+    depends_on: ["T3"]
+    addresses: ["RA-2"]
+    goal_behavior: >
+      [Codex F4 adopted: add cli.py to claimed_paths — goal requires
+       modifying validate CLI output for beyond_scope display]
+
+      1. Create .cccc/beyond_scope.yaml — a static configuration file listing
+         known Ralph limitations that can be covered by an Agent. Initial
+         content derived from 问题清单-v5-ralph.md §二 "🤖 Agent 可覆盖" items.
+         Use explicit mapping schema with matches.issue_codes for stable
+         runtime hit surface (Codex structural finding adopted):
+
+         ```yaml
+         beyond_scope_items:
+           - id: RV-15
+             description: "Ralph new rule bugs cannot self-check"
+             category: structural_limit
+             matches:
+               issue_codes: []
+           - id: RV-18
+             description: "goal_behavior function name existence"
+             category: semantic_gap
+             matches:
+               issue_codes: ["S_SYMBOL_TARGET_MISSING"]
+           - id: RO-10n
+             description: "Verification command semantic validity"
+             category: runtime_semantic
+             matches:
+               issue_codes: ["W_VERIFICATION_BEHAVIOR_MISMATCH"]
+           # ... all items marked 🤖 in §二
+         ```
+
+      2. In models.py, add `beyond_scope: bool = False` field to
+         ValidationIssue. This marks issues that fall into known
+         beyond-scope categories.
+
+      3. In validator.py validate_with_project(): after collecting all
+         issues, load .cccc/beyond_scope.yaml (if exists). For issues
+         whose code matches a beyond_scope_item pattern (configurable
+         mapping from issue codes to beyond_scope item IDs), set
+         beyond_scope=True on the issue.
+
+      4. In CLI output (cli.py validate): for issues with beyond_scope=True,
+         append " [beyond scope — agent review recommended]" to the message.
+    acceptance_criteria: >
+      1. .cccc/beyond_scope.yaml loads without error.
+      2. validate output marks matching issues with beyond_scope=True.
+      3. Missing .cccc/beyond_scope.yaml is not an error (empty list).
+      4. JSON output includes beyond_scope field.
+      5. beyond_scope items appear in validate summary count.
+    failure_path: >
+      If the mapping from issue codes to beyond_scope IDs is too rigid,
+      use a pattern-based approach (e.g. "any W_* with 'semantic' in
+      the code name").
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ra2_beyond_scope.py -q"
+      checks:
+        - name: beyond_scope_loaded
+          command: "pytest tests/ralph/test_ra2_beyond_scope.py -q -k test_config_loads"
+          required: true
+        - name: issue_marked
+          command: "pytest tests/ralph/test_ra2_beyond_scope.py -q -k test_issue_marked_beyond_scope"
+          required: true
+        - name: missing_config_ok
+          command: "pytest tests/ralph/test_ra2_beyond_scope.py -q -k test_missing_config_no_error"
+          required: true
+      covers:
+        tasks: ["T10"]
+        paths:
+          - src/cccc/ralph/models.py
+          - src/cccc/ralph/validator.py
+          - .cccc/beyond_scope.yaml
+    provides:
+      - name: beyond_scope_checklist
+        kind: runtime_capability
+        schema_hint: "beyond_scope.yaml config + ValidationIssue.beyond_scope flag"
+
+  # ── T11: RA-3 — verification_mode field ─────────────────────────────
+  - id: T11
+    title: "RA-3: Add verification_mode field to TaskSpec with agent_pending outcome"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/cli.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - tests/ralph/test_ra3_verification_mode.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+    depends_on: ["T3"]
+    addresses: ["RA-3"]
+    goal_behavior: >
+      [Codex F1+F2 adopted: (1) claim IPC contract file since BatchResult
+       and VerificationOutcome need updating; (2) do NOT return "skipped" for
+       agent mode — add "agent_pending" as a real outcome that complete can accept]
+
+      1. In models.py TaskSpec, add:
+         verification_mode: Literal["ralph", "agent"] = "ralph"
+         Default is "ralph" for backward compatibility.
+
+      2. In contracts/v1/ralph_ipc.py VerificationOutcome, add:
+         "agent_pending" as a valid outcome value.
+
+      3. In core.py verify(): when task.verification_mode == "agent",
+         return outcome="agent_pending" (NOT "skipped"). This is a valid
+         completion state meaning "awaiting external agent verification".
+
+      4. In core.py/cli.py complete path: accept "agent_pending" as a
+         completable outcome (alongside "passed"). The task can be marked
+         complete with a note that agent verification is pending.
+
+      5. In core.py suggest(): include verification_mode per task in
+         BatchResult metadata. Add task_metadata dict to BatchResult:
+         {task_id: {"verification_mode": "ralph"|"agent"}}.
+
+      6. In contracts/v1/ralph_ipc.py: add verification_mode to TaskRef
+         so it propagates through IPC to Foreman.
+
+      7. Plan loading: verification_mode is optional, defaults to "ralph".
+         Unknown values fail validation with clear error.
+    acceptance_criteria: >
+      1. Plan with verification_mode: ralph works exactly as before.
+      2. Plan with verification_mode: agent returns agent_pending from verify().
+      3. agent_pending outcome allows complete to succeed.
+      4. Plan without verification_mode defaults to "ralph".
+      5. Invalid verification_mode value fails plan loading with error.
+      6. suggest() output includes verification_mode per task.
+      7. TaskRef includes verification_mode for IPC transmission.
+      8. Existing tests pass unchanged.
+    failure_path: >
+      If agent_pending creates ambiguity in downstream consumers, add a
+      separate agent_verified outcome for when agent review completes.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ra3_verification_mode.py -q"
+      checks:
+        - name: ralph_mode_unchanged
+          command: "pytest tests/ralph/test_ra3_verification_mode.py -q -k test_ralph_mode_default"
+          required: true
+        - name: agent_pending_outcome
+          command: "pytest tests/ralph/test_ra3_verification_mode.py -q -k test_agent_mode_returns_agent_pending"
+          required: true
+        - name: agent_pending_completable
+          command: "pytest tests/ralph/test_ra3_verification_mode.py -q -k test_agent_pending_allows_complete"
+          required: true
+        - name: suggest_includes_mode
+          command: "pytest tests/ralph/test_ra3_verification_mode.py -q -k test_suggest_includes_mode"
+          required: true
+        - name: taskref_has_mode
+          command: "pytest tests/ralph/test_ra3_verification_mode.py -q -k test_taskref_includes_verification_mode"
+          required: true
+      covers:
+        tasks: ["T11"]
+        paths:
+          - src/cccc/ralph/models.py
+          - src/cccc/ralph/core.py
+          - src/cccc/contracts/v1/ralph_ipc.py
+    provides:
+      - name: verification_mode_routing
+        kind: runtime_capability
+        schema_hint: "TaskSpec.verification_mode: ralph|agent + agent_pending outcome"
+
+  # ── T12: RA-1 — Ralph Agent layer ──────────────────────────────────
+  - id: T12
+    title: "RA-1: Ralph Agent layer — beyond-scope semantic review via LLM"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/cccc/ralph/agent.py
+      - src/cccc/ralph/cli.py
+      - tests/ralph/test_ra1_agent.py
+    awareness_paths:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/models.py
+      - .cccc/beyond_scope.yaml
+    depends_on: ["T10"]
+    addresses: ["RA-1"]
+    goal_behavior: >
+      Create src/cccc/ralph/agent.py — the Ralph Agent module.
+
+      Architecture:
+      1. RalphAgent class with:
+         - __init__(workflow_id, plan, beyond_scope_items, api_key=None)
+         - review(issues: List[ValidationIssue]) -> List[AgentFinding]
+         - Each AgentFinding has: issue_ref, assessment, confidence, advisory_only=True
+
+      2. The agent:
+         - Receives only beyond_scope=True issues from validate output
+         - For each issue, constructs a prompt with:
+           * The issue description and code
+           * The relevant task's goal_behavior and acceptance_criteria
+           * The plan's overall context (title, scope)
+         - Does NOT read source code (only plan text + Ralph output)
+         - Calls an LLM API (configurable: Gemini Flash, Claude Haiku, etc.)
+         - Returns findings labeled "advisory only — no decision authority"
+
+      3. Configuration:
+         - API provider/model configurable via .cccc/ralph.yaml:
+           agent.provider: "google" | "anthropic" | "openai"
+           agent.model: "gemini-2.0-flash" (default)
+           agent.api_key_env: "GOOGLE_API_KEY" (env var name)
+         - Disabled with --no-agent CLI flag
+
+      4. CLI integration (cli.py):
+         - `ralph validate` with agent: after structural validation,
+           if beyond_scope issues exist and agent is enabled, run agent
+           review and append findings to output
+         - `ralph validate --no-agent`: skip agent, pure static mode
+         - Agent findings shown in separate section: "Agent Review (advisory)"
+
+      5. Error handling:
+         - API failure → log warning, continue without agent
+         - Timeout (30s per issue) → skip that issue
+         - No API key → warn and skip agent gracefully
+    acceptance_criteria: >
+      1. RalphAgent can be instantiated and review() returns findings.
+      2. --no-agent flag disables agent entirely.
+      3. Missing API key logs warning but doesn't fail validation.
+      4. Agent findings are clearly labeled "advisory only".
+      5. Agent receives only beyond_scope issues, not all issues.
+      6. Existing validate behavior unchanged when agent is disabled.
+    failure_path: >
+      If LLM API integration is too complex for initial implementation,
+      create the agent framework with a mock/stub provider that returns
+      placeholder findings. Real LLM integration can follow.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ra1_agent.py -q"
+      checks:
+        - name: agent_creates
+          command: "pytest tests/ralph/test_ra1_agent.py -q -k test_agent_init"
+          required: true
+        - name: no_agent_flag
+          command: "pytest tests/ralph/test_ra1_agent.py -q -k test_no_agent_skips"
+          required: true
+        - name: missing_key_graceful
+          command: "pytest tests/ralph/test_ra1_agent.py -q -k test_missing_api_key_graceful"
+          required: true
+      covers:
+        tasks: ["T12"]
+        paths: ["src/cccc/ralph/agent.py", "src/cccc/ralph/cli.py"]
+    consumes:
+      - name: beyond_scope_checklist
+        kind: runtime_capability
+        from: T10
+    provides:
+      - name: ralph_agent_layer
+        kind: runtime_capability
+        schema_hint: "RalphAgent class with review() → List[AgentFinding]"
+
+  # ── T13: RA-4 — Two-phase split alignment ──────────────────────────
+  - id: T13
+    title: "RA-4: Align suggest() with two-phase split (task batches + module split)"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/cccc/ralph/core.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - tests/ralph/test_ra4_two_phase.py
+    awareness_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+    depends_on: ["T11", "T12"]
+    addresses: ["RA-4"]
+    goal_behavior: >
+      Align Ralph suggest() output with the two-phase decomposition model
+      from 工作流蓝图.md §4.1:
+
+      Phase 1 (Ralph): suggest() outputs task batches respecting:
+      - _unlock_score() for prioritization
+      - _write_sets_conflict() for parallel safety
+      - _dependency_block_reasons() for dependency ordering
+      - Batch completion triggers re-suggest for next batch
+
+      Phase 2 (Foreman): module-level splitting per task
+      - RalphService exposes suggest_batch() that returns
+        ReadyBatchSuggestion with per-task metadata
+      - Each task includes verification_mode so Foreman knows routing
+      - Batch boundary: wait for all tasks in batch to complete/fail
+        before re-suggesting
+
+      [Codex structural finding adopted: Ralph should output batch grouping
+       metadata, not own the batch ID. The authoritative batch_id stays with
+       orchestrator/engine (ReadyBatchSuggestion.suggestion_id). Ralph adds
+       batch_sequence (monotonic) and batch_boundary as advisory metadata.]
+
+      Changes needed:
+      1. core.py suggest(): add batch_sequence (int, monotonic) and
+         batch_boundary (bool) to BatchResult as advisory metadata.
+         batch_sequence increments each time suggest() is called after
+         completions. batch_boundary=True means "complete this set before
+         re-suggesting". These are advisory — orchestrator may override.
+      2. ralph_service.py: pass batch_sequence and batch_boundary through
+         to ReadyBatchSuggestion alongside existing suggestion_id (which
+         remains the authoritative batch identifier).
+      3. contracts/v1/ralph_ipc.py: add batch_sequence and batch_boundary
+         fields to ReadyBatchSuggestion.
+    acceptance_criteria: >
+      1. suggest() returns batch_sequence in result.
+      2. After completing a batch, re-suggest returns incremented batch_sequence.
+      3. Existing suggest behavior preserved (new fields are additive).
+      4. RalphService passes batch metadata through to suggestions.
+      5. verification_mode included in per-task suggestion data.
+      6. orchestrator's suggestion_id remains the authoritative batch ID.
+    failure_path: >
+      If batch boundary semantics are too restrictive (some tasks could
+      start early), make batch_boundary optional/advisory.
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ra4_two_phase.py -q"
+      checks:
+        - name: batch_id_present
+          command: "pytest tests/ralph/test_ra4_two_phase.py -q -k test_suggest_has_batch_id"
+          required: true
+        - name: batch_increments
+          command: "pytest tests/ralph/test_ra4_two_phase.py -q -k test_batch_id_increments"
+          required: true
+      covers:
+        tasks: ["T13"]
+        paths: ["src/cccc/ralph/core.py", "src/cccc/daemon/foreman/ralph_service.py"]
+    consumes:
+      - name: verification_mode_routing
+        kind: runtime_capability
+        from: T11
+      - name: ralph_agent_layer
+        kind: runtime_capability
+        from: T12
+
+  # ── RAC-1 / RAC-2 DEFERRED ──────────────────────────────────────────
+  # [Codex F3 adopted] RAC-1 and RAC-2 require the Agent to READ source
+  # code and test files to verify CLI entry calls / boundary conditions.
+  # This contradicts RA-1's design principle ("不读代码"). These items
+  # require Agent v2 with explicit code-reading capability and are
+  # deferred to a follow-up plan. See 问题清单-v5-ralph.md RAC-1/RAC-2.
+  # ────────────────────────────────────────────────────────────────────
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # INTEGRATION TEST
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── T-int: Integration — full Ralph regression + new rules ──────────
+  - id: T-int
+    title: "Integration: Full Ralph test suite regression + new rule E2E"
+    role: integration
+    type: backend
+    claimed_paths:
+      - tests/ralph/test_v5_integration.py
+    awareness_paths:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/rules_advisory.py
+      - src/cccc/ralph/filesystem_validator.py
+      - src/cccc/ralph/semantic_validator.py
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/cli.py
+      - src/cccc/ralph/agent.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T4
+      - T5
+      - T6
+      - T7
+      - T8
+      - T9
+      - T10
+      - T11
+      - T12
+      - T13
+    addresses:
+      - RVE-1
+      - RVE-2
+      - RVE-3
+      - RVE-4
+      - RVE-5
+      - RVE-6
+      - RVE-7
+      - RVE-8
+      - RVE-9
+      - RA-1
+      - RA-2
+      - RA-3
+      - RA-4
+    goal_behavior: >
+      Create an integration test that:
+      1. Constructs a sample plan.yaml exercising ALL new rules.
+      2. Runs validate_with_project() on it.
+      3. Asserts each new code appears in the expected bucket (error/warning/hint).
+      4. Runs the full existing test suite to verify no regressions.
+      5. Tests suppress_flows interaction with new rules.
+      6. Tests beyond_scope marking.
+      7. Tests verification_mode routing with agent_pending outcome.
+      8. Tests batch_sequence metadata in suggest output.
+    acceptance_criteria: >
+      1. All existing Ralph tests pass (no regressions).
+      2. Integration test covers all 9 new rule codes.
+      3. Integration test covers suppress_flows.
+      4. Integration test covers beyond_scope flag.
+      5. Integration test covers verification_mode + agent_pending outcome.
+      6. `ralph validate` CLI runs on integration fixture without crash.
+    failure_path: >
+      If any existing test fails, diagnose the regression and fix in the
+      offending task before completing integration.
+    verification:
+      level: integration
+      command: "pytest tests/ralph/ -q"
+      checks:
+        - name: full_suite_pass
+          command: "pytest tests/ralph/ -q --tb=short"
+          required: true
+        - name: new_rules_integration
+          command: "pytest tests/ralph/test_v5_integration.py -q"
+          required: true
+        - name: cli_smoke
+          command: "pytest tests/ralph/test_v5_integration.py -q -k test_cli_validate_smoke"
+          required: true
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10", "T11", "T12", "T13"]
+        paths:
+          - src/cccc/ralph/validator.py
+          - src/cccc/ralph/rules_advisory.py
+          - src/cccc/ralph/filesystem_validator.py
+          - src/cccc/ralph/semantic_validator.py
+          - src/cccc/ralph/models.py
+          - src/cccc/ralph/core.py
+          - src/cccc/ralph/cli.py
+          - src/cccc/ralph/agent.py
+          - src/cccc/contracts/v1/ralph_ipc.py
+state:
+  completed_task_ids:
+    - T-int
+    - T9
+    - T7
+    - T13
+    - T12
+    - T4
+    - T1
+    - T11
+    - T10
+    - T8
+    - T2
+    - T6
+    - T5
+    - T3

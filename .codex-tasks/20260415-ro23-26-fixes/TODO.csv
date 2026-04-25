@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,确认 23-26 现状与修复边界,DONE,"23/24/26 的代码现状和 25 的约束边界已确认","rg -n \"RO-23n|RO-24n|RO-25n|RO-26n\" todo/问题清单-v5-ralph.md && rg -n \"critical_flows|forbidden_flows|unmet dependencies|awareness_paths\" src/cccc/ralph tests/ralph -S",2026-04-15T23:40:00,0,"23/24 未完整修复，26 已有代码与测试，25 仅能显式建模"
+2,实现 schema 与加载 UX 修复,DONE,"critical_flows/forbidden_flows 的错误可显式暴露且测试覆盖","pytest tests/ralph/test_plan_loader_ux.py -q",2026-04-15T23:47:00,0,"9 passed"
+3,补充回归测试并更新问题清单,DONE,"相关测试通过且文档状态更新","pytest tests/ralph/test_ralph_standalone.py -q -k 'shared_readonly_awareness or cli_complete_unmet_deps or cli_complete_already_completed or cli_complete_marks_done'",2026-04-15T23:49:00,0,"3 passed；问题清单移出 23/24/26，并说明 25 的 awareness_paths 建模路径"
+4,运行最终验证,DONE,"目标测试集全部通过","pytest tests/ralph/test_plan_loader_ux.py tests/ralph/test_ralph_standalone.py -q",2026-04-15T23:50:00,0,"161 passed"

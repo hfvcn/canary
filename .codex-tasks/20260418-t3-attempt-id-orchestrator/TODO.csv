@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect orchestrator and ops attempt_id flow,DONE,Target methods and data paths identified,,2026-04-18T00:00:00,0,Located retry_task/process_batch_suggestion/apply_task_event/complete_task
+2,Implement attempt_id generation shadow-state sync and completion passthrough,DONE,Requested code changes are applied,,2026-04-18T00:00:00,0,Orchestrator now generates/caches/clears attempt_id and canonical ops forwards it
+3,Run required pytest target and confirm pass,DONE,Specified pytest command exits 0,python -m pytest tests/test_foreman_workflow.py tests/test_workflow_state.py -q --tb=short,2026-04-18T00:00:00,0,71 passed in 1.17s

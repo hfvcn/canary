@@ -1,0 +1,84 @@
+{
+  "valid": false,
+  "errors": [
+    {
+      "code": "E_COVERS_UNKNOWN_FLOW",
+      "severity": "error",
+      "message": "task 'T1' covers flow 'ghost-flow' which is not declared in critical_flows or forbidden_flows",
+      "task_ids": [
+        "T1"
+      ],
+      "evidence": {
+        "flow_id": "ghost-flow"
+      },
+      "issue_instance_id": "e754f50e82042ffb",
+      "confidence": "exact",
+      "source": "validator",
+      "action_owner": "author",
+      "worker_relevance": "none"
+    }
+  ],
+  "warnings": [
+    {
+      "code": "W_COVERS_PATHS_UNVERIFIED",
+      "severity": "warning",
+      "message": "task 'T1' verification command references 'tests/test_app.py' outside claimed_paths and verification.covers.paths",
+      "task_ids": [
+        "T1"
+      ],
+      "evidence": {
+        "path": "tests/test_app.py",
+        "command_source": "command",
+        "command": "pytest tests/test_app.py -q",
+        "allowed_paths": [
+          "src/app.py"
+        ]
+      },
+      "issue_instance_id": "06fa83a29b4df114",
+      "confidence": "exact",
+      "source": "validator",
+      "action_owner": "author",
+      "worker_relevance": "none"
+    }
+  ],
+  "hints": [
+    {
+      "code": "H_SEMANTIC_COVERAGE_DEGRADED",
+      "severity": "hint",
+      "message": "some analyzers were skipped: advisory_ast: project language 'unknown' not in ['python']; semantic: project language 'unknown' not in ['python']; semantic_serena: project language 'unknown' not in ['python']",
+      "task_ids": [],
+      "evidence": {
+        "active_analyzers": [
+          "structural",
+          "filesystem"
+        ],
+        "skipped_analyzers": [
+          {
+            "name": "advisory_ast",
+            "reason": "project language 'unknown' not in ['python']"
+          },
+          {
+            "name": "semantic",
+            "reason": "project language 'unknown' not in ['python']"
+          },
+          {
+            "name": "semantic_serena",
+            "reason": "project language 'unknown' not in ['python']"
+          }
+        ],
+        "project_language": "unknown"
+      },
+      "issue_instance_id": "079f60c2d3cceedc",
+      "confidence": "exact",
+      "source": "validator",
+      "action_owner": "author",
+      "worker_relevance": "none"
+    }
+  ],
+  "report_schema_version": "1.0.0",
+  "ruleset_digest": "bcce242d64de28d063db52d6a45d87251b142ba9925a87585764dc79b815afcb",
+  "ralph_version": "0.4.7",
+  "metadata": {
+    "project_root": "/Users/vfch/Documents/project/canary/cccc-main-git/.codex-tasks/20260417-ralph-plan-yaml-smoke/fixture/project"
+  }
+}

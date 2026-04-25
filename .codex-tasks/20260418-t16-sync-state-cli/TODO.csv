@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect T16 scope and existing Ralph plan/CLI APIs,DONE,Insertion points and dependent APIs are confirmed,,2026-04-18T00:00:00,0,Read plan task specs and current plan_io/cli structure
+2,Add sync_plan_state to plan_io.py,DONE,sync_plan_state syncs new completed IDs idempotently,,2026-04-18T00:00:00,0,Added ledger scan for verification_passed and verification_skipped and synced new IDs via save_plan_state
+3,Add sync-state CLI parser and dispatch to cli.py,DONE,CLI accepts plan plus --ledger or --group and calls sync_plan_state,,2026-04-18T00:00:00,0,Added parser, dispatch branch, and _cmd_sync_state output handling
+4,Run requested import verification,DONE,Requested python import commands succeed,"python -c \"from cccc.ralph.cli import main; print('OK')\" && python -c \"from cccc.ralph.plan_io import sync_plan_state; print('OK')\"",2026-04-18T00:00:00,0,Both import checks passed; additional temp-file sync-state smoke test updated completed_task_ids

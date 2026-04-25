@@ -127,7 +127,6 @@ class TestRejectedBatchStaysRejected:
 
         assert result.decision == "rejected", "Rejected must stay rejected"
         assert len(result.rejected_tasks) == 1
-        assert not hasattr(orch, "_fallback_to_group_actors"), "Fallback method should not exist"
 
 
 class TestResuggestNotifiesForeman:

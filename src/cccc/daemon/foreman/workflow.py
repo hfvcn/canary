@@ -138,6 +138,7 @@ def assign_tasks(
     *,
     min_score: int = 50,
     prefer_reuse: bool = True,
+    busy_agent_ids: Optional[set] = None,
 ) -> List[TaskAssignment]:
     """Assign tasks to agents.
 
@@ -149,6 +150,7 @@ def assign_tasks(
         pool_manager: The agent pool manager
         min_score: Minimum score for agent reuse
         prefer_reuse: Whether to prefer reusing existing agents
+        busy_agent_ids: Set of agent IDs currently busy (from engine/shadow state)
 
     Returns:
         List of task assignments
@@ -160,6 +162,7 @@ def assign_tasks(
             task,
             min_score=min_score,
             prefer_reuse=prefer_reuse,
+            busy_agent_ids=busy_agent_ids,
         )
         assignments.append(assignment)
 
@@ -250,6 +253,7 @@ class ForemanWorkflow:
         models_registry_path: Optional[Path] = None,
         capabilities_dir: Optional[Path] = None,
         feishu_chat_id: Optional[str] = None,
+        group_loader: Optional[callable] = None,
     ):
         """Initialize the Foreman workflow.
 
@@ -259,6 +263,7 @@ class ForemanWorkflow:
             models_registry_path: Path to models registry
             capabilities_dir: Directory for capability files
             feishu_chat_id: Optional Feishu chat ID for notifications
+            group_loader: Optional callback returning list of enabled peer actor dicts
         """
         self.project_root = project_root
         self.agents_dir = agents_dir or (project_root / DEFAULT_AGENTS_DIR)
@@ -275,6 +280,7 @@ class ForemanWorkflow:
             agents_dir=self.agents_dir,
             models_registry_path=self.models_registry_path,
             capabilities_dir=self.capabilities_dir,
+            group_loader=group_loader,
         )
 
         # Optional Feishu adapter (lazy-loaded)

@@ -6,7 +6,6 @@ No daemon, no engine, no MCP — just pure computation on the plan file data.
 
 from __future__ import annotations
 
-import posixpath
 import subprocess
 import sys
 import time
@@ -23,7 +22,14 @@ from .models import (
     Verification,
 )
 
-GLOBAL_WRITE_CLAIM = "/"
+from cccc.kernel.claimed_paths import (
+    GLOBAL_WRITE_CLAIM,
+    conflicts_with_any as _conflicts_with_any,
+    normalize_path as _normalize_path,
+    normalize_write_set as _normalize_write_set,
+    paths_overlap as _paths_overlap,
+    write_sets_conflict as _write_sets_conflict,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -147,10 +153,22 @@ def suggest(plan: Plan) -> BatchResult:
         batch_claims.append(task_ws)
 
     n = len(ready)
+    ready_set = set(ready)
     return BatchResult(
         ready=ready,
         blocked=blocked,
         rationale=_suggest_rationale(n, len(blocked)),
+        task_metadata={
+            task.id: {"verification_mode": task.verification_mode}
+            for task in plan.tasks
+        },
+        batch_sequence=len(done),
+        batch_boundary=True,
+        task_summaries={
+            tid: task_map[tid].title
+            for tid in ready
+            if tid in task_map and task_map[tid].title
+        },
     )
 
 
@@ -166,6 +184,14 @@ def verify(
 ) -> Dict[str, Any]:
     """Run verification checks for a completed task. Returns structured result."""
     del changed_files
+
+    if task.verification_mode == "agent":
+        return {
+            "task_id": task.id,
+            "outcome": "agent_pending",
+            "reason": "awaiting external agent verification",
+            "checks": [],
+        }
 
     specs, reason = _resolve_verification_specs(task)
     if reason is not None:
@@ -225,48 +251,6 @@ def _resolve_verification_specs(task: TaskSpec) -> tuple[List[Dict[str, Any]], s
             "expected_exit_code": v.expected_exit_code,
         }
     ], None
-
-
-# ---------------------------------------------------------------------------
-# Path overlap / write-set helpers (extracted from ralph_service.py)
-# ---------------------------------------------------------------------------
-
-def _normalize_write_set(paths: List[str]) -> List[str]:
-    normalized: List[str] = []
-    for path in paths or [GLOBAL_WRITE_CLAIM]:
-        clean = _normalize_path(path)
-        if clean not in normalized:
-            normalized.append(clean)
-    return normalized or [GLOBAL_WRITE_CLAIM]
-
-
-def _normalize_path(path: str) -> str:
-    raw = str(path or "").strip().replace("\\", "/")
-    if not raw or raw == ".":
-        return GLOBAL_WRITE_CLAIM
-    normalized = posixpath.normpath(raw)
-    if normalized in ("", "."):
-        return GLOBAL_WRITE_CLAIM
-    return normalized.removeprefix("./")
-
-
-def _paths_overlap(left: str, right: str) -> bool:
-    if left == GLOBAL_WRITE_CLAIM or right == GLOBAL_WRITE_CLAIM:
-        return True
-    if left == right:
-        return True
-    return left.startswith(f"{right}/") or right.startswith(f"{left}/")
-
-
-def _write_sets_conflict(left: List[str], right: List[str]) -> bool:
-    return any(_paths_overlap(a, b) for a in left for b in right)
-
-
-def _conflicts_with_any(
-    candidate: List[str],
-    existing: List[List[str]],
-) -> bool:
-    return any(_write_sets_conflict(candidate, ws) for ws in existing)
 
 
 # ---------------------------------------------------------------------------

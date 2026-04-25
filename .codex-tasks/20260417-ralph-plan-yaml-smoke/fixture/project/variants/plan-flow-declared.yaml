@@ -1,0 +1,22 @@
+schema_version: "1.0.0"
+forbidden_flows:
+  - id: ghost-flow
+    description: forbid the ghost path
+tasks:
+  - id: T1
+    title: Flow Declared Boundary
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/app.py
+    goal_behavior: Keep the fixture application stable.
+    acceptance_criteria: The targeted pytest command passes.
+    verification:
+      level: unit
+      command: pytest tests/test_app.py -q
+      covers:
+        tasks:
+          - T1
+        flows:
+          - ghost-flow
+

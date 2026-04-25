@@ -1,0 +1,6 @@
+Validation Diff:
+Added (2):
+  - W_COVERS_PATHS_UNVERIFIED [T1] #06fa83a29b4df114: task 'T1' verification command references 'tests/test_app.py' outside claimed_paths and verification.covers.paths
+  - E_COVERS_UNKNOWN_FLOW [T1] #e754f50e82042ffb: task 'T1' covers flow 'ghost-flow' which is not declared in critical_flows or forbidden_flows
+Removed (0):
+Unchanged: 1

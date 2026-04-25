@@ -420,6 +420,21 @@ class TestRalphIPCHandler(unittest.TestCase):
 
         return td, cleanup
 
+    def _put_task_in_verifying(self, orchestrator, task_id: str, workflow_id: str) -> None:
+        from cccc.contracts.v1.ralph_ipc import TaskRef
+
+        orchestrator.engine.register_task(TaskRef(id=task_id, title=task_id), workflow_id)
+        orchestrator.engine.register_batch("b-verification", [task_id])
+        orchestrator.engine.approve_batch(
+            "b-verification",
+            [{"task_id": task_id, "agent_id": "worker-1", "claimed_paths": []}],
+        )
+        orchestrator.engine.report_worker_started(task_id, "worker-1")
+        orchestrator.engine.report_worker_completion(
+            task_id,
+            {"idempotency_key": f"idem-{uuid4()}"},
+        )
+
     def test_try_handle_ralph_op_unknown_returns_none(self) -> None:
         from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op
 
@@ -578,6 +593,74 @@ class TestRalphIPCHandler(unittest.TestCase):
         self.assertEqual(forwarded[0].task_id, "t1")
         self.assertIs(fake_orchestrator._daemon_request_fn, daemon_request_fn)
         get_orchestrator.assert_called_once_with("group-1", project_root=Path("/tmp/project"))
+
+    def test_ralph_verification_result_updates_engine_failed_state(self) -> None:
+        from cccc.daemon.foreman.workflow_orchestrator import clear_orchestrator, get_orchestrator
+        from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op
+        from cccc.kernel.workflow_state_types import WorkflowTaskStatus
+
+        _, cleanup = self._with_home()
+        group_id = f"group-{uuid4()}"
+        workflow_id = "wf-verification-skipped"
+        with tempfile.TemporaryDirectory() as project_dir:
+            try:
+                orchestrator = get_orchestrator(group_id, project_root=Path(project_dir))
+                self._put_task_in_verifying(orchestrator, "t1", workflow_id)
+
+                resp = try_handle_ralph_op(
+                    "ralph_verification_result",
+                    {
+                        "workflow_id": workflow_id,
+                        "group_id": group_id,
+                        "project_root": project_dir,
+                        "task_id": "t1",
+                        "overall_outcome": "skipped",
+                        "summary": "verification skipped",
+                    },
+                )
+
+                self.assertIsNotNone(resp)
+                self.assertTrue(resp.ok)
+                state = orchestrator.engine.get_task("t1")
+                self.assertIsNotNone(state)
+                self.assertEqual(state.status, WorkflowTaskStatus.FAILED)
+            finally:
+                clear_orchestrator(group_id)
+                cleanup()
+
+    def test_ralph_verification_result_updates_engine_completed_state(self) -> None:
+        from cccc.daemon.foreman.workflow_orchestrator import clear_orchestrator, get_orchestrator
+        from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op
+        from cccc.kernel.workflow_state_types import WorkflowTaskStatus
+
+        _, cleanup = self._with_home()
+        group_id = f"group-{uuid4()}"
+        workflow_id = "wf-verification-passed"
+        with tempfile.TemporaryDirectory() as project_dir:
+            try:
+                orchestrator = get_orchestrator(group_id, project_root=Path(project_dir))
+                self._put_task_in_verifying(orchestrator, "t1", workflow_id)
+
+                resp = try_handle_ralph_op(
+                    "ralph_verification_result",
+                    {
+                        "workflow_id": workflow_id,
+                        "group_id": group_id,
+                        "project_root": project_dir,
+                        "task_id": "t1",
+                        "overall_outcome": "passed",
+                        "summary": "verification passed",
+                    },
+                )
+
+                self.assertIsNotNone(resp)
+                self.assertTrue(resp.ok)
+                state = orchestrator.engine.get_task("t1")
+                self.assertIsNotNone(state)
+                self.assertEqual(state.status, WorkflowTaskStatus.COMPLETED)
+            finally:
+                clear_orchestrator(group_id)
+                cleanup()
 
     def test_ralph_verification_result_invalid_outcome(self) -> None:
         from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op

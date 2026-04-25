@@ -124,6 +124,7 @@ class AgentPoolManager:
         agents_dir: Path,
         models_registry_path: Path,
         capabilities_dir: Path,
+        group_loader: Optional[callable] = None,
     ):
         """Initialize the agent pool manager.
 
@@ -131,10 +132,12 @@ class AgentPoolManager:
             agents_dir: Directory containing agent YAML files
             models_registry_path: Path to models/registry.yaml
             capabilities_dir: Directory containing capability YAML files
+            group_loader: Optional callback returning list of enabled peer actor dicts
         """
         self.agents_dir = agents_dir
         self.models_registry_path = models_registry_path
         self.capabilities_dir = capabilities_dir
+        self._group_loader = group_loader
 
         # Track active assignments (agent_id -> task_id)
         self._active_assignments: Dict[str, str] = {}
@@ -362,6 +365,73 @@ class AgentPoolManager:
 
         return None
 
+    def _find_group_peer_agent(
+        self,
+        task: TaskRef,
+        busy_agent_ids: Optional[set] = None,
+    ) -> Optional[Agent]:
+        """Find a matching group peer actor for a task.
+
+        Checks group actors (created via cccc actor add) that are not in agents_dir YAMLs.
+        Uses runtime matching and availability from engine/shadow state.
+        """
+        if not self._group_loader:
+            return None
+
+        busy = busy_agent_ids or set()
+        try:
+            peers = self._group_loader()
+        except Exception:
+            logger.debug("Failed to load group peers", exc_info=True)
+            return None
+
+        if not peers:
+            return None
+
+        best_agent: Optional[Agent] = None
+        best_score = 0
+
+        for peer in peers:
+            actor_id = str(peer.get("id") or "").strip()
+            if not actor_id or actor_id in busy or actor_id in self._active_assignments:
+                continue
+
+            peer_runtime = str(peer.get("runtime") or "").strip()
+            score = 0
+            reasons: List[str] = []
+
+            inferred_domain = self._infer_domain_from_paths(task.claimed_paths or [])
+            if inferred_domain != "general" and peer_runtime:
+                runtime_domain_map = {
+                    "codex": ["backend", "general"],
+                    "claude": ["frontend", "backend", "general"],
+                    "gemini": ["general"],
+                }
+                domains = runtime_domain_map.get(peer_runtime, ["general"])
+                if inferred_domain in domains:
+                    score += 40
+                    reasons.append(f"Runtime {peer_runtime} matches domain {inferred_domain}")
+
+            if peer_runtime:
+                score += 30
+                reasons.append(f"Peer has runtime: {peer_runtime}")
+
+            if score > best_score:
+                best_score = score
+                best_agent = Agent(
+                    id=actor_id,
+                    name=str(peer.get("title") or actor_id),
+                    model_runtime=peer_runtime,
+                    model_id=str(peer.get("model_id") or ""),
+                    role_type="worker",
+                )
+
+        if best_agent and best_score >= 30:
+            logger.info("Reusing group peer actor %s (score=%d)", best_agent.id, best_score)
+            return best_agent
+
+        return None
+
     def create_agent_for_task(
         self,
         task: TaskRef,
@@ -448,9 +518,20 @@ Rules:
 - Do not renegotiate user scope or re-plan the workflow on your own.
 - Work through the repo/task evidence first, then implement the smallest correct change.
 - Report concrete evidence, changed files, and blockers back to Foreman.
-- Report progress or blockers via `cccc send "message" --to @foreman`. Report completion via `cccc task complete <task_id> --evidence "summary"`.
 - Raise risks or a better route early, with a specific recommendation.
 - Do not spawn extra workers unless Foreman explicitly asks.
+
+PROGRESS REPORTING:
+- While working on long tasks, periodically report progress:
+    cccc task heartbeat <task_id> --progress <0-100> --message "what you're doing"
+- Send at least every 2-3 minutes for tasks expected to take >5 minutes.
+- This prevents stall detection from flagging your task as stuck.
+
+COMPLETION PROTOCOL (REQUIRED):
+- After finishing ALL code changes, you MUST run:
+    cccc task complete <task_id> --changed-file <path> --evidence "summary"
+- This triggers the verification gate. Do NOT skip this step.
+- Use `cccc send --to @foreman` ONLY for progress updates or blockers, NOT for completion.
 """
 
     def assign_agent(self, agent_id: str, task_id: str) -> bool:
@@ -496,17 +577,20 @@ Rules:
         *,
         min_score: int = 50,
         prefer_reuse: bool = True,
+        busy_agent_ids: Optional[set] = None,
     ) -> TaskAssignment:
         """Find or create an agent for a task.
 
         This is the main entry point for agent selection. It will:
         1. Try to find an existing suitable agent if prefer_reuse is True
-        2. Create a new agent if no suitable agent found
+        2. Try to find a matching group peer actor
+        3. Create a new agent if no suitable agent found
 
         Args:
             task: Task to assign
             min_score: Minimum score for existing agent reuse
             prefer_reuse: Whether to prefer reusing existing agents
+            busy_agent_ids: Set of agent IDs currently busy (from engine/shadow state)
 
         Returns:
             TaskAssignment with the selected agent
@@ -516,10 +600,16 @@ Rules:
         reason = ""
 
         if prefer_reuse:
-            # Try to find existing agent
+            # Try to find existing agent in agents_dir YAMLs
             assigned_agent = self.find_best_agent(task, min_score=min_score)
             if assigned_agent:
                 reason = f"Reused existing agent with affinity for {task.type}"
+
+        if not assigned_agent:
+            # Try group peer actors before creating new
+            assigned_agent = self._find_group_peer_agent(task, busy_agent_ids)
+            if assigned_agent:
+                reason = f"Reused group peer actor {assigned_agent.id}"
 
         if not assigned_agent:
             # Create new agent

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 
-from cccc.ralph.core import _paths_overlap
+from cccc.kernel.claimed_paths import paths_overlap as _paths_overlap
 
 
 class MonitorMode(str, Enum):
@@ -232,3 +232,65 @@ def check_file_overstepping(
             "changed_files": changed_files,
         },
     )
+# ---------------------------------------------------------------------------
+# Pre-transition hook factories (ARCH-12 / ARCH-9)
+# ---------------------------------------------------------------------------
+
+def create_completer_mismatch_hook():
+    def hook(kind, data, engine):
+        from ...kernel.workflow_state_types import KIND_TASK_REPORTED_COMPLETED, TransitionRejected
+        if kind != KIND_TASK_REPORTED_COMPLETED:
+            return
+        task_id = str(data.get("task_id") or "")
+        task_state = engine.get_task(task_id)
+        if not task_state:
+            return
+        completing_agent = str((data.get("evidence") or {}).get("agent_id") or "")
+        alert = check_completer_mismatch(task_id, task_state.agent_id, completing_agent)
+        if not alert:
+            return
+        cfg = engine.get_monitor_config()
+        mode = cfg.completer_mismatch if cfg else MonitorMode.OBSERVE
+        if mode == MonitorMode.BLOCK:
+            raise TransitionRejected(alert_type=alert.alert_type, message=alert.message, evidence=alert.evidence)
+        engine.report_hook_alert({"alert_type": alert.alert_type, "severity": alert.severity, "task_id": alert.task_id, "message": alert.message, "evidence": alert.evidence, "mode": mode.value})
+    hook.invariant_id = "completer_mismatch"
+    return hook
+def create_file_overstepping_hook():
+    def hook(kind, data, engine):
+        from ...kernel.workflow_state_types import KIND_TASK_REPORTED_COMPLETED, TransitionRejected
+        if kind != KIND_TASK_REPORTED_COMPLETED:
+            return
+        task_id = str(data.get("task_id") or "")
+        task_state = engine.get_task(task_id)
+        if not task_state:
+            return
+        changed_files = list((data.get("evidence") or {}).get("changed_files") or [])
+        claimed_paths = list(task_state.task.claimed_paths or [])
+        alert = check_file_overstepping(task_id, changed_files, claimed_paths)
+        if not alert:
+            return
+        cfg = engine.get_monitor_config()
+        mode = cfg.file_overstepping if cfg else MonitorMode.OBSERVE
+        if mode == MonitorMode.BLOCK:
+            raise TransitionRejected(alert_type=alert.alert_type, message=alert.message, evidence=alert.evidence)
+        engine.report_hook_alert({"alert_type": alert.alert_type, "severity": alert.severity, "task_id": alert.task_id, "message": alert.message, "evidence": alert.evidence, "mode": mode.value})
+    hook.invariant_id = "file_overstepping"
+    return hook
+def create_unauthorized_subagent_hook(known_actors_fn):
+    def hook(kind, data, engine):
+        from ...kernel.workflow_state_types import KIND_TASK_STARTED, TransitionRejected
+        if kind != KIND_TASK_STARTED:
+            return
+        agent_id = str(data.get("agent_id") or "")
+        known = known_actors_fn()
+        alert = check_unauthorized_subagent(agent_id, known)
+        if not alert:
+            return
+        cfg = engine.get_monitor_config()
+        mode = cfg.unauthorized_subagent if cfg else MonitorMode.OBSERVE
+        if mode == MonitorMode.BLOCK:
+            raise TransitionRejected(alert_type=alert.alert_type, message=alert.message, evidence=alert.evidence)
+        engine.report_hook_alert({"alert_type": alert.alert_type, "severity": alert.severity, "task_id": alert.task_id, "message": alert.message, "evidence": alert.evidence, "mode": mode.value})
+    hook.invariant_id = "unauthorized_subagent"
+    return hook

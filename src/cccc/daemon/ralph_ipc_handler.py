@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 from uuid import uuid4
@@ -29,9 +30,10 @@ from ..contracts.v1.ralph_ipc import (
     VerificationResult,
     parse_ralph_message,
 )
-from ..util.time import utc_now_iso
+from ..util.time import parse_utc_iso, utc_now_iso
 
 logger = logging.getLogger("cccc.daemon.ralph_ipc")
+RALPH_STATE_TTL_SECONDS = 300
 
 # In-memory store for Ralph IPC state (can be extended to persistent storage)
 _RALPH_STATE: Dict[str, Any] = {
@@ -41,6 +43,49 @@ _RALPH_STATE: Dict[str, Any] = {
     "verifications": {},        # verification_id -> VerificationResult
     "actor_statuses": {},       # actor_id -> ActorStatus
 }
+
+
+def _cleanup_stale_ralph_state(ttl_seconds: int = 300) -> int:
+    """Remove _RALPH_STATE entries whose timestamp is older than *ttl_seconds*.
+
+    Supports legacy ``_created_at`` epoch values and real model ``created_at``
+    timestamps. Entries without either timestamp are left untouched.
+    Returns the number of entries removed.
+    """
+    now = time.time()
+    removed = 0
+    for bucket in ("pending_suggestions", "pending_restarts", "decisions", "verifications", "actor_statuses"):
+        store = _RALPH_STATE.get(bucket)
+        if not isinstance(store, dict):
+            continue
+        stale_keys = [
+            k for k, v in store.items()
+            if _is_stale_ralph_entry(v, now=now, ttl_seconds=ttl_seconds)
+        ]
+        for k in stale_keys:
+            del store[k]
+            removed += 1
+    return removed
+
+
+def _is_stale_ralph_entry(entry: Any, *, now: float, ttl_seconds: int) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    created_at = _entry_created_at_seconds(entry)
+    if created_at is None:
+        return False
+    return (now - created_at) > ttl_seconds
+
+
+def _entry_created_at_seconds(entry: Dict[str, Any]) -> Optional[float]:
+    raw_epoch = entry.get("_created_at")
+    if isinstance(raw_epoch, (int, float)):
+        return float(raw_epoch)
+    raw_created_at = str(entry.get("created_at") or "").strip()
+    parsed = parse_utc_iso(raw_created_at)
+    if parsed is None:
+        return None
+    return parsed.timestamp()
 
 
 def _error(code: str, message: str, *, details: Optional[Dict[str, Any]] = None) -> DaemonResponse:
@@ -145,6 +190,7 @@ def handle_ralph_batch_suggest(args: Dict[str, Any], *, daemon_request_fn: Any =
         rationale=str(args.get("rationale", "")),
         estimated_parallelism=int(args.get("estimated_parallelism", len(tasks))),
         assignments=dict(args.get("assignments") or {}),
+        fallback_allowed=bool(args.get("fallback_allowed", False)),
     )
 
     _RALPH_STATE["pending_suggestions"][suggestion_id] = suggestion.model_dump()
@@ -160,6 +206,8 @@ def handle_ralph_batch_suggest(args: Dict[str, Any], *, daemon_request_fn: Any =
     if args.get("auto_process"):
         process_result = _try_process_batch(suggestion, args, daemon_request_fn=daemon_request_fn)
         if process_result:
+            if process_result.get("status") == "error":
+                return _error("processing_error", process_result.get("reason") or process_result.get("error", "batch processing failed"))
             result["processing"] = process_result
 
     return _success(result)
@@ -205,6 +253,7 @@ def handle_ralph_register_and_suggest(
             estimated_parallelism=int(args.get("estimated_parallelism", len(tasks))),
             auto_start_agents=bool(args.get("auto_start_agents", True)),
             assignments=dict(args.get("assignments") or {}),
+            fallback_allowed=bool(args.get("fallback_allowed", False)),
         )
         return _success(
             {
@@ -232,7 +281,7 @@ def _try_process_batch(
     project_root = _resolve_group_project_root(group_id, args.get("project_root"))
 
     if not group_id or not project_root:
-        return {"status": "skipped", "reason": "missing group_id or project_root"}
+        return {"status": "error", "reason": "missing group_id or project_root"}
 
     try:
         from .foreman.workflow_orchestrator import get_orchestrator
@@ -245,7 +294,7 @@ def _try_process_batch(
         )
 
         if orchestrator is None:
-            return {"status": "skipped", "reason": "orchestrator not available"}
+            return {"status": "error", "reason": "orchestrator not available"}
 
         # Update daemon_request_fn on cached orchestrator (may have been created without it)
         if daemon_request_fn and not orchestrator._daemon_request_fn:
@@ -312,7 +361,7 @@ def _try_process_restart(
     project_root = _resolve_group_project_root(group_id, args.get("project_root"))
 
     if not group_id or not project_root:
-        return {"status": "skipped", "reason": "missing group_id or project_root"}
+        return {"status": "error", "reason": "missing group_id or project_root"}
 
     try:
         from .foreman.workflow_orchestrator import get_orchestrator
@@ -325,7 +374,7 @@ def _try_process_restart(
         )
 
         if orchestrator is None:
-            return {"status": "skipped", "reason": "orchestrator not available"}
+            return {"status": "error", "reason": "orchestrator not available"}
 
         if daemon_request_fn and not orchestrator._daemon_request_fn:
             orchestrator._daemon_request_fn = daemon_request_fn
@@ -364,7 +413,7 @@ def handle_ralph_verification_result(args: Dict[str, Any], *, daemon_request_fn:
         return err
 
     outcome = str(args["overall_outcome"])
-    if outcome not in ("passed", "failed", "skipped", "timeout"):
+    if outcome not in ("passed", "failed", "skipped", "timeout", "agent_pending"):
         return _error("invalid_outcome", f"Invalid verification outcome: {outcome}")
 
     verification_id = str(args.get("verification_id") or uuid4())
@@ -382,6 +431,7 @@ def handle_ralph_verification_result(args: Dict[str, Any], *, daemon_request_fn:
             "duration_ms": int(c.get("duration_ms", 0)),
             "details": c.get("details", {}),
         } for c in checks],
+        warnings=list(args.get("warnings") or []),
         summary=str(args.get("summary", "")),
     )
 
@@ -445,6 +495,8 @@ def handle_ralph_restart_suggest(args: Dict[str, Any], *, daemon_request_fn: Any
     if args.get("auto_process"):
         process_result = _try_process_restart(suggestion, args, daemon_request_fn=daemon_request_fn)
         if process_result:
+            if process_result.get("status") == "error":
+                return _error("processing_error", process_result.get("reason") or process_result.get("error", "restart processing failed"))
             result["processing"] = process_result
 
     return _success(result)
@@ -710,6 +762,7 @@ def handle_ralph_process_pending(args: Dict[str, Any], *, daemon_request_fn: Any
         rationale=suggestion_data.get("rationale", ""),
         estimated_parallelism=suggestion_data.get("estimated_parallelism", 1),
         assignments=dict(suggestion_data.get("assignments") or {}),
+        fallback_allowed=bool(suggestion_data.get("fallback_allowed", False)),
     )
 
     try:
@@ -1095,6 +1148,7 @@ def try_handle_ralph_op(
     handler = _RALPH_OPS.get(op)
     if handler is None:
         return None
+    _cleanup_stale_ralph_state(ttl_seconds=RALPH_STATE_TTL_SECONDS)
     # Inject daemon_request_fn for handlers that need it
     if op in (
         "ralph_batch_suggest",

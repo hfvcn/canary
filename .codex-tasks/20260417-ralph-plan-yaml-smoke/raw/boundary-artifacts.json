@@ -1,0 +1,230 @@
+{
+  "cases": {
+    "base": {
+      "rc": 0,
+      "codes": {
+        "errors": [],
+        "warnings": [],
+        "hints": [
+          "H_SEMANTIC_COVERAGE_DEGRADED"
+        ],
+        "issue_ids": [
+          "079f60c2d3cceedc"
+        ]
+      }
+    },
+    "flow_declared": {
+      "rc": 1,
+      "codes": {
+        "errors": [
+          "E_FORBIDDEN_FLOW_LEVEL_TOO_WEAK"
+        ],
+        "warnings": [
+          "W_COVERS_PATHS_UNVERIFIED"
+        ],
+        "hints": [
+          "H_SEMANTIC_COVERAGE_DEGRADED"
+        ],
+        "issue_ids": [
+          "06fa83a29b4df114",
+          "079f60c2d3cceedc",
+          "a04ec3cfeff15587"
+        ]
+      }
+    },
+    "pytest_k": {
+      "rc": 0,
+      "codes": {
+        "errors": [],
+        "warnings": [],
+        "hints": [
+          "H_SEMANTIC_COVERAGE_DEGRADED",
+          "W_VERIFICATION_SHAPE_UNKNOWN"
+        ],
+        "issue_ids": [
+          "079f60c2d3cceedc",
+          "85972a03502299f7"
+        ]
+      }
+    },
+    "make_test": {
+      "rc": 0,
+      "codes": {
+        "errors": [],
+        "warnings": [],
+        "hints": [
+          "H_SEMANTIC_COVERAGE_DEGRADED",
+          "W_VERIFICATION_SHAPE_UNKNOWN"
+        ],
+        "issue_ids": [
+          "079f60c2d3cceedc",
+          "85972a03502299f7"
+        ]
+      }
+    },
+    "suppress_expired": {
+      "rc": 0,
+      "codes": {
+        "errors": [],
+        "warnings": [
+          "W_SUPPRESS_EXPIRED"
+        ],
+        "hints": [
+          "H_SEMANTIC_COVERAGE_DEGRADED",
+          "H_SUPPRESS_UNUSED",
+          "W_VERIFICATION_SHAPE_UNKNOWN"
+        ],
+        "issue_ids": [
+          "079f60c2d3cceedc",
+          "1c6fcf912f000f2b",
+          "8411f4e146b4e829",
+          "85972a03502299f7"
+        ]
+      }
+    },
+    "suppress_incomplete": {
+      "rc": 1,
+      "codes": {
+        "errors": [
+          "E_SUPPRESS_LEASE_INCOMPLETE"
+        ],
+        "warnings": [],
+        "hints": [
+          "H_SEMANTIC_COVERAGE_DEGRADED",
+          "H_SUPPRESS_UNUSED",
+          "W_VERIFICATION_SHAPE_UNKNOWN"
+        ],
+        "issue_ids": [
+          "079f60c2d3cceedc",
+          "1c6fcf912f000f2b",
+          "85972a03502299f7",
+          "c94f9a88bad38167"
+        ]
+      }
+    },
+    "strict_unknown_field": {
+      "rc": 2,
+      "stdout": "",
+      "stderr": {
+        "error": {
+          "stage": "load",
+          "internal_error_code": "E_INTERNAL_LOAD",
+          "exception_type": "SchemaUnknownFieldError",
+          "message": "mystery_top_level: Extra inputs are not permitted"
+        }
+      }
+    },
+    "legacy_unknown_field": {
+      "rc": 0,
+      "codes": {
+        "errors": [],
+        "warnings": [],
+        "hints": [
+          "H_SEMANTIC_COVERAGE_DEGRADED",
+          "W_VERIFICATION_SHAPE_UNKNOWN"
+        ]
+      },
+      "stderr": [
+        "WARNING: legacy schema parsing active — plan.schema_version not declared. Future Ralph versions may require it by 2026-07-17."
+      ]
+    },
+    "comment_only_digest": {
+      "before_rc": 0,
+      "after_rc": 0,
+      "before_codes": {
+        "errors": [],
+        "warnings": [],
+        "hints": [
+          "H_SEMANTIC_COVERAGE_DEGRADED"
+        ],
+        "issue_ids": [
+          "079f60c2d3cceedc"
+        ]
+      },
+      "after_codes": {
+        "errors": [],
+        "warnings": [],
+        "hints": [
+          "H_SEMANTIC_COVERAGE_DEGRADED"
+        ],
+        "issue_ids": [
+          "079f60c2d3cceedc"
+        ]
+      },
+      "blocked": {
+        "accepted": false,
+        "task_id": "T1",
+        "event_type": "completed",
+        "reason": "plan_digest_divergence: Plan file '/Users/vfch/Documents/project/canary/cccc-main-git/.codex-tasks/20260417-ralph-plan-yaml-smoke/fixture/project/plan.yaml' was modified after registration (registered=8bebfd9ac0dd… current=125cd8b23aad…). Re-register the plan or use --force-stale-complete to override.",
+        "code": "plan_digest_divergence"
+      }
+    },
+    "diff_ruleset_only": {
+      "rc": 0,
+      "stdout": [
+        "Validation Diff:",
+        "Added (0):",
+        "Removed (0):",
+        "Unchanged: 1",
+        "Ruleset: ruleset_digest_change: before=bcce242d64de28d063db52d6a45d87251b142ba9925a87585764dc79b815afcb after=deadbeef"
+      ]
+    },
+    "diff_major_mismatch": {
+      "rc": 2,
+      "stderr": {
+        "error": {
+          "stage": "validate",
+          "internal_error_code": "E_INTERNAL_VALIDATE",
+          "exception_type": "ValueError",
+          "message": "major report schema version mismatch: before=1.0.0 after=2.0.0"
+        }
+      }
+    },
+    "audit_boundaries": {
+      "two_failures": {
+        "rc": 0,
+        "stdout": [
+          "Audit: CLEAN — no operational issues found."
+        ]
+      },
+      "three_failures": {
+        "rc": 0,
+        "stdout": [
+          "Audit: 1 issue(s) found",
+          "",
+          "  W_TASK_FLAPPING [T-three]: task 'T-three' has 3 verification failures within 7 days — possible flapping"
+        ]
+      },
+      "skip_complete": {
+        "rc": 0,
+        "stdout": [
+          "Audit: 1 issue(s) found",
+          "",
+          "  H_COMPLETED_BUT_UNVERIFIED [T-skip]: task 'T-skip' was completed after verification was skipped with no successful verification in between"
+        ]
+      },
+      "skip_pass_complete": {
+        "rc": 0,
+        "stdout": [
+          "Audit: CLEAN — no operational issues found."
+        ]
+      }
+    },
+    "w7_missing_metrics": {
+      "first_gate": "advisory",
+      "second_gate": "advisory",
+      "third_gate": "advisory",
+      "cache_sizes": [
+        1,
+        1,
+        2
+      ]
+    },
+    "w10_no_overlap": {
+      "decision": "approved",
+      "reason": "Foreman explicit assignment for 1 tasks",
+      "defer_event_count": 0
+    }
+  },
+  "failures": []
+}

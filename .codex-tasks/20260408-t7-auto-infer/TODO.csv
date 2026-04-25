@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read plan and validator context,DONE,Relevant T7 requirements and current validator flow are captured,test -f plans/phase4-deep-integration.yaml,2026-04-08,0,Read plan file and semantic validator before edits
+2,Implement auto-infer flow in semantic_validator.py,DONE,New helper and validator integration compile,python -c "from cccc.ralph.semantic_validator import auto_infer_semantic_targets; print('PASS')",2026-04-08,0,Includes severity downgrade for inferred-only evidence
+3,Add tests for gate and inferred severity behavior,DONE,pytest target covers new auto-infer cases,python -m pytest tests/test_ralph_semantic.py -x -q,2026-04-08,0,Keep inferred targets warning-or-lower
+4,Run requested verification commands,DONE,All user-specified commands pass,python -m pytest tests/test_ralph_semantic.py -x -q,2026-04-08,0,Also ran the inferred-no-error python check

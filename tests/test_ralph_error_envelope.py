@@ -179,7 +179,8 @@ class TestCLISemanticCrash:
 
         assert exit_code == 2
         captured = capsys.readouterr()
-        error_output = json.loads(captured.err)
+        stderr = captured.err
+        error_output = json.loads(stderr[stderr.find("{"):])
         assert error_output["error"]["stage"] == "semantic"
         assert error_output["error"]["internal_error_code"] == "E_INTERNAL_SEMANTIC"
         assert "semantic provider exploded" in error_output["error"]["message"]
@@ -321,7 +322,7 @@ class TestOrchestratorLedgerErrorEvent:
         mock_event.payload = {}
 
         # Make the inner method raise
-        def _blow_up(ev):
+        def _blow_up(ev, **_kwargs):
             raise RuntimeError("kaboom in apply_task_event")
 
         orchestrator._apply_task_event_inner = _blow_up

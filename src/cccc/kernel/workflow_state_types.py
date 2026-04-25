@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 from ..contracts.v1.ralph_ipc import TaskRef
 
@@ -24,8 +24,12 @@ KIND_TASK_BLOCKED = "workflow.task_blocked"
 KIND_VERIFICATION_WARNING = "workflow.verification_warning"
 KIND_MONITOR_VIOLATION = "workflow.monitor_violation"
 KIND_RALPH_INTERNAL_ERROR = "workflow.ralph_internal_error"
+KIND_TASK_DEFERRED = "workflow.task_deferred"
 KIND_PLAN_DIGEST_DIVERGENCE = "workflow.plan_digest_divergence"
 KIND_PLAN_DIGEST_DIVERGENCE_POST_HOC = "workflow.plan_digest_divergence_post_hoc"
+KIND_TRANSITION_REJECTED = "workflow.transition_rejected"
+KIND_MONITOR_MODE_CHANGED = "workflow.monitor_mode_changed"
+KIND_VERIFICATION_AGENT_PENDING = "workflow.verification_agent_pending"
 
 
 class WorkflowTaskStatus(str, Enum):
@@ -37,6 +41,7 @@ class WorkflowTaskStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     BLOCKED = "blocked"
+    DEFERRED = "deferred"
     ARCHIVED = "archived"
 
 
@@ -64,9 +69,28 @@ class TaskState:
     status: WorkflowTaskStatus
     batch_id: str = ""
     agent_id: str = ""
+    attempt_id: str = ""
+    assigned_by: str = ""
+    assigned_at: Optional[float] = None
     last_completion_idempotency_key: str = ""
     last_verification: Optional[Dict[str, Any]] = None
     last_heartbeat: Optional[float] = None
     progress_pct: Optional[int] = None
     blocked_reason: str = ""
     started_at: Optional[float] = None
+
+
+class TransitionRejected(Exception):
+    """Engine pre-transition hook rejected a state transition."""
+
+    def __init__(self, alert_type: str, message: str, evidence: dict | None = None):
+        self.alert_type = alert_type
+        self.message = message
+        self.evidence = evidence or {}
+        super().__init__(message)
+
+
+if TYPE_CHECKING:
+    from .workflow_state_engine import WorkflowEngine
+
+PreTransitionHook = Callable[[str, dict, "WorkflowEngine"], None]

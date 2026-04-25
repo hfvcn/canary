@@ -59,12 +59,13 @@ class WorkspaceIndex:
         if full_path is None:
             return False
         key = _path_exists_key(full_path, rel_path)
-        cached = self._path_cache.get(key)
-        if cached is not None:
-            return cached
         old_key = self._path_to_key.get(rel_path)
         if old_key is not None and old_key != key:
             self._path_cache.pop(old_key, None)
+        cached = self._path_cache.get(key)
+        if cached is not None:
+            self._path_to_key[rel_path] = key
+            return cached
         result = key[1] != MISSING_PATH_STAT
         self._path_cache[key] = result
         self._path_to_key[rel_path] = key

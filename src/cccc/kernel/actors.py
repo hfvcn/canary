@@ -218,6 +218,16 @@ def should_auto_start(actor: Dict[str, Any]) -> bool:
     return True
 
 
+def set_desired_state(group: Group, actor_id: str, state: str) -> None:
+    """Set an actor's desired_state to 'running' or 'stopped'."""
+    actor = find_actor(group, actor_id)
+    if actor is None:
+        raise ValueError(f"actor not found: {actor_id}")
+    actor["desired_state"] = state
+    actor["updated_at"] = utc_now_iso()
+    group.save()
+
+
 def add_actor(
     group: Group,
     *,

@@ -1,0 +1,220 @@
+# Phase 1: ralph validate --semantic (MVP)
+# Source: ralph-serena-proposals-evaluation.md §4.4 Phase 1
+# Scope: SemanticProvider + SerenaAdapter + 5 semantic rules + CLI --semantic flag
+
+plan_scope:
+  - src/cccc/ralph/
+
+tasks:
+  - id: T1-models
+    title: "Add semantic schema to Ralph models"
+    role: leaf
+    depends_on: []
+    claimed_paths:
+      - src/cccc/ralph/models.py
+    goal_behavior: |
+      Add SemanticTarget, SemanticBlock models to TaskSpec.
+      Add semantic_findings field to ValidationReport.
+      SemanticTarget: path (str) + symbol (str) + op (Literal create/modify_body/modify_interface/delete/rename).
+      SemanticBlock: mode (Literal off/advisory/strict) + targets (List[SemanticTarget]).
+      TaskSpec gets optional semantic: SemanticBlock | None.
+      ValidationReport gets semantic_findings: List[ValidationIssue] (default empty).
+      IssueSeverity must include existing values; S_ prefix codes are just strings.
+    acceptance_criteria: |
+      Plan.model_validate({'tasks': [{'id': 'T1', 'semantic': {'mode': 'advisory', 'targets': [{'path': 'foo.py', 'symbol': 'Foo/bar', 'op': 'modify_body'}]}}]}) succeeds.
+      Plan without semantic block still validates (backward compatible).
+      ValidationReport.semantic_findings is an empty list by default.
+    verification:
+      level: unit
+      checks:
+        - name: model-parse
+          command: "python -c \"from cccc.ralph.models import Plan, SemanticBlock, SemanticTarget; p = Plan.model_validate({'tasks': [{'id': 'T1', 'semantic': {'mode': 'advisory', 'targets': [{'path': 'foo.py', 'symbol': 'Foo', 'op': 'modify_body'}]}}]}); assert p.tasks[0].semantic is not None; assert p.tasks[0].semantic.mode == 'advisory'\""
+          required: true
+        - name: backward-compat
+          command: "python -c \"from cccc.ralph.models import Plan; p = Plan.model_validate({'tasks': [{'id': 'T1'}]}); assert p.tasks[0].semantic is None\""
+          required: true
+
+  - id: T2-provider
+    title: "Create SemanticProvider abstract interface"
+    role: leaf
+    depends_on: [T1-models]
+    claimed_paths:
+      - src/cccc/ralph/semantic_provider.py
+    goal_behavior: |
+      Define Protocol class SemanticProvider with methods:
+        symbol_exists(path: str, name_path: str) -> bool | None  (None = opaque/uncertain)
+        find_references(path: str, name_path: str) -> list[SymbolReference]  (each has ref_path, ref_symbol, confidence)
+        get_public_symbols(path: str) -> list[str]  (returns name_paths of public symbols)
+      SymbolReference is a simple dataclass: ref_path, ref_symbol, confidence (exact/best_effort/opaque).
+      Confidence enum/literal: exact | best_effort | opaque.
+      This is a pure interface file — no Serena dependency.
+    acceptance_criteria: |
+      from cccc.ralph.semantic_provider import SemanticProvider succeeds.
+      SemanticProvider is a Protocol (runtime_checkable).
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.semantic_provider import SemanticProvider, SymbolReference, Confidence\""
+          required: true
+
+  - id: T3-adapter
+    title: "Create SerenaAdapter OneShot implementation"
+    role: leaf
+    depends_on: [T2-provider]
+    claimed_paths:
+      - src/cccc/ralph/serena_adapter.py
+    goal_behavior: |
+      Implement SerenaAdapter that satisfies SemanticProvider protocol.
+      OneShot mode: uses Serena Python API directly (import from serena package).
+      Falls back gracefully: if Serena is not available, all methods return None/empty.
+      symbol_exists: uses find_symbol with name_path pattern, checks if results non-empty.
+      find_references: uses find_referencing_symbols.
+      get_public_symbols: uses get_symbols_overview.
+      Constructor takes project_root: Path. Initializes Serena project context.
+      All Serena errors are caught and returned as None/empty (never crash Ralph).
+    acceptance_criteria: |
+      SerenaAdapter can be instantiated with a project root.
+      If Serena is not available, methods return graceful defaults (None/[]).
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.serena_adapter import SerenaAdapter\""
+          required: true
+
+  - id: T4-rules
+    title: "Implement 5 semantic validation rules"
+    role: leaf
+    depends_on: [T1-models, T2-provider]
+    claimed_paths:
+      - src/cccc/ralph/semantic_validator.py
+    goal_behavior: |
+      New module with function: validate_semantic(plan: Plan, provider: SemanticProvider) -> list[ValidationIssue].
+      Implements 5 rules:
+      1. S_SYMBOL_TARGET_MISSING: target symbol not found (error in strict, warning in advisory)
+      2. S_DELETE_STILL_REFERENCED: delete op but symbol still has references (error/warning per mode)
+      3. S_INTERFACE_REFS_OUTSIDE_SCOPE: modify_interface/rename/delete refs extend beyond task + downstream claimed_paths (error/warning per mode)
+      4. S_PARTIAL_ENTRYPOINT_COVERAGE: file has public symbols but targets only cover some (always warning)
+      5. S_MASSIVE_REFACTOR: uncovered reference count > threshold (20) (always warning)
+      Each issue carries evidence with confidence level: exact/best_effort/opaque.
+      In strict mode, only exact-confidence issues can be errors; others stay warning.
+      In advisory mode, all issues are warnings/hints.
+      In off mode, skip entirely.
+      Skips tasks whose semantic block is None (backward compat).
+    acceptance_criteria: |
+      validate_semantic with a mock provider correctly produces S_SYMBOL_TARGET_MISSING when symbol doesn't exist.
+      validate_semantic in advisory mode never produces errors.
+      validate_semantic with mode=off returns empty list.
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.semantic_validator import validate_semantic\""
+          required: true
+
+  - id: T5-integrate
+    title: "Integrate semantic validation into validator.py"
+    role: integration
+    depends_on: [T4-rules, T3-adapter]
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+    goal_behavior: |
+      Modify validate_with_project to accept optional semantic_provider: SemanticProvider | None.
+      When semantic_provider is not None:
+        - Run validate_semantic(plan, semantic_provider) after filesystem checks.
+        - Add results to semantic_findings field of ValidationReport.
+        - Semantic errors/warnings also go into main errors/warnings lists (merged view).
+        - Suppression applies to semantic issues too (S_ codes can be suppressed).
+      "Only add blockers, never reduce": semantic issues only ADD to the report, never remove existing structural/filesystem issues.
+      When semantic_provider is None: behavior identical to current (backward compat).
+    acceptance_criteria: |
+      validate_with_project(plan, project_root=root) without semantic_provider works as before.
+      validate_with_project(plan, project_root=root, semantic_provider=provider) includes semantic findings.
+      S_ codes can be suppressed via suppress_codes.
+    verification:
+      level: integration
+      checks:
+        - name: backward-compat
+          command: "python -c \"from cccc.ralph.validator import validate_with_project; print('signature ok')\""
+          required: true
+      covers:
+        tasks: [T1-models, T2-provider, T3-adapter, T4-rules, T5-integrate]
+        flows: [semantic-validate-path, backward-compat]
+
+  - id: T6-cli
+    title: "Add --semantic flag and semantic-hints command to CLI"
+    role: leaf
+    depends_on: [T5-integrate]
+    claimed_paths:
+      - src/cccc/ralph/cli.py
+    goal_behavior: |
+      1. Add --semantic flag to 'ralph validate': when set, creates SerenaAdapter and passes to validate_with_project.
+      2. Add 'ralph semantic-hints <plan>' command: for each task's claimed_paths, lists public symbols using SerenaAdapter.get_public_symbols().
+         Output format: one section per task, listing symbols with their name_paths.
+         This helps Foreman fill in semantic.targets.
+      3. When --semantic is set but Serena unavailable, print warning and continue with structural-only validation.
+    acceptance_criteria: |
+      ralph validate plan.yaml --semantic runs without crash (even if Serena unavailable).
+      ralph semantic-hints plan.yaml lists symbols per task (when Serena available).
+    verification:
+      level: integration
+      checks:
+        - name: cli-help
+          command: "python -m cccc.ralph.cli validate --help | grep -q semantic"
+          required: true
+
+  - id: T7-tests
+    title: "Unit and integration tests for semantic validation"
+    role: verification
+    depends_on: [T1-models, T2-provider, T4-rules, T5-integrate, T6-cli]
+    claimed_paths:
+      - tests/test_ralph_semantic.py
+    goal_behavior: |
+      Test suite covering:
+      1. Model parsing: semantic block round-trip, backward compat (no semantic field)
+      2. Mock provider: create a simple mock that implements SemanticProvider, return controlled data
+      3. Rule tests with mock:
+         - S_SYMBOL_TARGET_MISSING: symbol doesn't exist -> error (strict) / warning (advisory)
+         - S_DELETE_STILL_REFERENCED: delete with refs -> error/warning
+         - S_INTERFACE_REFS_OUTSIDE_SCOPE: refs outside scope -> error/warning
+         - S_PARTIAL_ENTRYPOINT_COVERAGE: partial coverage -> warning
+         - S_MASSIVE_REFACTOR: high ref count -> warning
+      4. Mode tests: off returns empty, advisory never errors, strict allows errors
+      5. Confidence tests: best_effort stays warning even in strict mode
+      6. Integration: validate_with_project with mock provider merges semantic findings
+      7. Suppression: S_ codes can be suppressed
+      8. CLI: --semantic flag accepted by validate command
+    acceptance_criteria: |
+      All tests pass with pytest.
+      At least 15 test cases covering all 5 rules + mode combinations.
+    verification:
+      level: integration
+      checks:
+        - name: run-tests
+          command: "python -m pytest tests/test_ralph_semantic.py -v --tb=short"
+          required: true
+      covers:
+        tasks: [T1-models, T2-provider, T4-rules, T5-integrate, T6-cli, T7-tests]
+        flows: [semantic-validate-path, backward-compat]
+
+critical_flows:
+  - id: semantic-validate-path
+    description: "ralph validate --semantic triggers semantic checks and reports findings"
+    entrypoints:
+      - src/cccc/ralph/cli.py
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/semantic_validator.py
+    required_verification_level: unit
+
+  - id: backward-compat
+    description: "Plans without semantic block validate identically to before"
+    entrypoints:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/validator.py
+    required_verification_level: unit
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED

@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Review plan and existing tests,DONE,Missing coverage matrix is identified,test -f plans/phase4-deep-integration.yaml,,0,已完成缺口映射
+2,Add missing Phase 4 tests,DONE,tests/test_ralph_semantic.py contains new non-duplicate cases,test -f tests/test_ralph_semantic.py,,0,已补齐缺失用例
+3,Run targeted pytest and fix failures,DONE,pytest passes for tests/test_ralph_semantic.py,python -m pytest tests/test_ralph_semantic.py -v --tb=short,,0,90 passed

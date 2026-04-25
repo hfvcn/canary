@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read plan and current retry code paths,DONE,All relevant CLI/IPC/ops/orchestrator/engine/test paths inspected,,2026-04-15T00:00:00,0,Plan and contract confirmed before edits.
+2,Implement retry --assign through daemon and orchestrator,DONE,CLI parser and retry call chain accept assign_agent_id,,2026-04-15T00:00:00,0,Added CLI flag, forwarding, and retry_and_assign orchestration.
+3,Add and update tests,DONE,Retry-only and retry+assign behaviors are covered in focused tests,,2026-04-15T00:00:00,0,Added direct retry+assign and IPC forwarding coverage.
+4,Run required verification,DONE,All requested commands pass,,2026-04-15T00:00:00,0,Help check and both requested pytest commands passed.

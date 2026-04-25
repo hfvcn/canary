@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read plan and inspect Ralph conventions,DONE,"Plan requirements confirmed and implementation scope isolated","sed -n '1,260p' plans/phase4-deep-integration.yaml",2026-04-07T23:48:09+0800,0,"T1-metrics scoped to src/cccc/ralph/semantic_metrics.py"
+2,Implement semantic metrics module,DONE,"New module provides record_semantic_outcome compute_gate_readiness format_gate_report and GateReadiness","python -c \"from cccc.ralph.semantic_metrics import record_semantic_outcome, compute_gate_readiness, format_gate_report, GateReadiness; print('PASS')\"",2026-04-07T23:48:09+0800,0,"Implemented append-only JSONL recording, gate metrics, and per-confidence report formatting"
+3,Run plan verification,DONE,"Both plan verification commands print PASS","python -c \"import tempfile, pathlib\"",2026-04-07T23:48:09+0800,0,"Import check and plan functional test both printed PASS"

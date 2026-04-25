@@ -38,7 +38,7 @@ def test_path_exists_cached(tmp_path):
     assert workspace.path_exists("cached.py") is True
     file_path.unlink()
 
-    assert workspace.path_exists("cached.py") is True
+    assert workspace.path_exists("cached.py") is False
 
 
 def test_resolve_module_local():

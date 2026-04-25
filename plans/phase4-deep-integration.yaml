@@ -1,0 +1,827 @@
+# Phase 4: Deep integration — advisory→gate upgrades gated by Phase 1-3 practice data
+# Source: ralph-serena-proposals-evaluation.md §4.4 Phase 4
+# Principle: each upgrade requires accumulated data evidence before activating (findings §十八: 定期逆向检查)
+# Principle: "先跑通一条路径" — metrics infrastructure first, then gated upgrades one by one
+#
+# Codex review (2026-04-07): 10 findings adopted — see revision notes inline
+
+plan_scope:
+  - src/cccc/ralph/
+
+# ────────────────────────────────────────────
+# Findings pre-check (§十九):
+#   - Finding 1 (编译通过≠功能可用): every task has runtime verification, not just import checks
+#   - Finding 9 (先跑通一条路径): T0 models + T1 data gates first, upgrades gated by threshold evidence
+#   - Finding 13 (结构校验≠无缺陷): plan requires both Ralph validate AND Codex review
+#   - Finding 16 (负向不变量): forbidden_flows enforce "advisory-only cannot become hard gate without evidence"
+#   - Finding 18 (虚假繁荣): T1 explicitly produces audit-ready metrics, not just "more tests passing"
+# ────────────────────────────────────────────
+
+tasks:
+  # ═══════════════════════════════════════════
+  # Layer 0: Model extensions (must come first — Codex finding #1)
+  # ═══════════════════════════════════════════
+
+  - id: T0-models
+    title: "Add Phase 4 model extensions — fields required by all downstream tasks"
+    role: leaf
+    depends_on: []
+    claimed_paths:
+      - src/cccc/ralph/models.py
+    semantic:
+      mode: strict
+      targets:
+        - path: src/cccc/ralph/models.py
+          symbol: ValidationReport
+          op: modify_interface
+        - path: src/cccc/ralph/models.py
+          symbol: Plan
+          op: modify_interface
+        - path: src/cccc/ralph/models.py
+          symbol: SemanticTarget
+          op: modify_interface
+        - path: src/cccc/ralph/models.py
+          symbol: BatchResult
+          op: modify_interface
+    goal_behavior: |
+      Add Phase 4 fields to existing models. These must exist BEFORE any Phase 4 logic
+      because T2/T3/T5/T6/T7 all depend on these new fields.
+
+      ValidationReport:
+        + suggested_deps: Dict[str, List[str]] = {}      # T3: task_id -> suggested dependency task_ids
+        + consistency_reports: Dict[str, Any] = {}        # T6: task_id -> ConsistencyReport dict
+
+      Plan:
+        + auto_infer: bool = False                        # T7: enable auto-inference of semantic targets
+
+      SemanticTarget:
+        + inferred: bool = False                          # T7: mark as auto-inferred (never produces errors)
+
+      BatchResult:
+        + semantic_conflicts: List[Any] = []              # T2: ConflictResult objects
+        + blocked_by_semantic: List[str] = []             # T2: blocked task IDs
+
+      All new fields have defaults → backward compatible with Phase 1-3 plans.
+      NOTE: T3 uses "suggested_deps" not "injected_deps" — validate does not mutate plan (Codex finding #8).
+    acceptance_criteria: |
+      Existing Phase 1-3 plans parse without error (backward compat).
+      New fields are present and default to empty/False.
+      Plan with auto_infer=True parses correctly.
+      SemanticTarget with inferred=True parses correctly.
+      BatchResult with semantic_conflicts and blocked_by_semantic defaults to empty.
+    verification:
+      level: unit
+      checks:
+        - name: backward-compat
+          command: "python -c \"from cccc.ralph.models import Plan, ValidationReport, BatchResult; p = Plan.model_validate({'tasks': [{'id': 'T1'}]}); assert not p.auto_infer; r = ValidationReport(); assert r.suggested_deps == {}; print('PASS')\""
+          required: true
+        - name: new-fields
+          command: "python -c \"from cccc.ralph.models import Plan, SemanticTarget, BatchResult; p = Plan.model_validate({'tasks': [{'id': 'T1'}], 'auto_infer': True}); assert p.auto_infer; t = SemanticTarget(path='a.py', symbol='A', op='modify_body', inferred=True); assert t.inferred; b = BatchResult(); assert b.blocked_by_semantic == []; print('PASS')\""
+          required: true
+
+  # ═══════════════════════════════════════════
+  # Layer 0b: Metrics collection infrastructure
+  # ═══════════════════════════════════════════
+
+  - id: T1-metrics
+    title: "Semantic metrics collector — track false-positive/accuracy rates per confidence level"
+    role: leaf
+    depends_on: []
+    claimed_paths:
+      - src/cccc/ralph/semantic_metrics.py
+    goal_behavior: |
+      New module providing practice-data collection for Phase 4 gate decisions.
+
+      Functions:
+        record_semantic_outcome(plan_name, task_id, rule_code, predicted_severity,
+                                confidence, actual_outcome, metrics_path=None) -> None
+          Appends to a JSON-lines file at .ralph/semantic_metrics.jsonl (or custom path).
+          Each record: {plan, task, rule, predicted_severity, confidence: "exact"|"best_effort"|"opaque",
+                        actual_outcome: "true_positive"|"false_positive"|"missed", timestamp}
+          NOTE: confidence field added per Codex finding #2 — gates need per-confidence breakdown.
+
+        compute_gate_readiness(rule_code, threshold, confidence_filter=None,
+                               min_samples=50, metrics_path=None) -> GateReadiness
+          Reads the metrics file, filters by rule_code (and optionally confidence_filter).
+          Computes:
+            - total_predictions: int
+            - true_positives: int
+            - false_positives: int
+            - false_positive_rate: float
+            - accuracy: float
+            - sample_size_sufficient: bool (>= min_samples)
+            - gate_ready: bool (fpr < threshold AND sample_size_sufficient)
+          NOTE: min_samples raised to 50 for hard gates (Codex finding #10).
+          NOTE: confidence_filter allows computing readiness for "exact"-only predictions.
+          Returns GateReadiness dataclass.
+
+        format_gate_report(metrics_path=None) -> str
+          Human-readable summary of all tracked rules and their gate readiness.
+          Shows breakdown by confidence level.
+
+      GateReadiness dataclass:
+        rule_code, confidence_filter, total_predictions, true_positives, false_positives,
+        false_positive_rate, accuracy, sample_size_sufficient, gate_ready
+
+      Design:
+        - Append-only JSONL for auditability (no in-place mutation)
+        - File-based, no daemon dependency (Ralph stays stateless per-invocation)
+        - record_semantic_outcome is called by external tooling (Codex review, manual triage)
+        - compute_gate_readiness is called by gate-upgrade tasks to check thresholds
+    acceptance_criteria: |
+      record_semantic_outcome writes a valid JSONL line including confidence field.
+      compute_gate_readiness with 0 samples returns gate_ready=False.
+      compute_gate_readiness with 60 samples at 2% fpr returns gate_ready=True for threshold=0.05.
+      compute_gate_readiness with confidence_filter="exact" only counts exact-confidence predictions.
+      format_gate_report produces human-readable text with per-confidence breakdown.
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.semantic_metrics import record_semantic_outcome, compute_gate_readiness, format_gate_report, GateReadiness\""
+          required: true
+        - name: functional-test
+          command: "python -c \"
+            import tempfile, pathlib
+            from cccc.ralph.semantic_metrics import record_semantic_outcome, compute_gate_readiness
+            with tempfile.TemporaryDirectory() as d:
+                p = pathlib.Path(d) / 'metrics.jsonl'
+                for i in range(50):
+                    record_semantic_outcome('test', f'T{i}', 'S_SYMBOL_TARGET_MISSING', 'warning', 'exact', 'true_positive', metrics_path=p)
+                record_semantic_outcome('test', 'T50', 'S_SYMBOL_TARGET_MISSING', 'warning', 'exact', 'false_positive', metrics_path=p)
+                for i in range(10):
+                    record_semantic_outcome('test', f'B{i}', 'S_SYMBOL_TARGET_MISSING', 'warning', 'best_effort', 'false_positive', metrics_path=p)
+                g_all = compute_gate_readiness('S_SYMBOL_TARGET_MISSING', 0.05, min_samples=50, metrics_path=p)
+                assert not g_all.gate_ready, f'all-confidence fpr should be too high: {g_all.false_positive_rate}'
+                g_exact = compute_gate_readiness('S_SYMBOL_TARGET_MISSING', 0.05, confidence_filter='exact', min_samples=50, metrics_path=p)
+                assert g_exact.gate_ready, f'exact-only fpr should be low: {g_exact.false_positive_rate}'
+                print('PASS')
+          \""
+          required: true
+    provides:
+      - name: semantic_metrics_api
+        kind: artifact
+
+  # ═══════════════════════════════════════════
+  # Layer 1: Gated upgrades (each depends on T0 + T1)
+  # ═══════════════════════════════════════════
+
+  - id: T2-suggest-gate
+    title: "Upgrade suggest semantic advisory → configurable hard gate"
+    role: leaf
+    depends_on: [T0-models, T1-metrics]
+    claimed_paths:
+      - src/cccc/ralph/core.py
+    semantic:
+      mode: strict
+      targets:
+        - path: src/cccc/ralph/core.py
+          symbol: suggest
+          op: modify_interface
+        - path: src/cccc/ralph/core.py
+          symbol: _detect_semantic_conflicts
+          op: modify_interface
+    goal_behavior: |
+      Extend suggest() to support gated hard blocking of semantic conflicts.
+
+      Changes to suggest():
+        New parameter: semantic_gate: Literal["off", "advisory", "hard"] = "advisory"
+        When semantic_gate == "hard" AND semantic_provider given:
+          - _detect_semantic_conflicts now returns structured ConflictResult objects
+          - ConflictResult: task_id, conflicting_task_id, conflict_type, confidence, blocked (bool)
+          - Only exact-confidence conflicts can block (best_effort/opaque stay advisory)
+          - Hard conflicts REMOVE tasks from ready list
+          - Every blocked task MUST appear in BatchResult.blocked_by_semantic with explanation
+            in BatchResult.semantic_conflicts (Codex forbidden_flow: no-silent-task-removal)
+        When semantic_gate == "advisory": current behavior (non-blocking notes)
+        When semantic_gate == "off": skip semantic conflict detection entirely
+
+      Store results in BatchResult (fields added by T0-models):
+        semantic_conflicts: List[ConflictResult]
+        blocked_by_semantic: List[str] (task IDs removed from ready)
+
+      Guard: compute_gate_readiness("S_SUGGEST_CONFLICT", 0.05, confidence_filter="exact",
+             min_samples=50). If gate NOT ready, refuse hard mode → fall back to advisory + warning.
+    acceptance_criteria: |
+      suggest() with semantic_gate="advisory" returns same ready set as before.
+      suggest() with semantic_gate="hard" + exact conflict → task removed, appears in blocked_by_semantic.
+      suggest() with semantic_gate="hard" + best_effort conflict → NOT blocked.
+      suggest() with semantic_gate="off" → no semantic_conflicts output.
+      suggest() with semantic_gate="hard" + insufficient gate data → warning, falls back to advisory.
+    verification:
+      level: unit
+      checks:
+        - name: signature-check
+          command: "python -c \"import inspect; from cccc.ralph.core import suggest; sig = inspect.signature(suggest); assert 'semantic_gate' in sig.parameters; print('PASS')\""
+          required: true
+        - name: hard-gate-blocks
+          command: "python -c \"
+            from cccc.ralph.core import suggest
+            from cccc.ralph.models import Plan, TaskSpec, SemanticBlock, SemanticTarget
+            class MockP:
+                def symbol_exists(self, p, n): return True
+                def find_references(self, p, n): return [type('R', (), {'ref_path': 'shared.py', 'ref_symbol': 'X', 'confidence': 'exact'})()]
+                def get_public_symbols(self, p): return ['X']
+            t1 = TaskSpec(id='T1', claimed_paths=['a.py'], semantic=SemanticBlock(mode='strict', targets=[SemanticTarget(path='shared.py', symbol='X', op='modify_interface')]))
+            t2 = TaskSpec(id='T2', claimed_paths=['b.py'], semantic=SemanticBlock(mode='strict', targets=[SemanticTarget(path='shared.py', symbol='X', op='modify_body')]))
+            plan = Plan(tasks=[t1, t2])
+            result = suggest(plan, semantic_provider=MockP(), semantic_gate='advisory')
+            advisory_ready = len(result.ready)
+            result_hard = suggest(plan, semantic_provider=MockP(), semantic_gate='hard')
+            assert len(result_hard.blocked_by_semantic) > 0, 'hard gate should block at least one task'
+            print('PASS')
+          \""
+          required: true
+    consumes:
+      - name: semantic_metrics_api
+        kind: artifact
+
+  - id: T3-suggest-deps
+    title: "Upgrade S_IMPLICIT_SYMBOL_DEPENDENCY → suggested depends_on (no mutation)"
+    role: leaf
+    depends_on: [T0-models, T1-metrics]
+    claimed_paths:
+      - src/cccc/ralph/semantic_validator.py
+    semantic:
+      mode: strict
+      targets:
+        - path: src/cccc/ralph/semantic_validator.py
+          symbol: validate_semantic
+          op: modify_body
+    goal_behavior: |
+      Extend validate_semantic to suggest missing depends_on based on symbol evidence.
+      NOTE: per Codex finding #8, validate does NOT mutate the Plan. It returns suggestions
+      in ValidationReport.suggested_deps for the caller to inspect and optionally adopt.
+
+      New parameter: suggest_deps: bool = False
+      When suggest_deps=True AND S_IMPLICIT_SYMBOL_DEPENDENCY detected:
+        - Check gate_readiness("S_IMPLICIT_SYMBOL_DEPENDENCY", 0.20, confidence_filter="exact", min_samples=50)
+          (accuracy threshold 80% → fpr threshold 20%)
+        - If gate NOT ready: emit warning as before + hint "dep suggestion not yet available"
+        - If gate ready AND confidence == "exact":
+          - Emit S_DEPS_SUGGESTED hint documenting the suggestion with evidence
+          - Add to returned suggested_deps: {task_id: [suggested_dependency_task_ids]}
+        - If gate ready AND confidence != "exact":
+          - Emit S_DEPS_POSSIBLE_SUGGESTION hint (weaker signal)
+
+      suggested_deps is populated in ValidationReport (field added by T0-models).
+      The plan object is NEVER mutated — caller reads suggested_deps and decides.
+    acceptance_criteria: |
+      suggest_deps=False produces same output as Phase 2 (no suggestions).
+      suggest_deps=True with insufficient gate data emits warning, empty suggested_deps.
+      suggest_deps=True with gate ready + exact → suggested_deps populated + hint emitted.
+      suggest_deps=True with gate ready + best_effort → weaker hint, NOT in suggested_deps.
+      Plan object is not modified (no mutation).
+    verification:
+      level: unit
+      checks:
+        - name: signature-check
+          command: "python -c \"import inspect; from cccc.ralph.semantic_validator import validate_semantic; sig = inspect.signature(validate_semantic); assert 'suggest_deps' in sig.parameters; print('PASS')\""
+          required: true
+        - name: no-mutation
+          command: "python -c \"
+            from cccc.ralph.semantic_validator import validate_semantic
+            from cccc.ralph.models import Plan, TaskSpec, SemanticBlock, SemanticTarget
+            class MockP:
+                def symbol_exists(self, p, n): return True
+                def find_references(self, p, n): return [type('R', (), {'ref_path': 'b.py', 'ref_symbol': 'Y', 'confidence': 'exact'})()]
+                def get_public_symbols(self, p): return ['Y']
+            t1 = TaskSpec(id='T1', claimed_paths=['a.py'], semantic=SemanticBlock(targets=[SemanticTarget(path='a.py', symbol='X', op='modify_interface')]))
+            t2 = TaskSpec(id='T2', claimed_paths=['b.py'])
+            plan = Plan(tasks=[t1, t2])
+            orig_deps_t1 = list(t1.depends_on) if t1.depends_on else []
+            orig_deps_t2 = list(t2.depends_on) if t2.depends_on else []
+            issues = validate_semantic(plan, MockP(), suggest_deps=True)
+            assert (t1.depends_on or []) == orig_deps_t1, 'T1 depends_on was mutated!'
+            assert (t2.depends_on or []) == orig_deps_t2, 'T2 depends_on was mutated!'
+            print('PASS')
+          \""
+          required: true
+    consumes:
+      - name: semantic_metrics_api
+        kind: artifact
+
+  - id: T4-unlock-score
+    title: "Semantic-aware _unlock_score for suggest scheduling order"
+    role: leaf
+    depends_on: [T0-models, T2-suggest-gate]
+    claimed_paths:
+      - src/cccc/ralph/core.py
+    semantic:
+      mode: advisory
+      targets:
+        - path: src/cccc/ralph/core.py
+          symbol: suggest
+          op: modify_body
+    goal_behavior: |
+      Add semantic awareness to suggest()'s task ordering logic.
+
+      Current _unlock_score considers: dependency count, downstream tasks unblocked.
+      Add semantic factors when provider is available:
+
+      New function: compute_semantic_weight(task, provider) -> float
+        Returns a score adjustment based on:
+        1. modify_interface/rename/delete targets: +priority (do risky changes first so downstream can adapt)
+        2. High fanout targets (>10 refs): +priority (clear the bottleneck early)
+        3. create targets: -priority (new code can wait, existing code changes are riskier)
+
+        Decision model (from evaluation doc §4.4):
+        - "被依赖的基础设施" (high fanout, modify_interface) → prioritize
+        - "修改签名" affecting many callers → prioritize to unblock
+        - create/modify_body with low fanout → deprioritize (least disruptive)
+
+      Integration into suggest():
+        When semantic_provider given, final score = _unlock_score(task) + compute_semantic_weight(task, provider)
+        When no provider: score unchanged (backward compat).
+
+      Scoring is a heuristic, not a gate. It influences ordering, not blocking.
+    acceptance_criteria: |
+      suggest() without provider returns same ordering as before.
+      suggest() with provider and modify_interface task ranks it higher than create task.
+      suggest() with provider and high-fanout task ranks it above low-fanout task.
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.core import compute_semantic_weight; print('PASS')\""
+          required: true
+        - name: weight-interface-higher
+          command: "python -c \"
+            from cccc.ralph.core import compute_semantic_weight
+            from cccc.ralph.models import TaskSpec, SemanticBlock, SemanticTarget
+            class MockP:
+                def symbol_exists(self, p, n): return True
+                def find_references(self, p, n): return [type('R', (), {'ref_path': 'a.py', 'ref_symbol': 'x', 'confidence': 'exact'})() for _ in range(15)]
+                def get_public_symbols(self, p): return []
+            t_iface = TaskSpec(id='T1', semantic=SemanticBlock(targets=[SemanticTarget(path='a.py', symbol='A', op='modify_interface')]))
+            t_create = TaskSpec(id='T2', semantic=SemanticBlock(targets=[SemanticTarget(path='b.py', symbol='B', op='create')]))
+            w1 = compute_semantic_weight(t_iface, MockP())
+            w2 = compute_semantic_weight(t_create, MockP())
+            assert w1 > w2, f'{w1} should be > {w2}'
+            print('PASS')
+          \""
+          required: true
+
+  - id: T5-smart-tests
+    title: "Upgrade recommend_tests → selective test execution with coverage gate"
+    role: leaf
+    depends_on: [T0-models, T1-metrics]
+    claimed_paths:
+      - src/cccc/ralph/semantic_validator.py
+      - src/cccc/ralph/cli.py
+    semantic:
+      mode: advisory
+      targets:
+        - path: src/cccc/ralph/semantic_validator.py
+          symbol: recommend_tests
+          op: modify_interface
+        - path: src/cccc/ralph/semantic_validator.py
+          symbol: format_semantic_context
+          op: modify_body
+        - path: src/cccc/ralph/cli.py
+          symbol: _cmd_verify
+          op: modify_body
+    goal_behavior: |
+      Extend recommend_tests to produce a structured TestRecommendation.
+
+      NOTE: Codex finding #5 — changing return type breaks format_semantic_context (line 630)
+      and _cmd_verify (line 250) which consume recommend_tests as List[str].
+      Both callers MUST be updated in this task. Hence claimed_paths includes cli.py.
+
+      Changes to recommend_tests():
+        New return type: TestRecommendation (replaces plain List[str])
+        TestRecommendation:
+          test_files: List[str]          # affected test files (preserves old return shape)
+          pytest_selector: str           # e.g. "pytest tests/test_a.py tests/test_b.py"
+          coverage_confidence: float     # estimated coverage of affected code (0.0-1.0)
+          full_suite_recommended: bool   # True if coverage_confidence < threshold (0.9)
+          rationale: str                 # why these tests were selected
+
+        Coverage confidence estimation:
+          - 1.0: all references to modified symbols in test files with exact confidence
+          - 0.8: some references with best_effort confidence
+          - 0.5: opaque references exist
+          - full_suite_recommended = True when coverage_confidence < 0.9
+
+        Gate check: only claim "selective execution sufficient" when:
+          - coverage_confidence >= 0.9
+          - gate_readiness("S_RECOMMEND_TESTS", 0.10, confidence_filter="exact", min_samples=50)
+          - Otherwise: recommend as fast feedback + full suite still required
+
+      Update callers:
+        - format_semantic_context: use result.test_files instead of bare list
+        - _cmd_verify: serialize TestRecommendation to JSON output
+    acceptance_criteria: |
+      recommend_tests returns TestRecommendation with test_files and pytest_selector.
+      TestRecommendation.test_files is a list (backward compat for downstream).
+      format_semantic_context works with new return type (no crash).
+      _cmd_verify serializes TestRecommendation correctly.
+      Low coverage_confidence → full_suite_recommended=True.
+      High confidence + gate not ready → full_suite_recommended=True.
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.semantic_validator import recommend_tests, TestRecommendation; print('PASS')\""
+          required: true
+        - name: callers-work
+          command: "python -c \"
+            from cccc.ralph.semantic_validator import recommend_tests, TestRecommendation
+            from cccc.ralph.models import TaskSpec, SemanticBlock, SemanticTarget
+            class MockP:
+                def symbol_exists(self, p, n): return True
+                def find_references(self, p, n): return [type('R', (), {'ref_path': 'tests/test_foo.py', 'ref_symbol': 'test_x', 'confidence': 'exact'})()]
+                def get_public_symbols(self, p): return []
+            t = TaskSpec(id='T1', semantic=SemanticBlock(targets=[SemanticTarget(path='a.py', symbol='A', op='modify_body')]))
+            result = recommend_tests(t, MockP())
+            assert isinstance(result, TestRecommendation)
+            assert isinstance(result.test_files, list)
+            assert 'tests/test_foo.py' in result.test_files
+            assert result.full_suite_recommended  # no gate data → always True
+            print('PASS')
+          \""
+          required: true
+
+  - id: T6-consistency
+    title: "Post-verify consistency snapshot — check references updated after task completion"
+    role: leaf
+    depends_on: [T0-models]
+    claimed_paths:
+      - src/cccc/ralph/semantic_validator.py
+      - src/cccc/ralph/core.py
+    semantic:
+      mode: advisory
+      targets:
+        - path: src/cccc/ralph/semantic_validator.py
+          symbol: format_semantic_context
+          op: modify_body
+        - path: src/cccc/ralph/core.py
+          symbol: verify
+          op: modify_body
+    goal_behavior: |
+      New function: verify_post_change_consistency(task, provider, plan,
+                    pre_fingerprint=None) -> ConsistencyReport
+
+      NOTE: Codex finding #9 — pre_fingerprint parameter added. The pre-execution snapshot
+      (SemanticFingerprint from Phase 2) must be explicitly passed in, not magically retrieved.
+      If pre_fingerprint is None, skip delta comparison and only check current state.
+
+      Called after a task is marked completed. Checks:
+      1. For each modify_interface/rename/delete target:
+         - Re-query provider.find_references for the symbol
+         - If pre_fingerprint given: compare current refs with pre-execution refs
+         - Flag any reference that still points to old signature/name/deleted symbol
+      2. For each create target:
+         - Verify the symbol now exists (provider.symbol_exists)
+      3. For dependency chain:
+         - Check tasks consuming this task's provides are not broken
+
+      ConsistencyReport (dataclass):
+        task_id: str
+        checks_passed: int
+        checks_failed: int
+        stale_references: List[StaleReference]  # refs not updated
+        missing_creates: List[str]              # symbols that should exist but don't
+        overall: Literal["consistent", "inconsistent", "inconclusive"]
+
+      StaleReference (dataclass):
+        ref_path, ref_symbol, expected_state, confidence
+
+      Integration: verify() in core.py calls this when semantic_provider given.
+      ConsistencyReport stored in ValidationReport.consistency_reports (field from T0-models).
+      Does NOT block verification — adds findings for human/Agent review.
+    acceptance_criteria: |
+      verify_post_change_consistency with stale refs returns inconsistent.
+      verify_post_change_consistency with all refs updated returns consistent.
+      Create target that doesn't exist → flagged in missing_creates.
+      pre_fingerprint=None → skip delta, only check current state.
+      verify() in core.py calls this when provider given.
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.semantic_validator import verify_post_change_consistency, ConsistencyReport; print('PASS')\""
+          required: true
+        - name: stale-ref-detected
+          command: "python -c \"
+            from cccc.ralph.semantic_validator import verify_post_change_consistency
+            from cccc.ralph.models import TaskSpec, SemanticBlock, SemanticTarget, Plan
+            class StaleP:
+                def symbol_exists(self, p, n): return True
+                def find_references(self, p, n): return [type('R', (), {'ref_path': 'other.py', 'ref_symbol': 'old_ref', 'confidence': 'exact'})()]
+                def get_public_symbols(self, p): return []
+            t = TaskSpec(id='T1', claimed_paths=['a.py'], semantic=SemanticBlock(mode='strict', targets=[SemanticTarget(path='a.py', symbol='A', op='delete')]))
+            plan = Plan(tasks=[t])
+            report = verify_post_change_consistency(t, StaleP(), plan)
+            assert report.overall in ('inconsistent', 'inconclusive'), f'expected inconsistent, got {report.overall}'
+            print('PASS')
+          \""
+          required: true
+
+  - id: T7-auto-infer
+    title: "Upgrade semantic-hints → auto-infer symbols as default behavior"
+    role: leaf
+    depends_on: [T0-models, T1-metrics]
+    claimed_paths:
+      - src/cccc/ralph/semantic_validator.py
+    semantic:
+      mode: advisory
+      targets:
+        - path: src/cccc/ralph/semantic_validator.py
+          symbol: validate_semantic
+          op: modify_body
+    goal_behavior: |
+      New function: auto_infer_semantic_targets(task, provider) -> List[SemanticTarget]
+
+      For tasks WITHOUT explicit semantic.targets:
+        1. For each claimed_path, get_public_symbols()
+        2. Infer SemanticTarget for each public symbol based on task context:
+           - If task has "delete" in title/goal → op: delete
+           - If task has "rename" in title/goal → op: rename
+           - If task has "refactor"/"modify interface" → op: modify_interface
+           - Default: op: modify_body
+        3. Return inferred targets with inferred=True (field from T0-models)
+
+      Integration modes (controlled by Plan.auto_infer field from T0-models):
+        - auto_infer=False (default): no change, Foreman fills targets manually
+        - auto_infer=True:
+          - Check gate_readiness("S_SEMANTIC_HINTS_CONFIRM", 0.10, min_samples=50)
+          - If gate NOT ready: emit S_AUTO_INFER_NOT_READY warning, skip
+          - If gate ready: fill in missing targets with inferred=True
+          - Run validation rules against inferred targets
+          - Report S_TARGETS_AUTO_INFERRED hint listing what was inferred
+            (NOTE: "hint" not "info" — info severity doesn't exist, Codex finding #3)
+
+      Key constraint: inferred targets (inferred=True) NEVER produce errors even in strict mode.
+      Inferred targets are always treated as advisory-confidence (downgraded).
+    acceptance_criteria: |
+      auto_infer_semantic_targets with a mock provider returns targets with inferred=True.
+      auto_infer=False produces identical behavior to Phase 3.
+      auto_infer=True with insufficient gate data → warning, no inference.
+      auto_infer=True with gate ready → targets inferred, S_TARGETS_AUTO_INFERRED hint emitted.
+      Inferred targets never produce errors even in strict mode.
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.semantic_validator import auto_infer_semantic_targets; print('PASS')\""
+          required: true
+        - name: inferred-no-error
+          command: "python -c \"
+            from cccc.ralph.semantic_validator import validate_semantic, auto_infer_semantic_targets
+            from cccc.ralph.models import Plan, TaskSpec, SemanticBlock, SemanticTarget
+            class MockP:
+                def symbol_exists(self, p, n): return False  # symbol missing → would be error in strict
+                def find_references(self, p, n): return []
+                def get_public_symbols(self, p): return ['MissingSymbol']
+            t = TaskSpec(id='T1', claimed_paths=['a.py'])
+            inferred = auto_infer_semantic_targets(t, MockP())
+            assert all(tgt.inferred for tgt in inferred), 'all inferred targets should have inferred=True'
+            t.semantic = SemanticBlock(mode='strict', targets=inferred)
+            plan = Plan(tasks=[t])
+            issues = validate_semantic(plan, MockP())
+            errors = [i for i in issues if i.severity == 'error']
+            assert len(errors) == 0, f'inferred targets must not produce errors: {errors}'
+            print('PASS')
+          \""
+          required: true
+
+  # ═══════════════════════════════════════════
+  # Layer 2: Integration and wiring
+  # ═══════════════════════════════════════════
+
+  - id: T8-integrate
+    title: "Wire Phase 4 features into validator and CLI"
+    role: integration
+    depends_on: [T0-models, T1-metrics, T2-suggest-gate, T3-suggest-deps, T4-unlock-score, T5-smart-tests, T6-consistency, T7-auto-infer]
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/cli.py
+    semantic:
+      mode: strict
+      targets:
+        - path: src/cccc/ralph/validator.py
+          symbol: validate_with_project
+          op: modify_interface
+        - path: src/cccc/ralph/cli.py
+          symbol: _cmd_validate
+          op: modify_body
+        - path: src/cccc/ralph/cli.py
+          symbol: _cmd_suggest
+          op: modify_body
+        - path: src/cccc/ralph/cli.py
+          symbol: _cmd_verify
+          op: modify_body
+    goal_behavior: |
+      1. validator.py — validate_with_project:
+         New parameter: suggest_deps: bool = False
+         When suggest_deps=True, passes through to validate_semantic.
+         Stores suggested_deps in ValidationReport.
+         When plan.auto_infer=True, runs auto_infer_semantic_targets for tasks without targets.
+
+      2. cli.py — validate command:
+         New flag: --suggest-deps (activates dep suggestion)
+         New flag: --auto-infer (overrides plan.auto_infer to True)
+
+      3. cli.py — suggest command:
+         New flag: --semantic-gate off|advisory|hard (default: advisory)
+         Passes semantic_gate to suggest().
+
+      4. cli.py — verify command:
+         New flag: --consistency-check (runs verify_post_change_consistency after verify)
+
+      5. cli.py — new command: ralph gate-report
+         Calls format_gate_report() from semantic_metrics.
+         Does NOT require a plan file (like existing 'stats' command).
+         Shows current gate readiness for all tracked rules.
+
+      All new flags degrade gracefully when Serena unavailable or metrics insufficient.
+    acceptance_criteria: |
+      ralph validate --help shows --suggest-deps and --auto-infer flags.
+      ralph suggest --help shows --semantic-gate flag.
+      ralph verify --help shows --consistency-check flag.
+      ralph gate-report runs without crash (even with empty metrics file).
+      All existing CLI behavior unchanged when new flags not provided.
+    verification:
+      level: integration
+      checks:
+        - name: validate-flags
+          command: "python -m cccc.ralph.cli validate --help 2>&1 | grep -q suggest-deps"
+          required: true
+        - name: suggest-flags
+          command: "python -m cccc.ralph.cli suggest --help 2>&1 | grep -q semantic-gate"
+          required: true
+        - name: gate-report
+          command: "python -m cccc.ralph.cli gate-report --help 2>&1 | head -1"
+          required: false
+      covers:
+        tasks: [T0-models, T1-metrics, T2-suggest-gate, T3-suggest-deps, T4-unlock-score, T5-smart-tests, T6-consistency, T7-auto-infer, T8-integrate]
+        flows: [phase4-deep-integration, gate-data-flow, advisory-to-hard-upgrade]
+
+  # ═══════════════════════════════════════════
+  # Layer 3: Tests
+  # ═══════════════════════════════════════════
+
+  - id: T9-tests
+    title: "Tests for Phase 4 features"
+    role: verification
+    depends_on: [T0-models, T1-metrics, T2-suggest-gate, T3-suggest-deps, T4-unlock-score, T5-smart-tests, T6-consistency, T7-auto-infer, T8-integrate]
+    claimed_paths:
+      - tests/test_ralph_semantic.py
+    goal_behavior: |
+      Add test cases covering Phase 4 (30+ tests):
+
+      T0-models tests:
+        1. Phase 1-3 plans parse without error (regression)
+        2. New fields present with correct defaults
+        3. BatchResult has semantic_conflicts and blocked_by_semantic
+
+      T1-metrics tests:
+        4. record_semantic_outcome writes JSONL with confidence field
+        5. compute_gate_readiness with insufficient samples → gate_ready=False
+        6. compute_gate_readiness with enough samples + low fpr → gate_ready=True
+        7. compute_gate_readiness with enough samples + high fpr → gate_ready=False
+        8. compute_gate_readiness with confidence_filter only counts matching records
+        9. format_gate_report produces readable output with per-confidence breakdown
+
+      T2-suggest-gate tests:
+        10. suggest(semantic_gate="advisory") → non-blocking (same as Phase 3)
+        11. suggest(semantic_gate="hard") + exact conflict → task removed, in blocked_by_semantic
+        12. suggest(semantic_gate="hard") + best_effort conflict → NOT removed
+        13. suggest(semantic_gate="off") → no semantic output
+        14. suggest(semantic_gate="hard") + insufficient gate data → warning, advisory fallback
+
+      T3-suggest-deps tests:
+        15. suggest_deps=False → no change from Phase 2
+        16. suggest_deps=True + gate ready + exact → suggested_deps populated
+        17. suggest_deps=True + gate ready + best_effort → weaker hint only
+        18. suggest_deps=True + gate not ready → warning, empty suggested_deps
+        19. Plan object NOT mutated after suggest_deps=True
+
+      T4-unlock-score tests:
+        20. suggest without provider → same ordering as Phase 3
+        21. modify_interface task ranks higher than create task
+        22. High-fanout task ranks higher than low-fanout task
+
+      T5-smart-tests tests:
+        23. TestRecommendation includes test_files and pytest_selector
+        24. Low coverage_confidence → full_suite_recommended=True
+        25. High confidence + gate ready → full_suite_recommended can be False
+        26. format_semantic_context works with new TestRecommendation (no crash)
+
+      T6-consistency tests:
+        27. Stale references → inconsistent
+        28. All refs updated → consistent
+        29. Create target missing → flagged in missing_creates
+        30. pre_fingerprint=None → skip delta, only check current
+
+      T7-auto-infer tests:
+        31. auto_infer=False → no inference
+        32. auto_infer=True + gate ready → targets inferred with inferred=True
+        33. auto_infer=True + gate not ready → warning, no inference
+        34. Inferred targets NEVER produce errors in strict mode (forbidden flow)
+
+      Negative tests for forbidden_flows:
+        35. no-ungated-hard-block: hard gate with no metrics → falls back to advisory
+        36. no-silent-dep-suggestion: suggested_deps populated → hint issued in issues
+        37. no-inferred-errors: inferred=True target with missing symbol in strict → no error
+        38. no-selective-only-tests: low confidence → full_suite_recommended=True
+        39. no-cross-rule-gate: readiness for rule A cannot unlock gate for rule B
+        40. no-plan-mutation: validate/suggest/auto_infer never modify plan file or plan object
+        41. no-silent-task-removal: every blocked task has auditable explanation
+    acceptance_criteria: |
+      All 41 test cases pass with pytest.
+      Existing Phase 1-3 tests still pass (no regression).
+    verification:
+      level: integration
+      checks:
+        - name: run-tests
+          command: "python -m pytest tests/test_ralph_semantic.py -v --tb=short"
+          required: true
+      covers:
+        tasks: [T0-models, T1-metrics, T2-suggest-gate, T3-suggest-deps, T4-unlock-score, T5-smart-tests, T6-consistency, T7-auto-infer, T8-integrate, T9-tests]
+        flows: [phase4-deep-integration, gate-data-flow, advisory-to-hard-upgrade, no-ungated-hard-block, no-silent-dep-suggestion, no-inferred-errors, no-selective-only-tests, no-cross-rule-gate, no-plan-mutation, no-silent-task-removal]
+
+# ════════════════════════════════════════════
+# Critical flows
+# ════════════════════════════════════════════
+
+critical_flows:
+  - id: phase4-deep-integration
+    description: "Phase 4 features work end-to-end: metrics → gate check → upgrade activation"
+    entrypoints:
+      - src/cccc/ralph/semantic_metrics.py
+      - src/cccc/ralph/semantic_validator.py
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/cli.py
+    required_verification_level: integration
+
+  - id: gate-data-flow
+    description: "Metrics collection → gate readiness computation → upgrade decision"
+    entrypoints:
+      - src/cccc/ralph/semantic_metrics.py
+      - src/cccc/ralph/semantic_validator.py
+    required_verification_level: unit
+
+  - id: advisory-to-hard-upgrade
+    description: "Advisory finding with sufficient exact-confidence data can be upgraded to hard gate"
+    entrypoints:
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/semantic_validator.py
+    required_verification_level: unit
+
+# ════════════════════════════════════════════
+# Forbidden flows (negative invariants — findings §十六 + Codex review additions)
+# ════════════════════════════════════════════
+
+forbidden_flows:
+  # Original 4
+  - id: no-ungated-hard-block
+    description: "Hard semantic gate MUST NOT activate without sufficient exact-confidence metrics data (>= 50 samples, fpr < threshold)"
+    required_verification_level: unit
+
+  - id: no-silent-dep-suggestion
+    description: "Dep suggestions MUST appear in ValidationReport.suggested_deps AND emit a hint — never silent"
+    required_verification_level: unit
+
+  - id: no-inferred-errors
+    description: "Auto-inferred targets (inferred=True) MUST NOT produce error-level issues even in strict mode"
+    required_verification_level: unit
+
+  - id: no-selective-only-tests
+    description: "Selective test execution MUST NOT claim 'full suite not needed' without both high coverage_confidence AND gate data"
+    required_verification_level: unit
+
+  # Added per Codex review
+  - id: no-cross-rule-gate
+    description: "Gate readiness for one rule/confidence MUST NOT be used to unlock a gate for a different rule or weaker confidence bucket"
+    required_verification_level: unit
+
+  - id: no-plan-mutation
+    description: "validate, suggest, auto_infer MUST NOT mutate the input Plan object or persist changes to the plan file"
+    required_verification_level: unit
+
+  - id: no-silent-task-removal
+    description: "Every task removed from ready list by hard gate MUST appear in BatchResult.blocked_by_semantic with auditable explanation in semantic_conflicts"
+    required_verification_level: unit
+
+# ════════════════════════════════════════════
+# Suppress codes
+# ════════════════════════════════════════════
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+state:
+  completed_task_ids:
+    - T9-tests
+    - T8-integrate
+    - T7-auto-infer
+    - T6-consistency
+    - T5-smart-tests
+    - T4-unlock-score
+    - T3-suggest-deps
+    - T2-suggest-gate
+    - T1-metrics
+    - T0-models

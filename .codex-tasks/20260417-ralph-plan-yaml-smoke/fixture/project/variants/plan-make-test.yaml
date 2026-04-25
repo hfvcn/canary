@@ -1,0 +1,17 @@
+schema_version: "1.0.0"
+tasks:
+  - id: T1
+    title: Wrapper Command Boundary
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/app.py
+    goal_behavior: Wrapper commands should skip literal-path extraction.
+    acceptance_criteria: The wrapper test command is accepted.
+    verification:
+      level: unit
+      command: make test
+      covers:
+        tasks:
+          - T1
+

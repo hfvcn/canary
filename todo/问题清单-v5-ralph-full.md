@@ -857,6 +857,23 @@ plan_defaults:
 
 ---
 
+## 九b、2026-04-18 文档回补（从未解决清单迁入）
+
+> 说明：以下 3 项在代码与测试中已具备实现证据，2026-04-18 从 `问题清单-v5-ralph.md` 的“未解决”列表迁回 full 文档，避免继续作为待办误导。
+
+### 已确认完成
+
+- ✅ **RO-8n**: `W_VERIFICATION_PYTEST_K_NO_MATCH` 对“将创建测试文件”的场景已降级处理。当前 task claims 测试文件时降为 `hint`；plan 中其他 task claims 同一测试文件时也可降为 `hint`。对应实现与记录见 Wave 5 `RV-12`、`RV-17`。
+- ✅ **RO-9n**: `W_VERIFICATION_NO_CHECKS` 已实现并接入 `validate()` 主流程；当 `verification.command` 存在但 `checks=[]` 时会发出 warning，提示拆分 compile / test 等结构化 check。
+- ✅ **RO-11**: `failure_path` 字段与 `W_NO_FAILURE_PATH` 规则已实现；涉及 assignment / actor / worker / agent / async 场景但未声明失败处理时，Ralph 会报 warning。当前强度仍为 `warning`，尚未升级为 hard gate。
+
+### 文档对齐说明
+
+- `RO-8n` 的实现证据已在本文档 Wave 5 / Wave 8 记录中存在，本次仅修正其在“未解决”文档中的过期状态。
+- `RO-9n` 与 `RO-11` 属于后续代码已实现、但未及时从“未解决”清单迁出的文档漂移；本次一并回补到 full 文档。
+
+---
+
 ## 十a、v5-final-six 实施记录
 
 > 日期：2026-04-02
@@ -959,3 +976,140 @@ plan_defaults:
 | 11 | 角色约束 | `W_VERIFICATION_ROLE_NO_COVERS` | warning | v5-final-six RO-3 |
 | 11 | 角色约束 | `W_VERIFICATION_ROLE_CLAIMS_SOURCE` | warning | v5-final-six RO-3 |
 | 11 | 角色约束 | `W_LEAF_ROLE_IS_INTEGRATOR` | warning | v5-final-six RO-3 |
+| 12 | 验证强度 | `W_VERIFICATION_SHALLOW_CHECKS` | warning | RO-17 |
+| 12 | 验证强度 | `W_VERIFICATION_NO_CHECKS` | warning | Batch G |
+| 12 | 验证强度 | `W_NO_FAILURE_PATH` | warning | Batch G |
+| 13 | Finding 引用 | `W_FINDING_REF_INCOMPLETE` | warning | RO-12 |
+| 13 | Finding 引用 | `W_FINDING_REF_UNKNOWN_ENFORCER` | hint | RO-12 |
+
+---
+
+## 十一、RO-7n~RO-19 全量修复实施记录
+
+> 日期：2026-04-19
+> 计划：plans/fix-v5-ralph-ro.yaml
+> 流程：计划生成 → Ralph 验证(0 error, 5 warning) → Codex 审查(3 CRITICAL + 4 IMPORTANT fixed) → 并行执行(4 batch) → 365 tests passed
+> 涵盖：9 项待实施改进全部完成
+
+### 批次执行
+
+| Batch | Task | 改进项 | 文件 | 新测试 |
+|-------|------|--------|------|--------|
+| 1 | T1 | **RO-15** filesystem validator 目录崩溃 | filesystem_validator.py | 3 (49 total) |
+| 1 | T2 | **RO-17** W_VERIFICATION_SHALLOW_CHECKS | validator.py | 5 (22 total) |
+| 1 | T7 | **RO-19** 前端测试质量门 | web/package.json, vite.config.ts, ci.yml | 117 vitest |
+| 1 | T8 | **RO-18** 质量门 rollout 模式 | cli.py, quality-gate.yaml | 4 (154 total) |
+| 2 | T3 | **RO-7n/14n/13n** 流段+叶角色+plan_scope | validator.py, models.py | 8 (162 total) |
+| 3 | T4 | **RO-16/12** test_created_by + finding_refs | models.py, validator.py, fsv | 10 (81 total) |
+| 4 | T-int | 集成测试 + 回归 | test_v5_ro_integration.py | 7 (365 total) |
+
+### 已完成改进详情
+
+- ✅ **RO-15** (P1): `IsADirectoryError` 修复 — `_load_issue_file_map_cached` 捕获 IsADirectoryError；`_check_pytest` 检测目录路径后跳过 -k 和 node 解析
+- ✅ **RO-17** (P1): `W_VERIFICATION_SHALLOW_CHECKS` 规则 — 当 verification.checks 全为 compile/import/help 类（无 pytest behavior test）时 warn
+- ✅ **RO-19** (P1): 前端测试质量门 — web/package.json 新增 test/test:run/quality 脚本；vite.config.ts 添加 vitest jsdom 配置；CI 接入 test:run
+- ✅ **RO-18** (P2): 质量门 rollout 模式 — .cccc/quality-gate.yaml 配置 terminal/branch/repo 三层 gate；CLI `--gate` 参数支持 shadow/warn/enforce 模式
+- ✅ **RO-7n** (P2): Python 符号路径解析 — `_resolve_symbol_entrypoint()` 将 `module.Class.method` 解析为文件路径匹配 owned_paths
+- ✅ **RO-14n** (P2): Leaf 角色豁免 — `W_FLOW_OWNER_NO_VERIFICATION` 在 leaf 任务 + integration/verification 角色覆盖时降为 hint
+- ✅ **RO-13n** (P2): plan_scope 过滤 — `Plan.plan_scope` 字段 + `_entrypoint_in_scope()` 限制 critical entrypoint 检查范围
+- ✅ **RO-16** (P2): test_created_by 支持 — CriticalFlow/ForbiddenFlow 新增 `test_created_by` 字段；未完成的创建任务使 flow uncovered 降为 hint
+- ✅ **RO-12** (P2): finding_refs 校验 — `FindingRef` 模型 + `_check_finding_refs()` 校验 id/mitigation/enforced_by
+
+### 新增模型字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `Plan.plan_scope` | `List[str] = []` | 限定 critical entrypoint 检查范围 |
+| `Plan.finding_refs` | `List[FindingRef] = []` | 结构化 finding 引用与缓解措施 |
+| `CriticalFlow.test_created_by` | `List[str] = []` | 标记测试由哪个任务创建（延迟检查） |
+| `ForbiddenFlow.test_created_by` | `List[str] = []` | 同上 |
+| `BatchResult.task_metadata` | `Dict[str, Any] = {}` | 每任务元数据（verification_mode 等） |
+| `BatchResult.batch_sequence` | `int = 0` | 批次序号 |
+| `BatchResult.batch_boundary` | `bool = True` | 批次边界标记 |
+
+### Codex 审查关键发现（均已修复进计划）
+
+1. **[CRITICAL] T7 缺 CI 文件**：RO-19 要求 CI 接入但 claimed_paths 未包含 .github/workflows/ci.yml → 已加入
+2. **[CRITICAL] T3 测试文件放错**：flow/entrypoint 测试应在 test_ralph_standalone.py 不是 test_workflow_state.py → 已迁移
+3. **[CRITICAL] T3 RO-14n 条件写错**：只检查 covering_ids 非空，未过滤 role → 改为过滤 integration/verification role
+4. **[IMPORTANT] T4 漏 claim filesystem_validator 测试**：修改 _check_pytest_k 但未 claim 对应测试文件 → 已加入
+5. **[IMPORTANT] T3 awareness_paths 回归**：helper 只看 claimed_paths 会漏掉 awareness ownership → 改为使用 owned_paths
+6. **[IMPORTANT] T4 enforced_by 校验**：RO-12 要求 enforced_by 绑定已知 ID → 从 optional 改为 required
+7. **[IMPORTANT] T7 jsdom 依赖缺口**：vitest environment: "jsdom" 需要安装 jsdom 包 → 加入 goal_behavior
+
+### 实践新发现的 Ralph 不足
+
+- **RO-20** (P2): Worker 越界修改 claimed_paths 之外的文件 — T-int Codex worker 修改了 agent.py、core.py、workspace_index.py、plan_io.py（均不在 claimed_paths 中）。verify gate 无法拦截。建议新增 `W_WORKER_EXCEEDED_SCOPE`
+- **RO-13n-obs** ~~(已知局限)~~ **已修复**: ~~已有测试引用未实现功能~~ → RO 全量修复时补充了 batch_sequence/batch_boundary/verification_mode 实现，6 测试全部通过
+
+### E2E v13 验证结果（2026-04-19）
+
+> 干净 group g_3d4bace911d9，5 任务笔记应用，9 分钟完成
+> 报告：todo/e2e-实战评估报告-v13.md
+
+| 维度 | 分数 | 关键发现 |
+|------|------|----------|
+| 结果 | 4/5 | 0 CRITICAL（v5 的 SQLite 错误处理已通过验收标准驱动修复）, 8 WARN |
+| 过程 | 4/5 | verification_passed 5/5，自动闭环 4/5（T2 completer_mismatch），DAG 门控生效 |
+| 体验 | 3.5/5 | Ralph validate/suggest/verify 全部正面，Worker 不自行 complete 是主要摩擦 |
+| 综合 | 3.8/5 | 历史最高 |
+
+RO 改进在 v13 中的验证效果：
+- ✅ **RO-17 (W_VERIFICATION_SHALLOW_CHECKS)**: 验收标准中明确要求 behavior test，Worker 遵守。但 checks 深度仍不够（无并发/错误路径测试）—— 属 RO-17 "acceptance→checks 交叉检查" 增强方向
+- ✅ **RO-15**: 未触发目录路径崩溃（v13 plan 未使用目录路径验证命令，但修复已就绪）
+- ✅ **RO-19**: web/package.json 测试脚本 + CI 接入已生效（117 vitest tests）
+- ℹ️ **RO-18/13n/14n/7n/16/12**: v13 E2E 使用干净 plan，未直接触发这些改进的场景
+
+### 实践新发现
+
+- **RO-21** (P2): Ralph validate 执行无 ledger 事件 — Codex 过程审查发现 batch_registered 时戳早于 validate 声明。ralph validate 通过 CLI 执行不向 ledger 写事件，无法审计"先验证再提交"。对应 v3 问题清单 FIX-E2E-5
+
+---
+
+## v14 E2E 验证确认（2026-04-22）
+
+> 来源：E2E v14 全栈笔记应用实战，2146 tests pass
+> 评估报告：[e2e-实战评估报告-v14.md](./e2e-实战评估报告-v14.md)
+
+### 已验证修复
+
+| 编号 | 问题 | 解决方式 | 验证 |
+|------|------|----------|------|
+| RO-20 | Worker 越界修改 claimed_paths 之外文件 | `W_WORKER_EXCEEDED_SCOPE` warning 在 verify gate `_build_scope_warnings()` | 代码验证 + 2146 tests pass |
+| RO-22 | schema_version forbid 无迁移引导 | `_format_allowed_fields()` 附加允许字段列表到错误信息 | 代码验证 + 2146 tests pass |
+| RO-23 | required_issues 格式不一致 | `_required_issues_format_issue()` 检测 dict→string 并附示例 | 代码验证 + 2146 tests pass |
+
+### 部分修复
+
+| 编号 | 问题 | 现状 |
+|------|------|------|
+| RO-21 | validate 无 ledger 事件 | `_write_validation_event()` 已实现，但 v14 Foreman 未传 --group 参数，ledger 无事件。需自动检测 group |
+
+### v14 实践新发现
+
+- **RO-24** (P2): Verification checks 跨 task scope 未检测 — T1 的 check `pytest backend/tests/` 引用了 T2 的 claimed_paths，T1 首次 verification_failed 因 T2 尚未创建测试目录。ralph validate 应检测 checks 命令中的路径是否在当前 task 的 claimed_paths 范围内
+
+### v14 E2E 评分
+
+| 维度 | v14 |
+|------|-----|
+| 结果 | 2/5 |
+| 过程 | 3/5 |
+| 体验 | 3.8/5 |
+| 综合 | 3.0/5 |
+
+---
+
+## 2026-04-25 Codex 复核新增问题
+
+### RO-32 AI 修复测试/验收准入标准缺失（P1）
+> **来源**：2026-04-25 Codex 复核 + 用户反馈
+
+- **问题**：项目已有“真实场景验收”“verify gate”“E2E 实战”的设计原则，但没有沉淀为 P1/P2 修复的硬性测试准入标准。AI 容易用局部 mock、schema smoke、helper 单测或错误预期测试证明“测试通过”，真实 CLI/IPC/daemon 路径仍未被验证。
+- **典型表现**：
+  1. IPC verification 测试只断言 fake orchestrator 被调用，不断言 `WorkflowEngine` 状态变化。
+  2. TTL cleanup 测试使用 `_created_at` synthetic 数据，没有覆盖 handler 真实写入的 `created_at`。
+  3. 状态源合并测试没有构造 engine 空但 shadow state 污染的负向场景。
+  4. RA-3 测试曾把 `agent_pending` 可 complete 的错误行为固化为预期。
+- **改进方向**：建立测试等级与验收准入：`runtime-contract`、`unit-contract`、`schema-smoke`、`api-surface`。P1/P2 修复必须至少有一个 `runtime-contract` 测试，从 CLI/IPC op/daemon public entrypoint 进入，断言 public response、`WorkflowEngine`/ledger 权威状态和实际副作用。
+- **验收标准**：每个 P1/P2 修复必须提供修复前失败、修复后通过的真实入口测试；mock 不得替代被验证核心调用链；涉及“不再 fallback/不再 completed/不再 sync”的需求必须有负向测试；浅层 smoke 测试不得单独作为完成依据。

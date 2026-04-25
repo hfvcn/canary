@@ -1,4 +1,4 @@
-"""Ralph CLI — validate, suggest, verify from plan files.
+"""Ralph CLI — validate, suggest, verify, audit from plan files.
 
 Usage:
     ralph validate plan.yaml
@@ -6,28 +6,78 @@ Usage:
     ralph verify plan.yaml --task T1 [--changed-files a.py b.py] [--project-root .]
     ralph explain plan.yaml --task T1
     ralph explain --code E_DUPLICATE_TASK_ID
+    ralph audit --ledger .cccc/group/ledger.jsonl [--format json|text]
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import logging
 import subprocess
 import sys
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
-from .agent import build_error_envelope, _is_debug_traceback_enabled, RULE_DOCS
+from .agent import (
+    AgentSuggestion,
+    build_error_envelope,
+    create_agent,
+    _is_debug_traceback_enabled,
+    RULE_DOCS,
+)
 from .core import suggest, verify
-from .models import Plan, ValidationReport
+from .models import Plan, ValidationIssue, ValidationReport
 from .plan_io import load_plan, save_plan_state
-from .validator import validate, validate_with_project
+from .report_diff import (
+    diff_validation_reports,
+    format_report_diff_json,
+    format_report_diff_text,
+    load_validation_report,
+)
+from .validator import _sort_issues, validate, validate_with_project
 
 
 # Exit codes
 _EXIT_OK = 0
 _EXIT_VALIDATION_FAILURE = 1  # Plan-level validation failures
 _EXIT_INTERNAL_ERROR = 2       # Internal errors (load failures, crashes, etc.)
+logger = logging.getLogger(__name__)
+
+
+def _auto_detect_group(project_root: Path) -> str | None:
+    """Find the unique group whose project_root matches *project_root*."""
+    try:
+        from ..paths import ensure_home
+        from ..kernel.group import load_group
+
+        groups_dir = ensure_home() / "groups"
+        if not groups_dir.is_dir():
+            return None
+        resolved = str(project_root.resolve())
+        matches: list[str] = []
+        for gp in groups_dir.iterdir():
+            if not gp.is_dir():
+                continue
+            g = load_group(gp.name)
+            if g is None:
+                continue
+            g_root = str(g.doc.get("project_root") or "").strip()
+            if g_root and str(Path(g_root).resolve()) == resolved:
+                matches.append(g.group_id)
+        if len(matches) == 1:
+            logger.info("Auto-detected group %s for project_root %s", matches[0], resolved)
+            return matches[0]
+        if len(matches) > 1:
+            logger.warning(
+                "Multiple groups match project_root %s: %s — pass --group explicitly",
+                resolved, matches,
+            )
+    except Exception:
+        logger.debug("Auto-detect group failed", exc_info=True)
+    return None
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -39,9 +89,16 @@ def main(argv: List[str] | None = None) -> int:
 
     # --- validate ---
     p_val = sub.add_parser("validate", help="Check plan for structural issues")
-    p_val.add_argument("plan", type=Path, help="Path to plan.yaml or plan.json")
+    p_val.add_argument("plan", nargs="?", type=Path, help="Path to plan.yaml or plan.json")
     p_val.add_argument("--format", choices=["json", "text"], default="text")
     p_val.add_argument("--project-root", type=Path, help="Project root directory")
+    p_val.add_argument(
+        "--diff",
+        nargs=2,
+        metavar=("BEFORE", "AFTER"),
+        type=Path,
+        help="Diff two saved validation JSON reports by issue_instance_id",
+    )
     p_val.add_argument(
         "--suppress",
         nargs="*",
@@ -50,10 +107,34 @@ def main(argv: List[str] | None = None) -> int:
         help="Suppress specific validation codes (e.g., E_CRITICAL_ENTRYPOINT_UNOWNED)",
     )
     p_val.add_argument(
+        "--gate",
+        choices=["terminal", "branch", "repo"],
+        default=None,
+        help="Apply quality-gate rollout mode for the selected gate",
+    )
+    p_val.add_argument(
         "--no-semantic",
         action="store_true",
         default=False,
         help="Suppress Semantic Findings section in text output",
+    )
+    p_val.add_argument(
+        "--no-agent",
+        action="store_true",
+        default=False,
+        help="Skip agent review of beyond-scope issues (pure static mode)",
+    )
+    p_val.add_argument(
+        "--ledger",
+        type=Path,
+        default=None,
+        help="Write validation event to this ledger",
+    )
+    p_val.add_argument(
+        "--group",
+        type=str,
+        default=None,
+        help="Group ID (resolves ledger path)",
     )
 
     # --- suggest ---
@@ -82,11 +163,46 @@ def main(argv: List[str] | None = None) -> int:
     p_exp.add_argument("--task", help="Task ID to explain")
     p_exp.add_argument("--code", dest="rule_code", help="Validation rule code to explain")
 
+    # --- audit ---
+    p_aud = sub.add_parser("audit", help="Audit ledger for operational issues")
+    p_aud.add_argument("--ledger", type=Path, required=True, help="Path to ledger.jsonl")
+    p_aud.add_argument("--format", choices=["json", "text"], default="text")
+    p_aud.add_argument("--days", type=int, default=7, help="Lookback window in days (default: 7)")
+
+    # --- sync-state ---
+    p_sync = sub.add_parser("sync-state", help="Sync completed tasks from ledger to plan")
+    p_sync.add_argument("plan", type=Path, help="Path to plan.yaml")
+    p_sync.add_argument("--ledger", type=Path, help="Path to ledger.jsonl")
+    p_sync.add_argument("--group", type=str, help="Group ID (resolves ledger path)")
+
     args = parser.parse_args(argv)
 
     if args.command is None:
         parser.print_help()
         return 1
+
+    # ``audit`` does not require a plan file
+    if args.command == "audit":
+        try:
+            return _cmd_audit(args)
+        except Exception as exc:
+            _emit_error_envelope("validate", exc)
+            return _EXIT_INTERNAL_ERROR
+
+    if args.command == "sync-state":
+        try:
+            return _cmd_sync_state(args)
+        except Exception as exc:
+            _emit_error_envelope("sync-state", exc)
+            return _EXIT_INTERNAL_ERROR
+
+    # ``validate --diff`` does not require a plan file
+    if args.command == "validate" and getattr(args, "diff", None):
+        try:
+            return _cmd_validate_diff(args)
+        except Exception as exc:
+            _emit_error_envelope("validate", exc)
+            return _EXIT_INTERNAL_ERROR
 
     # ``explain --code`` does not require a plan file
     if args.command == "explain" and getattr(args, "rule_code", None):
@@ -151,17 +267,184 @@ def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
         _emit_error_envelope("semantic", exc)
         return _EXIT_INTERNAL_ERROR
 
+    gate_name = getattr(args, "gate", None)
+    if gate_name:
+        report = _apply_gate_mode(report, gate_name, project_root)
+
     show_semantic = not getattr(args, "no_semantic", False)
+    no_agent = getattr(args, "no_agent", False)
+
+    # --- Agent review of beyond-scope issues ---
+    agent_suggestions: list[AgentSuggestion] = []
+    if not no_agent:
+        all_issues = list(report.errors) + list(report.warnings) + list(report.hints)
+        beyond_scope = [i for i in all_issues if i.beyond_scope]
+        if beyond_scope:
+            checklist_path = (
+                project_root / "src" / "cccc" / "ralph" / "beyond_scope_checklist.yaml"
+            )
+            # Also try relative to the plan file location
+            if not checklist_path.exists():
+                plan_dir = args.plan.resolve().parent if args.plan else project_root
+                checklist_path = plan_dir / "beyond_scope_checklist.yaml"
+            agent = create_agent(checklist_path)
+            agent_suggestions = agent.review_beyond_scope(beyond_scope)
 
     if args.format == "json":
         payload = report.model_dump()
         payload["metadata"] = {"project_root": str(project_root)}
+        if gate_name:
+            payload["metadata"]["gate"] = gate_name
+        if agent_suggestions:
+            payload["agent_suggestions"] = [
+                {
+                    "issue_id": s.issue_id,
+                    "checklist_item_id": s.checklist_item_id,
+                    "suggestion": s.suggestion,
+                    "confidence": s.confidence,
+                    "advisory": s.advisory,
+                }
+                for s in agent_suggestions
+            ]
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         print(f"Resolved project root: {project_root}", file=sys.stderr)
+        if gate_name:
+            print(_format_gate_mode_banner(gate_name, project_root))
         _print_validation_text(report, show_semantic=show_semantic)
+        if agent_suggestions:
+            _print_agent_suggestions(agent_suggestions)
+
+    ledger_path = getattr(args, "ledger", None)
+    group_id = getattr(args, "group", None)
+    if not group_id and not ledger_path:
+        group_id = _auto_detect_group(project_root)
+    if not ledger_path and group_id:
+        try:
+            from ..kernel.group import load_group
+
+            g = load_group(group_id)
+            ledger_path = g.ledger_path
+        except Exception:
+            pass
+    if ledger_path:
+        try:
+            _write_validation_event(
+                ledger_path=ledger_path,
+                plan_path=args.plan,
+                report=report,
+                group_id=group_id or "",
+            )
+        except Exception:
+            logger.warning("Failed to write validation event to ledger", exc_info=True)
 
     return _EXIT_OK if report.valid else _EXIT_VALIDATION_FAILURE
+
+
+def _apply_gate_mode(report: ValidationReport, gate_name: str, project_root: Path) -> ValidationReport:
+    """Apply quality-gate.yaml overrides to a ValidationReport.
+
+    Returns the (possibly mutated) report with adjusted severities.
+    If quality-gate.yaml does not exist, returns report unchanged.
+    """
+    import yaml
+
+    gate_config_path = project_root / ".cccc" / "quality-gate.yaml"
+    if not gate_config_path.exists():
+        return report
+
+    with gate_config_path.open(encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+
+    gates = config.get("gates", {})
+    gate = gates.get(gate_name, {})
+    default_mode = gate.get("mode", "warn")
+    overrides = gate.get("overrides", {})
+
+    issues = list(report.errors) + list(report.warnings) + list(report.hints)
+    for issue in issues:
+        mode = overrides.get(issue.code, default_mode)
+        if mode == "warn":
+            continue
+        if mode == "shadow":
+            issue.severity = "hint"
+            continue
+        if mode == "enforce":
+            issue.severity = "error"
+            continue
+        raise ValueError(f"Unknown quality gate mode: {mode}")
+
+    report.errors = _sort_issues([issue for issue in issues if issue.severity == "error"])
+    report.warnings = _sort_issues([issue for issue in issues if issue.severity == "warning"])
+    report.hints = _sort_issues([issue for issue in issues if issue.severity == "hint"])
+    report.valid = len(report.errors) == 0
+    return report
+
+
+def _format_gate_mode_banner(gate_name: str, project_root: Path) -> str:
+    gate_config_path = project_root / ".cccc" / "quality-gate.yaml"
+    if not gate_config_path.exists():
+        return f"Quality gate: {gate_name} (no config found; report unchanged)"
+
+    import yaml
+
+    with gate_config_path.open(encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+
+    gate = (config.get("gates", {}) or {}).get(gate_name, {})
+    mode = gate.get("mode", "warn")
+    overrides = gate.get("overrides", {})
+    return f"Quality gate: {gate_name} (mode={mode}, overrides={len(overrides)})"
+
+
+def _write_validation_event(
+    *,
+    ledger_path: Path,
+    plan_path: Path,
+    report: ValidationReport,
+    group_id: str,
+) -> None:
+    from ..contracts.v1.ralph_ipc import (
+        IpcValidationError,
+        serialize_validation_event_v1,
+        validation_event_kind,
+    )
+    from ..kernel.ledger import append_event
+
+    def to_ipc(issue: ValidationIssue) -> IpcValidationError:
+        return IpcValidationError.model_validate(issue.model_dump())
+
+    plan_hash = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    data = serialize_validation_event_v1(
+        valid=report.valid,
+        errors=[to_ipc(issue) for issue in report.errors],
+        warnings=[to_ipc(issue) for issue in report.warnings],
+        hints=[to_ipc(issue) for issue in report.hints],
+        ruleset_digest=report.ruleset_digest,
+        plan_hash=plan_hash,
+    )
+    data["plan_path"] = str(plan_path)
+    append_event(
+        ledger_path,
+        kind=validation_event_kind(report.valid),
+        group_id=group_id,
+        scope_key="",
+        by="ralph",
+        data=data,
+    )
+
+
+def _cmd_validate_diff(args: argparse.Namespace) -> int:
+    before_path, after_path = args.diff
+    before = load_validation_report(before_path)
+    after = load_validation_report(after_path)
+    diff = diff_validation_reports(before, after)
+
+    if args.format == "json":
+        print(json.dumps(format_report_diff_json(diff), indent=2, ensure_ascii=False))
+    else:
+        print(format_report_diff_text(diff))
+    return _EXIT_OK
 
 
 def _cmd_suggest(plan: Plan, args: argparse.Namespace) -> int:
@@ -238,7 +521,7 @@ def _cmd_verify(plan: Plan, args: argparse.Namespace) -> int:
     )
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0 if result.get("outcome") == "passed" else 1
+    return 0 if result.get("outcome") in {"passed", "agent_pending"} else 1
 
 
 def _cmd_complete(plan: Plan, args: argparse.Namespace) -> int:
@@ -265,7 +548,12 @@ def _cmd_complete(plan: Plan, args: argparse.Namespace) -> int:
             plan_path=args.plan,
         )
         result = verify(task, changed_files=[], project_root=project_root)
-        if result.get("outcome") != "passed":
+        outcome = str(result.get("outcome") or "")
+        if outcome == "agent_pending":
+            print(f"error: verification pending for task '{task_id}'", file=sys.stderr)
+            print(json.dumps(result, indent=2, ensure_ascii=False), file=sys.stderr)
+            return 1
+        if outcome != "passed":
             print(f"error: verification failed for task '{task_id}'", file=sys.stderr)
             print(json.dumps(result, indent=2, ensure_ascii=False), file=sys.stderr)
             return 1
@@ -329,6 +617,208 @@ def _cmd_explain_code(code: str) -> int:
     print(f"Why it matters:\n  {doc.why_it_matters}\n")
     print(f"Fix template:\n  {doc.fix_template}\n")
     print(f"Suppress:\n  {doc.suppress_hint}")
+    return _EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# Audit
+# ---------------------------------------------------------------------------
+
+# Audit issue codes
+AUDIT_W_TASK_FLAPPING = "W_TASK_FLAPPING"
+AUDIT_H_COMPLETED_BUT_UNVERIFIED = "H_COMPLETED_BUT_UNVERIFIED"
+
+# Verification event kinds (stable strings from workflow_state_types)
+_KIND_VERIFICATION_FAILED = "workflow.verification_failed"
+_KIND_VERIFICATION_SKIPPED = "workflow.verification_skipped"
+_KIND_VERIFICATION_PASSED = "workflow.verification_passed"
+_KIND_TASK_REPORTED_COMPLETED = "workflow.task_reported_completed"
+
+FLAPPING_THRESHOLD = 3
+
+
+def _make_audit_instance_id(code: str, event_hash: str, task_id: str) -> str:
+    """Build a deterministic issue_instance_id from (code + event_hash + task_id)."""
+    raw = f"{code}:{event_hash}:{task_id}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _load_ledger_events(ledger_path: Path) -> List[Dict[str, Any]]:
+    """Load all events from a JSONL ledger file."""
+    if not ledger_path.exists():
+        return []
+    events: List[Dict[str, Any]] = []
+    for line in ledger_path.read_text(encoding="utf-8", errors="strict").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def _event_hash(event: Dict[str, Any]) -> str:
+    """Compute a short hash of a ledger event for instance_id generation."""
+    raw = json.dumps(event, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode()).hexdigest()[:12]
+
+
+def _event_timestamp(event: Dict[str, Any]) -> str:
+    """Extract ISO timestamp from a ledger event."""
+    return str(event.get("ts") or "")
+
+
+def _event_within_window(event: Dict[str, Any], cutoff_iso: str) -> bool:
+    """Check if event timestamp is >= cutoff_iso (both ISO 8601 strings)."""
+    ts = _event_timestamp(event)
+    if not ts:
+        return False
+    # Simple string comparison works for ISO 8601 dates
+    return ts >= cutoff_iso
+
+
+def audit_ledger(
+    events: List[Dict[str, Any]],
+    *,
+    days: int = 7,
+) -> List[ValidationIssue]:
+    """Scan ledger events and return audit issues.
+
+    Checks:
+    - W_TASK_FLAPPING: >= 3 verification failures for the same task_id within window
+    - H_COMPLETED_BUT_UNVERIFIED: verification.skipped followed by task_reported_completed
+      with no verification.passed in between
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=days)).isoformat()
+    issues: List[ValidationIssue] = []
+
+    # Filter to events within the lookback window
+    window_events = [e for e in events if _event_within_window(e, cutoff)]
+
+    # --- W_TASK_FLAPPING ---
+    # Count verification failures per task_id
+    failure_counts: Dict[str, List[Dict[str, Any]]] = {}
+    for event in window_events:
+        kind = str(event.get("kind") or "")
+        if kind != _KIND_VERIFICATION_FAILED:
+            continue
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        task_id = str(data.get("task_id") or "").strip()
+        if not task_id:
+            continue
+        failure_counts.setdefault(task_id, []).append(event)
+
+    for task_id, failure_events in failure_counts.items():
+        if len(failure_events) < FLAPPING_THRESHOLD:
+            continue
+        last_event = failure_events[-1]
+        eh = _event_hash(last_event)
+        instance_id = _make_audit_instance_id(AUDIT_W_TASK_FLAPPING, eh, task_id)
+        issues.append(ValidationIssue(
+            code=AUDIT_W_TASK_FLAPPING,
+            severity="warning",
+            message=(
+                f"task '{task_id}' has {len(failure_events)} verification failures "
+                f"within {days} days — possible flapping"
+            ),
+            task_ids=[task_id],
+            evidence={
+                "failure_count": len(failure_events),
+                "window_days": days,
+                "issue_instance_id": instance_id,
+            },
+        ))
+
+    # --- H_COMPLETED_BUT_UNVERIFIED ---
+    # Track per-task: last verification outcome and completion events
+    # We look for: verification_skipped → task_reported_completed with no
+    # verification_passed between them.
+    task_last_verification: Dict[str, str] = {}  # task_id -> last verification kind
+    for event in window_events:
+        kind = str(event.get("kind") or "")
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        task_id = str(data.get("task_id") or "").strip()
+        if not task_id:
+            continue
+
+        if kind in (_KIND_VERIFICATION_PASSED, _KIND_VERIFICATION_FAILED, _KIND_VERIFICATION_SKIPPED):
+            task_last_verification[task_id] = kind
+        elif kind == _KIND_TASK_REPORTED_COMPLETED:
+            last_ver = task_last_verification.get(task_id)
+            if last_ver == _KIND_VERIFICATION_SKIPPED:
+                eh = _event_hash(event)
+                instance_id = _make_audit_instance_id(
+                    AUDIT_H_COMPLETED_BUT_UNVERIFIED, eh, task_id,
+                )
+                issues.append(ValidationIssue(
+                    code=AUDIT_H_COMPLETED_BUT_UNVERIFIED,
+                    severity="hint",
+                    message=(
+                        f"task '{task_id}' was completed after verification was skipped "
+                        f"with no successful verification in between"
+                    ),
+                    task_ids=[task_id],
+                    evidence={
+                        "issue_instance_id": instance_id,
+                    },
+                ))
+
+    return issues
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    """Run ledger audit and output issues."""
+    ledger_path = args.ledger
+    if not ledger_path.exists():
+        print(f"error: ledger file not found: {ledger_path}", file=sys.stderr)
+        return _EXIT_INTERNAL_ERROR
+
+    events = _load_ledger_events(ledger_path)
+    issues = audit_ledger(events, days=args.days)
+
+    if args.format == "json":
+        payload = {
+            "issues": [i.model_dump() for i in issues],
+            "metadata": {
+                "ledger_path": str(ledger_path),
+                "days": args.days,
+                "total_events": len(events),
+            },
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        if not issues:
+            print("Audit: CLEAN — no operational issues found.")
+        else:
+            print(f"Audit: {len(issues)} issue(s) found\n")
+            for issue in issues:
+                _print_issue(issue)
+
+    return _EXIT_OK if not any(i.severity == "error" for i in issues) else _EXIT_VALIDATION_FAILURE
+
+
+def _cmd_sync_state(args: argparse.Namespace) -> int:
+    from .plan_io import sync_plan_state
+
+    ledger_path = args.ledger
+    if not ledger_path and args.group:
+        from ..kernel.group import load_group
+
+        group = load_group(args.group)
+        ledger_path = group.ledger_path
+
+    if not ledger_path:
+        print("Error: --ledger or --group required", file=sys.stderr)
+        return _EXIT_INTERNAL_ERROR
+
+    count = sync_plan_state(args.plan, ledger_path)
+    if count:
+        print(f"Synced {count} task(s) to {args.plan}")
+    else:
+        print(f"All tasks already up to date in {args.plan}")
     return _EXIT_OK
 
 
@@ -427,6 +917,13 @@ def _print_issue(issue) -> None:
     print(f"  {issue.code}{tasks}: {issue.message}")
 
 
+def _print_agent_suggestions(suggestions: list[AgentSuggestion]) -> None:
+    """Print agent advisory suggestions in text mode."""
+    print(f"\nAgent Suggestions (advisory only, for reference) ({len(suggestions)}):")
+    for s in suggestions:
+        print(f"  [agent] {s.checklist_item_id}: {s.suggestion} (confidence={s.confidence})")
+
+
 # ---------------------------------------------------------------------------
 # Error envelope helpers
 # ---------------------------------------------------------------------------
@@ -439,6 +936,7 @@ def _command_to_stage(command: str) -> str:
         "verify": "verify",
         "complete": "completion",
         "explain": "validate",
+        "audit": "validate",
     }
     return mapping.get(command or "", "validate")
 

@@ -25,10 +25,8 @@ from __future__ import annotations
 import hashlib
 import json as _json
 import logging
-import os
-import posixpath
 import time
-from dataclasses import dataclass, field
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -39,7 +37,11 @@ from ...kernel.workflow_state import WorkflowEngine, WorkflowTaskStatus
 from ...kernel.workflow_state_types import (
     KIND_PLAN_DIGEST_DIVERGENCE,
     KIND_PLAN_DIGEST_DIVERGENCE_POST_HOC,
+    KIND_TASK_DEFERRED,
     PreTransitionVetoed,
+    TaskState,
+    TransitionRejected,
+    WorkflowTaskStatus as _WTS,
 )
 from ...util.conv import coerce_bool
 from ..ops.agent_ops import get_agent
@@ -63,6 +65,7 @@ from .workflow_monitor import (
     check_unauthorized_subagent,
     MonitorAlert,
     MonitorConfig,
+    MonitorMode,
     get_default_config,
 )
 
@@ -73,233 +76,64 @@ TASK_STATUS_PENDING = "pending"
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_COMPLETED = "completed"
 TASK_STATUS_FAILED = "failed"
-TASK_STATUS_DEFERRED = "deferred"
+TASK_STATUS_DEFERRED = _WTS.DEFERRED.value
 SINGLE_WRITER_REASON = "single_writer_active"
+EXTERNAL_PRESSURE_REASON = "external_workflow_pressure"
+CROSS_WORKFLOW_ACTIVE_WINDOW_SECONDS = 300
 ORCHESTRATOR_SERVICE_ACTOR = "service:workflow_orchestrator"
-GLOBAL_WRITE_CLAIM = "/"
+from ...kernel.claimed_paths import (
+    GLOBAL_WRITE_CLAIM,
+    normalize_path as _normalize_path_fn,
+    normalize_write_set as _normalize_write_set_fn,
+)
+COMPLETER_MISMATCH_BLOCKED_REASON = "completer_mismatch_blocked"
 
+# Re-exported from extracted modules for backward compatibility (RO-31)
+from .admission import (  # noqa: E402, F811
+    collect_running_claimed_paths as _adm_collect_running_claimed_paths,
+    split_single_writer_tasks as _adm_split_single_writer_tasks,
+    build_deferred_result as _adm_build_deferred_result,
+    record_deferred_tasks as _adm_record_deferred_tasks,
+    get_active_external_tasks as _adm_get_active_external_tasks,
+    compute_cross_workflow_deferrals as _adm_compute_cross_workflow_deferrals,
+    build_group_actor_assignment as _adm_build_group_actor_assignment,
+    build_fallback_result as _adm_build_fallback_result,
+)
+from .verification_gate import (  # noqa: E402
+    auto_start_assigned_task_for_completion as _vg_auto_start,
+    process_completed_event as _vg_process_completed,
+    process_failed_event as _vg_process_failed,
+    COMPLETER_MISMATCH_BLOCKED_REASON as _VG_COMPLETER_MISMATCH,
+)
 
 # ---------------------------------------------------------------------------
-# PromptBudget — W3-10
+# PromptBudget — W3-10 (extracted to prompt_builder.py, re-exported here)
 # ---------------------------------------------------------------------------
 
-DEFAULT_PROMPT_TOKEN_BUDGET = 12_000
-PROMPT_BUDGET_ENV_VAR = "CCCC_PROMPT_TOKEN_BUDGET"
-MANDATORY_RATIO_LIMIT = 0.40
-CONTEXT_DEGRADED_MARKER = "[CONTEXT DEGRADED]"
-
-
-class PromptMinimaOverflow(ValueError):
-    """Raised when mandatory sections exceed 40% of the budget (E_PROMPT_MINIMA_OVERFLOW)."""
-
-    code = "E_PROMPT_MINIMA_OVERFLOW"
-
-
-def _estimate_tokens(text: str) -> int:
-    """Approximate token count (len / 4 fallback)."""
-    return max(1, len(text) // 4) if text else 0
-
-
-@dataclass
-class _PromptSection:
-    """A named section of the task prompt with its text."""
-    name: str
-    text: str
-    mandatory: bool = False
-    priority: int = 99  # Lower = higher priority
-
-
-@dataclass
-class _OmissionEntry:
-    """Record of what happened to a section during budgeting."""
-    section: str
-    original_tokens: int
-    included_tokens: int
-    strategy: str  # "kept", "condensed", "truncated", "omitted"
-
-
-@dataclass
-class PromptBudgetResult:
-    """Result of applying PromptBudget to a set of sections."""
-    text: str
-    omission_manifest: List[Dict[str, Any]] = field(default_factory=list)
-    total_tokens: int = 0
-    budget: int = 0
-
-
-class PromptBudget:
-    """Token-budget-aware prompt assembler.
-
-    Mandatory sections (Task ID, Title, Goal Behavior, Acceptance Criteria,
-    Verification Command, Do-Not-Ignore Issues, Recommended Tests, Forbidden
-    Actions) are never truncated.  If they exceed 40% of the budget the class
-    raises ``PromptMinimaOverflow`` (code ``E_PROMPT_MINIMA_OVERFLOW``).
-
-    Remaining sections are included in priority order:
-        contract > blockers > verification_command > recommended_tests
-        > condensed_semantic_focus > raw_semantic_context > context_store
-
-    When a section does not fit it is first condensed (symbol signatures only),
-    then truncated with a ``[CONTEXT DEGRADED]`` marker.
-    """
-
-    # Priority mapping — lower = higher priority
-    PRIORITY_MAP: Dict[str, int] = {
-        "contract": 10,
-        "blockers": 20,
-        "verification_command": 30,
-        "recommended_tests": 40,
-        "condensed_semantic_focus": 50,
-        "raw_semantic_context": 60,
-        "context_store": 70,
-    }
-
-    # Sections that are mandatory (never truncated)
-    MANDATORY_SECTIONS = frozenset({
-        "task_id",
-        "title",
-        "goal_behavior",
-        "acceptance_criteria",
-        "verification_command",
-        "do_not_ignore_issues",
-        "recommended_tests",
-        "forbidden_actions",
-    })
-
-    def __init__(self, budget: Optional[int] = None):
-        raw = budget
-        if raw is None:
-            env_val = os.environ.get(PROMPT_BUDGET_ENV_VAR, "")
-            if env_val.strip().isdigit():
-                raw = int(env_val.strip())
-        self.budget = raw if raw is not None else DEFAULT_PROMPT_TOKEN_BUDGET
-
-    @staticmethod
-    def condense(text: str) -> str:
-        """Condense text to symbol signatures only (first line of each def/class)."""
-        lines = text.splitlines()
-        condensed: List[str] = []
-        for line in lines:
-            stripped = line.strip()
-            if (
-                stripped.startswith("def ")
-                or stripped.startswith("class ")
-                or stripped.startswith("async def ")
-                or stripped.startswith("# ")
-                or stripped.startswith("## ")
-            ):
-                condensed.append(line)
-        if not condensed:
-            # Fallback: take first 3 lines
-            condensed = lines[:3]
-        return "\n".join(condensed)
-
-    def apply(self, sections: List[_PromptSection]) -> PromptBudgetResult:
-        """Assemble prompt text respecting the token budget.
-
-        Returns a ``PromptBudgetResult`` with the final text, omission manifest,
-        and budget accounting.
-        """
-        manifest: List[_OmissionEntry] = []
-        budget = self.budget
-
-        # --- Phase 1: mandatory sections ---
-        mandatory = [s for s in sections if s.mandatory]
-        optional = sorted(
-            [s for s in sections if not s.mandatory],
-            key=lambda s: s.priority,
-        )
-
-        mandatory_tokens = sum(_estimate_tokens(s.text) for s in mandatory)
-        if mandatory_tokens > int(budget * MANDATORY_RATIO_LIMIT):
-            raise PromptMinimaOverflow(
-                f"Mandatory sections use {mandatory_tokens} tokens "
-                f"(>{int(budget * MANDATORY_RATIO_LIMIT)} = 40% of {budget}). "
-                f"Reduce mandatory content or increase CCCC_PROMPT_TOKEN_BUDGET."
-            )
-
-        # All mandatory sections are included verbatim
-        included_parts: List[str] = []
-        used_tokens = 0
-        for s in mandatory:
-            tok = _estimate_tokens(s.text)
-            included_parts.append(s.text)
-            used_tokens += tok
-            manifest.append(_OmissionEntry(
-                section=s.name,
-                original_tokens=tok,
-                included_tokens=tok,
-                strategy="kept",
-            ))
-
-        # --- Phase 2: optional sections in priority order ---
-        remaining = budget - used_tokens
-        for s in optional:
-            orig_tokens = _estimate_tokens(s.text)
-            if orig_tokens <= remaining:
-                # Fits entirely
-                included_parts.append(s.text)
-                used_tokens += orig_tokens
-                remaining -= orig_tokens
-                manifest.append(_OmissionEntry(
-                    section=s.name,
-                    original_tokens=orig_tokens,
-                    included_tokens=orig_tokens,
-                    strategy="kept",
-                ))
-            elif remaining > 0:
-                # Try condensing first
-                condensed = self.condense(s.text)
-                condensed_tokens = _estimate_tokens(condensed)
-                if condensed_tokens <= remaining:
-                    included_parts.append(condensed)
-                    used_tokens += condensed_tokens
-                    remaining -= condensed_tokens
-                    manifest.append(_OmissionEntry(
-                        section=s.name,
-                        original_tokens=orig_tokens,
-                        included_tokens=condensed_tokens,
-                        strategy="condensed",
-                    ))
-                else:
-                    # Truncate to remaining budget
-                    char_limit = remaining * 4  # inverse of token estimate
-                    truncated = s.text[:char_limit]
-                    trunc_tokens = _estimate_tokens(truncated)
-                    included_parts.append(truncated + f"\n{CONTEXT_DEGRADED_MARKER}")
-                    used_tokens += trunc_tokens
-                    remaining -= trunc_tokens
-                    manifest.append(_OmissionEntry(
-                        section=s.name,
-                        original_tokens=orig_tokens,
-                        included_tokens=trunc_tokens,
-                        strategy="truncated",
-                    ))
-            else:
-                # No budget left — omit entirely
-                manifest.append(_OmissionEntry(
-                    section=s.name,
-                    original_tokens=orig_tokens,
-                    included_tokens=0,
-                    strategy="omitted",
-                ))
-
-        text = "\n\n".join(part for part in included_parts if part)
-        manifest_dicts = [
-            {
-                "section": m.section,
-                "original_tokens": m.original_tokens,
-                "included_tokens": m.included_tokens,
-                "strategy": m.strategy,
-            }
-            for m in manifest
-        ]
-        return PromptBudgetResult(
-            text=text,
-            omission_manifest=manifest_dicts,
-            total_tokens=used_tokens,
-            budget=budget,
-        )
+from .prompt_builder import (  # noqa: E402
+    DEFAULT_PROMPT_TOKEN_BUDGET,
+    PROMPT_BUDGET_ENV_VAR,
+    MANDATORY_RATIO_LIMIT,
+    CONTEXT_DEGRADED_MARKER,
+    PromptMinimaOverflow,
+    _estimate_tokens,
+    _PromptSection,
+    _OmissionEntry,
+    PromptBudgetResult,
+    PromptBudget,
+    build_issue_digest as _pb_build_issue_digest,
+    build_runtime_adapter_hint as _pb_build_runtime_adapter_hint,
+    build_task_prompt as _pb_build_task_prompt,
+    serialize_validation_issue as _pb_serialize_validation_issue,
+    serialize_validation_report as _pb_serialize_validation_report,
+    build_completion_summary as _pb_build_completion_summary,
+    build_failure_summary as _pb_build_failure_summary,
+    append_verification_checks as _pb_append_verification_checks,
+    format_verification_checks as _pb_format_verification_checks,
+    format_verification_check as _pb_format_verification_check,
+    build_stalled_summary as _pb_build_stalled_summary,
+    extract_evidence_summary as _pb_extract_evidence_summary,
+)
 
 
 class FeishuAdapterWrapper:
@@ -382,6 +216,7 @@ class WorkflowOrchestrator:
         self.foreman = ForemanWorkflow(
             project_root=project_root,
             feishu_chat_id=feishu_chat_id,
+            group_loader=self._load_enabled_peer_actors,
         )
 
         # Initialize Progress reporter
@@ -555,11 +390,17 @@ class WorkflowOrchestrator:
         workflow_id: str,
         *,
         started_at: str = "",
+        auto_process: Optional[bool] = None,
+        auto_start_agents: Optional[bool] = None,
     ) -> Dict[str, Any]:
         workflow = self._active_workflows.get(workflow_id)
         if workflow is not None:
             if started_at and not workflow.get("started_at"):
                 workflow["started_at"] = started_at
+            if auto_process is not None:
+                workflow["auto_process"] = auto_process
+            if auto_start_agents is not None:
+                workflow["auto_start_agents"] = auto_start_agents
             return workflow
 
         workflow = {
@@ -567,6 +408,8 @@ class WorkflowOrchestrator:
             "batches": [],
             "tasks": {},
             "synced_batches": set(),
+            "auto_process": bool(auto_process) if auto_process is not None else False,
+            "auto_start_agents": bool(auto_start_agents) if auto_start_agents is not None else True,
         }
         self._active_workflows[workflow_id] = workflow
         self.reporter.init_workflow(workflow_id)
@@ -670,6 +513,13 @@ class WorkflowOrchestrator:
             workflow_data["batches"].append(batch_id)
             return deferred_result
 
+        # Cross-workflow pressure: defer tasks whose claimed_paths overlap
+        # with tasks in other active (non-terminal) workflows.
+        pressure_result = self._defer_batch_for_cross_workflow_pressure(suggestion)
+        if pressure_result is not None:
+            workflow_data["batches"].append(batch_id)
+            return pressure_result
+
         # ARCH-1: If Foreman provided explicit assignments, use them directly
         if suggestion.assignments:
             self._log(f"[orchestrator] Using Foreman explicit assignments for batch {batch_id}")
@@ -694,6 +544,8 @@ class WorkflowOrchestrator:
                 rejected_tasks=[],
             )
         else:
+            # Sync busy agents from engine/shadow into pool before evaluation
+            self._sync_busy_agents_to_pool()
             # Process through Foreman agent pool evaluation
             result = self.foreman.process_batch_suggestion(
                 suggestion,
@@ -704,7 +556,14 @@ class WorkflowOrchestrator:
         # Track batch
         workflow_data["batches"].append(batch_id)
 
-        # ARCH-2: If rejected, notify Foreman and return immediately — no side effects
+        if not suggestion.assignments and result.decision == "rejected":
+            if getattr(suggestion, 'fallback_allowed', False):
+                self._log("[orchestrator] Fallback to group actors explicitly authorized")
+                fallback_result = self._fallback_to_group_actors(suggestion)
+                if fallback_result is not None:
+                    result = fallback_result
+
+        # If rejected, notify Foreman and return immediately — no side effects
         if result.decision == "rejected":
             self._log(f"[orchestrator] Batch {batch_id} rejected: {result.reason}")
             rejected_ids = [t.id for t in result.rejected_tasks]
@@ -732,11 +591,25 @@ class WorkflowOrchestrator:
                         "model_id": assignment.model_id or "",
                     }
                 )
+                tracked.pop("assignment_attempt_id", None)
 
         approved_ids = {t.id for t in result.approved_tasks}
-        approved_assignments = [
-            a for a in result.assignments if a.agent_id and a.task.id in approved_ids
-        ]
+        approved_assignments = []
+        for assignment in result.assignments:
+            if not assignment.agent_id or assignment.task.id not in approved_ids:
+                continue
+            attempt_id = str(uuid.uuid4())[:12]
+            approved_assignments.append(
+                {
+                    "task_id": assignment.task.id,
+                    "agent_id": assignment.agent_id,
+                    "attempt_id": attempt_id,
+                    "claimed_paths": list(assignment.task.claimed_paths or []),
+                }
+            )
+            tracked = workflow_data["tasks"].get(assignment.task.id)
+            if tracked is not None:
+                tracked["assignment_attempt_id"] = attempt_id
         if approved_assignments:
             self.engine.approve_batch(batch_id, approved_assignments)
 
@@ -786,7 +659,11 @@ class WorkflowOrchestrator:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         task_refs = [TaskRef.model_validate(task) for task in task_dicts]
-        self._ensure_active_workflow(workflow_id)
+        self._ensure_active_workflow(
+            workflow_id,
+            auto_process=kwargs.get("auto_process"),
+            auto_start_agents=kwargs.get("auto_start_agents"),
+        )
         for task in task_refs:
             self.engine.register_task(task, workflow_id)
             self._track_task_ref(workflow_id, task)
@@ -807,6 +684,7 @@ class WorkflowOrchestrator:
             # ARCH-1: Forward Foreman's explicit assignments to the suggestion
             if kwargs.get("assignments"):
                 suggestion.assignments = dict(kwargs["assignments"])
+            suggestion.fallback_allowed = bool(kwargs.get("fallback_allowed", False))
             self.process_batch_suggestion(
                 suggestion,
                 auto_start_agents=bool(kwargs.get("auto_start_agents", True)),
@@ -818,7 +696,57 @@ class WorkflowOrchestrator:
             "ready_task_ids": ready_task_ids,
         }
 
-    # ARCH-2: _fallback_to_group_actors DELETED — rejected batches stay rejected
+    def _fallback_to_group_actors(
+        self,
+        suggestion: ReadyBatchSuggestion,
+    ) -> Optional[BatchEvaluationResult]:
+        peer_actors = self._load_enabled_peer_actors()
+        if not peer_actors:
+            return None
+
+        self._log(
+            f"[orchestrator] Pool rejected batch {suggestion.suggestion_id}; "
+            f"falling back to {len(peer_actors)} group peer actors"
+        )
+        return _adm_build_fallback_result(suggestion, peer_actors)
+
+    def _build_group_actor_assignment(
+        self,
+        task: TaskRef,
+        actor: Dict[str, Any],
+    ) -> TaskAssignment:
+        return _adm_build_group_actor_assignment(task, actor)
+
+    def _sync_busy_agents_to_pool(self) -> None:
+        """Sync engine/shadow busy agent IDs into pool's _active_assignments.
+
+        RO-26: prefers engine state for status queries, falling back to
+        shadow state for metadata (agent_id mapping).
+        """
+        pool = getattr(self.foreman, "pool_manager", None)
+        if pool is None:
+            return
+        # Prefer engine for running/assigned status
+        engine_busy: dict[str, str] = {}
+        if hasattr(self.engine, "list_tasks"):
+            for ts in self.engine.list_tasks():
+                if ts.status in (WorkflowTaskStatus.RUNNING, WorkflowTaskStatus.ASSIGNED):
+                    aid = ts.agent_id or self._task_to_agent.get(ts.task.id, "")
+                    if aid:
+                        engine_busy[ts.task.id] = aid
+        if engine_busy:
+            for task_id, agent_id in engine_busy.items():
+                if agent_id and agent_id not in pool._active_assignments:
+                    pool._active_assignments[agent_id] = task_id
+            return
+        # Fallback: shadow state
+        for wdata in self._active_workflows.values():
+            for task_id, tdata in wdata.get("tasks", {}).items():
+                status = str(tdata.get("status") or "")
+                if status in (TASK_STATUS_RUNNING, "assigned"):
+                    agent_id = str(tdata.get("agent_id") or self._task_to_agent.get(task_id, "")).strip()
+                    if agent_id and agent_id not in pool._active_assignments:
+                        pool._active_assignments[agent_id] = task_id
 
     def _load_enabled_peer_actors(self) -> List[Dict[str, Any]]:
         group = load_group(self.group_id) or self.group
@@ -873,13 +801,19 @@ class WorkflowOrchestrator:
         if not running_assignments:
             return None
 
-        running_paths = self._collect_running_claimed_paths(running_assignments)
+        running_paths = _adm_collect_running_claimed_paths(
+            running_assignments,
+            self._extract_assignment_claimed_paths,
+            self._claims_global_write,
+        )
         if running_paths is None:
             return self._build_deferred_result(suggestion, suggestion.tasks)
 
-        safe_tasks, deferred_tasks = self._split_single_writer_tasks(
+        safe_tasks, deferred_tasks = _adm_split_single_writer_tasks(
             suggestion.tasks,
             running_paths,
+            self._extract_claimed_paths,
+            self._claims_global_write,
         )
         if not deferred_tasks:
             return None
@@ -895,33 +829,6 @@ class WorkflowOrchestrator:
         )
         return None
 
-    def _collect_running_claimed_paths(
-        self,
-        running_assignments: List[Dict[str, Any]],
-    ) -> Optional[set[str]]:
-        running_paths: set[str] = set()
-        for assignment in running_assignments:
-            claimed_paths = self._extract_assignment_claimed_paths(assignment)
-            if self._claims_global_write(claimed_paths):
-                return None
-            running_paths.update(claimed_paths)
-        return running_paths
-
-    def _split_single_writer_tasks(
-        self,
-        tasks: List[TaskRef],
-        running_paths: set[str],
-    ) -> tuple[List[TaskRef], List[TaskRef]]:
-        safe_tasks: List[TaskRef] = []
-        deferred_tasks: List[TaskRef] = []
-        for task in tasks:
-            claimed_paths = set(self._extract_claimed_paths(task))
-            if self._claims_global_write(claimed_paths) or claimed_paths & running_paths:
-                deferred_tasks.append(task)
-                continue
-            safe_tasks.append(task)
-        return safe_tasks, deferred_tasks
-
     def _build_deferred_result(
         self,
         suggestion: ReadyBatchSuggestion,
@@ -931,35 +838,86 @@ class WorkflowOrchestrator:
         self._log(
             f"[orchestrator] Deferring batch {suggestion.suggestion_id} due to active single-writer assignment"
         )
-        return BatchEvaluationResult(
-            suggestion=suggestion,
-            assignments=deferred_assignments,
-            decision="deferred",
-            reason=SINGLE_WRITER_REASON,
-        )
+        return _adm_build_deferred_result(suggestion, deferred_assignments, SINGLE_WRITER_REASON)
 
     def _record_deferred_tasks(
         self,
         workflow_id: str,
         tasks: List[TaskRef],
     ) -> List[TaskAssignment]:
+        return _adm_record_deferred_tasks(self.engine, tasks, SINGLE_WRITER_REASON)
+
+    # ------------------------------------------------------------------
+    # Cross-workflow pressure
+    # ------------------------------------------------------------------
+
+    def _get_active_external_tasks(
+        self,
+        exclude_workflow_id: str,
+        now: float,
+    ) -> List[TaskState]:
+        """Return tasks from *other* non-terminal workflows that are still active."""
+        return _adm_get_active_external_tasks(self.engine, exclude_workflow_id, now)
+
+    def _defer_batch_for_cross_workflow_pressure(
+        self,
+        suggestion: ReadyBatchSuggestion,
+    ) -> Optional[BatchEvaluationResult]:
+        """Defer tasks whose claimed_paths overlap with active external workflows."""
+        now = time.time()
+        external_tasks = self._get_active_external_tasks(suggestion.workflow_id, now)
+        if not external_tasks:
+            return None
+
+        safe_tasks, deferred_tasks, deferred_competing = _adm_compute_cross_workflow_deferrals(
+            suggestion, external_tasks, self._extract_claimed_paths,
+        )
+
+        if not deferred_tasks:
+            return None
+
+        # Record deferrals with extended data
         deferred_assignments: List[TaskAssignment] = []
-        for task in tasks:
+        for task in deferred_tasks:
             self._track_task_ref(
-                workflow_id,
+                suggestion.workflow_id,
                 task,
                 status=TASK_STATUS_DEFERRED,
-                reason=SINGLE_WRITER_REASON,
+                reason=EXTERNAL_PRESSURE_REASON,
             )
+            try:
+                self.engine.defer_task(task.id, EXTERNAL_PRESSURE_REASON)
+            except ValueError:
+                pass
             deferred_assignments.append(
                 TaskAssignment(
                     task=task,
                     agent_id="",
                     agent_name="",
-                    assignment_reason=SINGLE_WRITER_REASON,
+                    assignment_reason=EXTERNAL_PRESSURE_REASON,
                 )
             )
-        return deferred_assignments
+
+        if not safe_tasks:
+            self._log(
+                f"[orchestrator] Deferring entire batch {suggestion.suggestion_id} "
+                f"due to cross-workflow pressure"
+            )
+            return BatchEvaluationResult(
+                suggestion=suggestion,
+                assignments=deferred_assignments,
+                decision="deferred",
+                reason=EXTERNAL_PRESSURE_REASON,
+            )
+
+        # Partial deferral — allow safe tasks through
+        suggestion.tasks = safe_tasks
+        suggestion.estimated_parallelism = len(safe_tasks)
+        self._log(
+            f"[orchestrator] Allowing {len(safe_tasks)} tasks; "
+            f"deferred {len(deferred_tasks)} due to cross-workflow pressure"
+        )
+        return None
 
     def _extract_claimed_paths(self, task: TaskRef) -> List[str]:
         return self._normalize_claimed_paths(getattr(task, "claimed_paths", []) or [])
@@ -971,22 +929,10 @@ class WorkflowOrchestrator:
         return not claimed_paths or GLOBAL_WRITE_CLAIM in claimed_paths
 
     def _normalize_claimed_paths(self, claimed_paths: List[str]) -> List[str]:
-        normalized: List[str] = []
-        for path in claimed_paths or [GLOBAL_WRITE_CLAIM]:
-            clean_path = self._normalize_claimed_path(path)
-            if clean_path not in normalized:
-                normalized.append(clean_path)
-        return normalized
+        return _normalize_write_set_fn(claimed_paths)
 
     def _normalize_claimed_path(self, path: str) -> str:
-        raw_path = str(path or "").strip().replace("\\", "/")
-        if not raw_path or raw_path == ".":
-            return GLOBAL_WRITE_CLAIM
-
-        normalized = posixpath.normpath(raw_path)
-        if normalized in ("", "."):
-            return GLOBAL_WRITE_CLAIM
-        return normalized.removeprefix("./")
+        return _normalize_path_fn(path)
 
     def _get_pool_active_assignments(self) -> Dict[str, str]:
         """Get active agent assignments from the Foreman pool."""
@@ -1051,28 +997,87 @@ class WorkflowOrchestrator:
             return task_counts
 
         status_counts = {
-            TASK_STATUS_COMPLETED: 0,
-            TASK_STATUS_FAILED: 0,
-            TASK_STATUS_RUNNING: 0,
-            TASK_STATUS_PENDING: 0,
-            TASK_STATUS_DEFERRED: 0,
+            "completed": 0,
+            "failed": 0,
+            "running": 0,
+            "pending": 0,
+            "deferred": 0,
         }
         for assignment in assignments:
             status = str(assignment.get("status") or TASK_STATUS_PENDING)
-            if status in status_counts:
-                status_counts[status] += 1
+            bucket = self._snapshot_bucket_for_status(status)
+            if bucket:
+                status_counts[bucket] += 1
 
         task_counts.update(
             {
                 "total": len(assignments),
-                "completed": status_counts[TASK_STATUS_COMPLETED],
-                "failed": status_counts[TASK_STATUS_FAILED],
-                "running": status_counts[TASK_STATUS_RUNNING],
-                "pending": status_counts[TASK_STATUS_PENDING],
-                "deferred": status_counts[TASK_STATUS_DEFERRED],
+                "completed": status_counts["completed"],
+                "failed": status_counts["failed"],
+                "running": status_counts["running"],
+                "pending": status_counts["pending"],
+                "deferred": status_counts["deferred"],
             }
         )
         return task_counts
+
+    def _snapshot_bucket_for_status(self, status: str) -> Optional[str]:
+        normalized = str(status or TASK_STATUS_PENDING)
+        if normalized in {TASK_STATUS_COMPLETED, _WTS.ARCHIVED.value}:
+            return "completed"
+        if normalized in {TASK_STATUS_FAILED, _WTS.BLOCKED.value}:
+            return "failed"
+        if normalized in {TASK_STATUS_RUNNING, _WTS.ASSIGNED.value, _WTS.VERIFYING.value}:
+            return "running"
+        if normalized in {TASK_STATUS_PENDING, _WTS.PLANNED.value, _WTS.READY.value}:
+            return "pending"
+        if normalized == TASK_STATUS_DEFERRED:
+            return "deferred"
+        return None
+
+    def _get_shadow_state_assignments(self, workflow_id: str) -> List[Dict[str, Any]]:
+        if workflow_id:
+            if workflow_id not in self._active_workflows:
+                return []
+            assignments = self._active_workflows[workflow_id].get("tasks", {}).values()
+        else:
+            assignments = self._get_all_assignments()
+        return [self._serialize_assignment(assignment) for assignment in assignments]
+
+    def _build_engine_state_assignments(
+        self,
+        workflow_id: str,
+        engine_tasks: List[TaskState],
+    ) -> List[Dict[str, Any]]:
+        shadow_by_task = {
+            str(assignment.get("task_id") or ""): assignment
+            for assignment in self._get_shadow_state_assignments(workflow_id)
+            if assignment.get("task_id")
+        }
+        scoped_tasks = engine_tasks if not workflow_id else [ts for ts in engine_tasks if ts.workflow_id == workflow_id]
+        assignments: List[Dict[str, Any]] = []
+        for task_state in scoped_tasks:
+            shadow = shadow_by_task.get(task_state.task.id, {})
+            assignment = {
+                "task_id": task_state.task.id,
+                "task_title": task_state.task.title,
+                "title": task_state.task.title,
+                "task_type": task_state.task.type,
+                "task_ref": task_state.task,
+                "workflow_id": task_state.workflow_id,
+                "status": task_state.status.value,
+                "agent_id": task_state.agent_id,
+                "assigned_by": getattr(task_state, "assigned_by", ""),
+                "assigned_at": getattr(task_state, "assigned_at", None),
+                "attempt_id": getattr(task_state, "attempt_id", ""),
+                "claimed_paths": list(task_state.task.claimed_paths or []),
+                "batch_id": task_state.batch_id,
+            }
+            for field in ("duration_seconds", "changed_files", "error_message"):
+                if field in shadow:
+                    assignment[field] = shadow[field]
+            assignments.append(self._serialize_assignment(assignment))
+        return assignments
 
     def _start_assigned_agents(self, result: BatchEvaluationResult) -> None:
         """Start agents for approved task assignments.
@@ -1177,8 +1182,17 @@ class WorkflowOrchestrator:
                     tracked_task["status"] = TASK_STATUS_PENDING
                 continue
 
+            auto_started = False
+            try:
+                task_state = self.engine.get_task(task.id)
+                if task_state and task_state.status == WorkflowTaskStatus.ASSIGNED:
+                    self.engine.report_worker_started(task.id, agent_id, hook_ctx={})
+                    auto_started = True
+            except Exception:
+                logger.debug("Auto-start after assignment failed for %s", task.id, exc_info=True)
+
             if tracked_task is not None:
-                tracked_task["status"] = TASK_STATUS_RUNNING
+                tracked_task["status"] = TASK_STATUS_RUNNING if auto_started else "assigned"
 
     def _load_worker_prompt(self, agent_id: str) -> str:
         """Load the persisted worker prompt for an assigned agent."""
@@ -1245,23 +1259,7 @@ class WorkflowOrchestrator:
 
     @staticmethod
     def _serialize_validation_issue(issue: "ValidationIssue") -> Dict[str, Any]:
-        """Serialize a ValidationIssue to a dict suitable for IPC transmission.
-
-        Includes the W4 finding-metadata fields (confidence, source,
-        action_owner, worker_relevance) so downstream consumers can
-        filter and display issues.
-        """
-        return {
-            "code": issue.code,
-            "severity": issue.severity,
-            "message": issue.message,
-            "task_ids": list(issue.task_ids),
-            "evidence": dict(issue.evidence),
-            "confidence": issue.confidence,
-            "source": issue.source,
-            "action_owner": issue.action_owner,
-            "worker_relevance": issue.worker_relevance,
-        }
+        return _pb_serialize_validation_issue(issue)
 
     @staticmethod
     def _serialize_validation_report(
@@ -1269,90 +1267,14 @@ class WorkflowOrchestrator:
         *,
         semantic_summary: "Any | None" = None,
     ) -> Dict[str, Any]:
-        """Serialize a ValidationReport to a dict suitable for IPC transmission.
-
-        Includes the optional ``semantic_summary`` (W5-3) when provided.
-        """
-        from ...contracts.v1.ralph_ipc import SemanticSummary
-
-        all_issues = list(report.errors) + list(report.warnings) + list(report.hints)
-        result: Dict[str, Any] = {
-            "valid": report.valid,
-            "errors": [
-                WorkflowOrchestrator._serialize_validation_issue(i)
-                for i in report.errors
-            ],
-            "warnings": [
-                WorkflowOrchestrator._serialize_validation_issue(i)
-                for i in report.warnings
-            ],
-            "hints": [
-                WorkflowOrchestrator._serialize_validation_issue(i)
-                for i in report.hints
-            ],
-        }
-        if semantic_summary is not None:
-            if isinstance(semantic_summary, SemanticSummary):
-                result["semantic_summary"] = semantic_summary.model_dump()
-            elif isinstance(semantic_summary, dict):
-                result["semantic_summary"] = semantic_summary
-            else:
-                result["semantic_summary"] = semantic_summary
-        return result
+        return _pb_serialize_validation_report(report, semantic_summary=semantic_summary)
 
     @staticmethod
     def _build_issue_digest(issues: "List[Any]") -> str:
-        """Build a compact issue digest for worker prompt injection.
-
-        Filters issues to action_owner in {worker, shared} and selects up to
-        1 blocking + 1 execution_risk + 1 verification_risk entry.  Each entry
-        is a single-line action verb + brief evidence.
-        """
-        filtered = [
-            i for i in issues
-            if getattr(i, "action_owner", "unknown") in ("worker", "shared")
-        ]
-        if not filtered:
-            return ""
-
-        # Bucket by worker_relevance — keep first match per bucket
-        buckets: Dict[str, Any] = {}
-        for relevance in ("blocking", "execution_risk", "verification_risk"):
-            for issue in filtered:
-                if getattr(issue, "worker_relevance", "none") == relevance:
-                    buckets[relevance] = issue
-                    break
-
-        if not buckets:
-            return ""
-
-        lines: List[str] = []
-        for relevance, issue in buckets.items():
-            code = str(getattr(issue, "code", ""))
-            msg = str(getattr(issue, "message", "")).strip()
-            evidence = getattr(issue, "evidence", {})
-            evidence_brief = ""
-            if isinstance(evidence, dict):
-                for key in ("path", "summary", "detail", "message"):
-                    val = str(evidence.get(key, "")).strip()
-                    if val:
-                        evidence_brief = val
-                        break
-            line = f"[{relevance.upper()}] {code}: {msg}"
-            if evidence_brief:
-                line += f" ({evidence_brief})"
-            lines.append(line)
-
-        return "\n".join(lines)
+        return _pb_build_issue_digest(issues)
 
     def _build_runtime_adapter_hint(self, runtime: str) -> str:
-        runtime_name = str(runtime or "").strip().lower()
-        runtime_hints = {
-            "claude": "Write code directly. Use `cccc send --to @foreman --text \"...\"` for progress/help; report completion via `cccc task complete <task_id> --changed-file <path> --evidence \"summary\"`.",
-            "codex": "Use your internal workflow. Use `cccc send --to @foreman --text \"...\"` for progress/help; report completion via `cccc task complete <task_id> --changed-file <path> --evidence \"summary\"`.",
-            "gemini": "Execute the task. Use `cccc send --to @foreman --text \"...\"` for progress/help; report completion via `cccc task complete <task_id> --changed-file <path> --evidence \"summary\"`.",
-        }
-        return runtime_hints.get(runtime_name, "")
+        return _pb_build_runtime_adapter_hint(runtime)
 
     def _build_task_prompt(
         self,
@@ -1364,151 +1286,22 @@ class WorkflowOrchestrator:
         recommended_tests: Optional[List[str]] = None,
         forbidden_flows: Optional[List[Any]] = None,
     ) -> str:
-        """Build the task prompt to send to an agent.
-
-        Wraps all content through :class:`PromptBudget` so the resulting text
-        stays within the configured token budget.  Mandatory sections (task ID,
-        title, goal, acceptance criteria, verification command, forbidden
-        actions) are never truncated.  Lower-priority context is condensed or
-        omitted when space is limited.
-
-        Args:
-            issues: Optional list of ValidationIssue objects for this task.
-                Filtered to worker/shared action_owner and injected as
-                "Do-Not-Ignore Issues" mandatory section.
-            recommended_tests: Optional list of test selector strings to inject
-                as "Recommended Tests" mandatory section.
-            forbidden_flows: Optional list of ForbiddenFlow objects to inject
-                as "Forbidden Actions" mandatory section entries.
-        """
-        sections: List[_PromptSection] = []
-
-        # --- Mandatory sections (never truncated) ---
-        sections.append(_PromptSection(
-            name="task_id",
-            text=f"[Foreman Assignment]\nTask ID: {task.id}\nType: {task.type}",
-            mandatory=True,
-        ))
-        sections.append(_PromptSection(
-            name="title",
-            text=f"Title: {task.title}",
-            mandatory=True,
-        ))
-        if task.goal_behavior:
-            sections.append(_PromptSection(
-                name="goal_behavior",
-                text=f"Goal: {task.goal_behavior}",
-                mandatory=True,
-            ))
-        if task.acceptance_criteria:
-            sections.append(_PromptSection(
-                name="acceptance_criteria",
-                text=f"Acceptance Criteria: {task.acceptance_criteria}",
-                mandatory=True,
-            ))
-        if task.verification and task.verification.command:
-            sections.append(_PromptSection(
-                name="verification_command",
-                text=f"Verification Command: {task.verification.command}",
-                mandatory=True,
-                priority=PromptBudget.PRIORITY_MAP.get("verification_command", 30),
-            ))
-        # Do-not-ignore issues — from task attribute or computed from issues list
-        do_not_ignore = getattr(task, "do_not_ignore_issues", None)
-        if not do_not_ignore and issues:
-            do_not_ignore = self._build_issue_digest(issues)
-        if do_not_ignore:
-            sections.append(_PromptSection(
-                name="do_not_ignore_issues",
-                text=f"Do-Not-Ignore Issues:\n{do_not_ignore}",
-                mandatory=True,
-            ))
-        # Recommended tests — from parameter or task attribute
-        rec_tests_text = ""
-        if recommended_tests:
-            rec_tests_text = "\n".join(recommended_tests)
-        elif getattr(task, "recommended_tests", None):
-            rec_tests_text = str(task.recommended_tests)  # type: ignore[union-attr]
-        if rec_tests_text:
-            sections.append(_PromptSection(
-                name="recommended_tests",
-                text=f"Recommended Tests:\n{rec_tests_text}",
-                mandatory=True,
-                priority=PromptBudget.PRIORITY_MAP.get("recommended_tests", 40),
-            ))
-        # Forbidden actions — base text + project forbidden_flows
-        forbidden_lines = [
-            "Assigned by Foreman inside the Ralph workflow.",
-            "Execute this task only.",
-            "Do not contact the user to renegotiate scope.",
-        ]
-        if forbidden_flows:
-            for flow in forbidden_flows:
-                flow_id = str(getattr(flow, "id", "")).strip()
-                flow_desc = str(getattr(flow, "description", "")).strip()
-                if flow_id:
-                    forbidden_lines.append(f"[FORBIDDEN] {flow_id}: {flow_desc}")
-        forbidden_text = "\n".join(forbidden_lines)
-        sections.append(_PromptSection(
-            name="forbidden_actions",
-            text=forbidden_text,
-            mandatory=True,
-        ))
-
-        # --- Optional sections (subject to budget) ---
-        if task.claimed_paths:
-            sections.append(_PromptSection(
-                name="contract",
-                text=f"Scope (claimed files): {', '.join(task.claimed_paths)}",
-                priority=PromptBudget.PRIORITY_MAP.get("contract", 10),
-            ))
-
-        worker_prompt_text = str(worker_prompt or "").strip()
-        if worker_prompt_text:
-            sections.append(_PromptSection(
-                name="blockers",
-                text=f"Worker Assignment:\n{worker_prompt_text}",
-                priority=PromptBudget.PRIORITY_MAP.get("blockers", 20),
-            ))
-
-        adapter_hint = self._build_runtime_adapter_hint(runtime)
-        if adapter_hint:
-            sections.append(_PromptSection(
-                name="raw_semantic_context",
-                text=f"Runtime Adapter:\n{adapter_hint}",
-                priority=PromptBudget.PRIORITY_MAP.get("raw_semantic_context", 60),
-            ))
-
-        report_section = (
-            f"Report back to Foreman with:\n"
-            f"- progress delta or blockers\n"
-            f"- changed files or evidence\n"
-            f"- anything still unverified\n"
-            f'- Report completion via `cccc task complete {task.id} --changed-file <path> --evidence "summary"` as the primary completion method.\n'
-            f'- Use `cccc send --to @foreman --text "..."` for progress updates or blockers only, not for completion.'
-        )
-        sections.append(_PromptSection(
-            name="condensed_semantic_focus",
-            text=report_section,
-            priority=PromptBudget.PRIORITY_MAP.get("condensed_semantic_focus", 50),
-        ))
-
-        # Context store (lowest priority optional)
+        """Build the task prompt to send to an agent."""
+        # Load context store text
         context_text = ""
         if self._context_store is not None:
             prev_context = self._context_store.load(task.id)
             if prev_context is not None:
                 context_text = ContextStore.render_prompt_section(prev_context)
-        if context_text:
-            sections.append(_PromptSection(
-                name="context_store",
-                text=context_text,
-                priority=PromptBudget.PRIORITY_MAP.get("context_store", 70),
-            ))
-
-        budgeter = PromptBudget()
-        result = budgeter.apply(sections)
-        return result.text.rstrip() + "\n"
+        return _pb_build_task_prompt(
+            task,
+            worker_prompt=worker_prompt,
+            runtime=runtime,
+            issues=issues,
+            recommended_tests=recommended_tests,
+            forbidden_flows=forbidden_flows,
+            context_text=context_text,
+        )
 
     def _sync_batch_to_control_plane(self, result: BatchEvaluationResult) -> None:
         """Mirror Ralph batch decisions into shared coordination/task state."""
@@ -1731,30 +1524,50 @@ class WorkflowOrchestrator:
         Instead of waiting for the entire batch to complete, immediately suggest
         and start tasks whose depends_on are now fully satisfied.
         """
-        if not workflow_id or workflow_id not in self._active_workflows:
+        if not workflow_id:
             return
 
-        wf_data = self._active_workflows[workflow_id]
-        all_tasks = wf_data.get("tasks", {})
+        shadow_tasks = self._active_workflows.get(workflow_id, {}).get("tasks", {})
+        engine_tasks = []
+        if hasattr(self.engine, "list_tasks"):
+            engine_tasks = [task for task in self.engine.list_tasks() if task.workflow_id == workflow_id]
+        if not engine_tasks and not shadow_tasks:
+            return
 
-        # Collect remaining non-completed task refs
+        skip_statuses = {
+            TASK_STATUS_COMPLETED,
+            TASK_STATUS_RUNNING,
+            "assigned",
+            _WTS.BLOCKED.value,
+            _WTS.DEFERRED.value,
+        }
         remaining_refs: List[TaskRef] = []
         running_write_sets: List[List[str]] = []
-        for tid, tdata in all_tasks.items():
-            status = tdata.get("status", "")
-            if status in (TASK_STATUS_COMPLETED, TASK_STATUS_RUNNING):
-                if status == TASK_STATUS_RUNNING:
-                    running_write_sets.append(list(tdata.get("claimed_paths") or []))
-                continue
-            task_ref = tdata.get("task_ref")
-            if isinstance(task_ref, TaskRef):
-                remaining_refs.append(task_ref)
-            elif isinstance(task_ref, dict):
-                try:
-                    remaining_refs.append(TaskRef.model_validate(task_ref))
-                except Exception:
-                    continue
 
+        if engine_tasks:
+            for task_state in engine_tasks:
+                status = task_state.status.value
+                if status in skip_statuses:
+                    if status == TASK_STATUS_RUNNING:
+                        running_write_sets.append(list(task_state.task.claimed_paths or []))
+                    continue
+                remaining_refs.append(task_state.task)
+        else:
+            for tdata in shadow_tasks.values():
+                status = str(tdata.get("status") or "")
+                if status in skip_statuses:
+                    if status == TASK_STATUS_RUNNING:
+                        running_write_sets.append(list(tdata.get("claimed_paths") or []))
+                    continue
+                task_ref = tdata.get("task_ref")
+                if isinstance(task_ref, TaskRef):
+                    remaining_refs.append(task_ref)
+                    continue
+                if isinstance(task_ref, dict):
+                    try:
+                        remaining_refs.append(TaskRef.model_validate(task_ref))
+                    except Exception:
+                        continue
         if not remaining_refs:
             return
 
@@ -1769,6 +1582,15 @@ class WorkflowOrchestrator:
 
         ready_ids = [t.id for t in suggestion.tasks]
         self._log(f"[DAG gating] {len(ready_ids)} downstream tasks now ready: {ready_ids}")
+
+        workflow_data = self._active_workflows.get(workflow_id, {})
+        if workflow_data.get("auto_process"):
+            self._log(f"[DAG gating] auto_process=True, auto-advancing batch for {ready_ids}")
+            self.process_batch_suggestion(
+                suggestion,
+                auto_start_agents=workflow_data.get("auto_start_agents", True),
+            )
+            return
 
         # ARCH-3: Notify Foreman instead of auto-processing
         self._notify_foreman_task_update(
@@ -1941,7 +1763,7 @@ class WorkflowOrchestrator:
                     summary=self._build_stalled_summary(
                         agent_id=task.agent_id,
                         threshold_seconds=threshold,
-                        idle_seconds=int(now - task.last_heartbeat),
+                        idle_seconds=int(now - last_beat),
                         progress_pct=task.progress_pct,
                     ),
                 )
@@ -1949,8 +1771,8 @@ class WorkflowOrchestrator:
                 try:
                     alert = check_silent_agent(
                         task_id=task.task.id,
-                        assigned_at=task.last_heartbeat,
-                        last_event_at=task.last_heartbeat,
+                        assigned_at=last_beat,
+                        last_event_at=last_beat,
                         now=now,
                         timeout_s=float(threshold),
                     )
@@ -2019,11 +1841,10 @@ class WorkflowOrchestrator:
         changed_files: List[str],
         verification: Optional[VerificationResult] = None,
     ) -> str:
-        files_text = ", ".join(str(path).strip() for path in changed_files if str(path).strip())
-        summary = f"agent={str(agent_id or '').strip() or 'unknown'}, duration={int(duration_seconds)}s"
-        if files_text:
-            summary += f", changed_files={files_text}"
-        return WorkflowOrchestrator._append_verification_checks(summary, verification)
+        return _pb_build_completion_summary(
+            agent_id=agent_id, duration_seconds=duration_seconds,
+            changed_files=changed_files, verification=verification,
+        )
 
     @staticmethod
     def _build_failure_summary(
@@ -2033,48 +1854,22 @@ class WorkflowOrchestrator:
         suggestion: str,
         verification: Optional[VerificationResult] = None,
     ) -> str:
-        summary = f"agent={str(agent_name or '').strip() or 'unknown'}, error={str(error_message or '').strip() or '(none)'}"
-        hint = str(suggestion or "").strip()
-        if hint:
-            summary += f", suggestion={hint}"
-        return WorkflowOrchestrator._append_verification_checks(summary, verification)
+        return _pb_build_failure_summary(
+            agent_name=agent_name, error_message=error_message,
+            suggestion=suggestion, verification=verification,
+        )
 
     @staticmethod
-    def _append_verification_checks(
-        summary: str,
-        verification: Optional[VerificationResult],
-    ) -> str:
-        checks_text = WorkflowOrchestrator._format_verification_checks(verification)
-        if not checks_text:
-            return summary
-        return f"{summary}\n{checks_text}"
+    def _append_verification_checks(summary: str, verification: Optional[VerificationResult]) -> str:
+        return _pb_append_verification_checks(summary, verification)
 
     @staticmethod
-    def _format_verification_checks(
-        verification: Optional[VerificationResult],
-    ) -> str:
-        if verification is None or not verification.checks:
-            return ""
-
-        lines = ["Verification checks:"]
-        for check in verification.checks:
-            lines.append(f"  {WorkflowOrchestrator._format_verification_check(check)}")
-        return "\n".join(lines)
+    def _format_verification_checks(verification: Optional[VerificationResult]) -> str:
+        return _pb_format_verification_checks(verification)
 
     @staticmethod
     def _format_verification_check(check: Any) -> str:
-        name = str(getattr(check, "name", "") or "").strip() or "unknown"
-        outcome = str(getattr(check, "outcome", "") or "").strip() or "unknown"
-        line = f"{name}: {outcome}"
-
-        duration_ms = int(getattr(check, "duration_ms", 0) or 0)
-        if duration_ms > 0:
-            line += f" ({duration_ms}ms)"
-
-        message = str(getattr(check, "message", "") or "").strip()
-        if message:
-            line += f" - {message}"
-        return line
+        return _pb_format_verification_check(check)
 
     @staticmethod
     def _build_stalled_summary(
@@ -2084,13 +1879,10 @@ class WorkflowOrchestrator:
         idle_seconds: int,
         progress_pct: Optional[int],
     ) -> str:
-        summary = (
-            f"agent={str(agent_id or '').strip() or 'unknown'}, "
-            f"idle_for={int(idle_seconds)}s, threshold={int(threshold_seconds)}s"
+        return _pb_build_stalled_summary(
+            agent_id=agent_id, threshold_seconds=threshold_seconds,
+            idle_seconds=idle_seconds, progress_pct=progress_pct,
         )
-        if progress_pct is not None:
-            summary += f", progress={int(progress_pct)}%"
-        return summary
 
     def _notify_foreman_verification_result(
         self,
@@ -2110,19 +1902,7 @@ class WorkflowOrchestrator:
 
     @staticmethod
     def _extract_evidence_summary(payload: Dict[str, Any]) -> str:
-        summary = str(payload.get("evidence_summary") or "").strip()
-        if summary:
-            return summary
-
-        evidence = payload.get("evidence")
-        if not isinstance(evidence, dict):
-            return ""
-
-        for key in ("summary", "text", "message"):
-            value = str(evidence.get(key) or "").strip()
-            if value:
-                return value
-        return ""
+        return _pb_extract_evidence_summary(payload)
 
     def _save_task_context(
         self,
@@ -2169,6 +1949,24 @@ class WorkflowOrchestrator:
         except Exception:
             logger.debug("Failed to emit workflow.ralph_internal_error", exc_info=True)
 
+    def _auto_start_assigned_task_for_completion(
+        self,
+        *,
+        task_id: str,
+        state: TaskState,
+        payload_agent_id: str,
+        result: Dict[str, Any],
+        hook_ctx: Dict[str, Any],
+    ) -> Optional[TaskState]:
+        return _vg_auto_start(
+            engine=self.engine,
+            task_id=task_id,
+            state=state,
+            payload_agent_id=payload_agent_id,
+            result=result,
+            hook_ctx=hook_ctx,
+        )
+
     def apply_task_event(self, event, *, override_stale_digest: bool = False) -> Dict[str, Any]:
         """Process a unified task event with a verification gate (ledger-backed).
 
@@ -2184,6 +1982,14 @@ class WorkflowOrchestrator:
                 "event_type": str(getattr(event, "event_type", "") or ""),
                 "reason": f"plan_digest_divergence: {exc}",
                 "code": exc.code,
+            }
+        except TransitionRejected as exc:
+            return {
+                "accepted": False,
+                "task_id": str(getattr(event, "task_id", "") or ""),
+                "event_type": str(getattr(event, "event_type", "") or ""),
+                "reason": f"{exc.alert_type}: {exc.message}",
+                "code": exc.alert_type,
             }
         except Exception as exc:
             self._emit_ralph_internal_error(
@@ -2206,7 +2012,8 @@ class WorkflowOrchestrator:
             raise ValueError(f"task not found: {task_id}")
 
         result: Dict[str, Any] = {"accepted": True, "task_id": task_id, "event_type": event_type}
-        agent_id = str(payload.get("agent_id") or "").strip() or str(getattr(state, "agent_id", "") or "").strip()
+        payload_agent_id = str(payload.get("agent_id") or "").strip()
+        agent_id = payload_agent_id or str(getattr(state, "agent_id", "") or "").strip()
         _hook_ctx: Dict[str, Any] = {"override_stale_digest": override_stale_digest}
 
         if event_type == "heartbeat":
@@ -2223,138 +2030,37 @@ class WorkflowOrchestrator:
             return result
 
         if event_type == "completed":
-            duration_seconds = int(payload.get("duration_seconds") or 0)
-            changed_files = payload.get("changed_files") if isinstance(payload.get("changed_files"), list) else []
-            evidence_summary = self._extract_evidence_summary(payload)
-            if state.status in (
-                WorkflowTaskStatus.COMPLETED,
-                WorkflowTaskStatus.FAILED,
-                WorkflowTaskStatus.BLOCKED,
-                WorkflowTaskStatus.ARCHIVED,
-            ):
-                result["reason"] = f"terminal_state:{state.status.value}"
-                return result
-
-            if state.status == WorkflowTaskStatus.READY:
-                result["accepted"] = False
-                result["reason"] = (
-                    f"task_still_ready task_id={task_id} — task was registered but never approved/assigned. "
-                    f"Was auto_process=True used in workflow submit? "
-                    f"Task must pass through approve→assign before completion can be processed."
-                )
-                logger.warning("apply_task_event rejected: task %s still in READY (not approved)", task_id)
-                return result
-
-            if state.status == WorkflowTaskStatus.ASSIGNED:
-                self.engine.report_worker_started(task_id, agent_id, hook_ctx=_hook_ctx)
-                state = self.engine.get_task(task_id) or state
-
-            if state.status != WorkflowTaskStatus.RUNNING:
-                result["accepted"] = False
-                result["reason"] = f"task_not_running status={state.status.value}"
-                return result
-
-            self.engine.report_worker_completion(
-                task_id,
-                {
-                    "agent_id": agent_id,
-                    "duration_seconds": duration_seconds,
-                    "changed_files": list(changed_files),
-                    "idempotency_key": str(getattr(event, "idempotency_key", "") or "").strip(),
-                },
-                hook_ctx=_hook_ctx,
-            )
-
-            try:
-                verification = self.ralph.verify_completion(
-                    task_id,
-                    list(changed_files),
-                    workflow_id=state.workflow_id,
-                    task_ref=state.task,
-                )
-            except Exception as e:
-                verification = VerificationResult(
-                    verification_id=f"ver-error-{task_id}",
-                    workflow_id=state.workflow_id,
-                    task_id=task_id,
-                    overall_outcome="failed",
-                    checks=[],
-                    summary=f"verification_error: {e}",
-                )
-
-            self.engine.record_verification_result(task_id, verification, hook_ctx=_hook_ctx)
-            result["verification_outcome"] = verification.overall_outcome
-
-            if verification.overall_outcome in ("passed", "skipped"):
-                self.on_task_completed(
-                    task_id=task_id,
-                    agent_id=agent_id,
-                    duration_seconds=duration_seconds,
-                    changed_files=list(changed_files),
-                    workflow_id=payload.get("workflow_id") or state.workflow_id,
-                    verification=verification,
-                )
-                notification_outcome = verification.overall_outcome  # preserves "passed" or "skipped"
-                context_error = ""
-            else:
-                self.on_task_failed(
-                    task_id=task_id,
-                    error_message=verification.summary or "Verification failed",
-                    agent_name=agent_id,
-                    verification=verification,
-                )
-                notification_outcome = "failed"
-                context_error = verification.summary or "Verification failed"
-
-            try:
-                self._notify_foreman_verification_result(
-                    task_id=task_id,
-                    verification_outcome=notification_outcome,
-                    evidence_summary=evidence_summary,
-                    changed_files=list(changed_files),
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to send verification notification to foreman for task %s",
-                    task_id,
-                    exc_info=True,
-                )
-
-            self._save_task_context(
+            # Inject the idempotency_key into the payload for the gate helper
+            payload["idempotency_key"] = str(getattr(event, "idempotency_key", "") or "").strip()
+            return _vg_process_completed(
+                engine=self.engine,
+                ralph_service=self.ralph,
                 task_id=task_id,
-                task=state.task,
-                changed_files=list(changed_files),
-                last_error=context_error,
+                state=state,
+                payload=payload,
+                agent_id=agent_id,
+                hook_ctx=_hook_ctx,
+                result=result,
+                extract_evidence_summary_fn=self._extract_evidence_summary,
+                on_task_completed_fn=self.on_task_completed,
+                on_task_failed_fn=self.on_task_failed,
+                notify_verification_fn=self._notify_foreman_verification_result,
+                save_context_fn=self._save_task_context,
+                auto_start_fn=self._auto_start_assigned_task_for_completion,
             )
-            return result
 
         if event_type == "failed":
-            error_message = str(payload.get("error_message") or "").strip()
-            suggestion = str(payload.get("suggestion") or "").strip()
-            agent_name = str(payload.get("agent_name") or "").strip() or agent_id
-            changed_files = payload.get("changed_files") if isinstance(payload.get("changed_files"), list) else []
-            if state.status == WorkflowTaskStatus.ASSIGNED:
-                self.engine.report_worker_started(task_id, agent_id, hook_ctx=_hook_ctx)
-                state = self.engine.get_task(task_id) or state
-            if state.status == WorkflowTaskStatus.RUNNING:
-                self.engine.report_worker_failed(
-                    task_id,
-                    {"error_message": error_message, "suggestion": suggestion, "agent_name": agent_name},
-                    hook_ctx=_hook_ctx,
-                )
-            self.on_task_failed(
+            return _vg_process_failed(
+                engine=self.engine,
                 task_id=task_id,
-                error_message=error_message,
-                suggestion=suggestion,
-                agent_name=agent_name,
+                state=state,
+                payload=payload,
+                agent_id=agent_id,
+                hook_ctx=_hook_ctx,
+                result=result,
+                on_task_failed_fn=self.on_task_failed,
+                save_context_fn=self._save_task_context,
             )
-            self._save_task_context(
-                task_id=task_id,
-                task=state.task,
-                changed_files=list(changed_files),
-                last_error=error_message,
-            )
-            return result
 
         result["accepted"] = False
         result["reason"] = "unknown_event_type"
@@ -2376,13 +2082,19 @@ class WorkflowOrchestrator:
             td = wdata.get("tasks", {}).get(tid)
             if td:
                 td["status"] = TASK_STATUS_PENDING
+                td["agent_id"] = ""
+                td["agent_name"] = ""
+                td.pop("assignment_attempt_id", None)
                 td.pop("error_message", None)
                 break
 
         return {"accepted": True, "task_id": tid, "action": "retry_requested", "workflow_id": state.workflow_id}
 
     def block_task(self, task_id: str, reason: str) -> Dict[str, Any]:
-        """Foreman decision: block a task with a human-readable reason."""
+        """Foreman decision: block a task with a human-readable reason.
+
+        Cascades to all downstream dependents via DAG traversal.
+        """
         tid = str(task_id or "").strip()
         why = str(reason or "").strip()
         if not tid:
@@ -2392,16 +2104,70 @@ class WorkflowOrchestrator:
             raise ValueError(f"task not found: {tid}")
 
         self.engine.block_task(tid, why)
+        self._update_shadow_blocked(tid, why)
 
-        # Progress API does not have a first-class 'blocked' status; surface as failed with context.
+        cascaded_ids = self._cascade_block(state.workflow_id, tid, why)
+
+        return {
+            "accepted": True, "task_id": tid, "action": "blocked",
+            "workflow_id": state.workflow_id, "reason": why,
+            "cascaded_task_ids": cascaded_ids,
+        }
+
+    def _update_shadow_blocked(self, task_id: str, reason: str) -> None:
         for wdata in self._active_workflows.values():
-            td = wdata.get("tasks", {}).get(tid)
+            td = wdata.get("tasks", {}).get(task_id)
             if td:
                 td["status"] = TASK_STATUS_FAILED
-                td["error_message"] = f"blocked: {why}" if why else "blocked"
+                td["error_message"] = f"blocked: {reason}" if reason else "blocked"
                 break
 
-        return {"accepted": True, "task_id": tid, "action": "blocked", "workflow_id": state.workflow_id, "reason": why}
+    def _cascade_block(self, workflow_id: str, blocked_task_id: str, reason: str) -> List[str]:
+        """Cascade BLOCKED to all downstream dependents via reverse DAG traversal."""
+        reverse_deps: Dict[str, List[str]] = {}
+        all_tasks = self.engine.list_tasks() if hasattr(self.engine, "list_tasks") else []
+        for ts in all_tasks:
+            if ts.workflow_id != workflow_id:
+                continue
+            for dep_id in (ts.task.depends_on or []):
+                reverse_deps.setdefault(dep_id, []).append(ts.task.id)
+
+        visited: set = {blocked_task_id}
+        cascaded: List[str] = []
+        queue = list(reverse_deps.get(blocked_task_id, []))
+        while queue:
+            tid = queue.pop(0)
+            if tid in visited:
+                continue
+            visited.add(tid)
+            downstream = self.engine.get_task(tid)
+            if downstream is None:
+                continue
+            if downstream.status in {_WTS.COMPLETED, _WTS.ARCHIVED, _WTS.BLOCKED}:
+                continue
+            was_running = downstream.status == _WTS.RUNNING
+            cascade_reason = f"upstream {blocked_task_id} blocked: {reason}"
+            try:
+                self.engine.block_task(tid, cascade_reason)
+            except ValueError:
+                continue
+            self._update_shadow_blocked(tid, cascade_reason)
+            cascaded.append(tid)
+            if was_running:
+                self._notify_foreman_task_update(
+                    task_id=tid,
+                    new_status="cancelled",
+                    summary=f"Task {tid} cancelled: {cascade_reason}",
+                )
+            queue.extend(reverse_deps.get(tid, []))
+
+        if cascaded:
+            self._notify_foreman_task_update(
+                task_id=blocked_task_id,
+                new_status="blocked_cascade",
+                summary=f"Task {blocked_task_id} blocked. Cascaded to {len(cascaded)} downstream tasks: {cascaded}",
+            )
+        return cascaded
 
     def on_verification_result(
         self,
@@ -2410,31 +2176,61 @@ class WorkflowOrchestrator:
         """Handle verification result from Ralph."""
         workflow_id = verification.workflow_id
         outcome = verification.overall_outcome
+        task_id = str(verification.task_id or "").strip()
 
         self._log(f"[orchestrator] Verification for {workflow_id}: {outcome}")
+        self._record_external_verification(verification, task_id)
 
-        if outcome in ("passed", "skipped"):
-            # Check if workflow should complete (skipped also counts as success)
+        if outcome == "passed":
+            # Check if workflow should complete
             state = self.reporter.get_state()
             if state and state.current_batch_id:
-                # Batch verification passed/skipped, mark complete
+                # Batch verification passed, mark complete
                 self.reporter.on_batch_completed()
-        elif outcome == "failed":
-            # Notify about verification failure
-            task_id = verification.task_id or "unknown"
+        elif outcome in ("skipped", "failed", "timeout"):
+            # Both skipped and failed count as failure
+            reported_task_id = task_id or "unknown"
+            if outcome == "skipped":
+                error_message = (
+                    "Verification skipped: no commands configured. "
+                    "Add verification commands or use force_complete_unverified()."
+                )
+            elif outcome == "timeout":
+                error_message = verification.summary or "Verification timed out"
+            else:
+                error_message = verification.summary or "Verification failed"
 
             # Update assignment status
             for wdata in self._active_workflows.values():
-                td = wdata.get("tasks", {}).get(task_id)
+                td = wdata.get("tasks", {}).get(reported_task_id)
                 if td:
                     td["status"] = TASK_STATUS_FAILED
-                    td["error_message"] = verification.summary or "Verification failed"
+                    td["error_message"] = error_message
                     break
 
             self.reporter.on_task_failed(
-                task_id,
-                verification.summary or "Verification failed",
+                reported_task_id,
+                error_message,
             )
+
+    def _record_external_verification(
+        self,
+        verification: VerificationResult,
+        task_id: str,
+    ) -> None:
+        if not task_id:
+            return
+        state = self.engine.get_task(task_id)
+        if state is None:
+            self._log(f"[orchestrator] Verification task not registered: {task_id}")
+            return
+        if state.status != WorkflowTaskStatus.VERIFYING:
+            self._log(
+                f"[orchestrator] Verification ignored for {task_id}: "
+                f"status={state.status.value}"
+            )
+            return
+        self.engine.record_verification_result(task_id, verification)
 
     def _check_batch_completion(self, workflow_id: Optional[str]) -> None:
         """Check if current batch is complete."""
@@ -2473,34 +2269,27 @@ class WorkflowOrchestrator:
         else:
             kind = progress.get("status", "idle")
 
-        assignments: List[Dict[str, Any]] = []
-        if workflow_id and workflow_id in self._active_workflows:
-            assignments = [
-                self._serialize_assignment(assignment)
-                for assignment in self._active_workflows[workflow_id].get("tasks", {}).values()
-            ]
-        elif not workflow_id:
-            assignments = [
-                self._serialize_assignment(assignment)
-                for assignment in self._get_all_assignments()
-            ]
+        engine_tasks = self.engine.list_tasks() if hasattr(self.engine, "list_tasks") else []
+        if engine_tasks:
+            assignments = self._build_engine_state_assignments(workflow_id, engine_tasks)
+            task_fallback = None
+        else:
+            assignments = self._get_shadow_state_assignments(workflow_id)
+            task_fallback = progress.get(
+                "tasks",
+                {
+                    "total": 0,
+                    "completed": 0,
+                    "failed": 0,
+                    "running": 0,
+                    "pending": 0,
+                    "deferred": 0,
+                },
+            )
 
         snapshot = {
             "batches": progress.get("batches", {"total": 0, "completed": 0}),
-            "tasks": self._build_task_snapshot(
-                assignments,
-                progress.get(
-                    "tasks",
-                    {
-                        "total": 0,
-                        "completed": 0,
-                        "failed": 0,
-                        "running": 0,
-                        "pending": 0,
-                        "deferred": 0,
-                    },
-                ),
-            ),
+            "tasks": self._build_task_snapshot(assignments, task_fallback),
             "duration": progress.get("duration", {"workflow_seconds": 0, "batch_seconds": 0}),
             "recent_events": progress.get("recent_events", []),
             "assignments": assignments,

@@ -1,0 +1,405 @@
+# Batch D: Engine 状态转换正确、干净
+# 可验证结论: "DEFERRED 在 Engine 持久化；retry 清空旧 assignment；BLOCKED 级联取消下游"
+#
+# 对应问题清单: ARCH-7 (P1↑) + ARCH-8 (P1↑) + ARCH-11 (P1)
+# Finding 对照: #16(负向不变量) #17(失败必须暴露) #9(先跑通一条路径)
+#
+# 依赖: Batch C 已完成（ARCH-1/2/3/6, commit b9debf8）
+# 验证方法: DEFERRED 出现在 engine state；retry 后 agent_id 为空；BLOCKED 后 sibling 被取消
+#
+# Codex 审查后修正（adversarial-review-batch-d.md）：
+# - T1: register_batch 收窄允许状态 {PLANNED, READY, DEFERRED} + 清空 blocked_reason
+# - T3: attempt_id CAS 接入完整完成事件链路 apply_task_event + 旧字段兼容
+# - T5: engine.block_task 加终态保护+幂等 + visited 去重 + engine-first 读取
+# - T6: 新增 daemon IPC 完成路径测试 + 菱形 DAG 去重 + 空/旧 attempt_id 兼容
+
+tasks:
+  # === T1: ARCH-7 — DEFERRED 纳入 Engine 状态机 ===
+
+  - id: T1
+    title: "DEFERRED 纳入 WorkflowTaskStatus 枚举 + Engine 状态转换"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+    depends_on: []
+    goal_behavior: >
+      1. 在 WorkflowTaskStatus 枚举中新增 DEFERRED = "deferred"（位于 BLOCKED 之前）。
+      2. 在 workflow_state_types.py 新增事件类型常量 KIND_TASK_DEFERRED = "workflow.task_deferred"。
+      3. 在 WorkflowEngine 新增 defer_task(task_id, reason) 方法：
+         - 校验 task 存在
+         - 允许的源状态: PLANNED, READY（已排上 batch 但因冲突需要推迟）
+         - 写 ledger 事件 KIND_TASK_DEFERRED, data 含 workflow_id, task_id, reason
+         - 将 TaskState.status 设为 DEFERRED, 保存 reason 到 blocked_reason 字段（复用）
+      4. 新增 _apply_task_deferred(data) replay handler：
+         - 从 data 读取 task_id, reason
+         - 将 task 状态设为 DEFERRED, blocked_reason 设为 reason
+      5. 在 _apply_event() 的 handlers dict 中注册 KIND_TASK_DEFERRED。
+      6. 修改 register_batch()：
+         - 收窄允许的源状态为 {PLANNED, READY, DEFERRED}，拒绝 RUNNING/VERIFYING/FAILED/BLOCKED/ARCHIVED
+         - 从 DEFERRED → READY 时显式清空 blocked_reason
+         （Codex 审查修正：防止 register_batch 在冲突未消除时唤醒任务，
+          并避免 READY 任务携带陈旧 blocked_reason）
+    acceptance_criteria: >
+      WorkflowTaskStatus.DEFERRED 存在；
+      engine.defer_task() 写 ledger 事件且状态变为 DEFERRED；
+      replay_from_ledger() 正确还原 DEFERRED 状态；
+      register_batch() 只接受 PLANNED/READY/DEFERRED 进入 READY；
+      DEFERRED → READY 时 blocked_reason 被清空；
+      register_batch() 对 RUNNING/FAILED 等状态抛 ValueError。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'deferred or defer'"
+      covers:
+        tasks: ["T1"]
+    provides:
+      - name: engine_deferred_status
+        kind: module
+        schema_hint: "WorkflowTaskStatus.DEFERRED + Engine.defer_task() + register_batch narrowed + ledger replay"
+    addresses: ["ARCH-7"]
+
+  # === T2: ARCH-7 续 — Orchestrator 改用 Engine.defer_task() ===
+
+  - id: T2
+    title: "Orchestrator _record_deferred_tasks 改为调用 Engine.defer_task()"
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      1. 修改 _record_deferred_tasks()：
+         对每个 task 调用 self.engine.defer_task(task.id, reason)。
+         不再使用 _track_task_ref() 写入 _active_workflows 影子状态。
+         仍然返回 List[TaskAssignment] 以保持接口兼容。
+      2. 删除 TASK_STATUS_DEFERRED 本地常量（line 66），
+         改为从 WorkflowTaskStatus.DEFERRED.value 引用。
+      3. _build_task_snapshot() 中的 deferred 统计：
+         优先从 engine.list_tasks(status=DEFERRED) 获取数量，
+         shadow 统计作为 fallback（Phase F 才完全删 shadow）。
+      4. _resuggest_ready_tasks() 过滤候选时：
+         跳过 engine 中状态为 DEFERRED 的 task（不只看 shadow）。
+         （Codex 审查修正：read path 部分切到 engine-first，
+          避免 deferred 持久化后调度仍看旧 shadow）
+    acceptance_criteria: >
+      _record_deferred_tasks() 调用 engine.defer_task()；
+      ledger 中出现 workflow.task_deferred 事件；
+      TASK_STATUS_DEFERRED 本地常量已删除或改为引用枚举；
+      daemon 重启 replay 后 deferred 状态仍可还原；
+      _resuggest_ready_tasks 不将 engine 中 DEFERRED 的 task 放入建议。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_workflow_state.py tests/test_foreman_workflow.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T2"]
+    consumes:
+      - name: engine_deferred_status
+        from: T1
+    provides:
+      - name: orchestrator_deferred_via_engine
+        kind: runtime_capability
+        schema_hint: "Orchestrator defers tasks through Engine, not shadow state; read paths engine-first"
+    addresses: ["ARCH-7"]
+
+  # === T3: ARCH-8 — retry 清空 agent_id + attempt_id + 完整链路 CAS ===
+
+  - id: T3
+    title: "retry 清空 agent_id，引入 attempt_id，CAS 接入完成事件链路"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+      - "src/cccc/daemon/foreman/ralph_service.py"
+    depends_on: []
+    goal_behavior: >
+      1. TaskState 新增 attempt_id: str = "" 字段（assignment attempt 的唯一标识）。
+      2. 修改 retry_after_verification()：
+         replace(prev, status=READY) 改为
+         replace(prev, status=READY, agent_id="", attempt_id="")，
+         显式清空 agent_id 和 attempt_id。
+      3. 修改 _apply_retry_requested()：
+         同样 replace 时清空 agent_id 和 attempt_id，确保 replay 一致。
+      4. 修改 approve_batch()：
+         从 assignment 数据中读取 attempt_id（如果存在），写入 TaskState。
+      5. 修改 _apply_batch_approved()：
+         从 assignment 数据中读取 attempt_id，设入 TaskState。
+      6. 修改 report_worker_completion()：
+         新增可选 attempt_id 参数。CAS 逻辑：
+         - 如果 TaskState.attempt_id 非空且 payload attempt_id 非空：
+           必须匹配，不匹配时 raise ValueError（拒绝陈旧消息）
+         - 如果 TaskState.attempt_id 非空但 payload attempt_id 为空：
+           检查 payload 中 assignment_id 是否等于当前 attempt_id（向后兼容）
+         - 如果 TaskState.attempt_id 为空：跳过 CAS（旧 workflow 兼容）
+         （Codex 审查修正：明确旧字段映射策略，assignment_id 作为
+          旧版 attempt_id 的兼容来源，避免旧客户端被误拒绝或绕过）
+    acceptance_criteria: >
+      retry_after_verification 后 agent_id 和 attempt_id 均为空；
+      ledger replay 后 retry 的 task agent_id 为空；
+      approve_batch 写入 attempt_id；
+      report_worker_completion 对 attempt_id mismatch 拒绝（ValueError）；
+      旧 workflow（无 attempt_id）的完成事件仍被接受。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'retry or attempt'"
+      covers:
+        tasks: ["T3"]
+    provides:
+      - name: clean_retry_with_attempt_id
+        kind: module
+        schema_hint: "retry clears agent_id + attempt_id; CAS on complete with backward compat"
+    addresses: ["ARCH-8"]
+
+  # === T4: ARCH-8 续 — Orchestrator + 完成事件链路透传 attempt_id ===
+
+  - id: T4
+    title: "Orchestrator + 完成事件链路透传 attempt_id"
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+      - "src/cccc/daemon/foreman/ralph_service.py"
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+    depends_on: ["T3"]
+    goal_behavior: >
+      1. 修改 retry_task() 方法（line 1695-1707）：
+         在 shadow state 更新中，同时清空 td["agent_id"]、td["agent_name"]、
+         td.get("assignment_attempt_id")。
+      2. 修改 process_batch_suggestion()：
+         当 orchestrator 构建 TaskAssignment 时，生成 attempt_id（UUID4 短串），
+         写入 engine.approve_batch() 的 assignments 数据。
+         shadow state 中也记录 attempt_id。
+      3. 修改 apply_task_event()（line 1524-1686）：
+         从 event payload 提取 attempt_id（先看 attempt_id 字段，
+         fallback 到 assignment_id 字段作为旧版兼容）。
+         传递给 engine.report_worker_completion() 的 attempt_id 参数。
+         （Codex 审查修正：CAS 必须在 orchestrator 入口就做，
+          不能只在 engine 内部；真实完成事件链路是
+          handle_ralph_task_event → workflow_task_ops → apply_task_event → engine）
+      4. 修改 workflow_task_ops.complete_task()：
+         透传 attempt_id 参数到 orchestrator。
+    acceptance_criteria: >
+      retry_task 后 shadow state 中 agent_id 为空；
+      approve_batch 时 attempt_id 被传入 engine 并持久化；
+      apply_task_event 将 attempt_id 传给 engine.report_worker_completion；
+      旧客户端发送的 assignment_id 被映射为 attempt_id。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py tests/test_workflow_state.py tests/test_workflow_task_ops.py -q --tb=short"
+      covers:
+        tasks: ["T3", "T4"]
+    consumes:
+      - name: clean_retry_with_attempt_id
+        from: T3
+    provides:
+      - name: orchestrator_clean_retry
+        kind: runtime_capability
+        schema_hint: "Orchestrator retry clears shadow; attempt_id in full completion pipeline"
+    addresses: ["ARCH-8"]
+
+  # === T5: ARCH-11 — BLOCKED DAG 级联取消 ===
+
+  - id: T5
+    title: "BLOCKED 状态 DAG 级联：取消依赖于 blocked task 的下游任务"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/ralph/core.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      **Engine 侧加固（Codex 审查修正）：**
+      1. 修改 WorkflowEngine.block_task()：
+         - 终态保护：如果 task 状态为 COMPLETED/ARCHIVED，raise ValueError 拒绝覆盖
+         - 幂等保护：如果 task 状态已为 BLOCKED，静默返回（不重复写 ledger）
+         这防止级联阻塞把已完成任务错误地打成 BLOCKED。
+
+      **Orchestrator 级联逻辑：**
+      2. 新增 _cascade_block(workflow_id, blocked_task_id, reason) 方法：
+         - 使用 visited: set[str] 避免菱形 DAG 中 fan-in 节点被重复 block
+         - 递归前从 engine 读取 task 真实状态（不依赖 shadow state）
+         - 对于 engine 中状态为 COMPLETED/ARCHIVED 的 task，跳过
+         - 对于 engine 中状态已为 BLOCKED 的 task，跳过（engine 幂等保护）
+         - 对其余下游 task，调用 engine.block_task(downstream_id, cascade_reason)
+         - 更新 shadow state 中对应的 task
+         - 对 engine 中状态为 RUNNING 的下游 task，在 block 后通知 Foreman 需要取消
+      3. 修改 block_task() 方法：
+         在 engine.block_task() 调用后，调用 _cascade_block()。
+      4. 修改 _resuggest_ready_tasks()：
+         收集 remaining_refs 时，从 engine 查询 task 状态，
+         跳过 BLOCKED 和 DEFERRED 状态的 task。
+      5. 通知 Foreman：级联取消后向 Foreman 发送汇总通知，
+         包含被级联取消的 task ID 列表和原因。
+    acceptance_criteria: >
+      engine.block_task 拒绝覆盖 COMPLETED/ARCHIVED（ValueError）；
+      engine.block_task 对已 BLOCKED 的 task 幂等返回；
+      _cascade_block 使用 visited 集合，菱形 DAG 下每个 task 只 block 一次；
+      _cascade_block 从 engine 读状态，不依赖 shadow；
+      RUNNING 下游 task 被 block 后 Foreman 收到取消通知；
+      _resuggest_ready_tasks 不将 BLOCKED/DEFERRED task 放入建议。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py tests/test_workflow_e2e_closure.py tests/test_workflow_state.py -q --tb=short -k 'block or cascade'"
+      covers:
+        tasks: ["T5"]
+        flows:
+          - "blocked_cascade_cancels_downstream"
+    consumes:
+      - name: engine_deferred_status
+        from: T1
+    provides:
+      - name: blocked_dag_cascade
+        kind: runtime_capability
+        schema_hint: "BLOCKED cascades with dedup + terminal protection + engine-first reads"
+    addresses: ["ARCH-11"]
+
+  # === T6: E2E 验证 ===
+
+  - id: T6
+    title: "E2E 验证：Engine 状态转换完整性"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_engine_state_integrity.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+    depends_on: ["T2", "T4", "T5"]
+    goal_behavior: >
+      新建 tests/e2e/test_engine_state_integrity.py：
+
+      1. test_deferred_persisted_in_engine：
+         提交 batch → 触发 single-writer 冲突 → task 状态变为 DEFERRED →
+         ledger 有 workflow.task_deferred 事件 →
+         replay_from_ledger 后状态仍为 DEFERRED →
+         后续 register_batch 可将其恢复为 READY →
+         READY 后 blocked_reason 为空。
+
+      2. test_register_batch_rejects_invalid_source_states：
+         task 在 RUNNING/FAILED/BLOCKED 状态时调用 register_batch →
+         应 raise ValueError。只有 PLANNED/READY/DEFERRED 被接受。
+
+      3. test_retry_clears_agent_id_and_attempt_id：
+         task 被 assign 给 agent-A（带 attempt_id）→ task RUNNING →
+         task complete → verification failed → retry →
+         engine state 中 agent_id="" 且 attempt_id="" →
+         重新 approve_batch 给 agent-B（新 attempt_id）→
+         agent_id 和 attempt_id 更新。
+
+      4. test_stale_completion_rejected_by_attempt_id：
+         task 被 assign（attempt_id=X）→ retry（agent_id 清空）→
+         重新 assign（attempt_id=Y）→ 旧 agent 用 attempt_id=X 调 complete →
+         被拒绝（ValueError）。
+
+      5. test_old_client_completion_backward_compat：
+         task 被 assign（attempt_id=X）→ 旧客户端发送 assignment_id=X（无 attempt_id 字段）
+         → 完成事件被接受（assignment_id 映射为 attempt_id）。
+         （Codex 审查修正：旧字段兼容场景）
+
+      6. test_blocked_cascades_to_downstream：
+         DAG: T-A → T-B → T-C, T-A → T-D（T-B, T-D 并行依赖 T-A）。
+         block T-A → T-B, T-C, T-D 全部 BLOCKED。
+         ledger 中有 4 条 workflow.task_blocked 事件（不多不少）。
+
+      7. test_blocked_diamond_dag_dedup：
+         菱形 DAG: T-A → T-B, T-A → T-C, T-B → T-D, T-C → T-D。
+         block T-A → T-B, T-C, T-D 各 BLOCKED 一次。
+         ledger 中恰好 4 条 workflow.task_blocked（T-D 不重复）。
+         （Codex 审查修正：菱形 DAG 去重验证）
+
+      8. test_block_does_not_overwrite_completed：
+         T-A COMPLETED, T-B depends on T-A。
+         block T-B → T-B BLOCKED。
+         尝试级联到 T-A → engine 拒绝（COMPLETED 不可 block）。
+
+      9. test_blocked_running_sibling_gets_cancel_notification：
+         DAG: T-A, T-B 并行 → T-C。T-A RUNNING, T-B RUNNING。
+         block T-A → T-C BLOCKED。T-B 继续 RUNNING（不受影响）。
+         验证 _resuggest_ready_tasks 不将 BLOCKED 的 T-C 放入建议。
+
+      10. test_ledger_replay_full_lifecycle：
+          完整生命周期：register → defer → undefer(register_batch) →
+          assign(with attempt_id) → running → complete → verify_fail →
+          retry(agent_id cleared) → re-assign → block → cascade。
+          replay_from_ledger 后所有状态正确。
+    acceptance_criteria: >
+      10 个场景全部通过：DEFERRED 持久化、状态边界、retry 清空、
+      stale completion 拒绝、旧客户端兼容、BLOCKED 级联、
+      菱形 DAG 去重、COMPLETED 不可 block、
+      RUNNING sibling 不受影响、全生命周期 replay。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/e2e/test_engine_state_integrity.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5", "T6"]
+        flows:
+          - "deferred_lifecycle"
+          - "clean_retry_cas"
+          - "blocked_cascade_cancels_downstream"
+          - "no_retry_keeps_old_agent"
+          - "no_blocked_task_in_suggestions"
+          - "no_deferred_only_in_shadow"
+
+critical_entrypoints:
+  - src/cccc/kernel/workflow_state_engine.py
+  - src/cccc/kernel/workflow_state_types.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+
+critical_flows:
+  - id: deferred_lifecycle
+    description: "Task registered → deferred (single-writer conflict) → undeferred (register_batch) → proceeds normally"
+    entrypoints:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    required_verification_level: e2e
+  - id: clean_retry_cas
+    description: "Task fails verification → retry clears agent_id/attempt_id → re-assigned → stale completion rejected by CAS"
+    entrypoints:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    required_verification_level: e2e
+  - id: blocked_cascade_cancels_downstream
+    description: "Task blocked → all downstream dependents cascade-blocked → running siblings unaffected → resuggest skips blocked"
+    entrypoints:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    required_verification_level: e2e
+
+forbidden_flows:
+  - id: no_retry_keeps_old_agent
+    description: "retry_after_verification MUST NOT preserve old agent_id or attempt_id"
+    required_verification_level: e2e
+  - id: no_blocked_task_in_suggestions
+    description: "BLOCKED tasks MUST NOT appear in ralph suggest output or _resuggest_ready_tasks"
+    required_verification_level: e2e
+  - id: no_deferred_only_in_shadow
+    description: "DEFERRED state MUST be persisted in Engine ledger, not only in orchestrator shadow state"
+    required_verification_level: e2e
+
+required_issues:
+  - "ARCH-7"
+  - "ARCH-8"
+  - "ARCH-11"
+
+suppress_codes:
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+
+state:
+  completed_task_ids: ["T1", "T2", "T3", "T4", "T5", "T6"]
+  running_tasks: []
+  failed_task_ids: []

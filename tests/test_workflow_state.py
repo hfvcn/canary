@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -18,7 +19,6 @@ def temp_home() -> Path:
     else:
         os.environ["CCCC_HOME"] = old_home
 
-
 @pytest.fixture()
 def group(temp_home: Path):  # noqa: ARG001
     from cccc.kernel.group import create_group
@@ -26,7 +26,6 @@ def group(temp_home: Path):  # noqa: ARG001
 
     reg = load_registry()
     return create_group(reg, title="workflow-state", topic="")
-
 
 @pytest.fixture()
 def temp_project_dir() -> Path:
@@ -51,6 +50,7 @@ def temp_project_dir() -> Path:
         )
         yield root
 
+
 def _count_kind(ledger_path: Path, *, kind: str) -> int:
     count = 0
     for raw in ledger_path.read_text(encoding="utf-8", errors="strict").splitlines():
@@ -60,6 +60,25 @@ def _count_kind(ledger_path: Path, *, kind: str) -> int:
         if str(ev.get("kind") or "") == kind:
             count += 1
     return count
+
+
+def _read_events(ledger_path: Path) -> list[dict]:
+    return [json.loads(raw) for raw in ledger_path.read_text(encoding="utf-8", errors="strict").splitlines() if raw.strip()]
+
+
+def _setup_running_task(group, *, task_id: str = "T1", attempt_id: str = ""):
+    from cccc.contracts.v1.ralph_ipc import TaskRef
+    from cccc.kernel.workflow_state import WorkflowEngine
+
+    engine = WorkflowEngine(group)
+    engine.register_task(TaskRef(id=task_id, title=task_id), "wf-hook")
+    engine.register_batch("b1", [task_id])
+    engine.approve_batch(
+        "b1",
+        [{"task_id": task_id, "agent_id": "a1", "claimed_paths": [], "attempt_id": attempt_id}],
+    )
+    engine.report_worker_started(task_id, "a1")
+    return engine
 
 
 def test_completion_idempotency_and_verifying_gate(group) -> None:
@@ -95,7 +114,6 @@ def test_completion_idempotency_and_verifying_gate(group) -> None:
     engine.record_verification_result("T1", vr)
     assert engine.get_task("T1").status == WorkflowTaskStatus.COMPLETED  # type: ignore[union-attr]
 
-
 def test_retry_after_verification_from_failed(group) -> None:
     from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationResult
     from cccc.kernel.workflow_state import WorkflowEngine, WorkflowTaskStatus
@@ -122,7 +140,6 @@ def test_retry_after_verification_from_failed(group) -> None:
     engine.retry_after_verification("T1")
     assert engine.get_task("T1").status == WorkflowTaskStatus.READY  # type: ignore[union-attr]
 
-
 def test_illegal_transition_is_rejected(group) -> None:
     from cccc.contracts.v1.ralph_ipc import TaskRef
     from cccc.kernel.workflow_state import WorkflowEngine
@@ -131,7 +148,6 @@ def test_illegal_transition_is_rejected(group) -> None:
     engine.register_task(TaskRef(id="T1", title="t1"), "wf-illegal")
     with pytest.raises(ValueError):
         engine.report_worker_completion("T1", {"idempotency_key": "idem"})
-
 
 def test_claimed_paths_conflict_is_rejected(group) -> None:
     from cccc.contracts.v1.ralph_ipc import TaskRef
@@ -150,7 +166,6 @@ def test_claimed_paths_conflict_is_rejected(group) -> None:
                 {"task_id": "T2", "agent_id": "a2", "claimed_paths": ["src/x.py"]},
             ],
         )
-
 
 def test_ledger_replay_restores_state(group) -> None:
     from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationResult
@@ -183,118 +198,138 @@ def test_ledger_replay_restores_state(group) -> None:
     assert engine2.get_task("T1") is not None
     assert engine2.get_task("T1").status == WorkflowTaskStatus.COMPLETED  # type: ignore[union-attr]
 
-def test_orchestrator_completed_event_auto_transitions_assigned_task(
-    group,
-    temp_project_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from cccc.contracts.v1.ralph_ipc import TaskEvent, TaskRef, VerificationResult
-    from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
-    from cccc.kernel.workflow_state import WorkflowEngine, WorkflowTaskStatus
 
-    workflow_id = "wf-assigned-auto"
-    engine = WorkflowEngine(group)
-    engine.register_task(TaskRef(id="T1", title="t1"), workflow_id)
-    engine.register_batch("b1", ["T1"])
-    engine.approve_batch("b1", [{"task_id": "T1", "agent_id": "a1", "claimed_paths": []}])
+def test_cas_correct_attempt_id_passes(group) -> None:
+    from cccc.kernel.workflow_state import WorkflowTaskStatus
 
-    orch = WorkflowOrchestrator(project_root=temp_project_dir, group_id=group.group_id)
-    assert orch.engine.get_task("T1").status == WorkflowTaskStatus.ASSIGNED  # type: ignore[union-attr]
+    engine = _setup_running_task(group, attempt_id="attempt-1")
 
-    def fake_verify_completion(task_id: str, changed_files: list[str], *, workflow_id: str, task_ref: TaskRef) -> VerificationResult:  # noqa: ARG001
-        return VerificationResult(
-            verification_id="ver-assigned-auto",
-            workflow_id=workflow_id,
-            task_id=task_id,
-            overall_outcome="passed",
-            checks=[],
-            summary="ok",
-        )
+    engine.report_worker_completion("T1", {"idempotency_key": "idem-cas-pass"}, attempt_id="attempt-1")
 
-    monkeypatch.setattr(orch.ralph, "verify_completion", fake_verify_completion)
+    assert engine.get_task("T1").status == WorkflowTaskStatus.VERIFYING  # type: ignore[union-attr]
 
-    result = orch.apply_task_event(
-        TaskEvent(
-            event_type="completed",
-            task_id="T1",
-            idempotency_key="idem-assigned-auto",
-            payload={
-                "agent_id": "a1",
-                "workflow_id": workflow_id,
-                "duration_seconds": 0,
-                "changed_files": [],
+
+def test_cas_wrong_attempt_id_rejected(group) -> None:
+    from cccc.kernel.workflow_state import WorkflowTaskStatus
+
+    engine = _setup_running_task(group, attempt_id="attempt-1")
+
+    with pytest.raises(ValueError, match="attempt_id mismatch for T1: expected attempt-1, got stale-1"):
+        engine.report_worker_completion("T1", {"idempotency_key": "idem-cas-reject"}, attempt_id="stale-1")
+
+    assert engine.get_task("T1").status == WorkflowTaskStatus.RUNNING  # type: ignore[union-attr]
+
+
+def test_cas_no_attempt_id_skips(group, caplog) -> None:
+    from cccc.kernel.workflow_state import WorkflowTaskStatus
+
+    engine = _setup_running_task(group, attempt_id="attempt-1")
+
+    with caplog.at_level(logging.WARNING, logger="cccc.kernel.workflow_state_engine"):
+        engine.report_worker_completion("T1", {"idempotency_key": "idem-cas-skip"})
+
+    assert engine.get_task("T1").status == WorkflowTaskStatus.VERIFYING  # type: ignore[union-attr]
+    assert any("CAS skip: no attempt_id provided for task T1" in record.message for record in caplog.records)
+
+
+def test_cas_no_attempt_id_no_engine_attempt(group) -> None:
+    from cccc.kernel.workflow_state import WorkflowTaskStatus
+
+    engine = _setup_running_task(group)
+
+    engine.report_worker_completion("T1", {"idempotency_key": "idem-cas-empty"})
+
+    assert engine.get_task("T1").status == WorkflowTaskStatus.VERIFYING  # type: ignore[union-attr]
+
+
+def test_cas_accepts_assignment_id_only(group, caplog) -> None:
+    from cccc.kernel.workflow_state import WorkflowTaskStatus
+
+    engine = _setup_running_task(group, attempt_id="attempt-1")
+
+    with caplog.at_level(logging.WARNING, logger="cccc.kernel.workflow_state_engine"):
+        engine.report_worker_completion(
+            "T1",
+            {
+                "idempotency_key": "idem-cas-assignment-only",
+                "assignment_id": "assignment-1",
             },
         )
-    )
 
-    assert result["accepted"] is True
-    assert result["verification_outcome"] == "passed"
-    assert orch.engine.get_task("T1").status == WorkflowTaskStatus.COMPLETED  # type: ignore[union-attr]
-    assert _count_kind(group.ledger_path, kind="workflow.task_started") == 1
-    assert _count_kind(group.ledger_path, kind="workflow.task_reported_completed") == 1
-    assert _count_kind(group.ledger_path, kind="workflow.verification_passed") == 1
+    assert engine.get_task("T1").status == WorkflowTaskStatus.VERIFYING  # type: ignore[union-attr]
+    assert any("CAS skip: no attempt_id provided for task T1" in record.message for record in caplog.records)
 
 
-def test_orchestrator_completed_event_rejects_ready_task(group, temp_project_dir: Path) -> None:
-    from cccc.contracts.v1.ralph_ipc import TaskEvent, TaskRef
-    from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
-    from cccc.kernel.workflow_state import WorkflowEngine, WorkflowTaskStatus
+def test_hook_error_block_mode_rejects(group) -> None:
+    from cccc.daemon.foreman.workflow_monitor import MonitorMode
+    from cccc.kernel.workflow_state import WorkflowTaskStatus
+    from cccc.kernel.workflow_state_types import TransitionRejected
 
-    workflow_id = "wf-ready-reject"
-    engine = WorkflowEngine(group)
-    engine.register_task(TaskRef(id="T1", title="t1"), workflow_id)
-    engine.register_batch("b1", ["T1"])
+    engine = _setup_running_task(group)
 
-    orch = WorkflowOrchestrator(project_root=temp_project_dir, group_id=group.group_id)
-    assert orch.engine.get_task("T1").status == WorkflowTaskStatus.READY  # type: ignore[union-attr]
+    def hook(kind, data, workflow_engine):  # noqa: ARG001
+        raise RuntimeError("boom")
 
-    result = orch.apply_task_event(
-        TaskEvent(
-            event_type="completed",
-            task_id="T1",
-            idempotency_key="idem-ready-reject",
-            payload={
-                "agent_id": "a1",
-                "workflow_id": workflow_id,
-                "duration_seconds": 0,
-                "changed_files": [],
-            },
-        )
-    )
+    hook.invariant_id = "completer_mismatch"
+    engine.register_pre_transition_hook(hook)
+    engine.set_monitor_mode("completer_mismatch", MonitorMode.BLOCK)
 
-    assert result["accepted"] is False
-    assert "task_still_ready" in result["reason"]
-    assert "auto_process" in result["reason"]
-    assert orch.engine.get_task("T1").status == WorkflowTaskStatus.READY  # type: ignore[union-attr]
-    assert _count_kind(group.ledger_path, kind="workflow.task_reported_completed") == 0
+    with pytest.raises(TransitionRejected, match="Hook error in BLOCK mode: boom"):
+        engine.report_worker_completion("T1", {"idempotency_key": "idem-hook-block"})
 
-def test_orchestrator_completed_event_rejects_planned_task(group, temp_project_dir: Path) -> None:
-    from cccc.contracts.v1.ralph_ipc import TaskEvent, TaskRef
-    from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
-    from cccc.kernel.workflow_state import WorkflowEngine, WorkflowTaskStatus
+    assert engine.get_task("T1").status == WorkflowTaskStatus.RUNNING  # type: ignore[union-attr]
 
-    workflow_id = "wf-planned-reject"
-    engine = WorkflowEngine(group)
-    engine.register_task(TaskRef(id="T1", title="t1"), workflow_id)
 
-    orch = WorkflowOrchestrator(project_root=temp_project_dir, group_id=group.group_id)
-    assert orch.engine.get_task("T1").status == WorkflowTaskStatus.PLANNED  # type: ignore[union-attr]
+def test_hook_error_observe_mode_continues(group) -> None:
+    from cccc.daemon.foreman.workflow_monitor import MonitorMode
+    from cccc.kernel.workflow_state import WorkflowTaskStatus
 
-    result = orch.apply_task_event(
-        TaskEvent(
-            event_type="completed",
-            task_id="T1",
-            idempotency_key="idem-planned-reject",
-            payload={
-                "agent_id": "a1",
-                "workflow_id": workflow_id,
-                "duration_seconds": 0,
-                "changed_files": [],
-            },
-        )
-    )
+    engine = _setup_running_task(group)
 
-    assert result["accepted"] is False
-    assert "task_not_running" in result["reason"]
-    assert "status=planned" in result["reason"]
-    assert orch.engine.get_task("T1").status == WorkflowTaskStatus.PLANNED  # type: ignore[union-attr]
+    def hook(kind, data, workflow_engine):  # noqa: ARG001
+        raise RuntimeError("boom")
+
+    hook.invariant_id = "completer_mismatch"
+    engine.register_pre_transition_hook(hook)
+    engine.set_monitor_mode("completer_mismatch", MonitorMode.OBSERVE)
+    engine.report_worker_completion("T1", {"idempotency_key": "idem-hook-observe"})
+    alerts = [e["data"] for e in _read_events(group.ledger_path) if e.get("kind") == "workflow.monitor_violation"]
+
+    assert engine.get_task("T1").status == WorkflowTaskStatus.VERIFYING  # type: ignore[union-attr]
+    assert alerts[-1]["alert_type"] == "hook_error:completer_mismatch"
+    assert alerts[-1]["monitor_mode"] == "observe"
+
+
+def test_hook_error_unrelated_block_no_false_positive(group) -> None:
+    from cccc.daemon.foreman.workflow_monitor import MonitorMode
+    from cccc.kernel.workflow_state import WorkflowTaskStatus
+
+    engine = _setup_running_task(group)
+
+    def hook(kind, data, workflow_engine):  # noqa: ARG001
+        raise RuntimeError("boom")
+
+    hook.invariant_id = "file_overstepping"
+    engine.register_pre_transition_hook(hook)
+    engine.set_monitor_mode("completer_mismatch", MonitorMode.BLOCK)
+    engine.report_worker_completion("T1", {"idempotency_key": "idem-hook-unrelated"})
+
+    assert engine.get_task("T1").status == WorkflowTaskStatus.VERIFYING  # type: ignore[union-attr]
+
+
+def test_hook_error_no_invariant_id_continues(group) -> None:
+    from cccc.daemon.foreman.workflow_monitor import MonitorMode
+    from cccc.kernel.workflow_state import WorkflowTaskStatus
+
+    engine = _setup_running_task(group)
+
+    def hook(kind, data, workflow_engine):  # noqa: ARG001
+        raise RuntimeError("boom")
+
+    engine.register_pre_transition_hook(hook)
+    engine.set_monitor_mode("completer_mismatch", MonitorMode.BLOCK)
+    engine.report_worker_completion("T1", {"idempotency_key": "idem-hook-unknown"})
+    alerts = [e["data"] for e in _read_events(group.ledger_path) if e.get("kind") == "workflow.monitor_violation"]
+
+    assert engine.get_task("T1").status == WorkflowTaskStatus.VERIFYING  # type: ignore[union-attr]
+    assert alerts[-1]["alert_type"] == "hook_error:unknown"

@@ -45,6 +45,7 @@ VerificationOutcome = Literal[
     "failed",         # One or more checks failed
     "skipped",        # Verification was skipped
     "timeout",        # Verification timed out
+    "agent_pending",  # Awaiting external agent verification (RA-3)
 ]
 
 
@@ -93,6 +94,7 @@ class TaskRef(BaseModel):
 
     # WF-4 alignment: fields from TaskSpec (plan schema)
     role: str = ""  # leaf, integration, verification
+    verification_mode: str = "ralph"
     provides: List[Dict[str, Any]] = Field(default_factory=list)
     consumes: List[Dict[str, Any]] = Field(default_factory=list)
     addresses: List[str] = Field(default_factory=list)
@@ -117,6 +119,7 @@ class ReadyBatchSuggestion(BaseModel):
     created_at: str = Field(default_factory=utc_now_iso)
     # ARCH-1: Foreman-explicit task→actor assignments (empty = agent pool decides)
     assignments: Dict[str, str] = Field(default_factory=dict)
+    fallback_allowed: bool = False
 
     model_config = ConfigDict(extra="forbid")
 
@@ -145,6 +148,7 @@ class VerificationResult(BaseModel):
     task_id: Optional[str] = None  # Task that triggered verification, if any
     overall_outcome: VerificationOutcome
     checks: List[VerificationCheck] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
     summary: str = ""
     created_at: str = Field(default_factory=utc_now_iso)
 
@@ -323,3 +327,184 @@ def parse_ralph_message(data: Dict[str, Any]) -> RalphIPCMessage:
         return ActorStatus.model_validate(data)
     else:
         raise ValueError(f"Unknown Ralph IPC message type: {msg_type}")
+
+
+# ---------------------------------------------------------------------------
+# Shared validation event serializer — W8d-ledger-schema-parity
+# ---------------------------------------------------------------------------
+
+from .event import (
+    KIND_PLAN_VALIDATED,
+    KIND_PLAN_VALIDATION_FAILED,
+    KIND_SCHEMA_STATS,
+    PlanValidatedData,
+    PlanValidationFailedData,
+    SchemaStatsData,
+    ValidationFindingV1,
+    VALIDATION_EVENT_SCHEMA_VERSION,
+    VALIDATION_REPORT_SCHEMA_VERSION,
+)
+
+# Re-export constants for downstream import convenience
+WORKFLOW_PLAN_VALIDATED = KIND_PLAN_VALIDATED
+
+
+def _issue_to_finding_v1(issue: IpcValidationError) -> Dict[str, Any]:
+    """Convert an IpcValidationError to canonical v1 finding dict."""
+    return ValidationFindingV1(
+        code=issue.code,
+        issue_instance_id=str(getattr(issue, "issue_instance_id", "") or ""),
+        confidence=issue.confidence,
+        action_owner=issue.action_owner,
+        worker_relevance=issue.worker_relevance,
+        summary=issue.message,
+    ).model_dump()
+
+
+def serialize_validation_event_v1(
+    *,
+    valid: bool,
+    errors: List[IpcValidationError],
+    warnings: List[IpcValidationError],
+    hints: List[IpcValidationError],
+    ruleset_digest: str = "",
+    plan_hash: str = "",
+) -> Dict[str, Any]:
+    """Serialize a validation result to the canonical v1 event data payload.
+
+    Returns the ``data`` dict suitable for a ``workflow.plan_validated`` or
+    ``workflow.plan_validation_failed`` ledger event.
+    """
+    error_findings = [_issue_to_finding_v1(e) for e in errors]
+    warning_findings = [_issue_to_finding_v1(w) for w in warnings]
+    hint_findings = [_issue_to_finding_v1(h) for h in hints]
+
+    counts = {
+        "errors": len(errors),
+        "warnings": len(warnings),
+        "hints": len(hints),
+        "total": len(errors) + len(warnings) + len(hints),
+    }
+
+    if valid:
+        model = PlanValidatedData(
+            event_schema_version=VALIDATION_EVENT_SCHEMA_VERSION,
+            valid=True,
+            report_schema_version=VALIDATION_REPORT_SCHEMA_VERSION,
+            ruleset_digest=ruleset_digest,
+            plan_hash=plan_hash,
+            errors=error_findings,
+            warnings=warning_findings,
+            hints=hint_findings,
+            counts=counts,
+        )
+    else:
+        model = PlanValidationFailedData(
+            event_schema_version=VALIDATION_EVENT_SCHEMA_VERSION,
+            valid=False,
+            report_schema_version=VALIDATION_REPORT_SCHEMA_VERSION,
+            ruleset_digest=ruleset_digest,
+            plan_hash=plan_hash,
+            errors=error_findings,
+            warnings=warning_findings,
+            hints=hint_findings,
+            counts=counts,
+        )
+
+    return model.model_dump()
+
+
+def validation_event_kind(valid: bool) -> str:
+    """Return the appropriate event kind based on validation outcome."""
+    return KIND_PLAN_VALIDATED if valid else KIND_PLAN_VALIDATION_FAILED
+
+
+class _SchemaStats:
+    """Mutable counters for schema migration observability."""
+
+    __slots__ = ("events_written_v1", "events_read_v0", "events_read_v1")
+
+    def __init__(self) -> None:
+        self.events_written_v1: int = 0
+        self.events_read_v0: int = 0
+        self.events_read_v1: int = 0
+
+    def record_write_v1(self) -> None:
+        self.events_written_v1 += 1
+
+    def record_read(self, version: int) -> None:
+        if version >= 1:
+            self.events_read_v1 += 1
+        else:
+            self.events_read_v0 += 1
+
+    def to_event_data(self) -> Dict[str, Any]:
+        return SchemaStatsData(
+            event_schema_version=VALIDATION_EVENT_SCHEMA_VERSION,
+            events_written_v1=self.events_written_v1,
+            events_read_v0=self.events_read_v0,
+            events_read_v1=self.events_read_v1,
+        ).model_dump()
+
+    def reset(self) -> None:
+        self.events_written_v1 = 0
+        self.events_read_v0 = 0
+        self.events_read_v1 = 0
+
+
+# Module-level singleton for stats tracking
+schema_stats = _SchemaStats()
+
+
+def read_validation_event(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Dual-read v0/v1 validation event data.
+
+    v0 events lack ``event_schema_version`` — normalize them into v1 shape.
+    v1 events are returned as-is after model validation.
+    """
+    version = data.get("event_schema_version", 0)
+    schema_stats.record_read(version)
+
+    if version >= 1:
+        # v1 — validate and return
+        if data.get("valid", True):
+            return PlanValidatedData.model_validate(data).model_dump()
+        return PlanValidationFailedData.model_validate(data).model_dump()
+
+    # v0 compat: normalize bare issue lists into v1 findings
+    errors_raw = data.get("errors", data.get("validation_errors", []))
+    warnings_raw = data.get("warnings", data.get("validation_warnings", []))
+    hints_raw = data.get("hints", data.get("validation_hints", []))
+
+    def _coerce_finding(raw: Any) -> Dict[str, Any]:
+        if isinstance(raw, dict):
+            return ValidationFindingV1(
+                code=str(raw.get("code", "")),
+                summary=str(raw.get("message", raw.get("summary", ""))),
+                confidence=str(raw.get("confidence", "opaque")),
+                action_owner=str(raw.get("action_owner", "unknown")),
+                worker_relevance=str(raw.get("worker_relevance", "none")),
+            ).model_dump()
+        return ValidationFindingV1(code="", summary=str(raw)).model_dump()
+
+    errors = [_coerce_finding(e) for e in (errors_raw if isinstance(errors_raw, list) else [])]
+    warnings = [_coerce_finding(w) for w in (warnings_raw if isinstance(warnings_raw, list) else [])]
+    hints = [_coerce_finding(h) for h in (hints_raw if isinstance(hints_raw, list) else [])]
+    valid = data.get("valid", len(errors) == 0)
+
+    return {
+        "event_schema_version": VALIDATION_EVENT_SCHEMA_VERSION,
+        "valid": valid,
+        "report_schema_version": VALIDATION_REPORT_SCHEMA_VERSION,
+        "ruleset_digest": data.get("ruleset_digest", ""),
+        "plan_hash": str(data.get("plan_hash", "")),
+        "errors": errors,
+        "warnings": warnings,
+        "hints": hints,
+        "counts": {
+            "errors": len(errors),
+            "warnings": len(warnings),
+            "hints": len(hints),
+            "total": len(errors) + len(warnings) + len(hints),
+        },
+    }

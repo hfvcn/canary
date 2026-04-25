@@ -40,10 +40,14 @@ EventKind = Literal[
     "system.notify_ack",
     "presentation.publish",
     "presentation.clear",
+    "workflow.task_deferred",
     "workflow.monitor_violation",
     "workflow.ralph_internal_error",
     "workflow.plan_digest_divergence",
     "workflow.plan_digest_divergence_post_hoc",
+    "workflow.plan_validated",
+    "workflow.plan_validation_failed",
+    "ralph.schema_stats",
 ]
 
 KIND_RALPH_INTERNAL_ERROR = "workflow.ralph_internal_error"
@@ -217,6 +221,18 @@ class PresentationClearData(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class TaskDeferredData(BaseModel):
+    """Emitted when a task is deferred due to write-set conflict or external pressure."""
+
+    workflow_id: str = ""
+    task_id: str = ""
+    reason: str = ""
+    deferral_reason: str = ""  # "internal_writer_conflict" | "external_workflow_pressure"
+    competing_refs: List[Dict[str, Any]] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="allow")
+
+
 class MonitorViolationData(BaseModel):
     alert_type: str
     severity: str
@@ -259,7 +275,78 @@ class PlanDigestDivergenceData(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+# ---------------------------------------------------------------------------
+# V1 validation event data — W8d-ledger-schema-parity
+# ---------------------------------------------------------------------------
+
+CURRENT_SCHEMA_VERSION = 1
+
+VALIDATION_EVENT_SCHEMA_VERSION = 1
+VALIDATION_REPORT_SCHEMA_VERSION = 1
+
+KIND_PLAN_VALIDATED = "workflow.plan_validated"
+KIND_PLAN_VALIDATION_FAILED = "workflow.plan_validation_failed"
+KIND_SCHEMA_STATS = "ralph.schema_stats"
+
+
+class ValidationFindingV1(BaseModel):
+    """Canonical v1 shape for a single validation finding."""
+
+    code: str
+    issue_instance_id: str = ""
+    confidence: str = "opaque"
+    action_owner: str = "unknown"
+    worker_relevance: str = "none"
+    summary: str = ""
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class PlanValidatedData(BaseModel):
+    """v1 event payload for workflow.plan_validated."""
+
+    event_schema_version: int = VALIDATION_EVENT_SCHEMA_VERSION
+    valid: bool = True
+    report_schema_version: int = VALIDATION_REPORT_SCHEMA_VERSION
+    ruleset_digest: str = ""
+    plan_hash: str = ""
+    errors: List[ValidationFindingV1] = Field(default_factory=list)
+    warnings: List[ValidationFindingV1] = Field(default_factory=list)
+    hints: List[ValidationFindingV1] = Field(default_factory=list)
+    counts: Dict[str, int] = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="allow")
+
+
+class PlanValidationFailedData(BaseModel):
+    """v1 event payload for workflow.plan_validation_failed."""
+
+    event_schema_version: int = VALIDATION_EVENT_SCHEMA_VERSION
+    valid: bool = False
+    report_schema_version: int = VALIDATION_REPORT_SCHEMA_VERSION
+    ruleset_digest: str = ""
+    plan_hash: str = ""
+    errors: List[ValidationFindingV1] = Field(default_factory=list)
+    warnings: List[ValidationFindingV1] = Field(default_factory=list)
+    hints: List[ValidationFindingV1] = Field(default_factory=list)
+    counts: Dict[str, int] = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="allow")
+
+
+class SchemaStatsData(BaseModel):
+    """Debug event payload for ralph.schema_stats."""
+
+    event_schema_version: int = VALIDATION_EVENT_SCHEMA_VERSION
+    events_written_v1: int = 0
+    events_read_v0: int = 0
+    events_read_v1: int = 0
+
+    model_config = ConfigDict(extra="allow")
+
+
 class Event(BaseModel):
+    schema_version: int = CURRENT_SCHEMA_VERSION
     v: int = 1
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     ts: str = Field(default_factory=utc_now_iso)
@@ -300,11 +387,39 @@ _KIND_TO_MODEL = {
     "system.notify_ack": NotifyAckData,
     "presentation.publish": PresentationPublishData,
     "presentation.clear": PresentationClearData,
+    "workflow.task_deferred": TaskDeferredData,
     "workflow.monitor_violation": MonitorViolationData,
     KIND_RALPH_INTERNAL_ERROR: RalphInternalErrorData,
     "workflow.plan_digest_divergence": PlanDigestDivergenceData,
     "workflow.plan_digest_divergence_post_hoc": PlanDigestDivergenceData,
+    KIND_PLAN_VALIDATED: PlanValidatedData,
+    KIND_PLAN_VALIDATION_FAILED: PlanValidationFailedData,
+    KIND_SCHEMA_STATS: SchemaStatsData,
 }
+
+SCHEMA_VERSIONS: Dict[int, Dict[str, Any]] = {
+    CURRENT_SCHEMA_VERSION: {"kind_models": dict(_KIND_TO_MODEL)},
+}
+
+
+def deserialize_event(raw: Dict[str, Any]) -> Event:
+    if not isinstance(raw, dict):
+        raise ValueError("event must be a dict")
+    schema_version = int(raw.get("schema_version") or CURRENT_SCHEMA_VERSION)
+    if schema_version not in SCHEMA_VERSIONS:
+        raise ValueError(f"unsupported schema version: {schema_version}")
+    kind = str(raw.get("kind") or "").strip()
+    return Event(
+        schema_version=schema_version,
+        v=int(raw.get("v") or 1),
+        id=str(raw.get("id") or uuid.uuid4().hex),
+        ts=str(raw.get("ts") or utc_now_iso()),
+        kind=kind,
+        group_id=str(raw.get("group_id") or ""),
+        scope_key=str(raw.get("scope_key") or ""),
+        by=str(raw.get("by") or ""),
+        data=normalize_event_data(kind, raw.get("data")),
+    )
 
 
 def normalize_event_data(kind: str, data: Any) -> Dict[str, Any]:

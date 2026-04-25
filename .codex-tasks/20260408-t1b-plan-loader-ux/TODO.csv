@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,建立任务记录并确认T1b范围,DONE,"taskmaster文件存在且T1b验收/验证已提取","test -f .codex-tasks/20260408-t1b-plan-loader-ux/TODO.csv","2026-04-08 14:29",0,
+2,实现plan_io加载UX与bytes入口,DONE,"load_plan错误可聚合且load_plan_from_bytes复用完整加载链路","python -m pytest tests/ralph/test_plan_loader_ux.py -v --tb=short -k bytes","2026-04-08 14:29",0,
+3,新增T1b测试文件,DONE,"错误消息、聚合错误、repo defaults bytes加载都有测试","python -m pytest tests/ralph/test_plan_loader_ux.py -v --tb=short","2026-04-08 14:29",0,
+4,运行计划验证命令并收尾,DONE,"T1b计划中的验证命令执行完成","python -m pytest tests/ralph/test_plan_loader_ux.py -v --tb=short","2026-04-08 14:29",0,

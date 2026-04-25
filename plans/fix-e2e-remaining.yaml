@@ -1,0 +1,413 @@
+# Consolidated plan: E2E remaining fixes (FIX-E2E-2~6 + ARCH-5)
+# 可验证结论: "Pool 复用已有 actor、heartbeat 可观测、Worker 自行 complete、validate 有审计、batch 自动推进、CLI 支持 worker-prompt"
+#
+# 对应问题清单:
+#   FIX-E2E-2(P1) FIX-E2E-3(P2) FIX-E2E-4(P1) FIX-E2E-5(P2) FIX-E2E-6(P2) ARCH-5(P3)
+# Finding 对照: #11(分步验收) #9(先跑通一条路径)
+# Codex 审查: CR-01~07 已采纳（v2 修正版）
+#
+# 关键路径: T1(FIX-E2E-2) 独立 | T2(FIX-E2E-4)+T3(FIX-E2E-3) 独立 | T4(FIX-E2E-5) 独立
+#           T5(FIX-E2E-6) depends T1 | T6(ARCH-5) 独立 | T7(integration) depends all
+# 前提: Batch A~H + D-fix + EFH-fix + E2E-fix 已完成（253 tests pass）
+
+schema_version: "1.0.0"
+
+suppress_codes:
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "E_FORBIDDEN_FLOW_UNCOVERED"
+  - "W_PLAN_SCOPE_UNUSED"
+  - "W_UNCLAIMED_TEST_FOR_SOURCE"
+  - "W_TEST_COVERAGE_GAP"
+  - "W_FLOW_OWNER_NO_VERIFICATION"
+  - "W_NO_EARLY_INTEGRATION_CHECKPOINT"
+  - "W_NO_FAILURE_PATH"
+  - "W_VERIFICATION_PYTEST_K_NO_MATCH"
+  - "W_DEP_WITHOUT_CONSUME"
+  - "W_COVERS_PATHS_UNVERIFIED"
+
+suppress_instances:
+  - code: "W_DISCONNECTED_COMPONENTS"
+    reason: "T1/T2/T3/T4/T6 are independent leaf fixes with no true dependency; T7 integration task covers them all"
+  - code: "W_ISOLATED_TASK"
+    reason: "T1/T2/T3/T4/T6 are intentionally independent leaf fixes connected through T7 integration"
+
+required_issues:
+  - "FIX-E2E-2"
+  - "FIX-E2E-3"
+  - "FIX-E2E-4"
+  - "FIX-E2E-5"
+  - "FIX-E2E-6"
+  - "ARCH-5"
+
+tasks:
+  # ===================================================================
+  # P1: Pool actor reuse + Worker completion protocol
+  # ===================================================================
+
+  - id: T1
+    title: "FIX-E2E-2: Pool manager 优先复用已有 group actors"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/agent_pool.py"
+      - "src/cccc/daemon/foreman/workflow.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "tests/test_foreman_workflow.py"
+    awareness_paths:
+      - "src/cccc/kernel/actors.py"
+      - "src/cccc/kernel/group.py"
+    depends_on: []
+    goal_behavior: >
+      [CR-01 adopted] AgentPoolManager 在 ForemanWorkflow.__init__()（workflow.py line 274）中创建，
+      不在 orchestrator 中。可用性判断不能只看 pool 本地 _active_assignments，
+      必须查 engine/shadow assignment 状态。
+
+      修改方案：
+      1. AgentPoolManager.__init__ 新增 group_loader 回调参数（Callable returning list of actor dicts），
+         由 ForemanWorkflow 创建时传入（从 orchestrator 的 _load_enabled_peer_actors 复用逻辑）。
+      2. 新增 _find_group_peer_agent(task, busy_agent_ids: set) 方法：
+         - 调用 group_loader() 获取 enabled peer actors
+         - 对每个 peer 按 runtime 匹配度评分（复用 _score_agent_for_task 的部分逻辑）
+         - busy_agent_ids 从外部传入（orchestrator 从 engine/shadow 计算已占用 agents）
+         - 返回最佳匹配 agent（如果 score >= min_score）
+      3. create_or_reuse_agent() 新增 busy_agent_ids 参数：
+         在 find_best_agent() 返回 None 后、create_agent_for_task() 之前，
+         调用 _find_group_peer_agent(task, busy_agent_ids)。
+      4. WorkflowOrchestrator 在调用 pool.create_or_reuse_agent() 时，
+         从 _active_workflows shadow + engine 计算 busy_agent_ids 传入。
+      5. 新增测试 test_pool_reuses_group_peer_actor 和 test_pool_skips_busy_group_actor。
+    acceptance_criteria: >
+      测试:
+      1. group 中已有 frontend-worker(claude) 且空闲，pool 收到 frontend 类型 task 时复用该 actor。
+      2. group peer actor 已被 engine 分配（在 busy_agent_ids 中）时，不重复分配，走 create 路径。
+      3. 无匹配 group actor 时，仍正常走 create_agent_for_task() 创建新 agent。
+      4. _fallback_to_group_actors() 路径仍然工作（整批 rejected 时的 fallback）。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k 'create_or_reuse or group_peer or pool'"
+      checks:
+        - name: "pool_reuse_test"
+          command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k 'create_or_reuse or group_peer'"
+      covers:
+        tasks: ["T1"]
+    provides:
+      - name: pool_group_actor_reuse
+        kind: runtime_capability
+        schema_hint: "AgentPoolManager checks group actors (via engine state) before creating new ones"
+    addresses: ["FIX-E2E-2"]
+
+  - id: T2
+    title: "FIX-E2E-4: 在 Foreman Assignment 中嵌入 mandatory completion 协议"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/foreman/agent_pool.py"
+      - "tests/test_foreman_workflow.py"
+    awareness_paths:
+      - "src/cccc/cli/workflow_cmds.py"
+    depends_on: []
+    goal_behavior: >
+      [CR-05/CR-07 adopted] 当前 completion 指令已存在于两处 prompt 中，
+      但 report_section（priority=50）可被 PromptBudget 截断。问题是可见性不足，不是完全缺失。
+
+      修改：
+      1. _build_task_prompt()（orchestrator.py ~line 1767-1774）：
+         从 report_section（priority=50 可选 section）中拆出 completion 协议，
+         创建独立的 mandatory section（name="completion_protocol"）：
+         "COMPLETION PROTOCOL (REQUIRED):\n"
+         "After finishing ALL code changes, you MUST run:\n"
+         "  cccc task complete {task.id} --changed-file <path> --evidence \"summary\"\n"
+         "This triggers the verification gate. Do NOT use cccc send for completion."
+         report_section 中移除重复的 completion 文本，只保留 progress/blocker 报告指引。
+
+      2. _generate_worker_prompt()（agent_pool.py ~line 440）：
+         将现有的 "Report completion via..." 行加粗为独立区块，与 forbidden_actions 同级别强调。
+
+      3. [CR-07] 新增测试 test_completion_protocol_mandatory_under_tight_budget：
+         设置极低 token budget，验证 completion_protocol section 不被截断。
+         新增测试 test_build_task_prompt_uses_ralph_worker_contract（已有，验证覆盖即可）。
+    acceptance_criteria: >
+      测试:
+      1. _build_task_prompt() 生成的 prompt 中 completion 协议出现在 mandatory section（tight budget 不截断）。
+      2. 生成的 prompt 包含 "cccc task complete {task_id} --changed-file" 完整命令。
+      3. report_section 中不再重复 completion 指令。
+      4. [CR-07] 极低 budget (500 tokens) 下 completion protocol 仍然可见。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k 'build_task_prompt or completion_protocol or worker_contract'"
+      checks:
+        - name: "completion_protocol_test"
+          command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k 'build_task_prompt or completion_protocol'"
+      covers:
+        tasks: ["T2"]
+    provides:
+      - name: completion_protocol_in_prompt
+        kind: invariant
+        schema_hint: "Completion protocol is mandatory section, never truncated by budget"
+    addresses: ["FIX-E2E-4"]
+
+  - id: T3
+    title: "FIX-E2E-3: orchestrator 在 _start_assigned_agents 后主动触发 task_started"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "tests/test_foreman_workflow.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/cli/workflow_cmds.py"
+    depends_on: []
+    goal_behavior: >
+      [CR-03 adopted] 方法名是 _start_assigned_agents()（line 1362），不是 _assign_task_to_agent。
+      多处测试断言 ASSIGNED → RUNNING 顺序，不能消除 ASSIGNED 窗口。
+
+      修正方案（保留 ASSIGNED 窗口，仅缩短）：
+      1. 在 _start_assigned_agents()（line 1362）中，遍历 approved_tasks 并通知 agent 后，
+         对每个已成功分配的 task 调用 engine.report_worker_started(task_id, agent_id, hook_ctx={})。
+         这样 ASSIGNED 窗口仅持续分配到通知的时间（毫秒级），但状态机序列完整保留：
+         READY → APPROVED → ASSIGNED → RUNNING。
+      2. _auto_start_assigned_task_for_completion() 中添加保护：
+         如果 state.status 已经是 RUNNING，跳过 report_worker_started（避免重复 start）。
+      3. [CR-03] 更新 test_foreman_workflow.py line 1182 处的断言：
+         分配后 status 应为 RUNNING（不再是 ASSIGNED），因为 auto-start 在分配后立即触发。
+      4. 验证 completer_mismatch 检查仍然基于原始 assignment（不受 auto-start 影响）。
+    acceptance_criteria: >
+      测试:
+      1. 分配后调用 _start_assigned_agents 结束时，engine 中 task 状态为 RUNNING。
+      2. ledger 中 task_started 事件时戳紧跟 batch_approved。
+      3. Worker 后续发 completed 时不重复 start。
+      4. 原有 auto-start on complete 路径仍兼容 ASSIGNED 状态的 complete（edge case）。
+      5. completer_mismatch 检查不受影响。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k 'start_assigned or auto_start or mismatch'"
+      checks:
+        - name: "auto_start_test"
+          command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k 'start_assigned or auto_start'"
+      covers:
+        tasks: ["T3"]
+    provides:
+      - name: auto_start_on_assign
+        kind: runtime_capability
+        schema_hint: "Task transitions to RUNNING immediately after _start_assigned_agents, ASSIGNED window is milliseconds"
+    addresses: ["FIX-E2E-3"]
+
+  - id: T4
+    title: "FIX-E2E-5: ralph validate 写入 plan_hash 到 ledger 事件"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/cli.py"
+      - "tests/test_ralph_verification.py"
+    awareness_paths:
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+      - "src/cccc/kernel/ledger.py"
+    depends_on: []
+    goal_behavior: >
+      [CR-06 adopted] _write_validation_event() 已经工作（line 323-355）。
+      serialize_validation_event_v1() 和 validation_event_kind() 已正确实现。
+      不修改 ralph_ipc.py 的 canonical schema。
+
+      单一目标：在 _write_validation_event() 中，计算 plan 文件的 SHA-256 前 16 位作为 plan_hash，
+      添加到 data dict 中（在 serialize_validation_event_v1() 返回后、append_event 之前）：
+        data["plan_hash"] = hashlib.sha256(plan_path.read_bytes()).hexdigest()[:16]
+      这样审计时可通过 plan_hash 将 validate 事件与 batch_registered 关联。
+
+      不修改 serialize_validation_event_v1 的签名或 ralph_ipc.py 的 schema。
+      不修改 --group 到 ledger 的解析逻辑（已工作）。
+    acceptance_criteria: >
+      测试:
+      1. ralph validate --group GROUP plan.yaml 后，ledger 中 plan_validated 事件的 data 包含 plan_hash。
+      2. plan_hash 对同一文件始终一致（确定性）。
+      3. invalid plan 时 plan_validation_failed 事件也包含 plan_hash。
+      4. 不带 --group/--ledger 时不报错（不写事件即可）。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_ralph_verification.py -q --tb=short -k 'validate and ledger'"
+      checks:
+        - name: "validate_plan_hash_test"
+          command: "python -m pytest tests/test_ralph_verification.py -q --tb=short -k 'validate and plan_hash'"
+      covers:
+        tasks: ["T4"]
+        paths: ["tests/test_ralph_verification.py"]
+    provides:
+      - name: validate_audit_event
+        kind: runtime_capability
+        schema_hint: "ralph validate writes plan_hash to ledger event data"
+    addresses: ["FIX-E2E-5"]
+
+  - id: T5
+    title: "FIX-E2E-6: auto_process 模式下 batch 完成后自动推进下一批"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+      - "tests/test_foreman_workflow.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+      - "src/cccc/cli/workflow_cmds.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      [CR-02/CR-04 adopted] 当前问题：
+      1. auto_process flag 不持久化在 _active_workflows 中。
+      2. _resuggest_ready_tasks() 的 ARCH-3 合约是"只通知 Foreman"，不能直接改默认行为。
+
+      修改方案（opt-in 路径，不改 ARCH-3 默认语义）：
+      1. [CR-02] _ensure_active_workflow()（orchestrator.py line 562）中新增字段保存：
+         workflow["auto_process"] = auto_process
+         workflow["auto_start_agents"] = auto_start_agents
+         在 handle_ralph_register_and_suggest()（ralph_ipc_handler.py ~line 160-206）中，
+         将 auto_process 和 auto_start_agents 从 args 传入 orchestrator 的 _ensure_active_workflow。
+
+      2. [CR-04] 不修改 _resuggest_ready_tasks() 的默认行为。
+         新增 _maybe_auto_advance(workflow_id, suggestion) 方法：
+         - 读取 _active_workflows[wf_id].get("auto_process", False)
+         - 如果 True，调用 process_batch_suggestion(suggestion, auto_start_agents=workflow.get("auto_start_agents", True))
+         - 如果 False，走原有通知路径
+         在 _resuggest_ready_tasks() 末尾，将通知调用替换为 _maybe_auto_advance()。
+
+      3. T1 的 pool_group_actor_reuse 确保自动推进时复用已有 actors。
+    acceptance_criteria: >
+      测试:
+      1. workflow submit --auto-process 后，_active_workflows 中保存 auto_process=True。
+      2. auto_process=True 模式下，Batch 1 完成后 downstream ready tasks 自动注册为 Batch 2 并分配。
+      3. auto_process=False 模式下，行为不变（只通知 Foreman），ARCH-3 合约保持。
+      4. auto_start_agents flag 正确传递（不硬编码 True）。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k 'auto_process or auto_advance or resuggest'"
+      checks:
+        - name: "auto_advance_test"
+          command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k 'auto_advance or auto_process'"
+      covers:
+        tasks: ["T5"]
+    consumes:
+      - name: pool_group_actor_reuse
+    provides:
+      - name: auto_batch_advance
+        kind: runtime_capability
+        schema_hint: "auto_process mode auto-registers downstream ready batches; default behavior unchanged (ARCH-3)"
+    addresses: ["FIX-E2E-6"]
+
+  - id: T6
+    title: "ARCH-5: cccc actor add CLI 增加 --worker-prompt 参数"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/cli/main.py"
+      - "src/cccc/cli/actor_cmds.py"
+      - "tests/test_batch_h_cli_audit.py"
+    awareness_paths:
+      - "src/cccc/daemon/actors/actor_add_ops.py"
+      - "src/cccc/kernel/actors.py"
+    depends_on: []
+    goal_behavior: >
+      [CR-05 adopted] kernel add_actor() 已支持 worker_prompt（line 244）。
+      daemon handle_actor_add() 已读取 worker_prompt（line 51）并传给 add_actor()（line 211）。
+
+      CLI 层缺失：
+      1. main.py p_actor_add 中增加 --worker-prompt 参数（line 138-153 区域）：
+         p_actor_add.add_argument("--worker-prompt", default="", help="Worker system prompt override")
+      2. actor_cmds.py cmd_actor_add() 中读取 args.worker_prompt 并传入 daemon 调用的 args dict：
+         "worker_prompt": str(getattr(args, "worker_prompt", "") or "").strip()
+      3. cmd_actor_add() 的 fallback 路径（直接调用 add_actor）也需传入 worker_prompt。
+      4. [CR-05] 测试入口在 tests/test_batch_h_cli_audit.py，不在 test_foreman_workflow.py。
+    acceptance_criteria: >
+      测试:
+      1. argparse 接受 --worker-prompt 参数。
+      2. daemon 路径的 call_daemon args 包含 worker_prompt。
+      3. fallback 路径的 add_actor 调用包含 worker_prompt。
+      4. 不传 --worker-prompt 时 worker_prompt 为空字符串。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_batch_h_cli_audit.py -q --tb=short -k 'actor_add or worker_prompt'"
+      checks:
+        - name: "cli_worker_prompt_test"
+          command: "python -m pytest tests/test_batch_h_cli_audit.py -q --tb=short -k 'actor_add or worker_prompt'"
+      covers:
+        tasks: ["T6"]
+    provides:
+      - name: cli_worker_prompt_support
+        kind: runtime_capability
+        schema_hint: "cccc actor add --worker-prompt passes through CLI → daemon → kernel"
+    addresses: ["ARCH-5"]
+
+  # ===================================================================
+  # Integration: 验证所有修复的组合正确性
+  # ===================================================================
+
+  - id: T7
+    title: "集成验证: 全部 FIX-E2E-2~6 + ARCH-5 修复后回归测试"
+    role: integration
+    claimed_paths:
+      - "tests/test_foreman_workflow.py"
+      - "tests/test_workflow_state.py"
+      - "tests/test_ralph_verification.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/foreman/agent_pool.py"
+      - "src/cccc/daemon/foreman/workflow.py"
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+      - "src/cccc/ralph/cli.py"
+      - "src/cccc/cli/main.py"
+      - "src/cccc/cli/actor_cmds.py"
+    depends_on: ["T1", "T2", "T3", "T4", "T5", "T6"]
+    goal_behavior: >
+      运行完整测试套件，确认所有修复没有引入回归：
+      1. 运行 253+ 已有测试确认全部通过。
+      2. 运行各 fix 新增的测试确认修复生效。
+      3. 特别验证组合场景：
+         - auto_process + pool reuse：Batch 1 完成后 Batch 2 自动分配到已有 group actors。
+         - completion protocol + auto-start：分配后立即 RUNNING，Worker complete 触发 verify gate。
+         - validate event + batch timeline：validate 事件包含 plan_hash。
+      4. 新增集成测试覆盖以上组合场景。
+    acceptance_criteria: >
+      所有已有测试通过（不低于 253 个）；所有新增测试通过；无回归。
+      组合场景有明确测试用例。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/test_workflow_state.py tests/test_foreman_workflow.py tests/test_ralph_verification.py tests/ralph/test_ralph_standalone.py -q --tb=short"
+      checks:
+        - name: "full_regression"
+          command: "python -m pytest -q --tb=short"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]
+    consumes:
+      - name: pool_group_actor_reuse
+      - name: completion_protocol_in_prompt
+      - name: auto_start_on_assign
+      - name: validate_audit_event
+      - name: auto_batch_advance
+      - name: cli_worker_prompt_support
+    addresses: ["FIX-E2E-2", "FIX-E2E-3", "FIX-E2E-4", "FIX-E2E-5", "FIX-E2E-6", "ARCH-5"]
+
+critical_flows:
+  - id: CF1
+    description: "Pool manager checks group actors (via engine state) before creating new ones"
+    entrypoints:
+      - "src/cccc/daemon/foreman/agent_pool.py"
+    test_created_by: ["T1", "T7"]
+
+  - id: CF2
+    description: "Batch 2 auto-registers when Batch 1 completes in auto_process mode (opt-in, ARCH-3 preserved)"
+    entrypoints:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    test_created_by: ["T5", "T7"]
+
+  - id: CF3
+    description: "Worker always sees completion command even under tight prompt budget"
+    entrypoints:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    test_created_by: ["T2", "T7"]
+
+forbidden_flows:
+  - id: FF1
+    description: "Pool must not create new agent when matching idle group actor exists"
+    test_created_by: ["T1"]
+
+  - id: FF2
+    description: "Completion protocol must not be truncated by prompt budget"
+    test_created_by: ["T2"]
+
+  - id: FF3
+    description: "In auto_process mode, ready tasks must not wait for manual Foreman submit"
+    test_created_by: ["T5"]

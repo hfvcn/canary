@@ -1,0 +1,16 @@
+tasks:
+  - id: T1
+    title: Legacy Unknown Field Boundary
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/app.py
+    goal_behavior: Legacy schema should ignore unknown fields with a warning banner.
+    acceptance_criteria: Load succeeds and emits the legacy parser warning.
+    verification:
+      level: unit
+      command: make test
+      covers:
+        tasks:
+          - T1
+legacy_extra_field: true

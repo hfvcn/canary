@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
 
 import yaml
-from .models import CriticalFlow, Plan, RegistrationInvariant
+from pydantic import ValidationError
+
+from .models import CriticalFlow, ForbiddenFlow, Plan, RegistrationInvariant
 
 # ---------------------------------------------------------------------------
 # Legacy-schema stderr banner
@@ -18,6 +21,10 @@ _LEGACY_BANNER = (
     "WARNING: legacy schema parsing active \u2014 plan.schema_version not declared. "
     "Future Ralph versions may require it by 2026-07-17."
 )
+
+_SYNCABLE_VERIFICATION_KINDS = frozenset({
+    "workflow.verification_passed",
+})
 
 
 def _parse_raw_data(path: Path) -> Dict[str, Any]:
@@ -39,6 +46,47 @@ def _parse_raw_data(path: Path) -> Dict[str, Any]:
     if data is None:
         data = {}
     return data
+
+
+def _parse_raw_bytes(source: bytes, source_path: Path) -> Dict[str, Any]:
+    text = source.decode("utf-8")
+    suffix = source_path.suffix.lower()
+    if suffix in (".yaml", ".yml"):
+        data = yaml.safe_load(text)
+    elif suffix == ".json":
+        data = json.loads(text)
+    else:
+        try:
+            data = yaml.safe_load(text)
+        except Exception:
+            data = json.loads(text)
+    return data or {}
+
+
+@dataclass(frozen=True)
+class PlanLoadIssue:
+    task_id: str
+    field_path: str
+    message: str
+    suggested_format: str = ""
+
+
+class PlanLoadError(Exception):
+    """Raised when a plan is parseable but semantically malformed."""
+
+    def __init__(self, errors: list[PlanLoadIssue]) -> None:
+        self.errors = errors
+        super().__init__(self._format_errors())
+
+    def _format_errors(self) -> str:
+        lines = []
+        for issue in self.errors:
+            prefix = "plan" if issue.task_id == "<plan>" else f"task '{issue.task_id}'"
+            line = f"{prefix}: {issue.message}"
+            if issue.suggested_format:
+                line = f"{line}. {issue.suggested_format}"
+            lines.append(line)
+        return "\n".join(lines)
 
 
 def _known_fields(model_cls: type) -> set[str]:
@@ -65,6 +113,11 @@ def _get_task_fields() -> set[str]:
     return _TASK_FIELDS
 
 
+def _format_allowed_fields(model_name: str, fields: set[str], *, sort_fields: bool = True) -> str:
+    names = sorted(fields) if sort_fields else list(fields)
+    return f"Allowed {model_name} fields: {', '.join(names)}"
+
+
 def _check_strict_extra_fields(data: Dict[str, Any]) -> list[str]:
     """Return a list of human-readable error strings for unknown fields.
 
@@ -74,17 +127,19 @@ def _check_strict_extra_fields(data: Dict[str, Any]) -> list[str]:
     errors: list[str] = []
     plan_fields = _get_plan_fields()
     task_fields = _get_task_fields()
+    plan_guidance = _format_allowed_fields("plan", plan_fields)
+    task_guidance = _format_allowed_fields("task", task_fields)
 
     for key in data:
         if key not in plan_fields:
-            errors.append(f"{key}: Extra inputs are not permitted")
+            errors.append(f"{key}: Extra inputs are not permitted. {plan_guidance}")
 
     for idx, task_data in enumerate(data.get("tasks", []) or []):
         if not isinstance(task_data, dict):
             continue
         for key in task_data:
             if key not in task_fields:
-                errors.append(f"tasks.{idx}.{key}: Extra inputs are not permitted")
+                errors.append(f"tasks.{idx}.{key}: Extra inputs are not permitted. {task_guidance}")
 
     return errors
 
@@ -92,22 +147,172 @@ def _check_strict_extra_fields(data: Dict[str, Any]) -> list[str]:
 def load_plan(path: Path) -> Plan:
     """Load a plan from a YAML or JSON file."""
     data = _parse_raw_data(path)
+    return _load_plan_from_data(data, path)
 
+
+def load_plan_from_bytes(source: bytes, *, source_path: Path) -> Plan:
+    """Load a plan from already-read bytes using the full load pipeline."""
+    data = _parse_raw_bytes(source, source_path)
+    return _load_plan_from_data(data, source_path)
+
+
+def _load_plan_from_data(data: Dict[str, Any], source_path: Path) -> Plan:
+    load_issues = _collect_manual_load_issues(data)
+    if load_issues:
+        raise PlanLoadError(load_issues)
     has_schema_version = "schema_version" in data and data["schema_version"] is not None
 
     if has_schema_version:
-        # Strict mode: unknown fields → SchemaUnknownFieldError
         extra_errors = _check_strict_extra_fields(data)
         if extra_errors:
             raise SchemaUnknownFieldError("; ".join(extra_errors))
-        plan = Plan.model_validate(data)
+        plan = _validate_plan_or_raise(data)
     else:
-        # Legacy mode: silently ignore unknown fields + emit banner
-        plan = Plan.model_validate(data)
+        plan = _validate_plan_or_raise(data)
         print(_LEGACY_BANNER, file=sys.stderr)
 
     _tag_initial_plan_provenance(plan)
-    return _merge_repo_defaults(plan, path)
+    return _merge_repo_defaults(plan, source_path)
+
+
+def _validate_plan_or_raise(data: Dict[str, Any]) -> Plan:
+    try:
+        return Plan.model_validate(data)
+    except ValidationError as exc:
+        raise PlanLoadError(_issues_from_validation_error(exc)) from exc
+
+
+def _collect_manual_load_issues(data: Dict[str, Any]) -> list[PlanLoadIssue]:
+    issues: list[PlanLoadIssue] = []
+    issues.extend(_check_required_issues_shape(data))
+    issues.extend(_check_flow_shapes(data, "critical_flows", CriticalFlow))
+    issues.extend(_check_flow_shapes(data, "forbidden_flows", ForbiddenFlow))
+    issues.extend(_check_task_nested_shapes(data))
+    return issues
+
+
+def _check_required_issues_shape(data: Dict[str, Any]) -> list[PlanLoadIssue]:
+    raw = data.get("required_issues", [])
+    if not isinstance(raw, list):
+        return [_required_issue_error("required_issues")]
+    issues: list[PlanLoadIssue] = []
+    for idx, item in enumerate(raw):
+        if not isinstance(item, str):
+            issues.append(_required_issue_error(f"required_issues[{idx}]"))
+    return issues
+
+
+def _required_issue_error(field_path: str) -> PlanLoadIssue:
+    return PlanLoadIssue(
+        task_id="<plan>",
+        field_path=field_path,
+        message="required_issues expects a string list",
+        suggested_format='Use: required_issues: ["RO-1", ...]',
+    )
+
+
+def _check_flow_shapes(data: Dict[str, Any], field: str, model_cls: type) -> list[PlanLoadIssue]:
+    raw_items = data.get(field, [])
+    if not isinstance(raw_items, list):
+        return [_flow_type_issue(field, field, model_cls)]
+    issues: list[PlanLoadIssue] = []
+    allowed = set(model_cls.model_fields.keys())
+    for idx, item in enumerate(raw_items):
+        prefix = f"{field}[{idx}]"
+        if not isinstance(item, dict):
+            issues.append(_flow_type_issue(prefix, field, model_cls))
+            continue
+        for key in item:
+            if key not in allowed:
+                issues.append(_extra_field_issue(prefix, key, model_cls))
+    return issues
+
+
+def _flow_type_issue(field_path: str, field: str, model_cls: type) -> PlanLoadIssue:
+    examples = {
+        "critical_flows": (
+            'CriticalFlow, e.g. [{id: "my-flow", entrypoints: ["src/app.py"], '
+            'required_verification_level: "integration"}]'
+        ),
+        "forbidden_flows": (
+            'ForbiddenFlow, e.g. [{id: "no-X", description: "...", '
+            'required_verification_level: "unit"}]'
+        ),
+    }
+    expected = examples.get(field, model_cls.__name__)
+    return PlanLoadIssue("<plan>", field_path, f"{field_path} expects {expected}")
+
+
+def _extra_field_issue(prefix: str, key: str, model_cls: type) -> PlanLoadIssue:
+    field_path = f"{prefix}.{key}"
+    guidance = _format_allowed_fields(model_cls.__name__, model_cls.model_fields.keys(), sort_fields=False)
+    return PlanLoadIssue("<plan>", field_path, f"{field_path} Extra inputs are not permitted. {guidance}")
+
+
+def _check_task_nested_shapes(data: Dict[str, Any]) -> list[PlanLoadIssue]:
+    tasks = data.get("tasks", [])
+    if not isinstance(tasks, list):
+        return []
+    issues: list[PlanLoadIssue] = []
+    for task in tasks:
+        if isinstance(task, dict):
+            issues.extend(_check_one_task_nested_shapes(task))
+    return issues
+
+
+def _check_one_task_nested_shapes(task: Dict[str, Any]) -> list[PlanLoadIssue]:
+    task_id = str(task.get("id") or "<unknown>")
+    issues: list[PlanLoadIssue] = []
+    issues.extend(_check_contract_list_shape(task_id, task, "provides"))
+    issues.extend(_check_contract_list_shape(task_id, task, "consumes"))
+    issues.extend(_check_semantic_targets_shape(task_id, task))
+    return issues
+
+
+def _check_contract_list_shape(task_id: str, task: Dict[str, Any], field: str) -> list[PlanLoadIssue]:
+    raw_items = task.get(field, [])
+    if not isinstance(raw_items, list):
+        return [_contract_type_issue(task_id, field, field)]
+    issues: list[PlanLoadIssue] = []
+    for idx, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            issues.append(_contract_type_issue(task_id, f"{field}[{idx}]", field))
+    return issues
+
+
+def _contract_type_issue(task_id: str, field_path: str, field: str) -> PlanLoadIssue:
+    example = '{name: "my_api", kind: "artifact"}'
+    if field == "consumes":
+        example = '{name: "upstream_api", kind: "artifact"}'
+    return PlanLoadIssue(task_id, field_path, f"{field_path} expects Contract, e.g. {example}")
+
+
+def _check_semantic_targets_shape(task_id: str, task: Dict[str, Any]) -> list[PlanLoadIssue]:
+    semantic = task.get("semantic")
+    if not isinstance(semantic, dict):
+        return []
+    targets = semantic.get("targets", [])
+    if not isinstance(targets, list):
+        return [_semantic_target_issue(task_id, "semantic.targets")]
+    return [
+        _semantic_target_issue(task_id, f"semantic.targets[{idx}]")
+        for idx, target in enumerate(targets)
+        if not isinstance(target, dict)
+    ]
+
+
+def _semantic_target_issue(task_id: str, field_path: str) -> PlanLoadIssue:
+    example = '{mode: "strict", targets: [{path: "x.py", symbol: "X", op: "modify_body"}]}'
+    return PlanLoadIssue(task_id, field_path, f"{field_path} expects SemanticBlock, e.g. {example}")
+
+
+def _issues_from_validation_error(exc: ValidationError) -> list[PlanLoadIssue]:
+    issues: list[PlanLoadIssue] = []
+    for error in exc.errors():
+        field_path = ".".join(str(part) for part in error.get("loc", ()))
+        message = str(error.get("msg") or "invalid value")
+        issues.append(PlanLoadIssue("<plan>", field_path, f"{field_path} {message}"))
+    return issues
 
 
 class SchemaUnknownFieldError(Exception):
@@ -118,6 +323,62 @@ class SchemaUnknownFieldError(Exception):
     def __init__(self, detail: str) -> None:
         self.detail = detail
         super().__init__(detail)
+
+
+def sync_plan_state(plan_path: Path, ledger_path: Path) -> int:
+    """Sync completed_task_ids from passed verification events to plan.yaml."""
+    plan = load_plan(plan_path)
+    plan_task_ids = {task.id for task in plan.tasks if task.id}
+    if not ledger_path.exists() or not plan_task_ids:
+        return 0
+
+    plan_workflow_id = _read_plan_workflow_id(plan_path)
+    completed_ids = _collect_syncable_completed_ids(
+        ledger_path=ledger_path,
+        plan_task_ids=plan_task_ids,
+        plan_workflow_id=plan_workflow_id,
+    )
+    existing = set(plan.state.completed_task_ids) if plan.state else set()
+    new_ids = completed_ids - existing
+    for task_id in sorted(new_ids):
+        save_plan_state(plan_path, task_id)
+    return len(new_ids)
+
+
+def _read_plan_workflow_id(plan_path: Path) -> str:
+    workflow_id = _parse_raw_data(plan_path).get("workflow_id", "")
+    return str(workflow_id or "").strip()
+
+
+def _collect_syncable_completed_ids(
+    *,
+    ledger_path: Path,
+    plan_task_ids: set[str],
+    plan_workflow_id: str,
+) -> set[str]:
+    completed_ids: set[str] = set()
+    for line in ledger_path.read_text(encoding="utf-8").splitlines():
+        task_id = _syncable_task_id_from_ledger_line(line, plan_workflow_id)
+        if task_id in plan_task_ids:
+            completed_ids.add(task_id)
+    return completed_ids
+
+
+def _syncable_task_id_from_ledger_line(line: str, plan_workflow_id: str) -> str:
+    if not line.strip():
+        return ""
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return ""
+    if event.get("kind", "") not in _SYNCABLE_VERIFICATION_KINDS:
+        return ""
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    if plan_workflow_id:
+        workflow_id = str(data.get("workflow_id") or "").strip()
+        if workflow_id != plan_workflow_id:
+            return ""
+    return str(data.get("task_id") or "").strip()
 
 
 

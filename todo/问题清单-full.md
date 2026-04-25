@@ -195,6 +195,21 @@
 | ARCH-7 | DEFERRED 状态只在影子状态 | P2 | `workflow_orchestrator.py:64/556` |
 | ARCH-8 | retry_after_verification() 不清空 agent_id | P2 | `workflow_state_engine.py:153-161` |
 
+## 九-B、已解决 — v14 E2E 验证确认（2026-04-22）
+
+> 来源：E2E v14 全栈笔记应用实战，2146 tests pass
+> 验证报告：[e2e-实战评估报告-v14.md](./e2e-实战评估报告-v14.md)
+
+| 编号 | 问题 | 解决方式 | 验证 |
+|------|------|----------|------|
+| FIX-E2E-2 | Pool manager 不复用已有 group actors | `_find_group_peer_agent()` 三级选择：YAML→group peer→新建 | v14 E2E：backend-worker/frontend-worker 被正确复用，无多余 actor 创建 |
+| FIX-E2E-4 | Worker 不调用 cccc task complete | COMPLETION PROTOCOL 模板（mandatory=True）嵌入 worker prompt 和 task assignment | v14 E2E：codex 和 claude 两个 runtime 均自行调用 task complete |
+| FIX-E2E-6 | 批次完成后不自动推进下一批 | `_resuggest_ready_tasks()` + auto_process 自动 register+approve+assign | v14 E2E：T1→T2→T4 全部自动推进，零手工 submit |
+| ARCH-5 | cccc actor add CLI 缺 --worker-prompt | CLI argparse + daemon ops + kernel actors 三层实现 | v14 E2E：代码验证三层链路完整 |
+| RO-20 | Worker 越界修改 claimed_paths 之外文件 | `W_WORKER_EXCEEDED_SCOPE` warning 在 verify gate `_build_scope_warnings()` | 代码验证 + 2146 tests pass |
+| RO-22 | schema_version forbid 无迁移引导 | `_format_allowed_fields()` 附加允许字段列表到错误信息 | 代码验证 + 2146 tests pass |
+| RO-23 | required_issues 格式不一致 | `_required_issues_format_issue()` 检测 dict→string 并附示例 | 代码验证 + 2146 tests pass |
+
 ## 十、后续优先级
 
 1. **架构偏移 P0** — ARCH-1 submit 加 assignment > ARCH-2 删除静默 fallback

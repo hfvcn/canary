@@ -1,0 +1,145 @@
+# Phase 3: Scheduling and verification integration
+# Source: ralph-serena-proposals-evaluation.md §4.4 Phase 3
+
+plan_scope:
+  - src/cccc/ralph/
+
+tasks:
+  - id: T1-suggest-semantic
+    title: "suggest --semantic-advisory: symbol-level conflict detection in suggest"
+    role: leaf
+    depends_on: []
+    claimed_paths:
+      - src/cccc/ralph/core.py
+    goal_behavior: |
+      Extend the suggest() function to accept an optional semantic_provider parameter.
+      When provided, after computing write-set conflicts, also check for semantic conflicts:
+      - Two ready tasks that modify the same symbol (even in different files) get flagged as advisory.
+      - Two ready tasks where one modifies a symbol referenced by the other get advisory warning.
+      These are NOT hard blocks (still go into ready list), but appear as advisory notes
+      in BatchResult.rationale and a new advisory_conflicts field.
+      When semantic_provider is None, behavior is identical to current.
+    acceptance_criteria: |
+      suggest() without provider returns same result as before.
+      suggest() with provider and two tasks modifying same symbol returns advisory note.
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.core import suggest; print('ok')\""
+          required: true
+
+  - id: T2-recommend-tests
+    title: "verify --recommend-tests: recommend affected tests based on symbol references"
+    role: leaf
+    depends_on: []
+    claimed_paths:
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/semantic_validator.py
+    goal_behavior: |
+      Add function recommend_tests(task, provider, project_root) -> list[str].
+      For each semantic target, find all references. Filter references that are in test files
+      (paths containing 'test_' or under 'tests/' directory).
+      Returns sorted list of test file paths.
+      This is advisory only (fast feedback, does not replace full test suite).
+      Also add to verify() output: a 'recommended_tests' field when provider is given.
+    acceptance_criteria: |
+      recommend_tests with a mock provider returns test file paths that reference modified symbols.
+      verify() output includes recommended_tests when provider given.
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.semantic_validator import recommend_tests; print('ok')\""
+          required: true
+
+  - id: T3-prompt-enhancer
+    title: "Agent prompt enhancer: structured semantic context for LLM consumption"
+    role: leaf
+    depends_on: []
+    claimed_paths:
+      - src/cccc/ralph/semantic_validator.py
+    goal_behavior: |
+      Add function format_semantic_context(task, provider) -> str.
+      Produces a structured text block that can be injected into Agent prompts:
+        - Lists target symbols with their existence status
+        - Lists reference counts and key referencing files
+        - Lists dynamic hotspots (opaque confidence)
+        - Includes the semantic fingerprint summary
+      Format is designed for LLM consumption (clear, structured, no ambiguity).
+      This replaces the need for Agent to independently scan code — facts are pre-computed.
+    acceptance_criteria: |
+      format_semantic_context produces non-empty string for tasks with semantic blocks.
+      Output includes symbol names, reference counts, and risk level.
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.semantic_validator import format_semantic_context; print('ok')\""
+          required: true
+
+  - id: T4-cli-integration
+    title: "Wire Phase 3 features into CLI"
+    role: integration
+    depends_on: [T1-suggest-semantic, T2-recommend-tests, T3-prompt-enhancer]
+    claimed_paths:
+      - src/cccc/ralph/cli.py
+    goal_behavior: |
+      1. Add --semantic flag to 'ralph suggest': passes SerenaAdapter to suggest().
+      2. Add --recommend-tests flag to 'ralph verify': shows recommended test files.
+      3. Add 'ralph semantic-context <plan> --task <ID>': prints the prompt context for a task.
+      All flags degrade gracefully when Serena is unavailable.
+    acceptance_criteria: |
+      ralph suggest --help shows --semantic flag.
+      ralph verify --help shows --recommend-tests flag.
+      ralph semantic-context --help works.
+    verification:
+      level: integration
+      checks:
+        - name: suggest-flag
+          command: "python -m cccc.ralph.cli suggest --help | grep -q semantic"
+          required: true
+        - name: context-cmd
+          command: "python -m cccc.ralph.cli semantic-context --help 2>&1 | head -1"
+          required: false
+      covers:
+        tasks: [T1-suggest-semantic, T2-recommend-tests, T3-prompt-enhancer, T4-cli-integration]
+        flows: [phase3-schedule-verify]
+
+  - id: T5-tests
+    title: "Tests for Phase 3 features"
+    role: verification
+    depends_on: [T1-suggest-semantic, T2-recommend-tests, T3-prompt-enhancer, T4-cli-integration]
+    claimed_paths:
+      - tests/test_ralph_semantic.py
+    goal_behavior: |
+      Add tests:
+      1. suggest with semantic_provider and conflicting symbols -> advisory note
+      2. suggest without provider -> unchanged behavior
+      3. recommend_tests with test file references -> correct paths returned
+      4. format_semantic_context produces expected output structure
+      5. CLI flags accepted
+    acceptance_criteria: |
+      All tests pass. Existing tests still pass.
+    verification:
+      level: integration
+      checks:
+        - name: run-tests
+          command: "python -m pytest tests/test_ralph_semantic.py -v --tb=short"
+          required: true
+      covers:
+        tasks: [T1-suggest-semantic, T2-recommend-tests, T3-prompt-enhancer, T4-cli-integration, T5-tests]
+        flows: [phase3-schedule-verify]
+
+critical_flows:
+  - id: phase3-schedule-verify
+    description: "suggest --semantic and verify --recommend-tests produce advisory output"
+    entrypoints:
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/cli.py
+    required_verification_level: unit
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED

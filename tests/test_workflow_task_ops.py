@@ -16,6 +16,8 @@ FUNCTION_SIGNATURES = {
         "daemon_request_fn",
         "assignment_id",
         "actor_run_id",
+        "override_stale_digest",
+        "attempt_id",
     ],
     "fail_task": [
         "group_id",

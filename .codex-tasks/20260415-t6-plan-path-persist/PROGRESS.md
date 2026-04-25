@@ -1,0 +1,22 @@
+# Progress
+
+- Read `plans/fix-remaining-issues.yaml` task `T6-plan-path-persist`.
+- Confirmed current `plan_path` is stored only in `WorkflowOrchestrator._active_workflows`.
+- Confirmed `_auto_sync_plan_state()` and `_semantic_plan_name()` both still read `plan_path` from shadow state.
+- Confirmed `WorkflowEngine` currently replays task state only; it has no workflow-level metadata store.
+- Confirmed `RalphService.register_plan_context()` is called on submission but not restored after replay/startup.
+- Targeted change: add workflow metadata in engine, persist `plan_path` via task registration events, and re-register Ralph contexts from engine state during orchestrator startup.
+- Added `WorkflowMeta` and engine-side workflow metadata storage keyed by `workflow_id`.
+- `WorkflowEngine.register_task()` now accepts `plan_path`, writes it into `workflow.task_registered`, normalizes it to an absolute path, and restores it during replay.
+- Added `WorkflowEngine.get_plan_path()` for authoritative workflow-level plan lookup.
+- `WorkflowOrchestrator.register_and_suggest()` now passes `plan_path` into engine registration and no longer stores it in `_active_workflows`.
+- `_semantic_plan_name()` and `_auto_sync_plan_state()` now read `plan_path` from engine state.
+- Orchestrator startup now calls `_restore_plan_contexts_from_engine()` so `RalphService._plan_contexts` is rebuilt after replay.
+- Added coverage for:
+  - engine event persistence and replay of `plan_path`
+  - auto-sync using engine-backed `plan_path`
+  - Ralph plan-context restoration after restart
+- Verification passed:
+  - `python -m pytest tests/test_workflow_state.py -k plan_path -v --tb=short`
+  - `python -m pytest tests/test_workflow_state.py -v --tb=short`
+  - `python -m pytest tests/test_foreman_workflow.py -k plan -v --tb=short`

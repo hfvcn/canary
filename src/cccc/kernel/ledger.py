@@ -89,6 +89,7 @@ def append_event(
 
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     out = event.model_dump()
+    out["schema_version"] = 1
     line = json.dumps(out, ensure_ascii=False)
     if len(line.encode("utf-8", errors="replace")) > MAX_EVENT_BYTES:
         raise ValueError(f"ledger event too large (>{MAX_EVENT_BYTES} bytes): {kind}")
@@ -101,6 +102,20 @@ def append_event(
         release_lockfile(lk)
     _notify_append(out)
     return out
+
+
+def snapshot_ledger(ledger_path: Path | str, snapshot_dir: Path | str) -> Path:
+    """Create a timestamped copy of the ledger file for backup."""
+    import shutil
+    from datetime import datetime
+
+    ledger_path = Path(ledger_path)
+    snapshot_dir = Path(snapshot_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = snapshot_dir / f"ledger-{ts}.jsonl"
+    shutil.copy2(str(ledger_path), str(dest))
+    return dest
 
 
 def read_last_lines(path: Path, n: int) -> list[str]:

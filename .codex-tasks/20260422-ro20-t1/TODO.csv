@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,确认 T1 规格与现有验证流,DONE,目标文件与 warning 语义明确,test -f plans/fix-ro-20-23.yaml,,0,已读计划与相关实现
+2,实现 scope warning 代码,DONE,VerificationResult 和 verify_completion 支持 warnings,python -m pytest tests/test_ralph_verification.py -k "scope or verification_result" -q,,0,已完成并通过全量回归
+3,补测试覆盖,DONE,新增 scope 场景并覆盖 IPC warnings 转发,python -m pytest tests/test_ralph_verification.py -k "scope or verification_result" -q,,0,scope 五个场景和 IPC 转发断言已补齐
+4,运行完整验证,DONE,tests/test_ralph_verification.py 全量通过,python -m pytest tests/test_ralph_verification.py -q,,0,38 passed in 0.75s

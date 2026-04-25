@@ -1,0 +1,845 @@
+# Consolidated plan: All remaining issues (Batch D + E + F + G + H)
+# 可验证结论: "Engine 状态完整、转换安全、是唯一真相源；Ralph 规则增强；CLI/审计闭环"
+#
+# 对应问题清单:
+#   ARCH-7(T2) ARCH-8 ARCH-11 ARCH-12 ARCH-9(block切换) ARCH-4 ARCH-10 ARCH-5
+#   FIX-13 FIX-15 FIX-16 FIX-17 FIX-18 FIX-19 FIX-20 RO-9n RO-11
+# Finding 对照: #1(编译≠功能) #2(按文件拆→死代码) #9(先跑通一条路径) #16(负向不变量) #17(失败必须暴露)
+#
+# 关键路径: D(T1-T5) → E(T6-T11) → F(T12-T18) — G/H(T19-T26) 可穿插任意阶段
+# 前提: Batch A/B/C 已完成；Batch D T1(DEFERRED in engine) 已实现（uncommitted）
+#
+# 所有任务描述来自已通过 Codex 审查的 batch 计划，本计划做合并+依赖对齐+状态修正
+
+schema_version: "1.0.0"
+
+tasks:
+  # ===================================================================
+  # Batch D: Engine 状态转换正确、干净 (ARCH-7 T2, ARCH-8, ARCH-11)
+  # ===================================================================
+
+  - id: T1
+    title: "Orchestrator _record_deferred_tasks 改为调用 Engine.defer_task()"
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+    depends_on: []
+    goal_behavior: >
+      1. 修改 _record_deferred_tasks()：对每个 task 调用 self.engine.defer_task(task.id, reason)。
+         不再使用 _track_task_ref() 写入 _active_workflows 影子状态。仍返回 List[TaskAssignment]。
+      2. 删除 TASK_STATUS_DEFERRED 本地常量（line 66），改为从 WorkflowTaskStatus.DEFERRED.value 引用。
+      3. _build_task_snapshot() 中的 deferred 统计：优先从 engine.list_tasks(status=DEFERRED) 获取。
+      4. _resuggest_ready_tasks() 过滤候选时：跳过 engine 中状态为 DEFERRED 的 task。
+    acceptance_criteria: >
+      _record_deferred_tasks() 调用 engine.defer_task()；ledger 中出现 workflow.task_deferred 事件；
+      TASK_STATUS_DEFERRED 本地常量已删除或改为引用枚举；daemon 重启 replay 后 deferred 状态可还原；
+      _resuggest_ready_tasks 不将 engine 中 DEFERRED 的 task 放入建议。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_workflow_state.py tests/test_foreman_workflow.py -q --tb=short"
+      covers:
+        tasks: ["T1"]
+    provides:
+      - name: orchestrator_deferred_via_engine
+        kind: runtime_capability
+        schema_hint: "Orchestrator defers tasks through Engine, not shadow state"
+    addresses: ["ARCH-7"]
+
+  - id: T2
+    title: "retry 清空 agent_id，引入 attempt_id，CAS 接入完成事件链路"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+    depends_on: []
+    goal_behavior: >
+      1. TaskState 新增 attempt_id: str = "" 字段。
+      2. retry_after_verification()：replace(prev, status=READY, agent_id="", attempt_id="")。
+      3. _apply_retry_requested()：同样清空 agent_id 和 attempt_id。
+      4. approve_batch()：从 assignment 数据读取 attempt_id 写入 TaskState。
+      5. _apply_batch_approved()：从 assignment 数据读取 attempt_id。
+      6. report_worker_completion() 新增可选 attempt_id 参数。CAS 逻辑：
+         - TaskState.attempt_id 非空且 payload attempt_id 非空：必须匹配
+         - TaskState.attempt_id 非空但 payload attempt_id 为空：检查 assignment_id 兼容
+         - TaskState.attempt_id 为空：跳过 CAS（旧 workflow 兼容）
+    acceptance_criteria: >
+      retry_after_verification 后 agent_id 和 attempt_id 均为空；
+      approve_batch 写入 attempt_id；report_worker_completion 对 attempt_id mismatch 拒绝；
+      旧 workflow（无 attempt_id）仍被接受。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'retry or attempt'"
+      covers:
+        tasks: ["T2"]
+    provides:
+      - name: clean_retry_with_attempt_id
+        kind: module
+        schema_hint: "retry clears agent_id + attempt_id; CAS on complete with backward compat"
+    addresses: ["ARCH-8"]
+
+  - id: T3
+    title: "Orchestrator + 完成事件链路透传 attempt_id"
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+    depends_on: ["T2"]
+    goal_behavior: >
+      1. retry_task() 清空 shadow state 中 agent_id/agent_name/assignment_attempt_id。
+      2. process_batch_suggestion()：生成 attempt_id（UUID4 短串），写入 engine + shadow。
+      3. apply_task_event()：从 event payload 提取 attempt_id（fallback 到 assignment_id），
+         传递给 engine.report_worker_completion()。
+      4. workflow_task_ops.complete_task()：透传 attempt_id 参数到 orchestrator。
+    acceptance_criteria: >
+      retry_task 后 shadow state 中 agent_id 为空；approve_batch 时 attempt_id 传入 engine；
+      apply_task_event 将 attempt_id 传给 engine；旧客户端 assignment_id 被映射为 attempt_id。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py tests/test_workflow_state.py -q --tb=short"
+      covers:
+        tasks: ["T2", "T3"]
+    consumes:
+      - name: clean_retry_with_attempt_id
+        from: T2
+    provides:
+      - name: orchestrator_clean_retry
+        kind: runtime_capability
+        schema_hint: "Orchestrator retry clears shadow; attempt_id in full completion pipeline"
+    addresses: ["ARCH-8"]
+
+  - id: T4
+    title: "BLOCKED 状态 DAG 级联取消下游任务"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/ralph/core.py"
+    depends_on: []
+    goal_behavior: >
+      Engine 侧：
+      1. block_task() 加终态保护（COMPLETED/ARCHIVED 拒绝 ValueError）+ 幂等（已 BLOCKED 跳过）。
+      Orchestrator 侧：
+      2. 新增 _cascade_block(workflow_id, blocked_task_id, reason)：
+         visited set 避免菱形 DAG 重复；递归前从 engine 读 task 真实状态；
+         COMPLETED/ARCHIVED 跳过；RUNNING 下游 block 后通知 Foreman 取消。
+      3. block_task() 调用后执行 _cascade_block()。
+      4. _resuggest_ready_tasks() 跳过 BLOCKED 和 DEFERRED。
+      5. 级联后向 Foreman 发汇总通知。
+    acceptance_criteria: >
+      engine.block_task 拒绝覆盖 COMPLETED/ARCHIVED；已 BLOCKED 幂等返回；
+      _cascade_block 用 visited 去重；菱形 DAG 每 task 只 block 一次；
+      RUNNING 下游被 block 后 Foreman 收到取消通知；
+      _resuggest_ready_tasks 不将 BLOCKED/DEFERRED 放入建议。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py tests/test_workflow_state.py -q --tb=short -k 'block or cascade'"
+      covers:
+        tasks: ["T4"]
+    provides:
+      - name: blocked_dag_cascade
+        kind: runtime_capability
+        schema_hint: "BLOCKED cascades with dedup + terminal protection + engine-first reads"
+    addresses: ["ARCH-11"]
+
+  - id: T5
+    title: "E2E 验证：Batch D — Engine 状态转换完整性"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_engine_state_integrity.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    depends_on: ["T1", "T3", "T4"]
+    goal_behavior: >
+      新建 tests/e2e/test_engine_state_integrity.py，10 个场景：
+      1. test_deferred_persisted_in_engine
+      2. test_register_batch_rejects_invalid_source_states
+      3. test_retry_clears_agent_id_and_attempt_id
+      4. test_stale_completion_rejected_by_attempt_id
+      5. test_old_client_completion_backward_compat
+      6. test_blocked_cascades_to_downstream
+      7. test_blocked_diamond_dag_dedup
+      8. test_block_does_not_overwrite_completed
+      9. test_blocked_running_sibling_gets_cancel_notification
+      10. test_ledger_replay_full_lifecycle
+    acceptance_criteria: >
+      10 个场景全部通过。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/e2e/test_engine_state_integrity.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5"]
+        flows:
+          - "deferred_lifecycle"
+          - "clean_retry_cas"
+          - "blocked_cascade_cancels_downstream"
+          - "no_retry_keeps_old_agent"
+          - "no_blocked_task_in_suggestions"
+          - "no_deferred_only_in_shadow"
+
+  # ===================================================================
+  # Batch E: 非法转换被 Engine 拦截 (ARCH-12, ARCH-9 block切换, FIX-16)
+  # ===================================================================
+
+  - id: T6
+    title: "TransitionRejected 异常 + pre-transition hook 类型 + 新事件常量"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    depends_on: ["T5"]
+    goal_behavior: >
+      1. 新增 TransitionRejected(alert_type, message, evidence) 异常类。
+      2. 新增 KIND_TRANSITION_REJECTED、KIND_MONITOR_MODE_CHANGED 常量。
+      3. 新增 PreTransitionHook 类型别名。
+    acceptance_criteria: >
+      TransitionRejected 可被 import；KIND 常量和 PreTransitionHook 类型存在。
+    verification:
+      level: unit
+      command: "python -c \"from cccc.kernel.workflow_state_types import TransitionRejected, KIND_TRANSITION_REJECTED, PreTransitionHook; print('OK')\""
+      covers:
+        tasks: ["T6"]
+    provides:
+      - name: transition_rejected_type
+        kind: module
+        schema_hint: "TransitionRejected exception + PreTransitionHook type + new event KIND constants"
+    addresses: ["ARCH-12"]
+
+  - id: T7
+    title: "Engine pre-transition hook 机制 + 监控模式持久化 + alert 缓存"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    depends_on: ["T6"]
+    goal_behavior: >
+      1. Engine 新增 _pre_transition_hooks、_monitor_config、_pending_hook_alerts。
+      2. 新增 register_pre_transition_hook/get_monitor_config/set_monitor_mode/report_hook_alert。
+      3. 新增 _run_pre_transition_hooks（BLOCK raise/OBSERVE buffer）+ _flush_pending_hook_alerts。
+      4. 在 report_worker_started 和 report_worker_completion 的 _append 前后插入 hook 调用。
+      5. Replay handlers for monitor_mode_changed and transition_rejected。
+    acceptance_criteria: >
+      hook 在 _append 之前被调用；TransitionRejected 阻断转换；observe alerts 在 transition 后 flush；
+      set_monitor_mode 持久化到 ledger；replay 恢复 config；无 hook 时行为不变。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'hook or monitor_mode or transition_rejected'"
+      covers:
+        tasks: ["T6", "T7"]
+    consumes:
+      - name: transition_rejected_type
+        from: T6
+    provides:
+      - name: engine_hook_mechanism
+        kind: module
+        schema_hint: "Engine pre-transition hooks + alert buffer + MonitorConfig persistence"
+    addresses: ["ARCH-12", "ARCH-9"]
+
+  - id: T8
+    title: "Engine block_task 支持 cascade 参数，返回结构化结果"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    depends_on: ["T7"]
+    goal_behavior: >
+      1. 新增 _build_reverse_deps() → Dict[str, List[str]]。
+      2. block_task 新签名：block_task(task_id, reason, cascade=False) → List[Dict]。
+         cascade=True 调用 _cascade_block_downstream。
+      3. _cascade_block_downstream：BFS + visited 去重 + 终态保护 + 幂等。
+         返回结构化列表含 task_id、previous_status、blocked_reason。
+    acceptance_criteria: >
+      cascade=False 返回空列表；cascade=True 返回含 previous_status 的结构化结果；
+      菱形 DAG 去重；COMPLETED 不被覆盖。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'cascade or reverse_dep'"
+      covers:
+        tasks: ["T8"]
+    consumes:
+      - name: engine_hook_mechanism
+        from: T7
+    provides:
+      - name: engine_cascade_block
+        kind: module
+        schema_hint: "block_task(cascade=True) returns structured results with previous_status"
+    addresses: ["FIX-16"]
+
+  - id: T9
+    title: "三个不变量的 pre-transition hook 实现（mode-aware）"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    depends_on: ["T7"]
+    goal_behavior: >
+      新增三个 hook 工厂函数：
+      1. create_completer_mismatch_hook()：BLOCK raise TransitionRejected，OBSERVE report_hook_alert。
+      2. create_file_overstepping_hook()：同理 changed_files vs claimed_paths。
+      3. create_unauthorized_subagent_hook(known_actors_fn)：参数为持久化 actor registry 回调。
+      所有 hook 对不相关 kind 直接 return。不直接写 ledger。
+    acceptance_criteria: >
+      BLOCK + mismatch → raise TransitionRejected；OBSERVE + mismatch → report_hook_alert；
+      hooks 不直接写 ledger；不相关 kind 零开销 return。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py tests/test_worker_collaboration_integration.py -q --tb=short -k 'hook'"
+      covers:
+        tasks: ["T9"]
+    consumes:
+      - name: engine_hook_mechanism
+        from: T7
+    provides:
+      - name: invariant_hooks
+        kind: module
+        schema_hint: "Three mode-aware pre-transition hook factories"
+    addresses: ["ARCH-12", "ARCH-9"]
+
+  - id: T10
+    title: "Orchestrator 注册 hooks + 使用 engine cascade + 处理 TransitionRejected"
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+    depends_on: ["T8", "T9"]
+    goal_behavior: >
+      1. 初始化时注册 3 个 hooks（unauthorized_subagent 用 group.doc["actors"]）。
+      2. block_task 改用 engine.block_task(cascade=True)，据 previous_status 发通知。
+      3. apply_task_event 中 try/except TransitionRejected → accepted=False + 通知 Foreman。
+      4. 保留 on_task_completed 中 WF-6 monitor checks。
+    acceptance_criteria: >
+      hooks 注册到 engine；cascade 使用 engine 结构化结果；TransitionRejected 被捕获；
+      RUNNING 下游被 block 后 Foreman 收到取消通知。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py tests/test_worker_collaboration_integration.py -q --tb=short"
+      covers:
+        tasks: ["T7", "T8", "T9", "T10"]
+    consumes:
+      - name: engine_cascade_block
+        from: T8
+      - name: invariant_hooks
+        from: T9
+    provides:
+      - name: orchestrator_engine_guard_integration
+        kind: runtime_capability
+        schema_hint: "Hooks registered, cascade delegated, TransitionRejected handled"
+    addresses: ["ARCH-12", "ARCH-9", "FIX-16"]
+
+  - id: T11
+    title: "E2E 验证：Batch E — Engine 拦截非法转换"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_batch_e_engine_guard.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    depends_on: ["T10"]
+    goal_behavior: >
+      新建 tests/e2e/test_batch_e_engine_guard.py，13 个场景：
+      1-3. completer_mismatch BLOCK/OBSERVE/matching
+      4. file_overstepping BLOCK 5. unauthorized_agent BLOCK
+      6. unexpected exception 不阻塞 7. monitor_mode 持久化
+      8. observe→block 切换 9-12. engine cascade 变体
+      13. 全生命周期 replay
+    acceptance_criteria: >
+      13 个场景全部通过。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/e2e/test_batch_e_engine_guard.py -q --tb=short"
+      covers:
+        tasks: ["T6", "T7", "T8", "T9", "T10", "T11"]
+        flows:
+          - "hook_rejects_completer_mismatch"
+          - "engine_cascade_via_orchestrator"
+          - "mode_persistence_via_ledger"
+          - "no_state_change_on_rejection"
+
+  # ===================================================================
+  # Batch F: Engine 是唯一真相源 (ARCH-4, ARCH-10, FIX-13, FIX-17, FIX-18)
+  # ===================================================================
+
+  - id: T12
+    title: "Ledger 事件 schema_version 字段 + ledger snapshot"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/ledger.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    depends_on: ["T11"]
+    goal_behavior: >
+      1. append_event() 向 data dict 注入 "schema_version": 1。
+      2. 新增 snapshot_ledger(ledger_path, snapshot_dir) → Path。
+      3. replay_from_ledger 无需修改（schema_version 对现有 handler 透明）。
+    acceptance_criteria: >
+      新事件 data 含 schema_version: 1；旧事件 replay 正常；snapshot 正确。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'schema_version or snapshot'"
+      covers:
+        tasks: ["T12"]
+    provides:
+      - name: ledger_schema_version
+        kind: module
+        schema_hint: "schema_version=1 in all new events + snapshot utility"
+    addresses: ["ARCH-10"]
+
+  - id: T13
+    title: "TaskState 扩展 assigned_by + assigned_at，approve_batch 写入"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    depends_on: ["T12"]
+    goal_behavior: >
+      1. TaskState 新增 assigned_by: str = "" 和 assigned_at: Optional[float] = None。
+      2. approve_batch() 读取并写入 assigned_by/assigned_at。
+      3. _apply_batch_approved() 同样读取（旧事件用默认值）。
+      4. _normalize_assignment() 白名单加入 assigned_by/assigned_at。
+    acceptance_criteria: >
+      approve_batch 写入 provenance；replay 正确恢复；旧 ledger 不报错。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'assigned_by or assigned_at'"
+      covers:
+        tasks: ["T13"]
+    consumes:
+      - name: ledger_schema_version
+        from: T12
+    provides:
+      - name: engine_assignment_provenance
+        kind: module
+        schema_hint: "TaskState.assigned_by + assigned_at"
+    addresses: ["ARCH-4"]
+
+  - id: T14
+    title: "get_workflow_state 优先读 engine，shadow 作 fallback"
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    depends_on: ["T13"]
+    goal_behavior: >
+      1. assignments 从 engine.list_tasks() 构建。
+      2. 从 shadow 补充 engine 不存在的字段。
+      3. task snapshot 统计从 engine 聚合。
+    acceptance_criteria: >
+      assignments 含 provenance；status 来自 engine；graceful fallback。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k 'workflow_state or get_state'"
+      covers:
+        tasks: ["T13", "T14"]
+    consumes:
+      - name: engine_assignment_provenance
+        from: T13
+    provides:
+      - name: engine_authoritative_state
+        kind: runtime_capability
+        schema_hint: "get_workflow_state reads engine first"
+    addresses: ["ARCH-4"]
+
+  - id: T15
+    title: "_resuggest_ready_tasks 改读 engine"
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    depends_on: ["T14"]
+    goal_behavior: >
+      1. 从 engine.list_tasks() 构建 remaining_refs 和 running_write_sets。
+      2. 跳过 COMPLETED/RUNNING/BLOCKED/DEFERRED。
+      3. workflow_id fallback（从 engine 推导）。
+    acceptance_criteria: >
+      _active_workflows 无数据时仍工作；remaining_refs 从 engine 构建。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k 'resuggest or ready_tasks'"
+      covers:
+        tasks: ["T15"]
+    consumes:
+      - name: engine_authoritative_state
+        from: T14
+    provides:
+      - name: resuggest_engine_backed
+        kind: runtime_capability
+        schema_hint: "_resuggest_ready_tasks reads engine"
+    addresses: ["FIX-17"]
+
+  - id: T16
+    title: "ralph sync-state 命令"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/cli.py"
+      - "src/cccc/ralph/plan_io.py"
+    awareness_paths:
+      - "src/cccc/kernel/ledger.py"
+      - "src/cccc/kernel/group.py"
+    depends_on: []
+    goal_behavior: >
+      1. plan_io.py 新增 sync_plan_state(plan_path, ledger_path) → int。
+      2. CLI 新增 sync-state 子命令。
+      3. 从 ledger 读取 verification 事件提取 completed task_ids。
+    acceptance_criteria: >
+      sync-state 同步 completed_task_ids；幂等；suggest 正确反映。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py tests/ralph/test_ralph_standalone.py -q --tb=short -k 'sync_state or sync_plan'"
+      covers:
+        tasks: ["T16"]
+    provides:
+      - name: plan_state_sync
+        kind: cli_command
+        schema_hint: "ralph sync-state syncs from ledger to plan.yaml"
+    addresses: ["FIX-13"]
+
+  - id: T17
+    title: "E2E 验证：FIX-18 metadata 端到端透传"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_metadata_passthrough.py"
+    awareness_paths:
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    depends_on: ["T12"]
+    goal_behavior: >
+      5 个场景：TaskRef 全字段保留、model_dump 往返、verify_completion 执行 checks、
+      无 checks 时 skipped、metadata replay 保留。
+    acceptance_criteria: >
+      5 个场景全部通过。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/e2e/test_metadata_passthrough.py -q --tb=short"
+      covers:
+        tasks: ["T17"]
+    addresses: ["FIX-18"]
+
+  - id: T18
+    title: "E2E 验证：Batch F — Engine 唯一真相源"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_batch_f_engine_truth.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/ralph/plan_io.py"
+    depends_on: ["T14", "T15", "T16", "T17"]
+    goal_behavior: >
+      10 个场景：schema_version、metadata、provenance、get_workflow_state、
+      resuggest、plan sync、ledger snapshot。
+    acceptance_criteria: >
+      10 个场景全部通过。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/e2e/test_batch_f_engine_truth.py -q --tb=short"
+      covers:
+        tasks: ["T12", "T13", "T14", "T15", "T16", "T17", "T18"]
+        flows:
+          - "assignment_provenance_lifecycle"
+          - "plan_state_sync"
+          - "no_shadow_dependency_in_resuggest"
+
+  # ===================================================================
+  # Batch G: Ralph 规则增强 (RO-9n, RO-11) — 可与 D/E/F 穿插
+  # ===================================================================
+
+  - id: T19
+    title: "新增 W_VERIFICATION_NO_CHECKS 规则"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/validator.py"
+    awareness_paths:
+      - "src/cccc/ralph/models.py"
+    depends_on: []
+    goal_behavior: >
+      1. 新增 _check_verification_no_checks(plan)：command 非空但 checks=[] 时报 warning。
+      2. 在 _collect_structural_issues() 中注册。
+    acceptance_criteria: >
+      command + checks=[] 触发 W_VERIFICATION_NO_CHECKS；checks 非空不触发。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_ralph_verification.py -x -q"
+      checks:
+        - name: "existing tests pass"
+          command: "python -m pytest tests/test_ralph_verification.py -x -q"
+          required: true
+      covers:
+        tasks: ["T19"]
+    provides:
+      - name: w_verification_no_checks_rule
+        kind: validation_rule
+        schema_hint: "W_VERIFICATION_NO_CHECKS warning"
+    addresses: ["RO-9n"]
+
+  - id: T20
+    title: "新增 W_NO_FAILURE_PATH 规则"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/validator.py"
+      - "src/cccc/ralph/models.py"
+    awareness_paths:
+      - "tests/ralph/sample_good_plan.yaml"
+    depends_on: ["T19"]
+    goal_behavior: >
+      1. models.py TaskSpec 新增 failure_path: str = ""。
+      2. 新增 _check_failure_path(plan)：只对 goal_behavior 含 assignment/actor/worker/agent 或 role=integration 检查。
+      3. 在 _collect_structural_issues() 中注册。
+    acceptance_criteria: >
+      assignment 任务无 failure 描述触发 W_NO_FAILURE_PATH；普通任务不触发。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_ralph_verification.py -x -q"
+      checks:
+        - name: "existing tests pass"
+          command: "python -m pytest tests/test_ralph_verification.py -x -q"
+          required: true
+      covers:
+        tasks: ["T20"]
+    consumes:
+      - name: w_verification_no_checks_rule
+        from: T19
+    provides:
+      - name: w_no_failure_path_rule
+        kind: validation_rule
+        schema_hint: "W_NO_FAILURE_PATH warning"
+    addresses: ["RO-11"]
+
+  - id: T21
+    title: "集成测试：两条新 Ralph 规则"
+    role: integration
+    claimed_paths:
+      - "tests/test_ralph_verification.py"
+    awareness_paths:
+      - "src/cccc/ralph/validator.py"
+    depends_on: ["T19", "T20"]
+    goal_behavior: >
+      6 个测试：no_checks 报/不报、failure_path 报/不报/字段/描述。
+    acceptance_criteria: >
+      6 个新测试通过；现有测试不受影响。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_ralph_verification.py -x -q"
+      covers:
+        tasks: ["T19", "T20", "T21"]
+
+  # ===================================================================
+  # Batch H: CLI/审计完整 (ARCH-5, FIX-15, FIX-19, FIX-20) — 可穿插
+  # ===================================================================
+
+  - id: T22
+    title: "CLI actor add --worker-prompt"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/cli/actor_cmds.py"
+    awareness_paths:
+      - "src/cccc/daemon/actors/actor_add_ops.py"
+    depends_on: []
+    goal_behavior: >
+      1. argparse 新增 --worker-prompt。
+      2. daemon request args 加 worker_prompt。
+      3. local fallback 也传入。
+    acceptance_criteria: >
+      --worker-prompt 生效；不带时行为不变。
+    verification:
+      level: unit
+      command: "python -c \"from cccc.cli.actor_cmds import cmd_actor_add; print('OK')\""
+      covers:
+        tasks: ["T22"]
+    addresses: ["ARCH-5"]
+
+  - id: T23
+    title: "ralph validate 写 ledger 事件"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/cli.py"
+    awareness_paths:
+      - "src/cccc/kernel/ledger.py"
+    depends_on: []
+    goal_behavior: >
+      1. validate subparser 新增 --ledger/--group。
+      2. 验证后写 workflow.plan_validated 事件。
+      3. 不指定时跳过。
+    acceptance_criteria: >
+      --ledger 后 ledger 出现 workflow.plan_validated；不带时不变。
+    verification:
+      level: unit
+      command: "python -c \"from cccc.ralph.cli import main; print('OK')\""
+      covers:
+        tasks: ["T23"]
+    addresses: ["FIX-15"]
+
+  - id: T24
+    title: "verification_skipped summary 含具体原因"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/ralph_service.py"
+    awareness_paths:
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+    depends_on: []
+    goal_behavior: >
+      审查所有 skip 路径，确保 summary 含 "verification skipped: <原因>"。
+    acceptance_criteria: >
+      所有 skip summary 含具体原因；执行行为不变。
+    verification:
+      level: unit
+      command: "python -c \"from cccc.daemon.foreman.ralph_service import RalphService; print('OK')\""
+      covers:
+        tasks: ["T24"]
+    addresses: ["FIX-20"]
+
+  - id: T25
+    title: "daemon heartbeat sweep stall detection + null heartbeat fix"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/automation/engine.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+    depends_on: []
+    goal_behavior: >
+      1. 修复 check_stalled_tasks() last_heartbeat=None crash。
+      2. _run_heartbeat_sweep 接收 group，通过 get_orchestrator 调用 check_stalled_tasks。
+    acceptance_criteria: >
+      null heartbeat 不 crash；sweep 调用 check_stalled_tasks。
+    verification:
+      level: unit
+      command: "python -c \"from cccc.daemon.automation.engine import AutomationManager; print('OK')\""
+      covers:
+        tasks: ["T25"]
+    addresses: ["FIX-19"]
+
+  - id: T26
+    title: "集成验证：Batch H — CLI + 审计"
+    role: integration
+    claimed_paths:
+      - "tests/test_batch_h_cli_audit.py"
+    awareness_paths:
+      - "src/cccc/cli/actor_cmds.py"
+      - "src/cccc/ralph/cli.py"
+      - "src/cccc/daemon/foreman/ralph_service.py"
+    depends_on: ["T22", "T23", "T24", "T25"]
+    goal_behavior: >
+      4 个测试：actor_add prompt、validate ledger、skip summary、stall no crash。
+    acceptance_criteria: >
+      4 个场景通过。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_batch_h_cli_audit.py -q --tb=short"
+      covers:
+        tasks: ["T22", "T23", "T24", "T25", "T26"]
+
+critical_entrypoints:
+  - src/cccc/kernel/workflow_state_engine.py
+  - src/cccc/kernel/workflow_state_types.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - src/cccc/daemon/foreman/workflow_monitor.py
+  - src/cccc/ralph/validator.py
+  - src/cccc/ralph/cli.py
+
+critical_flows:
+  - id: deferred_lifecycle
+    description: "Task → deferred (conflict) → undeferred → proceeds"
+    entrypoints: ["src/cccc/kernel/workflow_state_engine.py", "src/cccc/daemon/foreman/workflow_orchestrator.py"]
+    required_verification_level: e2e
+  - id: clean_retry_cas
+    description: "Verify fail → retry clears agent_id/attempt_id → stale completion rejected"
+    entrypoints: ["src/cccc/kernel/workflow_state_engine.py"]
+    required_verification_level: e2e
+  - id: blocked_cascade_cancels_downstream
+    description: "Task blocked → downstream cascade → running siblings unaffected"
+    entrypoints: ["src/cccc/daemon/foreman/workflow_orchestrator.py"]
+    required_verification_level: e2e
+  - id: hook_rejects_completer_mismatch
+    description: "Wrong agent complete → BLOCK hook rejects → state unchanged"
+    entrypoints: ["src/cccc/kernel/workflow_state_engine.py"]
+    required_verification_level: e2e
+  - id: engine_cascade_via_orchestrator
+    description: "block_task(cascade=True) → structured results → orchestrator notifies"
+    entrypoints: ["src/cccc/kernel/workflow_state_engine.py", "src/cccc/daemon/foreman/workflow_orchestrator.py"]
+    required_verification_level: e2e
+  - id: mode_persistence_via_ledger
+    description: "set_monitor_mode → ledger → replay → config restored"
+    entrypoints: ["src/cccc/kernel/workflow_state_engine.py"]
+    required_verification_level: e2e
+  - id: assignment_provenance_lifecycle
+    description: "approve_batch with provenance → engine stores → replay restores"
+    entrypoints: ["src/cccc/kernel/workflow_state_engine.py"]
+    required_verification_level: e2e
+  - id: plan_state_sync
+    description: "ralph sync-state reads ledger → updates plan.yaml"
+    entrypoints: ["src/cccc/ralph/cli.py"]
+    required_verification_level: e2e
+
+forbidden_flows:
+  - id: no_retry_keeps_old_agent
+    description: "retry MUST NOT preserve old agent_id or attempt_id"
+    required_verification_level: e2e
+  - id: no_blocked_task_in_suggestions
+    description: "BLOCKED/DEFERRED MUST NOT appear in suggest or resuggest"
+    required_verification_level: e2e
+  - id: no_deferred_only_in_shadow
+    description: "DEFERRED MUST be in Engine ledger, not only shadow"
+    required_verification_level: e2e
+  - id: no_state_change_on_rejection
+    description: "TransitionRejected MUST NOT produce state change"
+    required_verification_level: e2e
+  - id: no_shadow_dependency_in_resuggest
+    description: "_resuggest_ready_tasks MUST NOT read from _active_workflows"
+    required_verification_level: e2e
+
+required_issues:
+  - "ARCH-7"
+  - "ARCH-8"
+  - "ARCH-11"
+  - "ARCH-12"
+  - "ARCH-9"
+  - "ARCH-4"
+  - "ARCH-10"
+  - "ARCH-5"
+  - "FIX-13"
+  - "FIX-15"
+  - "FIX-16"
+  - "FIX-17"
+  - "FIX-18"
+  - "FIX-19"
+  - "FIX-20"
+  - "RO-9n"
+  - "RO-11"
+
+suppress_codes:
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

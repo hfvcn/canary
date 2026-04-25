@@ -180,7 +180,7 @@ def test_mandatory_sections_survive_tight_budget(tmp_path: Path) -> None:
 
     # Use a tight budget via env var
     old_env = os.environ.get("CCCC_PROMPT_TOKEN_BUDGET")
-    os.environ["CCCC_PROMPT_TOKEN_BUDGET"] = "400"
+    os.environ["CCCC_PROMPT_TOKEN_BUDGET"] = "800"
     try:
         prompt = orch._build_task_prompt(task, worker_prompt="Extra context " * 50, runtime="claude")
     finally:

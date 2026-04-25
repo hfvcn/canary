@@ -1,0 +1,488 @@
+# Plan: RO-20~RO-23 — Ralph 问题清单 v5 剩余待实施改进
+#
+# 来源：todo/问题清单-v5-ralph.md § 一 待实施改进（4 项）
+# 工作流：findings.md § 〇 经验证的工作流程
+#
+# 设计原则：
+#   - #2  按功能切片拆分，避免按文件拆分产生死代码
+#   - #9  波次推进，write-set 冲突由 ralph suggest 自动序列化
+#   - #11 verification 必须真正跑命令，不是 py_compile
+#   - #13 结构校验 + 代码审查互补
+#
+# Codex 审查修正（2026-04-22）：
+#   - T2 原方案基于过时前提：_write_validation_event() 已实现（cli.py:323），
+#     PlanValidatedData 已存在（event.py:303）。重新定义为增强现有实现（加 plan_hash）
+#   - T3 原方案定位错误：critical_flows/forbidden_flows 的 extra fields 在
+#     _collect_manual_load_issues() 拦截（plan_io.py:175），不在 _check_strict_extra_fields()
+#   - T1 path match 必须用 _paths_overlap()（core.py:267）避免 src/auth 误吞 src/authorization
+#   - T1 需同步改 ralph_ipc_handler.py:381 转发 warnings 字段
+#   - T-int mixed-case 测试不成立：_collect_manual_load_issues() 先于 strict-schema 抛出
+#
+# 批次预期（由 ralph suggest 决定）：
+#   Batch 1: T1             — ralph_service.py + ralph_ipc.py + ralph_ipc_handler.py（独占）
+#   Batch 2: T2/T3/T4       — 写冲突由 ralph suggest 序列化
+#   Batch 3: T-int           — 全量集成（depends_on 全部 leaf）
+
+schema_version: "1.0.0"
+
+required_issues:
+  - "RO-20"
+  - "RO-21"
+  - "RO-22"
+  - "RO-23"
+
+semantic_mode: "off"
+auto_infer: false
+
+critical_entrypoints:
+  - src/cccc/daemon/foreman/ralph_service.py
+  - src/cccc/ralph/plan_io.py
+  - src/cccc/ralph/cli.py
+
+critical_flows:
+  - id: verify_scope_check
+    description: "Worker complete → verify_completion → scope check against claimed_paths → warning in result"
+    entrypoints:
+      - src/cccc/daemon/foreman/ralph_service.py
+    required_verification_level: unit
+
+  - id: plan_load_guidance
+    description: "Plan YAML with invalid fields → load_plan → PlanLoadError with guidance message"
+    entrypoints:
+      - src/cccc/ralph/plan_io.py
+    required_verification_level: unit
+
+forbidden_flows:
+  - id: FF_scope_check_false_positive
+    description: "Worker modifying only files within claimed_paths must NOT trigger W_WORKER_EXCEEDED_SCOPE"
+    required_verification_level: unit
+
+  - id: FF_legacy_plan_regression
+    description: "Plans without schema_version must NOT get strict-mode error messages"
+    required_verification_level: unit
+
+# 本计划不改 daemon 基础设施（server.py），
+# 继承的 ralph.yaml critical entrypoints/flows 与本计划无关
+suppress_codes:
+  - "W_VERIFICATION_PYTEST_K_NO_MATCH"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+  - "W_FLOW_OWNER_NO_VERIFICATION"
+  - "W_UNCLAIMED_TEST_FOR_SOURCE"
+  - "W_TEST_COVERAGE_GAP"
+  - "W_PLAN_SCOPE_UNUSED"
+
+# ═════════════════════════════════════════════════════════════════════════
+# Tasks
+# ═════════════════════════════════════════════════════════════════════════
+
+tasks:
+
+  # ─────────────────────────────────────────────────────────────────────
+  # T1: RO-20 — Worker 越界修改检测 (P2)
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: T1
+    title: "RO-20: Detect worker scope violation in verify_completion"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RO-20"]
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - src/cccc/daemon/ralph_ipc_handler.py
+      - tests/test_ralph_verification.py
+    awareness_paths:
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/models.py
+    goal_behavior: >
+      Add scope violation detection to verify_completion in ralph_service.py.
+      Currently `changed_files` is passed in but immediately deleted (line 440:
+      `del changed_files`). This task uses it to check against claimed_paths.
+
+      Implementation:
+      1. In ralph_ipc.py VerificationResult model (line 136), add field:
+         `warnings: List[str] = Field(default_factory=list)` — backward
+         compatible, existing consumers see empty list. Note: VerificationResult
+         has extra="forbid" (line 152); adding a new field with default is safe
+         because "forbid" only rejects unknown INPUT, not missing fields.
+
+      2. In ralph_service.py verify_completion (line 431):
+         - Remove `del changed_files` (line 440)
+         - After resolving task_ref (line 442), get claimed_paths from
+           task_ref: `claimed = getattr(task_ref, 'claimed_paths', []) or []`
+         - Use `_paths_overlap` from ralph.core (line 267) for matching.
+           This function already handles path-segment boundaries correctly:
+           `left.startswith(f"{right}/")` prevents `src/auth` from matching
+           `src/authorization`.
+         - For each changed_file, check if ANY claimed path overlaps with it.
+           If no overlap, the file is out of scope.
+         - If out-of-scope files exist, build warning string:
+           `f"W_WORKER_EXCEEDED_SCOPE: modified {len(exceeded)} file(s) outside
+           claimed_paths: {', '.join(sorted(exceeded)[:5])}"`
+         - Attach warnings list to all returned VerificationResult instances.
+
+      3. In ralph_ipc_handler.py handle_ralph_verification_result (line 381):
+         - Add `warnings` to the manually constructed VerificationResult dict
+           at line 381-394. Currently only fixed fields are forwarded.
+         - Add: `warnings=args.get("warnings", [])` to the constructor.
+
+      4. Do NOT fail verification for scope violations (warning only).
+
+      Tests in tests/test_ralph_verification.py:
+      - test_scope_violation_detected: changed_files includes files outside
+        claimed_paths → VerificationResult.warnings contains W_WORKER_EXCEEDED_SCOPE
+      - test_scope_no_violation: changed_files within claimed_paths → empty warnings
+      - test_scope_empty_changed_files: changed_files=[] → no warning
+      - test_scope_path_boundary: claimed_path="src/auth" and
+        changed_file="src/authorization/login.py" → W_WORKER_EXCEEDED_SCOPE
+        (not a false negative from naive prefix match)
+      - test_scope_subdirectory_match: claimed_path="src/ralph" and
+        changed_file="src/ralph/core.py" → no warning (parent-child overlap)
+    acceptance_criteria: >
+      1. verify_completion with changed_files outside claimed_paths returns
+         VerificationResult with W_WORKER_EXCEEDED_SCOPE in warnings
+      2. verify_completion with changed_files inside claimed_paths returns
+         empty warnings
+      3. Path-segment boundary: "src/auth" does NOT match "src/authorization"
+      4. VerificationResult model has warnings field (List[str], default [])
+      5. ralph_ipc_handler forwards warnings through IPC
+      6. Existing verify_completion behavior unchanged for checks/outcome
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_ralph_verification.py -k scope -q"
+      checks:
+        - name: scope_violation
+          command: "python -m pytest tests/test_ralph_verification.py -k test_scope -q"
+          required: true
+        - name: existing_verification_tests
+          command: "python -m pytest tests/test_ralph_verification.py -q"
+          required: true
+      covers:
+        tasks: [T1]
+        flows: [verify_scope_check, FF_scope_check_false_positive]
+        paths: [tests/test_ralph_verification.py]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # T2: RO-21 — 验证事件增强：plan_hash + 审计完整性 (P2)
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: T2
+    title: "RO-21: Enhance validation event with plan_hash for audit trail"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RO-21"]
+    claimed_paths:
+      - src/cccc/ralph/cli.py
+      - src/cccc/contracts/v1/event.py
+      - tests/test_ralph_verification.py
+    awareness_paths:
+      - src/cccc/ralph/validator.py
+    goal_behavior: >
+      Enhance the existing validation event mechanism with plan_hash for
+      audit trail completeness.
+
+      IMPORTANT: The core event writing is ALREADY IMPLEMENTED:
+      - _write_validation_event() exists at cli.py:323
+      - PlanValidatedData model exists at event.py:303
+      - EventKind includes workflow.plan_validated (event.py:48)
+      - --ledger and --group CLI args are already wired (cli.py:243-262)
+
+      What is MISSING per RO-21 spec:
+      1. plan_hash (sha256 of plan file content) is not in PlanValidatedData.
+         Add `plan_hash: str = ""` field to PlanValidatedData (event.py:303)
+         and PlanValidationFailedData (event.py:318).
+
+      2. In _write_validation_event (cli.py:323), compute sha256 of
+         plan_path.read_bytes() and pass it to the event payload.
+
+      3. Write tests that verify the complete event pipeline:
+         - test_validation_event_has_plan_hash: validate with --ledger →
+           event in ledger contains non-empty plan_hash
+         - test_validation_event_hash_deterministic: same plan content →
+           same plan_hash across two runs
+         - test_validation_failed_event_has_plan_hash: failed validation
+           also includes plan_hash
+
+      Do NOT reimplement what already exists. Focus on the plan_hash gap.
+    acceptance_criteria: >
+      1. PlanValidatedData and PlanValidationFailedData have plan_hash field
+      2. _write_validation_event computes and includes sha256 plan_hash
+      3. Existing validation event behavior unchanged (counts, findings, etc.)
+      4. Tests verify plan_hash is present and deterministic
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_ralph_verification.py -k plan_hash -q"
+      checks:
+        - name: plan_hash_tests
+          command: "python -m pytest tests/test_ralph_verification.py -k plan_hash -q"
+          required: true
+        - name: existing_verification_tests
+          command: "python -m pytest tests/test_ralph_verification.py -q"
+          required: true
+      covers:
+        tasks: [T2]
+        paths: [tests/test_ralph_verification.py]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # T3: RO-22 — schema_version strict mode 迁移引导 (P3)
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: T3
+    title: "RO-22: Add migration guidance when plan loader rejects legacy fields"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RO-22"]
+    claimed_paths:
+      - src/cccc/ralph/plan_io.py
+      - tests/ralph/test_ralph_standalone.py
+    awareness_paths:
+      - src/cccc/ralph/models.py
+    goal_behavior: >
+      Add migration guidance to PlanLoadError messages when fields are
+      rejected in plan loading.
+
+      IMPORTANT: There are TWO separate rejection paths:
+
+      Path A — _collect_manual_load_issues() (plan_io.py:175):
+        Runs for ALL plans (legacy and strict). Checks critical_flows and
+        forbidden_flows items against model fields. Currently emits:
+        "critical_flows[0].name Extra inputs are not permitted"
+        This is the path that catches legacy fields like name, segment,
+        covered_by in critical_flows, and violated_by in forbidden_flows.
+
+      Path B — _check_strict_extra_fields() (plan_io.py:117):
+        Runs ONLY for plans with schema_version. Checks plan-level and
+        task-level fields. Currently emits:
+        "fieldname: Extra inputs are not permitted"
+
+      Implementation:
+      1. In _collect_manual_load_issues() (plan_io.py:186-198):
+         When an unknown field is found in critical_flows, enhance the
+         PlanLoadIssue message to include allowed fields:
+         "critical_flows[0].name: unknown field. Allowed CriticalFlow
+         fields: id, description, entrypoints, test_created_by,
+         required_verification_level"
+         Same for forbidden_flows items using ForbiddenFlow fields.
+
+      2. In _check_strict_extra_fields() (plan_io.py:127-137):
+         When unknown plan-level or task-level fields are found, append
+         guidance about allowed fields:
+         "some_field: Extra inputs are not permitted. Allowed plan fields:
+         schema_version, tasks, state, ..."
+         For task fields: "tasks.0.some_field: Extra inputs are not
+         permitted. Allowed task fields: id, title, role, ..."
+
+      3. Update SchemaUnknownFieldError.__str__ (plan_io.py:292) to
+         format the enhanced messages clearly.
+
+      Tests in tests/ralph/test_ralph_standalone.py:
+      - test_strict_schema_unknown_flow_field_guidance: plan with
+        critical_flows[].name → PlanLoadError mentions allowed fields
+      - test_strict_schema_unknown_plan_field_guidance: plan with
+        schema_version and unknown plan field → error mentions allowed fields
+      - test_strict_schema_unknown_task_field_guidance: plan with
+        schema_version and unknown task field → error mentions allowed fields
+      - test_legacy_plan_unknown_flow_field_guidance: plan WITHOUT
+        schema_version but with critical_flows[].name → still gets guidance
+        (because _collect_manual_load_issues runs for all plans)
+    acceptance_criteria: >
+      1. Unknown critical_flows/forbidden_flows fields → PlanLoadError with
+         allowed fields listed
+      2. Unknown plan-level fields (strict mode) → SchemaUnknownFieldError
+         with allowed plan fields listed
+      3. Unknown task-level fields (strict mode) → SchemaUnknownFieldError
+         with allowed task fields listed
+      4. Legacy plans still load correctly when fields are valid
+      5. Existing test_plan_loader_ux.py tests pass unchanged
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_ralph_standalone.py -k strict_schema -q"
+      checks:
+        - name: guidance_tests
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -k guidance -q"
+          required: true
+        - name: existing_ralph_tests
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -q"
+          required: true
+        - name: existing_loader_ux_tests
+          command: "python -m pytest tests/ralph/test_plan_loader_ux.py -q"
+          required: true
+      covers:
+        tasks: [T3]
+        flows: [plan_load_guidance, FF_legacy_plan_regression]
+        paths: [tests/ralph/test_ralph_standalone.py]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # T4: RO-23 — required_issues 格式错误引导 (P3)
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: T4
+    title: "RO-23: Add format guidance when required_issues receives dict list"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RO-23"]
+    claimed_paths:
+      - src/cccc/ralph/plan_io.py
+      - tests/ralph/test_ralph_standalone.py
+    awareness_paths:
+      - src/cccc/ralph/models.py
+    goal_behavior: >
+      Add early detection and guidance when required_issues uses dict format
+      instead of string list.
+
+      Current behavior: Pydantic reports "Input should be a valid string"
+      at required_issues[N] which is unhelpful. The planning AI doesn't
+      know that required_issues expects ["RO-20", "RO-21"] not
+      [{id: "RO-20", title: "..."}].
+
+      Implementation:
+      In plan_io.py _collect_manual_load_issues (line 175), add a check
+      for required_issues items BEFORE the existing critical_flows check:
+      ```
+      for idx, item in enumerate(data.get("required_issues", []) or []):
+          if isinstance(item, dict):
+              issue_id = item.get("id", "")
+              issues.append(PlanLoadIssue(
+                  task_id="<plan>",
+                  field_path=f"required_issues[{idx}]",
+                  message=(
+                      f"required_issues expects a string list, not dicts. "
+                      f'Use: required_issues: ["{issue_id or "ISSUE-1"}", ...] '
+                      f"(got dict with keys: {sorted(item.keys())})"
+                  ),
+                  suggested_format='["RO-20", "RO-21"]',
+              ))
+      ```
+
+      This runs before Pydantic validation (line 220-222), so the user
+      sees a clear message instead of the cryptic Pydantic error.
+
+      NOTE: _collect_manual_load_issues() short-circuits — if it returns
+      issues, _load_plan_from_data() raises PlanLoadError immediately
+      (line 221-222) and never reaches Pydantic or strict-schema checks.
+      This is correct behavior: fix format errors first.
+
+      Tests in tests/ralph/test_ralph_standalone.py:
+      - test_required_issues_dict_format_guidance: plan with
+        required_issues: [{id: "RO-1", title: "foo"}] → PlanLoadError
+        with message containing "expects a string list"
+      - test_required_issues_string_format_ok: plan with
+        required_issues: ["RO-1"] → loads successfully
+      - test_required_issues_mixed_format_guidance: plan with
+        required_issues: ["RO-1", {id: "RO-2"}] → PlanLoadError for
+        the dict item only
+    acceptance_criteria: >
+      1. required_issues with dict items raises PlanLoadError with
+         guidance showing correct string format
+      2. required_issues with string items loads correctly (no regression)
+      3. Error message extracts `id` from dict for suggestion
+      4. Mixed list (some str, some dict) reports only the dict items
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_ralph_standalone.py -k required_issues -q"
+      checks:
+        - name: format_guidance
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -k test_required_issues -q"
+          required: true
+        - name: existing_ralph_tests
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -q"
+          required: true
+      covers:
+        tasks: [T4]
+        flows: [plan_load_guidance]
+        paths: [tests/ralph/test_ralph_standalone.py]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # T-int: Integration — 全量回归 + 跨任务验证
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: T-int
+    title: "Integration: cross-task regression across all RO-20~23 changes"
+    role: integration
+    type: backend
+    depends_on: [T1, T2, T3, T4]
+    addresses: []
+    claimed_paths:
+      - tests/test_ro_20_23_integration.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - src/cccc/daemon/ralph_ipc_handler.py
+      - src/cccc/ralph/cli.py
+      - src/cccc/contracts/v1/event.py
+      - src/cccc/ralph/plan_io.py
+    goal_behavior: >
+      Write a focused integration test that exercises cross-task interactions.
+
+      IMPORTANT: _collect_manual_load_issues() short-circuits before
+      strict-schema checks. Test plan-load scenarios SEPARATELY, not as
+      a single mixed-error case.
+
+      Tests in tests/test_ro_20_23_integration.py:
+
+      1. test_verify_completion_scope_warnings_preserved:
+         Create a RalphService with a loaded plan, call verify_completion
+         with changed_files exceeding scope, confirm the returned
+         VerificationResult has W_WORKER_EXCEEDED_SCOPE in warnings AND
+         the verification checks still run correctly. This exercises T1.
+
+      2. test_plan_load_dict_required_issues_guidance:
+         Load a plan with dict-format required_issues → PlanLoadError
+         with string format guidance. Exercises T4.
+
+      3. test_plan_load_strict_unknown_field_guidance:
+         Load a plan with schema_version + unknown critical_flow field →
+         PlanLoadError with allowed fields. Exercises T3.
+         (This CANNOT be combined with test 2 because _collect_manual_load_issues
+         short-circuits.)
+
+      4. test_validation_event_plan_hash_in_ledger:
+         Run ralph validate with --ledger, verify event has plan_hash.
+         Exercises T2.
+
+      5. test_existing_suites_regression:
+         Verify all existing test suites still pass.
+    acceptance_criteria: >
+      1. Integration tests pass covering cross-task interactions
+      2. Full existing test suites pass:
+         - tests/test_ralph_verification.py
+         - tests/ralph/test_ralph_standalone.py
+         - tests/ralph/test_filesystem_validator.py
+         - tests/ralph/test_plan_loader_ux.py
+         - tests/test_plan_schema_version.py
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_ro_20_23_integration.py tests/test_ralph_verification.py tests/ralph/test_ralph_standalone.py tests/ralph/test_plan_loader_ux.py tests/test_plan_schema_version.py -q"
+      checks:
+        - name: integration_tests
+          command: "python -m pytest tests/test_ro_20_23_integration.py -q"
+          required: true
+        - name: verification_regression
+          command: "python -m pytest tests/test_ralph_verification.py -q"
+          required: true
+        - name: standalone_regression
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -q"
+          required: true
+        - name: loader_ux_regression
+          command: "python -m pytest tests/ralph/test_plan_loader_ux.py -q"
+          required: true
+        - name: schema_version_regression
+          command: "python -m pytest tests/test_plan_schema_version.py -q"
+          required: true
+      covers:
+        tasks: [T1, T2, T3, T4, T-int]
+        flows: [verify_scope_check, plan_load_guidance, FF_scope_check_false_positive, FF_legacy_plan_regression]
+        paths: [tests/test_ro_20_23_integration.py]
+state:
+  completed_task_ids:
+    - T-int
+    - T4
+    - T2
+    - T3
+    - T1

@@ -1,0 +1,306 @@
+# Batch G2: v5+v6 实战问题修复
+# 可验证结论: "plan.yaml state 自动同步；Foreman 提示词含 --group 和 checks 质量要求；
+#              resuggest 通知排除已运行任务；batch_approved 事件含 assigned_by；
+#              动态创建的 actor 不触发 unauthorized_subagent"
+#
+# 对应问题清单:
+#   FIX-13 (P1) plan.yaml state 自动回写（自动化部分）
+#   FIX-21 (P1) Foreman 文档说明 ralph --group 参数 + checks 质量
+#   FIX-22 (P2) resuggest 通知排除 RUNNING 任务
+#   FIX-23 (P1) assigned_by 字段填充
+#   FIX-24 (P1) monitor unauthorized_subagent 对动态 actor 的误报
+# Finding 对照: #1(编译通过≠功能可用) #5(讨论从用户场景出发) #17(失败必须暴露)
+#
+# 依赖: Batch G/H 已完成（v6 E2E 验收），E/F 已完成（engine guard + truth source）
+#
+# 设计决策:
+# 1. FIX-13: workflow submit --plan 时将 plan_path 存入 orchestrator workflow context。
+#    on_task_completed (~line 1098) 后自动调用 sync_plan_state。
+#    sync_plan_state 需要按 plan 内声明的 task IDs 过滤，避免多 workflow 共用 ledger 时污染。
+#    plan_path 只存内存态（_active_workflows），daemon 重启后丢失——这是已知限制，
+#    FIX-13 定义为"自动化"而非"持久化"，daemon 重启后需手动 ralph sync-state。
+# 2. FIX-21: 在 prompt_files.py 的 preamble 中添加 --group 用法和 checks 质量要求。
+# 3. FIX-22: _resuggest_ready_tasks 中将 ASSIGNED 排除出 remaining_refs（continue 跳过），
+#    但不加入 running_write_sets——ASSIGNED 任务尚未开始写，不算 active writer。
+#    (Codex C1: 只排除不通知，不当 active conflict)
+# 4. FIX-23: 使用已有的 find_foreman(group) 获取 foreman actor_id（第一个 enabled actor），
+#    而非手动查 role 字段。(Codex C2: find_foreman 是正确 API)
+# 5. FIX-24: known_actors_fn lambda 改为 load_group 获取最新 group doc。
+#
+# Codex 审查后修正（2026-04-07）：
+# C1: FIX-22 ASSIGNED 不加入 running_write_sets，只排除不通知
+# C2: FIX-23 使用 find_foreman() 而非查 role 字段
+# C3: FIX-13 sync_plan_state 需按 plan task IDs 过滤，避免多 workflow 污染
+# C4: FIX-13 plan_path 只存内存态，声明 daemon 重启后丢失的已知限制
+# C5: T3 verification 路径锚定到 on_task_completed (line 1098)，非不存在的 _handle_verification_result
+# C6: T4 dynamic actor 测试必须命中 KIND_TASK_STARTED 而非 completion 路径
+
+tasks:
+  # === T1: FIX-13 — plan.yaml state 自动回写（全链路） ===
+
+  - id: T1
+    title: "plan.yaml state 自动回写：CLI 透传 plan_path + orchestrator 存储 + 完成后自动 sync"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/cli/workflow_cmds.py"
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/ralph/plan_io.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/daemon/server.py"
+      - "src/cccc/cli/main.py"
+      - "src/cccc/ralph/validator.py"
+      - "src/cccc/ralph/cli.py"
+    depends_on: []
+    goal_behavior: >
+      1. cli/workflow_cmds.py cmd_workflow_submit: 当使用 --plan 时，将 plan_path 的绝对路径
+         (Path(plan_path).resolve()) 加入 payload（字段名 plan_path）。
+
+      2. ralph_ipc_handler.py handle_ralph_register_and_suggest: 将 args 中的 plan_path
+         透传给 orchestrator.register_and_suggest() kwargs。
+
+      3. workflow_orchestrator.py:
+         a. register_and_suggest() 接收 plan_path kwarg，存入 workflow dict：
+            workflow_data = self._ensure_active_workflow(workflow_id)
+            if kwargs.get("plan_path"):
+                workflow_data["plan_path"] = str(kwargs["plan_path"])
+            注意：_ensure_active_workflow 只补 started_at (~line 209)，plan_path 应在返回后设置，
+            确保同一 workflow_id 二次 submit 时覆盖旧值。
+         b. on_task_completed (~line 1098): 方法末尾（在 _resuggest_ready_tasks 之后），
+            如果当前 workflow 有 plan_path，调用 _auto_sync_plan_state(wf_id)。
+         c. 新增 _auto_sync_plan_state(workflow_id) 辅助方法：
+            - 从 _active_workflows[workflow_id] 取 plan_path
+            - 加载 plan 获取其声明的 task IDs（plan_io.load_plan(plan_path).tasks 的 id 集合）
+            - 调用 sync_plan_state(plan_path, self.group.ledger_path)
+            - try/except 包裹，失败只 log warning 不中断
+
+      4. ralph/plan_io.py sync_plan_state: 新增可选参数 task_id_filter: Optional[Set[str]]。
+         当提供时，只 sync task_id 在 filter 中的事件。
+         这防止多 workflow 共用 ledger 时将其他 workflow 的完成任务错误写入当前 plan。
+         不提供时保持原有行为（全量 sync）——向后兼容 CLI ralph sync-state 手动调用。
+
+      已知限制：plan_path 只存 _active_workflows 内存态，daemon 重启后丢失。
+      重启后需手动 ralph sync-state。
+    acceptance_criteria: >
+      workflow submit --plan plan.yaml 后，当任一属于该 plan 的任务 verification 完成，
+      plan.yaml state.completed_task_ids 自动包含该 task_id。
+      其他 workflow 的完成任务不会被错误同步。
+      daemon 启动和 CLI 入口路径不受影响。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py tests/test_workflow_state.py -x -q"
+      checks:
+        - name: "modules import cleanly"
+          command: "python -c \"from cccc.cli.workflow_cmds import cmd_workflow_submit; from cccc.daemon.ralph_ipc_handler import handle_ralph_register_and_suggest; from cccc.ralph.plan_io import sync_plan_state; print('OK')\""
+          required: true
+        - name: "daemon server imports cleanly"
+          command: "python -c \"import cccc.daemon.server; print('OK')\""
+          required: true
+        - name: "existing workflow tests pass"
+          command: "python -m pytest tests/test_foreman_workflow.py -x -q"
+          required: true
+      covers:
+        tasks: ["T1"]
+        flows:
+          - "daemon_startup"
+          - "cli_workflow"
+    provides:
+      - name: plan_auto_sync
+        kind: data_flow
+        schema_hint: "plan.yaml auto-synced after task verification"
+    consumes: []
+    addresses: ["FIX-13"]
+
+  # === T2: FIX-21 — Foreman 提示词更新 ===
+
+  - id: T2
+    title: "Foreman 提示词补充 ralph --group 参数和 checks 质量要求"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/prompt_files.py"
+    awareness_paths:
+      - "src/cccc/kernel/system_prompt.py"
+    depends_on: []
+    goal_behavior: >
+      1. 在 prompt_files.py 的 _build_default_preamble_body() 的 "Ralph workflow:" 段落中，
+         在 "Peer workers execute assigned scope..." 行之后、"Coordination checklist:" 段之前，
+         追加以下文本块（单独一个段落）：
+
+         Ralph CLI integration:
+         - After creating a plan, validate it: `ralph validate plan.yaml --project-root . --group GROUP_ID`
+           (writes plan_validated event to the ledger for audit trail).
+         - To sync plan state from the ledger: `ralph sync-state plan.yaml --group GROUP_ID`
+           (prefer this over manual `ralph complete` calls).
+         - Verification quality: every task's verification.checks MUST cover each point in acceptance_criteria.
+           Compile/import checks only prove syntax — if acceptance requires CRUD, checks must include
+           actual API calls or pytest tests that verify each endpoint exists.
+
+      2. 不修改 system_prompt.py _role_policy_lines。
+    acceptance_criteria: >
+      _build_default_preamble_body() 返回的文本包含 '--group GROUP_ID'（至少两次，
+      分别用于 validate 和 sync-state）和 'acceptance_criteria' 关键词。
+    verification:
+      level: unit
+      command: "python -c \"from cccc.kernel.prompt_files import _build_default_preamble_body; body = _build_default_preamble_body(); assert body.count('--group GROUP_ID') >= 2; assert 'acceptance_criteria' in body; print('OK')\""
+      checks:
+        - name: "prompt body contains group param and checks quality"
+          command: "python -c \"from cccc.kernel.prompt_files import _build_default_preamble_body; body = _build_default_preamble_body(); assert body.count('--group GROUP_ID') >= 2, 'missing --group'; assert 'acceptance_criteria' in body, 'missing checks quality'; print('OK')\""
+          required: true
+      covers:
+        tasks: ["T2"]
+    provides:
+      - name: foreman_prompt_ralph_group
+        kind: documentation
+        schema_hint: "Foreman prompt includes --group param and checks quality"
+    consumes: []
+    addresses: ["FIX-21"]
+
+  # === T3: FIX-22 + FIX-23 + FIX-24 — orchestrator 三项修复 ===
+
+  - id: T3
+    title: "orchestrator 修复：resuggest 排除 ASSIGNED + assigned_by 填充 + monitor 动态 actors"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+      - "src/cccc/kernel/actors.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      FIX-22 (resuggest, Codex C1):
+      1. 在 _resuggest_ready_tasks() (~line 1252) 中，将 ASSIGNED 加入 continue 分支
+         （与 BLOCKED/DEFERRED 同组），不进入 remaining_refs。
+         注意：不加入 running_write_sets——ASSIGNED 任务尚未开始写文件，不算 active conflict。
+         remaining_refs 只保留 PLANNED 和 READY 状态的任务。
+
+      FIX-23 (assigned_by, Codex C2):
+      2. 在 process_batch_suggestion() 构造 approved_assignments (~line 389) 时，
+         为每个 assignment dict 添加：
+         - "assigned_by": 通过已有 find_foreman(self.group) 获取 foreman actor_id
+         - "assigned_at": time.time()
+         使用方法：在 approved_assignments 循环前获取一次 foreman_id：
+           foreman_actor = find_foreman(load_group(self.group_id) or self.group)
+           foreman_id = str(foreman_actor.get("id") or "") if foreman_actor else ""
+         然后每个 dict 添加 "assigned_by": foreman_id, "assigned_at": time.time()。
+         Engine approve_batch() 已有读取这两个字段的逻辑 (~line 87-89)。
+
+      FIX-24 (monitor):
+      3. 在 __init__ (~line 195) 中，create_unauthorized_subagent_hook 的
+         known_actors_fn lambda 改为：
+         lambda: {str(a.get("actor_id") or a.get("id") or "")
+                  for a in ((load_group(self.group_id) or self.group).doc.get("actors") or [])}
+         每次 hook 执行时 load_group 获取最新 group 文档。
+    acceptance_criteria: >
+      resuggest 通知只包含 PLANNED/READY 任务（ASSIGNED 排除，不加入 running_write_sets）；
+      batch_approved 事件含非空 assigned_by（等于 find_foreman 返回的 actor_id）和 assigned_at；
+      actor add 创建的新 actor 不触发 unauthorized_subagent violation。
+    failure_path: >
+      如果 load_group 在 hot path 中产生性能问题，可改为在 actor_add 成功后
+      通过 event 通知 orchestrator 刷新 group 引用。当前规模下直接读取即可。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py tests/test_workflow_state.py -x -q"
+      checks:
+        - name: "assigned_by and find_foreman used"
+          command: "grep -q 'assigned_by' src/cccc/daemon/foreman/workflow_orchestrator.py && grep -q 'find_foreman' src/cccc/daemon/foreman/workflow_orchestrator.py"
+          required: true
+        - name: "load_group used for dynamic actors"
+          command: "grep -q 'load_group' src/cccc/daemon/foreman/workflow_orchestrator.py"
+          required: true
+        - name: "existing workflow tests pass"
+          command: "python -m pytest tests/test_foreman_workflow.py tests/test_workflow_state.py -x -q"
+          required: true
+      covers:
+        tasks: ["T3"]
+    provides:
+      - name: clean_resuggest_notification
+        kind: behavior
+        schema_hint: "resuggest only includes PLANNED/READY tasks, ASSIGNED excluded without adding to running_write_sets"
+      - name: batch_approved_provenance
+        kind: data_field
+        schema_hint: "batch_approved event contains assigned_by (from find_foreman) + assigned_at"
+      - name: dynamic_actor_recognition
+        kind: behavior
+        schema_hint: "monitor hook reads latest group doc via load_group on each invocation"
+    consumes:
+      - name: plan_auto_sync
+        from_task: T1
+    addresses: ["FIX-22", "FIX-23", "FIX-24"]
+
+  # === T4: 集成验证 — Batch G2 全覆盖 ===
+
+  - id: T4
+    title: "集成验证：新增 pytest 用例验证 Batch G2 全部五项修复"
+    role: integration
+    claimed_paths:
+      - "tests/test_foreman_workflow.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/prompt_files.py"
+      - "src/cccc/ralph/plan_io.py"
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    depends_on: ["T1", "T2", "T3"]
+    goal_behavior: >
+      在 tests/test_foreman_workflow.py 中新增以下测试用例：
+
+      1. test_plan_path_stored_and_auto_syncs:
+         通过 orchestrator.register_and_suggest() 传入 plan_path=<临时 plan.yaml>，
+         然后模拟 on_task_completed 调用。验证 plan.yaml 的 state.completed_task_ids
+         自动包含完成的 task_id。同时验证其他 workflow 的 task 不被错误同步。
+
+      2. test_resuggest_excludes_assigned_not_running_write_sets:
+         设置多任务 DAG，将 T-A 标为 ASSIGNED（通过 approve_batch）。
+         调用 _resuggest_ready_tasks()，mock ralph.suggest_ready_batch 捕获入参。
+         验证：remaining_refs 不含 T-A；running_write_sets 不含 T-A 的 claimed_paths。
+
+      3. test_batch_approved_has_assigned_by_from_find_foreman:
+         通过 process_batch_suggestion() 处理带 assignments 的 suggestion。
+         验证 engine 中 TaskState.assigned_by == group 的第一个 enabled actor id，
+         assigned_at 为合理时间戳。断言 approved["data"]["assignments"][0]["assigned_by"] 非空。
+
+      4. test_monitor_sees_dynamically_added_actor (Codex C6):
+         构造 orchestrator（group 含 actor-A），注册 task。
+         然后向 group 文件添加 actor-B（模拟 actor add）。
+         通过 engine 发 KIND_TASK_STARTED 事件（agent_id=actor-B）。
+         验证：hook 不抛 TransitionRejected，无 violation 记录。
+
+      5. test_prompt_contains_group_and_checks_quality:
+         调用 _build_default_preamble_body()，
+         assert body.count('--group GROUP_ID') >= 2,
+         assert 'acceptance_criteria' in body。
+    acceptance_criteria: >
+      5 个新测试全部通过；现有测试不受影响；
+      test 4 必须命中 KIND_TASK_STARTED 事件路径（非 completion）来验证 FIX-24。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_foreman_workflow.py -x -q"
+      checks:
+        - name: "all tests pass including new ones"
+          command: "python -m pytest tests/test_foreman_workflow.py -x -q"
+          required: true
+      covers:
+        tasks: ["T1", "T2", "T3", "T4"]
+    provides: []
+    consumes:
+      - name: plan_auto_sync
+        from_task: T1
+      - name: foreman_prompt_ralph_group
+        from_task: T2
+      - name: clean_resuggest_notification
+        from_task: T3
+      - name: batch_approved_provenance
+        from_task: T3
+      - name: dynamic_actor_recognition
+        from_task: T3
+    addresses: ["FIX-13", "FIX-21", "FIX-22", "FIX-23", "FIX-24"]
+
+state:
+  completed_task_ids:
+    - T4
+    - T3
+    - T2
+    - T1

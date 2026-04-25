@@ -67,16 +67,16 @@ class TestWebBindPreflight(unittest.TestCase):
         return td, cleanup
 
     def test_in_use_port_reports_clear_message(self) -> None:
-        from cccc.ports.web.bind_preflight import ensure_tcp_port_bindable
+        from cccc.ports.web import bind_preflight
 
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.bind(("127.0.0.1", 0))
-        port = int(listener.getsockname()[1])
-        try:
+        port = 8848
+        with patch.object(
+            bind_preflight.socket,
+            "getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", port))],
+        ), patch.object(bind_preflight.socket, "socket", return_value=_AddrInUseSocket()):
             with self.assertRaises(RuntimeError) as ctx:
-                ensure_tcp_port_bindable(host="127.0.0.1", port=port)
-        finally:
-            listener.close()
+                bind_preflight.ensure_tcp_port_bindable(host="127.0.0.1", port=port)
 
         message = str(ctx.exception)
         self.assertIn(f"Web port {port} is unavailable", message)

@@ -150,6 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_actor_add.add_argument("--submit", choices=["enter", "newline", "none"], default="enter", help="Submit key (default: enter)")
     p_actor_add.add_argument("--by", default="user", help="Requester (default: user)")
     p_actor_add.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_actor_add.add_argument("--worker-prompt", default="", help="Worker system prompt override")
     p_actor_add.set_defaults(func=cmd_actor_add)
 
     p_actor_rm = actor_sub.add_parser("remove", help="Remove an actor")

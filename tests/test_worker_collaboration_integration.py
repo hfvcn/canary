@@ -162,7 +162,14 @@ def test_completion_notifies_foreman(temp_home: Path, temp_project_dir: Path) ->
     with patch.object(orchestrator.reporter, "on_task_completed", return_value=True) as report_mock:
         assert orchestrator.on_task_completed("T1", "worker-1", 12, ["src/task.py"]) is True
 
-    report_mock.assert_called_once_with("T1", "worker-1", 12, ["src/task.py"], verification_checks=None)
+    report_mock.assert_called_once_with(
+        "T1",
+        "worker-1",
+        12,
+        ["src/task.py"],
+        verification_checks=None,
+        verification_outcome="passed",
+    )
     req = daemon_request_fn.call_args.args[0]
     assert req.op == "send"
     assert req.args["to"] == ["@foreman"]

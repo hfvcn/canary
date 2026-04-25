@@ -152,9 +152,23 @@ class TestPhasedSubmission(unittest.TestCase):
                 self.assertEqual(result["submitted"], 2)
                 self.assertEqual(captured_batches, [["T1", "T3"]])
 
-                tracked_tasks = orchestrator._active_workflows["wf-phased"]["tasks"]
-                tracked_tasks["T1"]["status"] = TASK_STATUS_COMPLETED
-                tracked_tasks["T3"]["status"] = TASK_STATUS_RUNNING
+                # RO-26: drive state via engine (single truth source) instead
+                # of mutating shadow state directly.
+                engine = orchestrator.engine
+                # Move T1 through assigned -> running -> completed
+                engine.register_batch("b-T1", ["T1"])
+                engine.approve_batch("b-T1", [{"task_id": "T1", "agent_id": "w1", "claimed_paths": ["src/a.py"]}])
+                engine.report_worker_started("T1", "w1")
+                engine.report_worker_completion("T1", {"agent_id": "w1", "duration_seconds": 0, "changed_files": []})
+                from cccc.contracts.v1.ralph_ipc import VerificationResult
+                engine.record_verification_result("T1", VerificationResult(
+                    verification_id="v-T1", workflow_id="wf-phased", task_id="T1",
+                    overall_outcome="passed", checks=[], warnings=[], summary="ok",
+                ))
+                # Move T3 through assigned -> running
+                engine.register_batch("b-T3", ["T3"])
+                engine.approve_batch("b-T3", [{"task_id": "T3", "agent_id": "w2", "claimed_paths": ["src/c.py"]}])
+                engine.report_worker_started("T3", "w2")
 
                 # ARCH-3: resuggest should notify, not auto-process
                 orchestrator._resuggest_ready_tasks("wf-phased")

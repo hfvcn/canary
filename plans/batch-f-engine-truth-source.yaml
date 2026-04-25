@@ -1,0 +1,435 @@
+# Batch F: Engine 读路径 Phase 2 + metadata 验证 + plan sync
+# 可验证结论: "metadata 端到端可验证、assignment provenance 写入 engine、resuggest 主路径读 engine、plan state 可同步"
+#
+# 对应问题清单: ARCH-4 Phase 2 (P1) + ARCH-10 基础 (P0) + FIX-13 (P1) + FIX-17 (P1) + FIX-18 (P0)
+# Finding 对照: #2(按文件拆→死代码) #3(讨论精细度≠验证粗糙度)
+#
+# 依赖: Batch E 已完成（ARCH-12/ARCH-9/FIX-16, 6 tasks, 121 tests）
+# 验证方法: task_registered 事件含 verification.checks；get_workflow_state 读 engine；resuggest 不读 shadow
+#
+# 设计决策:
+# 1. ARCH-10 本批只做基础设施（schema_version + snapshot），完整迁移脚本/rollback drill 留 Phase 4
+# 2. FIX-18 管道代码链路完整（Codex 审查确认），T2 改为验证确认+补覆盖测试，非修断点
+# 3. ARCH-4 只做 Phase 2（最小 assignment provenance 写入 engine），不删 _active_workflows
+# 4. FIX-17 将 _resuggest_ready_tasks 从 shadow 切到 engine.list_tasks()
+# 5. FIX-13 提供 ralph sync-state 命令（从 ledger 同步到 plan.yaml），不做 daemon 自动回写
+
+tasks:
+  # === T1: ARCH-10 基础 — schema_version + ledger snapshot ===
+
+  - id: T1
+    title: "Ledger 事件 schema_version 字段 + ledger snapshot 命令"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/ledger.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/contracts/v1/event.py"
+    depends_on: []
+    goal_behavior: >
+      1. 修改 append_event()（ledger.py line 63-102）：
+         在构建 Event 之前，向 payload（normalize 后的 data dict）注入
+         "schema_version": 1。这样每个新写入的 ledger 事件都带版本标记。
+         不修改 Event 模型——schema_version 只是 data dict 中的一个字段。
+      2. 新增 snapshot_ledger(ledger_path: Path, snapshot_dir: Path) -> Path 函数：
+         - 创建 snapshot_dir（如果不存在）
+         - 将 ledger_path 复制到 snapshot_dir/ledger-{timestamp}.jsonl
+         - 返回 snapshot 文件路径
+         - 用于 Phase 4 部署前的物理快照
+      3. replay_from_ledger 无需修改——它读 data dict，schema_version 只是一个额外字段，
+         对现有 _apply_* handler 透明（向后兼容）。
+         旧事件无 schema_version，新事件有 schema_version=1。
+    acceptance_criteria: >
+      新写入的 ledger 事件 data 中包含 schema_version: 1；
+      旧事件（无 schema_version）replay 仍正常；
+      snapshot_ledger 创建正确的副本文件；
+      现有测试不受影响。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'schema_version or snapshot'"
+      covers:
+        tasks: ["T1"]
+    provides:
+      - name: ledger_schema_version
+        kind: module
+        schema_hint: "schema_version=1 in all new events + snapshot utility"
+    addresses: ["ARCH-10"]
+
+  # === T2: FIX-18 — metadata 全链路透传验证 + 修复 ===
+
+  - id: T2
+    title: "FIX-18 metadata 端到端验证测试 + 边缘路径修复（如有）"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_metadata_passthrough.py"
+    awareness_paths:
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+      - "src/cccc/ralph/models.py"
+      - "src/cccc/cli/workflow_cmds.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    depends_on: []
+    goal_behavior: >
+      **背景（Codex 审查确认）：**
+      代码链路已完整：TaskSpec.to_task_ref() 映射全字段 → CLI model_dump() →
+      daemon handler Pydantic 解析 → orchestrator register → engine 存储。
+      verify_completion() 已按 checks → command → verification_command 解析。
+      T2 的任务是**用测试证明**管道可用，并修复任何边缘路径（如有）。
+
+      **写 E2E 验证测试（新文件 tests/e2e/test_metadata_passthrough.py）：**
+      1. test_taskref_preserves_all_metadata_fields：
+         - 构造含 goal_behavior、acceptance_criteria、verification（带 checks）、
+           provides、consumes、addresses 的 TaskRef
+         - 调用 engine.register_task()
+         - 断言 engine.get_task(tid).task.goal_behavior 非空
+         - 断言 engine.get_task(tid).task.verification.checks 非空
+         - 读 ledger 中 task_registered 事件，断言 data 含这些字段
+      2. test_taskref_roundtrip_via_model_dump：
+         - TaskRef → model_dump() → TaskRef.model_validate() 往返
+         - 断言所有字段保留（verification.checks 长度一致）
+      3. test_verify_completion_executes_structured_checks：
+         - 构造含 verification.checks 的 task_ref（check command = "true"）
+         - 调用 ralph_service.verify_completion 或等价逻辑
+         - 断言返回 VerificationResult 的 checks 非空
+      4. test_verify_completion_skips_when_no_checks：
+         - 构造 verification=None 的 task_ref
+         - verify_completion 应返回 skipped
+      5. test_metadata_survives_replay：
+         - register_task with full metadata → replay → metadata preserved
+    acceptance_criteria: >
+      5 个测试场景通过：metadata 在 engine 中保留、ledger 中保留、
+      model_dump 往返一致、verify_completion 执行 checks、replay 后保留。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/e2e/test_metadata_passthrough.py -q --tb=short"
+      covers:
+        tasks: ["T2"]
+    provides:
+      - name: metadata_passthrough_verified
+        kind: runtime_capability
+        schema_hint: "Full TaskRef metadata flows plan→engine; verify gate executes checks"
+    addresses: ["FIX-18"]
+
+  # === T3: ARCH-4 Phase 2 — assignment provenance 写入 engine ===
+
+  - id: T3
+    title: "TaskState 扩展 assigned_by + assigned_at，approve_batch 写入"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      1. TaskState（workflow_state_types.py line 42-55）新增字段：
+         - assigned_by: str = ""  # "foreman" | "system" | actor_id
+         - assigned_at: Optional[float] = None  # unix timestamp
+      2. 修改 approve_batch()（workflow_state_engine.py line 70-96）：
+         从 assignment dict 中读取 assigned_by 和 assigned_at（如果存在）：
+         assigned_by = str(a.get("assigned_by") or "").strip()
+         assigned_at_val = a.get("assigned_at")  # float or None
+         写入 TaskState：
+         self._tasks[tid] = replace(prev, ..., assigned_by=assigned_by,
+                                    assigned_at=assigned_at_val or time.time())
+      3. 修改 _apply_batch_approved()（replay handler）：
+         从 assignment data 读取 assigned_by, assigned_at，
+         设入 TaskState。旧事件无此字段时使用默认值（""和 None）。
+      4. 修改 _normalize_assignment()：当前实现只保留白名单字段
+         （task_id/agent_id/attempt_id/claimed_paths）。必须将 assigned_by 和
+         assigned_at 加入白名单，否则这些字段在 normalize 阶段被丢弃。
+         （Codex 审查修正：原计划误认为"已保留所有 key"）
+      5. assigned_at 处理：使用 assigned_at if assigned_at is not None else time.time()
+         而非 assigned_at or time.time()（避免 0.0 被当作 falsy）。
+    acceptance_criteria: >
+      TaskState 有 assigned_by 和 assigned_at 字段；
+      approve_batch 写入 assigned_by 和 assigned_at 到 TaskState 和 ledger；
+      replay 后 assigned_by 和 assigned_at 正确恢复；
+      旧 ledger 事件（无此字段）replay 不报错，使用默认值。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'assigned_by or assigned_at or assignment_provenance'"
+      covers:
+        tasks: ["T3"]
+    consumes:
+      - name: ledger_schema_version
+        from: T1
+    provides:
+      - name: engine_assignment_provenance
+        kind: module
+        schema_hint: "TaskState.assigned_by + assigned_at, written by approve_batch, restored by replay"
+    addresses: ["ARCH-4"]
+
+  # === T4: ARCH-4 Phase 2 cont — get_workflow_state 读 engine ===
+
+  - id: T4
+    title: "get_workflow_state 优先读 engine，shadow 作 fallback"
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+    depends_on: ["T3"]
+    goal_behavior: >
+      修改 get_workflow_state()（workflow_orchestrator.py line 1961-2008）：
+      1. assignments 列表改为优先从 engine 构建：
+         - 遍历 engine.list_tasks()，对每个 TaskState 构建 assignment dict：
+           {"task_id": ts.task.id, "title": ts.task.title, "status": ts.status.value,
+            "agent_id": ts.agent_id, "assigned_by": ts.assigned_by,
+            "assigned_at": ts.assigned_at, "attempt_id": ts.attempt_id,
+            "claimed_paths": ts.task.claimed_paths, "batch_id": ts.batch_id}
+         - 从 shadow state 补充 engine 中不存在的字段（如 changed_files、duration_seconds）：
+           如果 wf_id in _active_workflows 且 task_id in tasks:
+             合并 shadow 的 duration_seconds、changed_files、error_message
+      2. task snapshot 统计也从 engine 计算：
+         - total/completed/failed/running/pending/deferred 从 engine task statuses 聚合
+      3. 添加注释标记哪些数据来自 engine vs shadow：
+         # Engine-authoritative: status, agent_id, assigned_by, assigned_at, attempt_id
+         # Shadow-supplement: duration_seconds, changed_files, error_message
+         # TODO: Batch I — move remaining shadow data to engine
+    acceptance_criteria: >
+      get_workflow_state 返回的 assignments 中包含 assigned_by 和 assigned_at；
+      status 来源于 engine（权威）而非 shadow；
+      engine 无数据时 graceful fallback 到 shadow（不崩溃）；
+      daemon 重启后 get_workflow_state 仍返回正确数据（来自 engine replay）。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_workflow_state.py tests/test_foreman_workflow.py -q --tb=short -k 'workflow_state or get_state'"
+      covers:
+        tasks: ["T3", "T4"]
+    consumes:
+      - name: engine_assignment_provenance
+        from: T3
+    provides:
+      - name: engine_authoritative_state
+        kind: runtime_capability
+        schema_hint: "get_workflow_state reads engine first, shadow supplements"
+    addresses: ["ARCH-4"]
+
+  # === T5: FIX-17 — resuggest 从 engine 读 ===
+
+  - id: T5
+    title: "_resuggest_ready_tasks 改读 engine，不依赖 _active_workflows task 数据"
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+    depends_on: ["T4"]
+    goal_behavior: >
+      修改 _resuggest_ready_tasks()（workflow_orchestrator.py line 1126-1182）：
+      1. 不再从 self._active_workflows[workflow_id]["tasks"] 读取数据。
+         改为从 engine.list_tasks() 获取所有 TaskState。
+      2. 构建 remaining_refs 和 running_write_sets：
+         for ts in self.engine.list_tasks():
+             if ts.workflow_id != workflow_id: continue
+             if ts.status == COMPLETED: continue
+             if ts.status == RUNNING:
+                 running_write_sets.append(list(ts.task.claimed_paths or []))
+                 continue
+             if ts.status in (BLOCKED, DEFERRED): continue
+             remaining_refs.append(ts.task)  # TaskRef from engine
+      3. 保留后续逻辑不变：
+         - 调用 self.ralph.suggest_ready_batch(remaining_refs, running_write_sets, workflow_id)
+         - 通知 Foreman
+      4. 唯一仍需 shadow 的：workflow_id 的发现（line 1127 的 if check）。
+         添加 fallback: 如果 workflow_id not in _active_workflows，
+         尝试从 engine.list_tasks() 推导 workflow_id（取第一个 task 的 workflow_id）。
+    acceptance_criteria: >
+      _resuggest_ready_tasks 在 _active_workflows 无任务数据时仍能工作；
+      remaining_refs 和 running_write_sets 从 engine 正确构建；
+      DAG 下游任务就绪时 Foreman 仍收到通知。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_workflow_state.py tests/test_foreman_workflow.py tests/test_workflow_e2e_closure.py -q --tb=short -k 'resuggest or ready_tasks'"
+      covers:
+        tasks: ["T5"]
+    consumes:
+      - name: engine_authoritative_state
+        from: T4
+    provides:
+      - name: resuggest_engine_backed
+        kind: runtime_capability
+        schema_hint: "_resuggest_ready_tasks reads engine, not shadow task data"
+    addresses: ["FIX-17"]
+
+  # === T6: FIX-13 — ralph sync-state 命令 ===
+
+  - id: T6
+    title: "ralph sync-state 命令：从 ledger 同步 completed_task_ids 到 plan.yaml"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/cli.py"
+      - "src/cccc/ralph/plan_io.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/ledger.py"
+    depends_on: []
+    goal_behavior: >
+      1. 在 plan_io.py 新增 sync_plan_state(plan_path: Path, ledger_path: Path) -> int：
+         - 从 ledger 读取所有 workflow.verification_passed 和 workflow.verification_skipped 事件
+         - 提取 task_id 列表（这些 task 已通过/跳过验证 = completed）
+         - 对每个 task_id 调用 save_plan_state(plan_path, task_id)
+         - 返回新增的 completed count
+      2. 在 ralph CLI（cli.py）新增 sync-state 子命令：
+         ralph sync-state plan.yaml --ledger PATH_TO_LEDGER
+         或 ralph sync-state plan.yaml --group GROUP_ID
+         - --ledger: 直接指定 ledger 文件路径
+         - --group: 从 group config 推导 ledger 路径
+         - 调用 sync_plan_state()
+         - 输出同步结果："Synced N tasks to plan.yaml"
+      3. 如果 group_id 提供但无 --ledger：
+         使用 load_group(group_id).ledger_path 获取 ledger 路径。
+         不要手拼路径或读 group.doc——使用 kernel/group.py 的正式 API。
+         （Codex 审查修正：原计划方案会平行复制路径推导逻辑）
+    acceptance_criteria: >
+      ralph sync-state plan.yaml --ledger path 正确同步 completed_task_ids；
+      已在 plan 中的 task 不重复添加（幂等）；
+      sync 后 ralph suggest plan.yaml 不再显示已完成的 task 为 ready。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'sync_state or sync_plan'"
+      covers:
+        tasks: ["T6"]
+    provides:
+      - name: plan_state_sync
+        kind: cli_command
+        schema_hint: "ralph sync-state syncs completed_task_ids from ledger to plan.yaml"
+    addresses: ["FIX-13"]
+
+  # === T7: E2E 验证 ===
+
+  - id: T7
+    title: "E2E 验证：metadata 透传 + assignment provenance + resuggest + plan sync"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_batch_f_engine_truth.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/foreman/ralph_service.py"
+      - "src/cccc/ralph/plan_io.py"
+      - "src/cccc/kernel/ledger.py"
+    depends_on: ["T2", "T4", "T5", "T6"]
+    goal_behavior: >
+      新建 tests/e2e/test_batch_f_engine_truth.py：
+
+      **ARCH-10 schema version：**
+      1. test_new_events_have_schema_version：
+         - 创建 engine，注册 task，approve batch
+         - 读 ledger 逐行解析
+         - 断言所有新事件 data 中含 schema_version: 1
+      2. test_old_events_without_schema_version_replay：
+         - 手动写入无 schema_version 的旧格式事件到 ledger
+         - replay_from_ledger 成功，状态正确
+
+      **FIX-18 metadata：**
+      3. test_task_registered_contains_metadata：
+         - 创建含 goal_behavior + verification.checks 的 TaskRef
+         - engine.register_task()
+         - 读 ledger 中 task_registered 事件
+         - 断言 data.task.goal_behavior 非空
+         - 断言 data.task.verification.checks 非空
+      4. test_full_pipeline_metadata_passthrough：
+         - 模拟 CLI → handler → orchestrator → engine 全链路
+         - 断言 engine.get_task(tid).task.goal_behavior 非空
+
+      **ARCH-4 assignment provenance：**
+      5. test_approve_batch_records_provenance：
+         - approve_batch(assignments=[{..., assigned_by: "foreman", assigned_at: 1234}])
+         - 断言 engine.get_task(tid).assigned_by == "foreman"
+         - 断言 engine.get_task(tid).assigned_at == 1234
+      6. test_provenance_survives_replay：
+         - approve_batch with provenance → replay → provenance preserved
+      7. test_get_workflow_state_reads_engine：
+         - approve_batch with provenance
+         - 调用 get_workflow_state (如果集成测试可用)
+         - 断言返回的 assignments 中含 assigned_by
+
+      **FIX-17 resuggest：**
+      8. test_resuggest_from_engine_not_shadow：
+         - 注册 DAG tasks 到 engine（A→B, A→C）
+         - 不写入 _active_workflows
+         - 完成 task A
+         - _resuggest_ready_tasks 应发现 B, C 就绪
+         - （可能需要 mock ralph.suggest_ready_batch）
+
+      **FIX-13 plan sync：**
+      9. test_sync_plan_state_from_ledger：
+         - 写入含 verification_passed 事件的 ledger
+         - 创建 plan.yaml 含 state.completed_task_ids: []
+         - 调用 sync_plan_state()
+         - 断言 plan.yaml 的 completed_task_ids 包含通过验证的 task
+
+      **Ledger snapshot：**
+      10. test_snapshot_ledger_creates_copy：
+          - 写入几条事件
+          - snapshot_ledger()
+          - 断言 snapshot 文件存在且内容与原始一致
+    acceptance_criteria: >
+      10 个场景全部通过。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/e2e/test_batch_f_engine_truth.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]
+        flows:
+          - "metadata_full_pipeline"
+          - "assignment_provenance_lifecycle"
+          - "resuggest_engine_backed"
+          - "plan_state_sync"
+          - "no_shadow_dependency_in_resuggest"
+
+critical_entrypoints:
+  - src/cccc/kernel/workflow_state_engine.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - src/cccc/daemon/ralph_ipc_handler.py
+
+critical_flows:
+  - id: metadata_full_pipeline
+    description: "plan.yaml → TaskSpec.to_task_ref() → CLI → daemon handler → orchestrator → engine.register_task → task_registered event with goal_behavior + verification.checks"
+    entrypoints:
+      - "src/cccc/daemon/ralph_ipc_handler.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    required_verification_level: e2e
+  - id: assignment_provenance_lifecycle
+    description: "approve_batch with assigned_by/assigned_at → engine stores → ledger records → replay restores → get_workflow_state returns"
+    entrypoints:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    required_verification_level: e2e
+  - id: resuggest_engine_backed
+    description: "_resuggest_ready_tasks reads engine.list_tasks() not _active_workflows for task data"
+    entrypoints:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    required_verification_level: e2e
+  - id: plan_state_sync
+    description: "ralph sync-state reads ledger verification events → updates plan.yaml completed_task_ids"
+    entrypoints:
+      - "src/cccc/ralph/cli.py"
+    required_verification_level: e2e
+
+forbidden_flows:
+  - id: no_shadow_dependency_in_resuggest
+    description: "_resuggest_ready_tasks MUST NOT read task_ref or status from _active_workflows"
+    required_verification_level: e2e
+
+required_issues:
+  - "ARCH-4"
+  - "ARCH-10"
+  - "FIX-13"
+  - "FIX-17"
+  - "FIX-18"
+
+suppress_codes:
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+
+state:
+  completed_task_ids: ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]
+  running_tasks: []
+  failed_task_ids: []

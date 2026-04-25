@@ -112,7 +112,21 @@ def _build_verification_error(task_id: str, workflow_id: str, exc: Exception) ->
     )
 
 
-def complete_task(group_id, task_id, agent_id, changed_files, evidence, workflow_id, project_root, daemon_request_fn, *, assignment_id="", actor_run_id="", override_stale_digest=False):
+def complete_task(
+    group_id,
+    task_id,
+    agent_id,
+    changed_files,
+    evidence,
+    workflow_id,
+    project_root,
+    daemon_request_fn,
+    *,
+    assignment_id="",
+    actor_run_id="",
+    override_stale_digest=False,
+    attempt_id="",
+):
     try:
         orchestrator = _get_orchestrator_or_raise(group_id, project_root, daemon_request_fn)
         _get_state_or_raise(orchestrator, task_id, workflow_id)
@@ -125,6 +139,7 @@ def complete_task(group_id, task_id, agent_id, changed_files, evidence, workflow
                 "duration_seconds": DEFAULT_DURATION_SECONDS,
                 "changed_files": _normalize_changed_files(changed_files),
                 "evidence": evidence,
+                "attempt_id": str(attempt_id or "").strip(),
                 "assignment_id": str(assignment_id or "").strip(),
                 "actor_run_id": str(actor_run_id or "").strip(),
             },
@@ -225,7 +240,10 @@ def verify_task(group_id, task_id, workflow_id, project_root, daemon_request_fn)
 
         orchestrator.engine.record_verification_result(normalized_task_id, verification)
         notification_error = ""
-        if verification.overall_outcome in ("passed", "skipped"):
+        if verification.overall_outcome == "agent_pending":
+            # RA-3: agent verification — task stays in VERIFYING, just notify
+            notification_outcome = "agent_pending"
+        elif verification.overall_outcome == "passed":
             orchestrator.on_task_completed(
                 task_id=normalized_task_id,
                 agent_id=agent_id,
@@ -234,7 +252,20 @@ def verify_task(group_id, task_id, workflow_id, project_root, daemon_request_fn)
                 workflow_id=state.workflow_id,
                 verification=verification,
             )
-            notification_outcome = verification.overall_outcome  # preserves "passed" or "skipped"
+            notification_outcome = "passed"
+        elif verification.overall_outcome == "skipped":
+            error_msg = (
+                "Verification skipped: no commands configured. "
+                "Add verification commands or use force_complete_unverified()."
+            )
+            orchestrator.on_task_failed(
+                task_id=normalized_task_id,
+                error_message=error_msg,
+                agent_name=agent_id,
+                verification=verification,
+            )
+            notification_outcome = "skipped"
+            notification_error = error_msg
         else:
             orchestrator.on_task_failed(
                 task_id=normalized_task_id,

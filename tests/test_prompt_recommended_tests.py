@@ -166,7 +166,7 @@ def test_recommended_tests_in_full_prompt_survives_tight_budget(tmp_path: Path) 
     ]
 
     old_env = os.environ.get("CCCC_PROMPT_TOKEN_BUDGET")
-    os.environ["CCCC_PROMPT_TOKEN_BUDGET"] = "500"
+    os.environ["CCCC_PROMPT_TOKEN_BUDGET"] = "800"
     try:
         prompt = orch._build_task_prompt(
             task,

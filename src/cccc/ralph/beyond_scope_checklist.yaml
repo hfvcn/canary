@@ -1,0 +1,39 @@
+# Beyond-scope checklist — items that Ralph's static validation cannot fully verify.
+# These are passed to Ralph Agent (RA-1) for semantic review.
+# Source: todo/问题清单-v5-ralph.md § 二 已知局限 (marked 🤖 可覆盖)
+
+items:
+  - id: RV-15
+    pattern: ".*"  # meta-rule: Ralph cannot self-check its own rule bugs
+    description: "Ralph 新规则自身的 bug 无法自检"
+    match_type: manual  # Agent reviews all validate output for rule consistency
+
+  - id: RV-18
+    pattern: "goal_behavior"
+    description: "goal_behavior 中引用的函数名可能不存在"
+    match_type: field_content  # Agent checks if referenced symbols exist
+
+  - id: RV-19
+    pattern: "awareness_paths"
+    description: "模型扩展可能破坏已有语义（awareness_paths 案例）"
+    match_type: field_content
+
+  - id: RV-20
+    pattern: "monitor"
+    description: "monitor wiring 调用位置可行性无法静态验证"
+    match_type: field_content
+
+  - id: RO-10n
+    pattern: "W_VERIFICATION"
+    description: "verification 命令强度无法检测连接级/运行时语义 bug"
+    match_type: code_prefix  # Agent reviews verification commands for runtime coverage
+
+  - id: RO-11n
+    pattern: "claimed_paths"
+    description: "计划中'删除函数'的副作用链无法静态检测"
+    match_type: field_content
+
+  - id: RO-12n
+    pattern: "claimed_paths"
+    description: "同一文件多入口只覆盖部分时 Ralph 不报警"
+    match_type: field_content

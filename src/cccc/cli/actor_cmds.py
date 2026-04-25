@@ -79,6 +79,7 @@ def cmd_actor_add(args: argparse.Namespace) -> int:
             if not k:
                 continue
             env[k] = v
+    worker_prompt = str(getattr(args, "worker_prompt", "") or "").strip()
     default_scope_key = ""
     if args.scope:
         default_scope_key = detect_scope(Path(args.scope)).scope_key
@@ -102,7 +103,9 @@ def cmd_actor_add(args: argparse.Namespace) -> int:
                     "by": by,
                     "command": command,
                     "env": env,
+                    "worker_prompt": worker_prompt,
                     "default_scope_key": default_scope_key,
+                    "start": True,
                 },
             }
         )
@@ -125,6 +128,7 @@ def cmd_actor_add(args: argparse.Namespace) -> int:
             title=title,
             command=command,
             env=env,
+            worker_prompt=worker_prompt,
             default_scope_key=default_scope_key,
             submit=submit,
             runner=runner,  # type: ignore
@@ -134,7 +138,8 @@ def cmd_actor_add(args: argparse.Namespace) -> int:
         _print_json({"ok": False, "error": {"code": "actor_add_failed", "message": str(e)}})
         return 2
     ev = append_event(group.ledger_path, kind="actor.add", group_id=group.group_id, scope_key="", by=by, data={"actor": actor})
-    _print_json({"ok": True, "result": {"actor": actor, "event": ev}})
+    start_ev = append_event(group.ledger_path, kind="actor.start", group_id=group.group_id, scope_key="", by=by, data={"actor_id": actor_id, "runner": runner, "runner_effective": None})
+    _print_json({"ok": True, "result": {"actor": actor, "event": ev, "start_event": start_ev, "running": True}})
     return 0
 
 def cmd_actor_remove(args: argparse.Namespace) -> int:
@@ -185,7 +190,7 @@ def cmd_actor_start(args: argparse.Namespace) -> int:
         return 2
     try:
         require_actor_permission(group, by=by, action="actor.start", target_actor_id=actor_id)
-        actor = update_actor(group, actor_id, {"enabled": True})
+        actor = update_actor(group, actor_id, {"enabled": True, "desired_state": "running"})
     except Exception as e:
         _print_json({"ok": False, "error": {"code": "actor_start_failed", "message": str(e)}})
         return 2
@@ -213,7 +218,7 @@ def cmd_actor_stop(args: argparse.Namespace) -> int:
         return 2
     try:
         require_actor_permission(group, by=by, action="actor.stop", target_actor_id=actor_id)
-        actor = update_actor(group, actor_id, {"enabled": False})
+        actor = update_actor(group, actor_id, {"enabled": False, "desired_state": "stopped"})
     except Exception as e:
         _print_json({"ok": False, "error": {"code": "actor_stop_failed", "message": str(e)}})
         return 2

@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,建立真实 plan.yaml 验收真值文件,DONE,"SPEC/TODO/PROGRESS 已创建","test -f .codex-tasks/20260417-ralph-plan-yaml-smoke/SPEC.md && test -f .codex-tasks/20260417-ralph-plan-yaml-smoke/TODO.csv && test -f .codex-tasks/20260417-ralph-plan-yaml-smoke/PROGRESS.md",2026-04-17T00:00:00,0,任务从仓库测试改为真实 fixture 验收
+2,创建 plan.yaml fixture 与最小项目,DONE,"fixture/project/plan.yaml 与配套 src/tests 已存在","test -f .codex-tasks/20260417-ralph-plan-yaml-smoke/fixture/project/plan.yaml && test -f .codex-tasks/20260417-ralph-plan-yaml-smoke/fixture/project/src/app.py && test -f .codex-tasks/20260417-ralph-plan-yaml-smoke/fixture/project/tests/test_app.py",2026-04-17T00:00:00,0,fixture 项目与本地 .cccc/ralph.yaml 已写盘
+3,执行 Ralph CLI 与 orchestrator 直驱验收,DONE,"validate/diff/guard 均按时机生效","test -f .codex-tasks/20260417-ralph-plan-yaml-smoke/raw/summary.md",2026-04-17T00:00:00,0,基线 validate=0 变更后新增 2 个目标规则 完成时 stale digest 阻断生效
+4,建立边界场景矩阵,DONE,"边界场景与预期结果已写入 raw/boundary-summary.md","test -f .codex-tasks/20260417-ralph-plan-yaml-smoke/raw/boundary-summary.md",2026-04-17T00:00:00,0,已纳入 strict schema skip 分支 suppress lease diff audit runtime 最小探针
+5,执行 plan.yaml 边界与结果层边界验收,DONE,"边界场景命中预期且结论可复现","test -f .codex-tasks/20260417-ralph-plan-yaml-smoke/raw/boundary-artifacts.json",2026-04-17T00:00:00,0,所有边界断言通过 无新增失败项

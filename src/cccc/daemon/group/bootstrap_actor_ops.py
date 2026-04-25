@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from ...kernel.active import load_active
-from ...kernel.actors import list_actors
+from ...kernel.actors import list_actors, should_auto_start
 from ...kernel.group import load_group
 from ...util.conv import coerce_bool
 from ...runners import headless as headless_runner
@@ -82,7 +82,7 @@ def autostart_running_groups(
             actor_id = str(actor.get("id") or "").strip()
             if not actor_id:
                 continue
-            if not coerce_bool(actor.get("enabled"), default=True):
+            if not should_auto_start(actor):
                 continue
 
             if callable(resolve_linked_actor_before_start):

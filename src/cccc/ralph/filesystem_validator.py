@@ -7,6 +7,7 @@ import shlex
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from .covers_paths_validator import check_covers_paths_unverified
 from .graph_utils import transitive_deps
 from .models import Plan, TaskSpec, ValidationIssue
 from .workspace_index import WorkspaceIndex
@@ -41,7 +42,7 @@ def _load_issue_file_map_cached(path: Path) -> Dict[str, Any]:
         _issue_file_map_cache.pop(old_key, None)
     try:
         source = path.read_text(encoding="utf-8")
-    except (FileNotFoundError, UnicodeDecodeError):
+    except (FileNotFoundError, UnicodeDecodeError, IsADirectoryError):
         return {}
     result: Dict[str, Any] = {"_raw": source}
     _issue_file_map_cache[key] = result
@@ -87,25 +88,31 @@ def validate_filesystem(
         verification = task.verification
         if verification is None:
             continue
-        command = verification.command.strip()
-        if not command:
-            continue
+        issues.extend(check_covers_paths_unverified(task))
         projected = workspace.projected_paths(plan, task.id)
         # RV-24: upstream-only projected for self-verification detection
         upstream_projected = workspace.projected_paths(
             plan, task.id, include_self=False,
         )
-        issues.extend(
-            _check_verification_command(
-                command,
-                task.id,
-                projected,
-                workspace,
-                task.claimed_paths,
-                all_plan_claimed,
-                upstream_projected=upstream_projected,
+        commands: list[str] = []
+        if verification.command.strip():
+            commands.append(verification.command.strip())
+        for check in verification.checks:
+            command = check.command.strip()
+            if command and command not in commands:
+                commands.append(command)
+        for command in commands:
+            issues.extend(
+                _check_verification_command(
+                    command,
+                    task.id,
+                    projected,
+                    workspace,
+                    task.claimed_paths,
+                    all_plan_claimed,
+                    upstream_projected=upstream_projected,
+                )
             )
-        )
     issues.extend(_check_test_coverage_gaps(plan, project_root, workspace))
     issues.extend(_check_registration_invariants(plan, project_root, workspace))
     issues.extend(_check_unclaimed_tests_for_source(plan, project_root, workspace))
@@ -716,6 +723,8 @@ def _check_pytest(
         )]
 
     file_path, _, node_part = target.partition("::")
+    if Path(workspace.project_root / file_path).is_dir():
+        return []
     claims_target = any(
         file_path == cp or file_path.startswith(cp.rstrip("/") + "/") or cp == file_path
         for cp in claimed_paths
@@ -727,6 +736,7 @@ def _check_pytest(
     )
     path_issues = _check_path_target(
         file_path, task_id, projected, workspace,
+        emit_missing_file_error=True,
         upstream_projected=up_proj,
     )
     if path_issues:
@@ -803,6 +813,7 @@ def _check_path_target(
     projected: set[str],
     workspace: WorkspaceIndex,
     *,
+    emit_missing_file_error: bool = False,
     upstream_projected: Optional[Set[str]] = None,
 ) -> List[ValidationIssue]:
     if workspace.path_exists(rel_path):
@@ -813,6 +824,7 @@ def _check_path_target(
     covered_by_upstream = workspace.is_covered_by_projected(rel_path, up_proj)
     covered_by_any = workspace.is_covered_by_projected(rel_path, projected)
 
+    legacy_issue: ValidationIssue
     if covered_by_upstream:
         severity = "hint"
         message = f"task '{task_id}' references projected path '{rel_path}' that is not on disk yet"
@@ -827,13 +839,40 @@ def _check_path_target(
         severity = "warning"
         message = f"task '{task_id}' references missing path '{rel_path}'"
 
-    return [_issue(
+    legacy_issue = _issue(
         code="W_VERIFICATION_TARGET_MISSING",
         severity=severity,
         task_id=task_id,
         message=message,
         evidence={"target": rel_path},
-    )]
+    )
+    if (
+        not emit_missing_file_error
+        or covered_by_upstream
+        or covered_by_any
+        or _path_looks_related_to_projected(rel_path, projected)
+    ):
+        return [legacy_issue]
+    if any(ch in rel_path for ch in "*?[]"):
+        return [legacy_issue]
+    return [
+        legacy_issue,
+        _issue(
+            code="E_VERIFICATION_TARGET_MISSING_FILE",
+            severity="error",
+            task_id=task_id,
+            message=f"task '{task_id}' references missing file '{rel_path}'",
+            evidence={"missing_path": rel_path},
+        ),
+    ]
+
+
+def _path_looks_related_to_projected(rel_path: str, projected: set[str]) -> bool:
+    rel_name = PurePosixPath(rel_path).stem.removeprefix("test_")
+    for candidate in projected:
+        if PurePosixPath(candidate).stem.removeprefix("test_") == rel_name:
+            return True
+    return False
 
 
 def _missing_module_issue(

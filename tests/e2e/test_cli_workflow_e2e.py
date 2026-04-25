@@ -119,23 +119,23 @@ def _install_transition_probe(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     original_verify = WorkflowEngine.record_verification_result
     seen_statuses: list[str] = []
 
-    def wrapped_started(self: WorkflowEngine, task_id: str, agent_id: str) -> None:
+    def wrapped_started(self: WorkflowEngine, task_id: str, agent_id: str, **kwargs) -> None:
         task = self.get_task(task_id)
         assert task is not None
         seen_statuses.append(task.status.value)
         assert task.status == WorkflowTaskStatus.ASSIGNED
-        original_started(self, task_id, agent_id)
+        original_started(self, task_id, agent_id, **kwargs)
         running = self.get_task(task_id)
         assert running is not None
         seen_statuses.append(running.status.value)
         assert running.status == WorkflowTaskStatus.RUNNING
 
-    def wrapped_verify(self: WorkflowEngine, task_id: str, result) -> None:
+    def wrapped_verify(self: WorkflowEngine, task_id: str, result, **kwargs) -> None:
         task = self.get_task(task_id)
         assert task is not None
         seen_statuses.append(task.status.value)
         assert task.status == WorkflowTaskStatus.VERIFYING
-        original_verify(self, task_id, result)
+        original_verify(self, task_id, result, **kwargs)
 
     monkeypatch.setattr(WorkflowEngine, "report_worker_started", wrapped_started)
     monkeypatch.setattr(WorkflowEngine, "record_verification_result", wrapped_verify)

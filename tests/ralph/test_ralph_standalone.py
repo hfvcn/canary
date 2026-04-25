@@ -10,10 +10,17 @@ from pathlib import Path
 import pytest
 import yaml
 
-from cccc.ralph.cli import _cmd_complete, _cmd_verify, _resolve_project_root, main
+from cccc.ralph.cli import (
+    _apply_gate_mode,
+    _cmd_complete,
+    _cmd_verify,
+    _resolve_project_root,
+    main,
+)
 from cccc.ralph.core import suggest, _paths_overlap, _normalize_write_set
 from cccc.ralph.models import (
     BatchResult,
+    CheckSpec,
     Plan,
     PlanState,
     RegistrationInvariant,
@@ -23,10 +30,17 @@ from cccc.ralph.models import (
     VerificationCovers,
     Contract,
     CriticalFlow,
+    ValidationIssue,
     ValidationReport,
 )
 from cccc.ralph.validator import validate, validate_with_project
-from cccc.ralph.plan_io import load_plan, save_plan_state
+from cccc.ralph.plan_io import (
+    PlanLoadError,
+    SchemaUnknownFieldError,
+    load_plan,
+    save_plan_state,
+    sync_plan_state,
+)
 
 TESTS_DIR = Path(__file__).parent
 
@@ -413,6 +427,105 @@ def test_cli_suppress_does_not_modify_file(tmp_path, monkeypatch):
     assert plan_path.read_text(encoding="utf-8") == original
 
 
+def _write_quality_gate_config(project_root: Path) -> None:
+    config_dir = project_root / ".cccc"
+    config_dir.mkdir(exist_ok=True)
+    (config_dir / "quality-gate.yaml").write_text(
+        "gates:\n"
+        "  terminal:\n"
+        "    mode: warn\n"
+        "    overrides:\n"
+        "      W_VERIFICATION_SHALLOW_CHECKS: shadow\n"
+        "      W_FINDING_REF_INCOMPLETE: shadow\n"
+        "  branch:\n"
+        "    mode: warn\n"
+        "    overrides: {}\n"
+        "  repo:\n"
+        "    mode: enforce\n"
+        "    overrides: {}\n",
+        encoding="utf-8",
+    )
+
+
+def _make_shallow_checks_plan() -> Plan:
+    return Plan(
+        tasks=[
+            TaskSpec(
+                id="T1",
+                claimed_paths=["src/example.py"],
+                acceptance_criteria="handles concurrency safely",
+                verification=Verification(
+                    level="unit",
+                    command="python -m py_compile src/example.py",
+                    checks=[
+                        CheckSpec(
+                            name="compile_check",
+                            command="python -m py_compile src/example.py",
+                        ),
+                        CheckSpec(
+                            name="import_check",
+                            command="python -c \"import example\"",
+                        ),
+                    ],
+                    covers=VerificationCovers(tasks=["T1"]),
+                ),
+            )
+        ]
+    )
+
+
+def test_gate_shadow_mode(tmp_path):
+    _write_quality_gate_config(tmp_path)
+    report = validate(_make_shallow_checks_plan())
+
+    gated_report = _apply_gate_mode(report, "terminal", tmp_path)
+
+    assert gated_report.valid is True
+    assert "W_VERIFICATION_SHALLOW_CHECKS" not in [issue.code for issue in gated_report.warnings]
+    assert "W_VERIFICATION_SHALLOW_CHECKS" not in [issue.code for issue in gated_report.errors]
+    assert "W_VERIFICATION_SHALLOW_CHECKS" in [issue.code for issue in gated_report.hints]
+
+
+def test_gate_enforce_mode(tmp_path):
+    _write_quality_gate_config(tmp_path)
+    report = validate(_make_shallow_checks_plan())
+
+    gated_report = _apply_gate_mode(report, "repo", tmp_path)
+
+    assert gated_report.valid is False
+    assert "W_VERIFICATION_SHALLOW_CHECKS" in [issue.code for issue in gated_report.errors]
+    assert "W_VERIFICATION_SHALLOW_CHECKS" not in [issue.code for issue in gated_report.warnings]
+    assert "W_VERIFICATION_SHALLOW_CHECKS" not in [issue.code for issue in gated_report.hints]
+
+
+def test_gate_missing_config(tmp_path):
+    report = ValidationReport(
+        valid=True,
+        warnings=[
+            ValidationIssue(
+                code="W_VERIFICATION_SHALLOW_CHECKS",
+                severity="warning",
+                message="warning",
+            )
+        ],
+    )
+    original = report.model_copy(deep=True)
+
+    gated_report = _apply_gate_mode(report, "terminal", tmp_path)
+
+    assert gated_report is report
+    assert gated_report.model_dump() == original.model_dump()
+
+
+def test_gate_default_no_flag():
+    report = validate(_make_shallow_checks_plan())
+
+    assert report.valid is True
+    assert "W_VERIFICATION_SHALLOW_CHECKS" in [issue.code for issue in report.warnings]
+    assert "W_VERIFICATION_SHALLOW_CHECKS" not in [issue.code for issue in report.errors]
+    assert "W_VERIFICATION_SHALLOW_CHECKS" not in [issue.code for issue in report.hints]
+
+
 # ---------------------------------------------------------------------------
 # Validator tests
 # ---------------------------------------------------------------------------
@@ -671,6 +784,206 @@ class TestValidator:
         warning_codes = [issue.code for issue in report.warnings]
         assert "W_FLOW_SEGMENT_UNOWNED" not in warning_codes
         assert "W_FLOW_OWNER_NO_VERIFICATION" not in warning_codes
+
+    def test_python_symbol_path_resolves(self):
+        plan = self._make_plan(
+            [{
+                "id": "T1",
+                "claimed_paths": ["src/cccc/daemon/foreman/orchestrator.py"],
+                "verification": {
+                    "level": "integration",
+                    "command": "true",
+                    "covers": {"tasks": ["T1"], "flows": ["startup_flow"]},
+                },
+            }],
+            critical_flows=[CriticalFlow(id="startup_flow", entrypoints=["orchestrator._start"])],
+        )
+
+        report = validate(plan)
+
+        assert "W_FLOW_SEGMENT_UNOWNED" not in [issue.code for issue in report.warnings]
+
+    def test_symbol_path_via_awareness(self):
+        plan = self._make_plan(
+            [{
+                "id": "T1",
+                "claimed_paths": ["src/cccc/ralph/validator.py"],
+                "awareness_paths": ["src/cccc/daemon/foreman/orchestrator.py"],
+                "verification": {
+                    "level": "integration",
+                    "command": "true",
+                    "covers": {"tasks": ["T1"], "flows": ["startup_flow"]},
+                },
+            }],
+            critical_flows=[CriticalFlow(id="startup_flow", entrypoints=["orchestrator._start"])],
+        )
+
+        report = validate(plan)
+
+        assert "W_FLOW_SEGMENT_UNOWNED" not in [issue.code for issue in report.warnings]
+
+    def test_path_entrypoint_unchanged(self):
+        plan = self._make_plan(
+            [{
+                "id": "T1",
+                "claimed_paths": ["src/cccc/daemon/foreman"],
+                "verification": {
+                    "level": "integration",
+                    "command": "true",
+                    "covers": {"tasks": ["T1"], "flows": ["startup_flow"]},
+                },
+            }],
+            critical_flows=[
+                CriticalFlow(
+                    id="startup_flow",
+                    entrypoints=["src/cccc/daemon/foreman/orchestrator.py"],
+                )
+            ],
+        )
+
+        report = validate(plan)
+
+        assert "W_FLOW_SEGMENT_UNOWNED" not in [issue.code for issue in report.warnings]
+
+    def test_leaf_exemption_with_integration(self):
+        plan = self._make_plan(
+            [
+                {
+                    "id": "T1",
+                    "role": "leaf",
+                    "claimed_paths": ["src/server.py"],
+                    "verification": {
+                        "level": "unit",
+                        "command": "true",
+                        "covers": {"tasks": ["T1"]},
+                    },
+                },
+                {
+                    "id": "T2",
+                    "role": "integration",
+                    "claimed_paths": ["src/integration.py"],
+                    "depends_on": ["T1"],
+                    "verification": {
+                        "level": "integration",
+                        "command": "true",
+                        "covers": {"tasks": ["T1", "T2"], "flows": ["startup_flow"]},
+                    },
+                },
+            ],
+            critical_flows=[CriticalFlow(id="startup_flow", entrypoints=["src/server.py"])],
+        )
+
+        report = validate(plan)
+
+        warnings = [issue for issue in report.warnings if issue.code == "W_FLOW_OWNER_NO_VERIFICATION"]
+        hints = [issue for issue in report.hints if issue.code == "W_FLOW_OWNER_NO_VERIFICATION"]
+        assert warnings == []
+        assert len(hints) == 1
+        assert hints[0].task_ids == ["T1"]
+
+    def test_leaf_no_exemption_leaf_only(self):
+        plan = self._make_plan(
+            [
+                {
+                    "id": "T1",
+                    "role": "leaf",
+                    "claimed_paths": ["src/server.py"],
+                    "verification": {
+                        "level": "unit",
+                        "command": "true",
+                        "covers": {"tasks": ["T1"]},
+                    },
+                },
+                {
+                    "id": "T2",
+                    "role": "leaf",
+                    "claimed_paths": ["src/integration.py"],
+                    "depends_on": ["T1"],
+                    "verification": {
+                        "level": "integration",
+                        "command": "true",
+                        "covers": {"tasks": ["T1", "T2"], "flows": ["startup_flow"]},
+                    },
+                },
+            ],
+            critical_flows=[CriticalFlow(id="startup_flow", entrypoints=["src/server.py"])],
+        )
+
+        report = validate(plan)
+
+        warnings = [issue for issue in report.warnings if issue.code == "W_FLOW_OWNER_NO_VERIFICATION"]
+        assert len(warnings) == 1
+        assert warnings[0].task_ids == ["T1"]
+        assert "W_FLOW_OWNER_NO_VERIFICATION" not in [issue.code for issue in report.hints]
+
+    def test_leaf_no_exemption_without_covering(self):
+        plan = self._make_plan(
+            [{
+                "id": "T1",
+                "role": "leaf",
+                "claimed_paths": ["src/server.py"],
+                "verification": {
+                    "level": "unit",
+                    "command": "true",
+                    "covers": {"tasks": ["T1"]},
+                },
+            }],
+            critical_flows=[CriticalFlow(id="startup_flow", entrypoints=["src/server.py"])],
+        )
+
+        report = validate(plan)
+
+        warnings = [issue for issue in report.warnings if issue.code == "W_FLOW_OWNER_NO_VERIFICATION"]
+        assert len(warnings) == 1
+        assert warnings[0].task_ids == ["T1"]
+        assert "W_FLOW_OWNER_NO_VERIFICATION" not in [issue.code for issue in report.hints]
+
+    def test_plan_scope_filters_entrypoints(self):
+        plan = self._make_plan(
+            [{
+                "id": "T1",
+                "claimed_paths": ["src/cccc/ralph/validator.py"],
+                "verification": {
+                    "level": "unit",
+                    "command": "true",
+                    "covers": {"tasks": ["T1"]},
+                },
+            }],
+            plan_scope=["src/cccc/ralph/"],
+            critical_entrypoints=["src/cccc/daemon/server.py"],
+            critical_flows=[CriticalFlow(id="daemon_flow", entrypoints=["src/cccc/daemon/server.py"])],
+        )
+
+        report = validate(plan)
+
+        scoped_codes = {
+            issue.code
+            for issue in report.errors + report.warnings + report.hints
+        }
+        assert "E_CRITICAL_ENTRYPOINT_UNOWNED" not in scoped_codes
+        assert "E_CRITICAL_FLOW_UNCOVERED" not in scoped_codes
+        assert "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED" not in scoped_codes
+
+    def test_empty_plan_scope_checks_all(self):
+        plan = self._make_plan(
+            [{
+                "id": "T1",
+                "claimed_paths": ["src/cccc/ralph/validator.py"],
+                "verification": {
+                    "level": "unit",
+                    "command": "true",
+                    "covers": {"tasks": ["T1"]},
+                },
+            }],
+            critical_entrypoints=["src/cccc/daemon/server.py"],
+            critical_flows=[CriticalFlow(id="daemon_flow", entrypoints=["src/cccc/daemon/server.py"])],
+        )
+
+        report = validate(plan)
+
+        assert "E_CRITICAL_ENTRYPOINT_UNOWNED" in [issue.code for issue in report.hints]
+        assert "E_CRITICAL_FLOW_UNCOVERED" in [issue.code for issue in report.errors]
+        assert "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED" in [issue.code for issue in report.hints]
 
     def test_consumer_without_provider(self):
         plan = self._make_plan([
@@ -1172,6 +1485,24 @@ class TestPlanIO:
         plan_path.write_text(plan_text, encoding="utf-8")
         return plan_path
 
+    def _write_ledger(self, ledger_path: Path, events: list[dict[str, object]]) -> None:
+        ledger_path.write_text(
+            "".join(f"{json.dumps(event)}\n" for event in events),
+            encoding="utf-8",
+        )
+
+    def _verification_event(
+        self,
+        *,
+        task_id: str,
+        workflow_id: str = "",
+        kind: str = "workflow.verification_passed",
+    ) -> dict[str, object]:
+        data: dict[str, object] = {"task_id": task_id}
+        if workflow_id:
+            data["workflow_id"] = workflow_id
+        return {"kind": kind, "data": data}
+
     def test_load_bad_plan(self):
         plan = load_plan(TESTS_DIR / "sample_bad_plan.yaml")
         assert len(plan.tasks) == 6
@@ -1188,6 +1519,146 @@ class TestPlanIO:
         }
         assert plan.tasks[3].verification is not None
         assert plan.tasks[3].verification.level == "integration"
+
+    def test_strict_schema_unknown_flow_field_guidance(self, tmp_path):
+        plan_path = self._write_repo_plan(
+            tmp_path,
+            plan_text=(
+                'schema_version: "1.0.0"\n'
+                "tasks:\n"
+                "  - id: T1\n"
+                "critical_flows:\n"
+                "  - id: flow-1\n"
+                "    name: legacy-name\n"
+            ),
+        )
+
+        with pytest.raises(PlanLoadError) as excinfo:
+            load_plan(plan_path)
+
+        message = str(excinfo.value)
+        allowed_fields = ", ".join(CriticalFlow.model_fields.keys())
+        assert "critical_flows[0].name Extra inputs are not permitted" in message
+        assert f"Allowed CriticalFlow fields: {allowed_fields}" in message
+
+    def test_strict_schema_unknown_plan_field_guidance(self, tmp_path):
+        plan_path = self._write_repo_plan(
+            tmp_path,
+            plan_text=(
+                'schema_version: "1.0.0"\n'
+                "tasks:\n"
+                "  - id: T1\n"
+                "unknown_plan_field: nope\n"
+            ),
+        )
+
+        with pytest.raises(SchemaUnknownFieldError) as excinfo:
+            load_plan(plan_path)
+
+        allowed_fields = ", ".join(sorted(Plan.model_fields.keys()))
+        assert (
+            str(excinfo.value)
+            == f"unknown_plan_field: Extra inputs are not permitted. "
+            f"Allowed plan fields: {allowed_fields}"
+        )
+
+    def test_strict_schema_unknown_task_field_guidance(self, tmp_path):
+        plan_path = self._write_repo_plan(
+            tmp_path,
+            plan_text=(
+                'schema_version: "1.0.0"\n'
+                "tasks:\n"
+                "  - id: T1\n"
+                "    unknown_task_field: nope\n"
+            ),
+        )
+
+        with pytest.raises(SchemaUnknownFieldError) as excinfo:
+            load_plan(plan_path)
+
+        allowed_fields = ", ".join(sorted(TaskSpec.model_fields.keys()))
+        assert (
+            str(excinfo.value)
+            == f"tasks.0.unknown_task_field: Extra inputs are not permitted. "
+            f"Allowed task fields: {allowed_fields}"
+        )
+
+    def test_legacy_plan_unknown_flow_field_guidance(self, tmp_path):
+        plan_path = self._write_repo_plan(
+            tmp_path,
+            plan_text=(
+                "tasks:\n"
+                "  - id: T1\n"
+                "critical_flows:\n"
+                "  - id: flow-1\n"
+                "    name: legacy-name\n"
+            ),
+        )
+
+        with pytest.raises(PlanLoadError) as excinfo:
+            load_plan(plan_path)
+
+        message = str(excinfo.value)
+        allowed_fields = ", ".join(CriticalFlow.model_fields.keys())
+        assert "critical_flows[0].name Extra inputs are not permitted" in message
+        assert f"Allowed CriticalFlow fields: {allowed_fields}" in message
+
+    def test_required_issues_dict_format_guidance(self, tmp_path):
+        plan_path = self._write_repo_plan(
+            tmp_path,
+            plan_text=(
+                'schema_version: "1.0.0"\n'
+                "required_issues:\n"
+                "  - id: RO-1\n"
+                "    title: foo\n"
+                "tasks:\n"
+                "  - id: T1\n"
+            ),
+        )
+
+        with pytest.raises(PlanLoadError) as excinfo:
+            load_plan(plan_path)
+
+        message = str(excinfo.value)
+        assert "required_issues expects a string list" in message
+        assert 'Use: required_issues: ["RO-1", ...]' in message
+
+    def test_required_issues_string_format_ok(self, tmp_path):
+        plan_path = self._write_repo_plan(
+            tmp_path,
+            plan_text=(
+                'schema_version: "1.0.0"\n'
+                "required_issues:\n"
+                "  - RO-1\n"
+                "tasks:\n"
+                "  - id: T1\n"
+            ),
+        )
+
+        plan = load_plan(plan_path)
+
+        assert plan.required_issues == ["RO-1"]
+
+    def test_required_issues_mixed_format_guidance(self, tmp_path):
+        plan_path = self._write_repo_plan(
+            tmp_path,
+            plan_text=(
+                'schema_version: "1.0.0"\n'
+                "required_issues:\n"
+                "  - RO-1\n"
+                "  - id: RO-2\n"
+                "tasks:\n"
+                "  - id: T1\n"
+            ),
+        )
+
+        with pytest.raises(PlanLoadError) as excinfo:
+            load_plan(plan_path)
+
+        message = str(excinfo.value)
+        assert len(excinfo.value.errors) == 1
+        assert excinfo.value.errors[0].field_path == "required_issues[1]"
+        assert "required_issues expects a string list" in message
 
     def test_repo_metadata_plan_defaults_merge(self, tmp_path):
         plan_path = self._write_repo_plan(
@@ -1488,6 +1959,70 @@ class TestPlanIO:
 
         parsed = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
         assert parsed["state"]["completed_task_ids"].count("T4") == 1
+
+    def test_sync_plan_filters_by_plan_tasks(self, tmp_path):
+        plan_path = self._write_repo_plan(
+            tmp_path,
+            plan_text="tasks:\n  - id: T1\n  - id: T2\n",
+        )
+        ledger_path = plan_path.parent / "ledger.jsonl"
+        self._write_ledger(
+            ledger_path,
+            [
+                self._verification_event(task_id="T1"),
+                self._verification_event(task_id="T999"),
+            ],
+        )
+
+        synced = sync_plan_state(plan_path, ledger_path)
+        saved = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+
+        assert synced == 1
+        assert saved["state"]["completed_task_ids"] == ["T1"]
+
+    def test_sync_plan_filters_cross_workflow(self, tmp_path):
+        plan_path = self._write_repo_plan(
+            tmp_path,
+            plan_text="workflow_id: wf-a\ntasks:\n  - id: T1\n",
+        )
+        ledger_path = plan_path.parent / "ledger.jsonl"
+        self._write_ledger(
+            ledger_path,
+            [self._verification_event(task_id="T1", workflow_id="wf-b")],
+        )
+
+        assert sync_plan_state(plan_path, ledger_path) == 0
+
+        self._write_ledger(
+            ledger_path,
+            [
+                self._verification_event(task_id="T1", workflow_id="wf-b"),
+                self._verification_event(task_id="T1", workflow_id="wf-a"),
+            ],
+        )
+
+        synced = sync_plan_state(plan_path, ledger_path)
+        saved = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+
+        assert synced == 1
+        assert saved["state"]["completed_task_ids"] == ["T1"]
+
+    def test_sync_plan_no_workflow_id_fallback(self, tmp_path):
+        plan_path = self._write_repo_plan(
+            tmp_path,
+            plan_text="tasks:\n  - id: T1\n",
+        )
+        ledger_path = plan_path.parent / "ledger.jsonl"
+        self._write_ledger(
+            ledger_path,
+            [self._verification_event(task_id="T1", workflow_id="wf-other")],
+        )
+
+        synced = sync_plan_state(plan_path, ledger_path)
+        saved = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+
+        assert synced == 1
+        assert saved["state"]["completed_task_ids"] == ["T1"]
 
 
 class TestRegistrationInvariant:

@@ -1,0 +1,17 @@
+schema_version: "1.0.0"
+tasks:
+  - id: T1
+    title: Pytest K Boundary
+    role: leaf
+    type: backend
+    claimed_paths:
+      - src/app.py
+    goal_behavior: Filtered pytest without explicit target should skip literal-path rule.
+    acceptance_criteria: The filtered pytest command is accepted.
+    verification:
+      level: unit
+      command: pytest -k app -q
+      covers:
+        tasks:
+          - T1
+

@@ -1,0 +1,2 @@
+{"kind": "workflow.verification_skipped", "ts": "2026-04-17T12:20:24.943178+00:00", "data": {"task_id": "T-skip"}}
+{"kind": "workflow.task_reported_completed", "ts": "2026-04-17T13:20:24.943178+00:00", "data": {"task_id": "T-skip"}}

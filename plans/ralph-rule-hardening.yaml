@@ -1,0 +1,501 @@
+# Ralph Rule Hardening — 5 new advisory rules for Phase 4 remediation blind spots
+#
+# Source: todo/问题清单-v5-ralph.md §一 (RVCMD-1, RVCMD-2, RFILE-1, RAPI-1, RCONTRACT-1)
+# Context: these 5 rules were discovered as Ralph blind spots during
+#   plans/phase4-remediation.yaml v1→v3 Codex review cycles. Each rule is grounded
+#   in a concrete failed validation (phase4-remediation v1/v2/v3 reviews).
+#
+# Design notes:
+# - All 5 rules live in a NEW module `src/cccc/ralph/rules_advisory.py` as pure
+#   functions taking Plan (+ optional WorkspaceIndex) and returning List[ValidationIssue].
+#   This lets test coverage and rule evolution stay decoupled from validator.py's
+#   ~1700-line hot file.
+# - validator.py adds a single wiring call in `_collect_structural_issues()` plus
+#   project-root-scoped calls in `validate_with_project()` for the 2 rules that
+#   need filesystem access (RVCMD-2 script existence, RFILE-1 issue-file map,
+#   RCONTRACT-1 extra=forbid model scan).
+# - Test file is a new `tests/test_ralph_advisory_rules.py` claimed by T2.
+# - CLI --strict-verification flag is out of scope for this plan; all new rules
+#   emit warning/hint severity by default. Strict mode deferred to a later plan.
+#
+# Findings pre-check:
+# - Finding 1 (编译通过≠功能可用): T2 runs pytest on real test file, not compile-only
+# - Finding 2 (按文件拆任务产生孤立代码): T0 is a NEW module (no shared-file conflict);
+#   T1 wires it into validator.py as a single-point integration
+# - Finding 9 (先跑通一条路径): T0+T1+T2 together form the minimum end-to-end slice;
+#   documentation and CLI polish deferred
+# - Finding 13 (结构校验≠语义正确): plan demands Ralph validate AND Codex discussion
+#   before execution
+# - Finding 18 (虚假繁荣): T2 tests must re-create each of the 3 concrete trigger
+#   instances from phase4-remediation v1/v2/v3 Codex reviews as fixtures
+
+plan_scope:
+  - src/cccc/ralph/rules_advisory.py
+  - src/cccc/ralph/validator.py
+  - tests/test_ralph_advisory_rules.py
+
+semantic_mode: "off"  # 5 pure structural rules, no Serena needed
+auto_infer: false
+
+required_issues:
+  - RVCMD-1
+  - RVCMD-2
+  - RFILE-1
+  - RAPI-1
+  - RCONTRACT-1
+
+tasks:
+  # ════════════════════════════════════════════
+  # T0 — Foundation: rules_advisory module (new file, no conflict)
+  # ════════════════════════════════════════════
+
+  - id: T0-rules-advisory-module
+    title: "Create rules_advisory.py with 5 new advisory rule implementations"
+    role: leaf
+    depends_on: []
+    addresses: [RVCMD-1, RVCMD-2, RFILE-1, RAPI-1, RCONTRACT-1]
+    claimed_paths:
+      - src/cccc/ralph/rules_advisory.py
+    awareness_paths:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/filesystem_validator.py
+      - todo/问题清单-v5-ralph.md
+      - todo/问题清单-v5-ralph-full.md
+    goal_behavior: |
+      Create a new module `src/cccc/ralph/rules_advisory.py` containing 5 pure
+      rule functions. Each function takes `plan: Plan` and optionally
+      `workspace: WorkspaceIndex | None` and `project_root: Path | None`, returns
+      `List[ValidationIssue]` from `cccc.ralph.models`. The module MUST NOT
+      import validator.py (breaks the cycle); it imports only from models and
+      workspace_index (WorkspaceIndex).
+
+      Module exports:
+
+        def check_verification_command_syntax(plan: Plan) -> List[ValidationIssue]:
+            """RVCMD-1: detect broken `python -c` bodies and intent mismatches.
+
+            For every task.verification.checks[*].command AND verification.command:
+              1. Literal `\\n` detection: if command contains `python -c "..."` or
+                 `python -c '...'` and the quoted payload contains the literal
+                 two-character sequence `\\n` (backslash + n) OUTSIDE a string literal,
+                 emit W_VERIFICATION_COMMAND_INVALID_SYNTAX (warning). Rationale:
+                 shell does not expand `\\n`; python receives literal backslash-n
+                 and raises SyntaxError. See phase4-remediation v1 Codex F6.
+              2. AST parse check: extract the `python -c` payload via shlex.split
+                 or a paired-quote regex; run `ast.parse(payload)`. On SyntaxError,
+                 emit W_VERIFICATION_COMMAND_INVALID_SYNTAX with the parser error
+                 message in evidence.
+              3. Intent mismatch: if the command contains
+                 `assert hasattr(...)` or `assert not hasattr(...)`, extract the
+                 attribute name. Cross-reference the task's goal_behavior for
+                 `<ClassName> MUST NOT have <attr>` or `<ClassName> MUST have <attr>`
+                 patterns. If the assert direction contradicts the goal, emit
+                 W_VERIFICATION_INTENT_MISMATCH (hint). See phase4-remediation v3
+                 Codex F-v3-2 (RalphService.runtime_plan drift).
+            """
+
+        def check_verification_script_ownership(
+            plan: Plan, workspace: WorkspaceIndex | None = None,
+        ) -> List[ValidationIssue]:
+            """RVCMD-2: detect verification commands pointing at missing/unowned scripts.
+
+            For every task.verification.checks[*].command AND verification.command:
+              - Regex-extract path tokens matching `(scripts|bin|tools)/[\\w/.-]+\\.(py|sh|bash)`.
+              - For each extracted path:
+                * If workspace is None, skip (cannot check filesystem).
+                * If file does NOT exist in project AND not claimed by any task:
+                    emit E_VERIFICATION_SCRIPT_MISSING (error).
+                * If file exists but is not in the task's claimed_paths /
+                    awareness_paths / any dep-task claimed_paths:
+                    emit W_VERIFICATION_SCRIPT_UNOWNED (warning).
+            See phase4-remediation v2 Codex F-new-4 (scripts/verify_phase4_remediation/
+            referenced by 6 tasks but directory did not exist).
+            """
+
+        def check_addresses_file_alignment(
+            plan: Plan, issue_file_map: Dict[str, Set[str]] | None = None,
+        ) -> List[ValidationIssue]:
+            """RFILE-1 part 1: task.addresses references must reach issue hot files.
+
+            If issue_file_map is provided (built by validator.py from problem-list
+            markdown), for each task:
+              - For each issue_id in task.addresses:
+                * If issue_id in issue_file_map AND the intersection of
+                  issue_file_map[issue_id] with (claimed_paths ∪ awareness_paths)
+                  is empty, emit W_ADDRESSES_HOT_FILE_GAP (warning).
+                * The evidence dict must include the issue_id, the expected hot
+                  files list, and the task's claimed paths — so the message is
+                  actionable.
+              - If issue_file_map is None or empty, silently skip (no noise).
+            See phase4-remediation v1 Codex F3 (T4 addressed RDEAD-1 but did not
+            claim models.py where ValidationReport.consistency_reports lived).
+            """
+
+        def check_api_signature_consistency(plan: Plan) -> List[ValidationIssue]:
+            """RAPI-1: detect same method name with drifting host or arg list.
+
+            For every task, scan goal_behavior, acceptance_criteria, every
+            verification.checks[*].command, and every Plan.forbidden_flows[*]
+            .description. Extract tuples `(host, method, arg_count)` via the
+            pattern `([\\w.]+)\\.(\\w+)\\(([^)]*)\\)`. Group by `method`:
+              - If the same method name appears with 2+ distinct `host` values
+                across ANY combination of (task text, forbidden_flow text) within
+                ONE plan: emit W_API_HOST_DRIFT (warning). Evidence must list
+                all (host, location) pairs.
+              - If the same (host, method) pair appears with differing
+                arg_count across 2+ locations: emit W_API_ARGS_DRIFT (warning).
+            Skip method names that are stdlib obvious (append, extend, model_dump,
+            model_validate, startswith, endswith, split, strip, join) to reduce
+            noise.
+            See phase4-remediation v3 Codex F-v3-2 (PlanContext.runtime_plan(engine)
+            vs ctx.runtime_plan(workflow_id, engine) vs RalphService.runtime_plan).
+            """
+
+        def check_new_return_structure_ownership(
+            plan: Plan,
+            extra_forbid_models: Dict[str, str] | None = None,
+        ) -> List[ValidationIssue]:
+            """RCONTRACT-1: detect new return fields without contract-file claim.
+
+            Scan each task's goal_behavior + acceptance_criteria for indicator
+            phrases:
+              - `in result`, `in response`, `in workflow_data`
+              - `返回 ... 字段`, `new field`, `extend ... with`
+              - `VerificationResult ... field`, `DaemonResponse ... field`
+            If any indicator matches AND none of the task's claimed_paths match
+            the patterns `contracts/v1/*.py`, `**/models.py`, `**/_types.py`,
+            `**/ipc.py`, emit W_NEW_RETURN_FIELD_NOT_IN_CONTRACT (warning).
+
+            Second check using extra_forbid_models (built by validator.py from
+            project_root via AST scan for `model_config = ConfigDict(extra="forbid")`
+            or `class Config: extra = "forbid"`):
+              - If task goal_behavior mentions adding a field to a model in
+                extra_forbid_models AND does not claim the file where the model
+                is defined (value of the dict), emit
+                E_EXTRA_FORBID_MODEL_EXTENSION_UNCLAIMED (error).
+            See phase4-remediation v1 Codex F4 (T5 event with no contract claim)
+            and v2 Codex F-new-2 (T4 VerificationResult extra=forbid without
+            ralph_ipc.py claim).
+            """
+
+      Also add module-private helpers (NOT exported):
+        _extract_python_c_payload(cmd: str) -> Optional[str]
+        _extract_method_call_tuples(text: str) -> List[Tuple[str, str, int]]
+        _STDLIB_METHODS: frozenset[str]
+        _RETURN_FIELD_INDICATORS: List[re.Pattern]
+
+      Module docstring must state: "Advisory rules added 2026-04-08 from
+      phase4-remediation Codex review findings. See todo/问题清单-v5-ralph.md
+      §一 RVCMD-1/RVCMD-2/RFILE-1/RAPI-1/RCONTRACT-1 for rationale."
+    acceptance_criteria: |
+      File src/cccc/ralph/rules_advisory.py exists with exactly 5 exported
+      functions: check_verification_command_syntax, check_verification_script_ownership,
+      check_addresses_file_alignment, check_api_signature_consistency,
+      check_new_return_structure_ownership.
+      Each function returns List[ValidationIssue] from cccc.ralph.models.
+      Module does NOT import from cccc.ralph.validator (breaks cycle).
+      Module imports WorkspaceIndex from cccc.ralph.workspace_index only
+      when used.
+      All functions handle empty/missing fields gracefully (no AttributeError
+      on TaskSpec without verification, addresses, semantic, etc.).
+    verification:
+      level: unit
+      checks:
+        - name: module-imports
+          command: 'python -c "from cccc.ralph.rules_advisory import check_verification_command_syntax, check_verification_script_ownership, check_addresses_file_alignment, check_api_signature_consistency, check_new_return_structure_ownership; print(''PASS'')"'
+          required: true
+        - name: no-validator-import
+          command: 'python -c "import ast, pathlib; tree = ast.parse(pathlib.Path(''src/cccc/ralph/rules_advisory.py'').read_text()); imports = [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]; bad = [i for i in imports if any(''validator'' in (a.name if isinstance(i, ast.Import) else (i.module or '''')) for a in (i.names if isinstance(i, ast.Import) else [i]))]; assert not bad, ''rules_advisory must not import validator''; print(''PASS'')"'
+          required: true
+        - name: empty-plan-smoke
+          command: 'python -c "from cccc.ralph.models import Plan; from cccc.ralph.rules_advisory import check_verification_command_syntax, check_verification_script_ownership, check_api_signature_consistency, check_addresses_file_alignment, check_new_return_structure_ownership; p = Plan(tasks=[]); assert check_verification_command_syntax(p) == []; assert check_verification_script_ownership(p, workspace=None) == []; assert check_api_signature_consistency(p) == []; assert check_addresses_file_alignment(p) == []; assert check_new_return_structure_ownership(p) == []; print(''PASS'')"'
+          required: true
+      covers:
+        tasks: [T0-rules-advisory-module]
+        flows: []
+    provides:
+      - name: rules_advisory_module
+        kind: artifact
+
+  # ════════════════════════════════════════════
+  # T1 — Wire the 5 rules into validator.py
+  # ════════════════════════════════════════════
+
+  - id: T1-validator-wiring
+    title: "Wire rules_advisory into validator._collect_structural_issues and validate_with_project"
+    role: integration
+    depends_on: [T0-rules-advisory-module]
+    addresses: [RVCMD-1, RVCMD-2, RFILE-1, RAPI-1, RCONTRACT-1]
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+    awareness_paths:
+      - src/cccc/ralph/rules_advisory.py
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/filesystem_validator.py
+      - src/cccc/ralph/plan_io.py
+    consumes:
+      - name: rules_advisory_module
+        kind: artifact
+    goal_behavior: |
+      Modify `src/cccc/ralph/validator.py` to wire the 5 rules from T0.
+
+      Changes:
+
+      1. Add import at top of validator.py (after existing rel imports):
+           from . import rules_advisory
+
+      2. In `_collect_structural_issues(plan)` (lines 101-134), append AFTER
+         the existing `_check_semantic_dependencies` call is removed from its
+         current location (it lives inside `validate_with_project`, NOT here —
+         verify this before editing). The structural-only rules that do NOT
+         need project_root go into `_collect_structural_issues`:
+           issues.extend(rules_advisory.check_verification_command_syntax(plan))
+           issues.extend(rules_advisory.check_api_signature_consistency(plan))
+
+      3. In `validate_with_project()` (lines 158-261), after the
+         `_check_semantic_dependencies` call (around line 191), append the
+         3 project-root-dependent rules:
+           issues_sa = rules_advisory.check_verification_script_ownership(plan, workspace=workspace)
+           issues_af = rules_advisory.check_addresses_file_alignment(plan, issue_file_map=issue_file_map)
+           issues_rs = rules_advisory.check_new_return_structure_ownership(plan, extra_forbid_models=extra_forbid_models)
+           all_issues += issues_sa + issues_af + issues_rs
+
+      4. Build `issue_file_map: Dict[str, Set[str]]` from problem-list markdown.
+         Add a new private helper `_load_issue_file_map(project_root: Path)
+         -> Dict[str, Set[str]]` to validator.py:
+           - Look for `todo/问题清单-v5-ralph.md` and
+             `todo/问题清单-v5-ralph-full.md` under project_root.
+           - Parse H3 sections (`### <ID> <title>`). For each section, extract
+             all backtick-quoted path tokens matching `\\b[\\w/.-]+\\.(py|md|yaml|json)\\b`.
+             Build `{issue_id: set(paths)}`.
+           - If neither file exists, return {}.
+           - Cache result per project_root using functools.lru_cache on a helper
+             that takes the stringified path. DO NOT block validate if the file
+             cannot be read (log warning, return {}).
+         Call from validate_with_project just before the rule invocations.
+
+      5. Build `extra_forbid_models: Dict[str, str]` by AST-scanning `src/**/*.py`
+         under project_root for `model_config = ConfigDict(extra="forbid")` or
+         `class Config: extra = "forbid"` inside a Pydantic BaseModel subclass.
+         Map `{ClassName: relative_path}`. Helper
+         `_scan_extra_forbid_models(project_root: Path) -> Dict[str, str]`.
+         Must tolerate unparseable files (skip, don't raise). Cache result.
+         Call from validate_with_project before the rule invocations.
+
+      6. Update `semantic_codes` set near line 243 — DO NOT add the 5 new codes
+         there; they are not semantic_findings, they are regular warnings/hints.
+
+      7. The new 5 rules must:
+           - NOT break any existing test in tests/test_ralph_validator*.py,
+             tests/test_ralph_semantic.py, tests/test_ralph_verification.py.
+           - Return empty lists on empty plan (already T0 acceptance).
+           - Be resilient to tasks without verification, addresses, etc.
+
+      CRITICAL: The 5 new rules MUST only fire when their specific trigger
+      conditions are met. No plan that previously passed validate should start
+      failing due to added noise. If a new rule has a false-positive rate that
+      causes >5% of existing valid plans to regress, downgrade its severity to
+      hint in T0 before wiring (i.e. iterate T0 before proceeding with T1).
+    acceptance_criteria: |
+      validator.py imports rules_advisory.
+      _collect_structural_issues calls check_verification_command_syntax and
+      check_api_signature_consistency.
+      validate_with_project calls check_verification_script_ownership,
+      check_addresses_file_alignment, check_new_return_structure_ownership
+      with workspace/issue_file_map/extra_forbid_models respectively.
+      _load_issue_file_map and _scan_extra_forbid_models helpers exist with
+      functools caching and tolerant error handling.
+      Running `python -m cccc.ralph.cli validate plans/phase4-remediation.yaml`
+      still reports `valid (with warnings)` or better — no new errors introduced
+      on the reference plan.
+    verification:
+      level: integration
+      checks:
+        - name: existing-suite-intact
+          command: "python -m pytest tests/test_ralph_semantic.py tests/test_ralph_verification.py tests/ralph/ -q --tb=line"
+          required: true
+        - name: reference-plan-still-valid
+          command: "python -m cccc.ralph.cli validate plans/phase4-remediation.yaml 2>&1 | grep -E '^valid' | head -1"
+          required: true
+        - name: wired-calls-present
+          command: 'python -c "import pathlib; src = pathlib.Path(''src/cccc/ralph/validator.py'').read_text(); assert ''rules_advisory.check_verification_command_syntax'' in src; assert ''rules_advisory.check_api_signature_consistency'' in src; assert ''rules_advisory.check_verification_script_ownership'' in src; assert ''rules_advisory.check_addresses_file_alignment'' in src; assert ''rules_advisory.check_new_return_structure_ownership'' in src; print(''PASS'')"'
+          required: true
+      covers:
+        tasks: [T0-rules-advisory-module, T1-validator-wiring]
+        flows:
+          - full-rule-path
+    provides:
+      - name: rules_advisory_wired
+        kind: artifact
+
+  # ════════════════════════════════════════════
+  # T2 — Tests: recreate each v1/v2/v3 trigger as fixture + positive/negative tests
+  # ════════════════════════════════════════════
+
+  - id: T2-advisory-rule-tests
+    title: "Unit tests for the 5 new advisory rules"
+    role: verification
+    depends_on: [T1-validator-wiring]
+    addresses: [RVCMD-1, RVCMD-2, RFILE-1, RAPI-1, RCONTRACT-1]
+    claimed_paths:
+      - tests/test_ralph_advisory_rules.py
+    awareness_paths:
+      - src/cccc/ralph/rules_advisory.py
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/models.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - src/cccc/daemon/foreman/ralph_service.py
+    consumes:
+      - name: rules_advisory_wired
+        kind: artifact
+    goal_behavior: |
+      Create `tests/test_ralph_advisory_rules.py` covering all 5 rules with
+      positive (rule fires) and negative (rule is silent) cases. Tests use
+      pytest style — no fixtures other than standard `tmp_path`.
+
+      Required test cases (at minimum 15 tests total):
+
+      1. RVCMD-1 (check_verification_command_syntax):
+         - test_rvcmd1_literal_backslash_n_fires: construct a Plan with one task
+           whose verification.checks[0].command is
+           `python -c "import foo; \\nfor x in foo.bar: print(x)"` (literal
+           backslash-n). Assert W_VERIFICATION_COMMAND_INVALID_SYNTAX in result.
+         - test_rvcmd1_literal_backslash_n_inside_string_silent: command
+           `python -c "print(''\\\\n'')"` — assert rule returns [] because the
+           literal backslash-n is inside a Python string literal, not executable syntax.
+         - test_rvcmd1_valid_python_c_silent: command
+           `python -c "print(1)"` — assert rule returns [].
+         - test_rvcmd1_top_level_verification_command_checked: construct a Plan
+           whose verification.command is `python -c "import foo; \\nfor x in foo.bar: print(x)"`;
+           assert W_VERIFICATION_COMMAND_INVALID_SYNTAX in result so the rule
+           covers both verification.command and checks[*].command paths.
+         - test_rvcmd1_intent_mismatch_hint: task goal_behavior contains
+           "RalphService MUST NOT have runtime_plan"; check command is
+           `assert hasattr(RalphService, 'runtime_plan')`. Assert
+           W_VERIFICATION_INTENT_MISMATCH in result.
+         - test_rvcmd1_intent_aligned_silent: goal "MUST have X" + assert
+           hasattr(..., X) — assert no mismatch hint.
+
+      2. RVCMD-2 (check_verification_script_ownership):
+         - test_rvcmd2_missing_script_errors: verification.command references
+           `scripts/verify_foo/check.py` that does not exist in tmp_path project
+           and is not claimed. Use WorkspaceIndex(tmp_path). Assert
+           E_VERIFICATION_SCRIPT_MISSING.
+         - test_rvcmd2_check_command_missing_script_errors: verification.checks[0]
+           .command references `scripts/verify_foo/check.py`; assert the same
+           E_VERIFICATION_SCRIPT_MISSING so checks[*].command is also covered.
+         - test_rvcmd2_existing_unowned_warns: create the file under tmp_path
+           but do NOT put it in any task.claimed_paths. Assert
+           W_VERIFICATION_SCRIPT_UNOWNED.
+         - test_rvcmd2_existing_owned_silent: file exists AND is in task's
+           claimed_paths. Assert rule returns [].
+         - test_rvcmd2_no_workspace_silent: rule returns [] when workspace=None.
+
+      3. RFILE-1 (check_addresses_file_alignment):
+         - test_rfile1_hot_file_gap_warns: issue_file_map = {"RDEAD-1":
+           {"src/cccc/ralph/models.py"}}; task with addresses=["RDEAD-1"] and
+           claimed_paths=["src/cccc/daemon/foreman/ralph_service.py"]. Assert
+           W_ADDRESSES_HOT_FILE_GAP in result with RDEAD-1 in evidence.
+         - test_rfile1_hot_file_covered_silent: same issue_file_map but task
+           claims models.py. Assert rule returns [].
+         - test_rfile1_empty_map_silent: issue_file_map={} → rule returns [].
+
+      4. RAPI-1 (check_api_signature_consistency):
+         - test_rapi1_host_drift_warns: plan has one task with goal_behavior
+           mentioning `PlanContext.runtime_plan(engine)`, another task with
+           `RalphService.runtime_plan(engine)`. Assert W_API_HOST_DRIFT.
+         - test_rapi1_args_drift_warns: two tasks both reference
+           `ctx.runtime_plan(engine)` and `ctx.runtime_plan(workflow_id, engine)`.
+           Assert W_API_ARGS_DRIFT.
+         - test_rapi1_stdlib_skipped: references to `.append()`, `.model_dump()`
+           never fire. Assert rule returns [] for a plan full of stdlib calls.
+
+      5. RCONTRACT-1 (check_new_return_structure_ownership):
+         - test_rcontract1_new_field_no_contract_claim_warns: task
+           goal_behavior = "extend VerificationResult with semantic_details
+           field in result"; claimed_paths = ["src/cccc/daemon/foreman/
+           ralph_service.py"] (no contract file). Assert
+           W_NEW_RETURN_FIELD_NOT_IN_CONTRACT.
+         - test_rcontract1_with_contract_claim_silent: same goal but
+           claimed_paths includes "src/cccc/contracts/v1/ralph_ipc.py". Assert
+           rule returns [].
+         - test_rcontract1_extra_forbid_model_errors: extra_forbid_models =
+           {"VerificationResult": "src/cccc/contracts/v1/ralph_ipc.py"}; task
+           text names VerificationResult as the target model for a new field but
+           does not claim ralph_ipc.py. Assert
+           E_EXTRA_FORBID_MODEL_EXTENSION_UNCLAIMED.
+
+      6. Integration check with validator (not unit-level):
+         - test_rvalidator_wired_runs_rules: load a tiny plan through
+           `validate(plan)` that triggers RVCMD-1 and RAPI-1 (both work without
+           project_root), assert the codes appear in report.warnings.
+         - test_rvalidate_with_project_runs_filesystem_rules: using tmp_path,
+           call validate_with_project on a plan that triggers RVCMD-2, assert
+           the code appears in report.errors.
+
+      Regression constraint: DO NOT monkeypatch rules_advisory in tests. Each
+      test must exercise the real function. See findings §十八 — tests that
+      monkeypatch production paths create virtual prosperity.
+    acceptance_criteria: |
+      tests/test_ralph_advisory_rules.py exists with >=15 test functions.
+      Rule-specific tests start with `test_r` followed by the rule short code;
+      the 2 validator integration tests may use `test_rvalidator_*` /
+      `test_rvalidate_*`.
+      pytest tests/test_ralph_advisory_rules.py -v passes.
+      No test monkeypatches rules_advisory or validator.
+    verification:
+      level: integration
+      checks:
+        - name: pytest-new-file
+          command: "python -m pytest tests/test_ralph_advisory_rules.py -v --tb=short"
+          required: true
+        - name: test-count-minimum
+          command: 'python -c "import ast, pathlib; tree = ast.parse(pathlib.Path(''tests/test_ralph_advisory_rules.py'').read_text()); funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name.startswith(''test_'')]; assert len(funcs) >= 15, f''expected >=15 tests, got {len(funcs)}''; print(f''PASS ({len(funcs)} tests)'')"'
+          required: true
+        - name: no-monkeypatch-of-rules
+          command: 'python -c "import pathlib; src = pathlib.Path(''tests/test_ralph_advisory_rules.py'').read_text(); bad_patterns = [\"monkeypatch.setattr(rules_advisory\", \"monkeypatch.setattr(''cccc.ralph.rules_advisory''\", \"monkeypatch.setattr(''cccc.ralph.validator.rules_advisory''\"]; found = [p for p in bad_patterns if p in src]; assert not found, f''forbidden monkeypatches found: {found}''; print(''PASS'')"'
+          required: true
+        - name: tests-exercise-rules-advisory
+          command: 'python -c "import pathlib; src = pathlib.Path(''tests/test_ralph_advisory_rules.py'').read_text(); assert ''src/cccc/ralph/rules_advisory.py'' in src or ''cccc.ralph.rules_advisory'' in src, ''tests must reference the rules_advisory module under test''; print(''PASS'')"'
+          required: true
+        - name: tests-exercise-validator-wiring
+          command: 'python -c "import pathlib; src = pathlib.Path(''tests/test_ralph_advisory_rules.py'').read_text(); assert ''cccc.ralph.validator'' in src or ''src/cccc/ralph/validator.py'' in src, ''tests must cover validator wiring path''; print(''PASS'')"'
+          required: true
+      covers:
+        tasks: [T0-rules-advisory-module, T1-validator-wiring, T2-advisory-rule-tests]
+        flows:
+          - full-rule-path
+          - no-validator-import-in-advisory
+          - no-production-monkeypatch-in-tests
+          - no-severity-inflation
+    provides:
+      - name: advisory_rule_tests
+        kind: artifact
+
+critical_flows:
+  - id: full-rule-path
+    description: "Plan with trigger instance → validator loads → rules_advisory fires → ValidationIssue in report"
+    entrypoints:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/rules_advisory.py
+    required_verification_level: unit
+
+forbidden_flows:
+  - id: no-validator-import-in-advisory
+    description: "src/cccc/ralph/rules_advisory.py MUST NOT import from cccc.ralph.validator (import cycle)"
+    required_verification_level: unit
+  - id: no-production-monkeypatch-in-tests
+    description: "tests/test_ralph_advisory_rules.py MUST NOT monkeypatch rules_advisory or validator internals (findings §十八)"
+    required_verification_level: unit
+  - id: no-severity-inflation
+    description: "The 5 new rules MUST NOT emit severity=error unless the trigger is unambiguous. RVCMD-1/RAPI-1/RFILE-1/RCONTRACT-1 advisory paths emit warning or hint. Only E_VERIFICATION_SCRIPT_MISSING and E_EXTRA_FORBID_MODEL_EXTENSION_UNCLAIMED may emit error."
+    required_verification_level: unit
+
+suppress_codes:
+  # Repo default critical flows are daemon_startup + cli_workflow — this plan's
+  # scope is src/cccc/ralph/ only, so both are out of reach. Same suppression
+  # pattern as plans/phase1-semantic-mvp.yaml.
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_ENTRYPOINT_UNOWNED

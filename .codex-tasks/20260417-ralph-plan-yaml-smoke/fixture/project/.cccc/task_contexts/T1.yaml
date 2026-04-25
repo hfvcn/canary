@@ -1,0 +1,9 @@
+goal: Keep the fixture application stable.
+completed_steps: []
+unresolved: []
+next_steps: []
+iteration: 4
+last_error: ''
+changed_files:
+- src/app.py
+updated_at: '2026-04-17T13:42:31Z'

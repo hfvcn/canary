@@ -1,0 +1,394 @@
+# Consolidated plan: Codex review fixes (D-fix + EFH-fix)
+# 可验证结论: "CAS 和 mismatch 检查正确；hook fail-closed in BLOCK；sync/validate/suppress 一致"
+#
+# 对应问题清单:
+#   FIX-27(P0) FIX-28(P0) FIX-29(P1) FIX-30(P1) FIX-31(P2) FIX-32(P1)
+# Finding 对照: #16(负向不变量) #17(失败必须暴露)
+#
+# 关键路径: T1(FIX-27) → T2(FIX-28) → T7(integration) — T3/T4/T5/T6 独立 → T7
+# 前提: Batch D~H 已完成（163 tests pass）
+#
+# T1+T2 解决 Critical 级别问题（D-fix batch）
+# T3~T6 解决 High/Medium 级别问题（EFH-fix batch）
+# T7 集成验证所有修复
+
+schema_version: "1.0.0"
+
+suppress_codes:
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "E_FORBIDDEN_FLOW_UNCOVERED"
+  - "W_PLAN_SCOPE_UNUSED"
+  - "W_UNCLAIMED_TEST_FOR_SOURCE"
+  - "W_TEST_COVERAGE_GAP"
+  - "W_FLOW_OWNER_NO_VERIFICATION"
+  - "W_NO_EARLY_INTEGRATION_CHECKPOINT"
+  - "W_NO_FAILURE_PATH"
+  - "W_VERIFICATION_PYTEST_K_NO_MATCH"
+  - "W_DEP_WITHOUT_CONSUME"
+  - "W_COVERS_PATHS_UNVERIFIED"
+
+suppress_instances:
+  - code: "W_DISCONNECTED_COMPONENTS"
+    reason: "T3/T4/T5/T6 are independent leaf fixes with no true dependency; T7 integration task covers them all"
+  - code: "W_ISOLATED_TASK"
+    reason: "T3/T4/T5/T6 are intentionally independent leaf fixes connected through T7 integration"
+
+tasks:
+  # ===================================================================
+  # D-fix: Critical — CAS + mismatch 保护完整性
+  # ===================================================================
+
+  - id: T1
+    title: "FIX-27: completed 事件前先做 completer_mismatch 检查，再自动 start"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    depends_on: []
+    goal_behavior: >
+      修改 apply_task_event() 中 event_type == "completed" && state.status == ASSIGNED 的路径（约 line 2506-2508）：
+      1. 在调用 report_worker_started() 之前，先获取 engine 当前 task 的 agent_id 作为 original_agent_id（即 state.agent_id）。
+      2. 如果 payload 的 agent_id 与 original_agent_id 不同，查 engine monitor config 的 completer_mismatch mode：
+         - BLOCK mode：拒绝此事件（result["accepted"] = False, reason = "completer_mismatch_blocked"），不调用 report_worker_started。
+           同时写 ledger 审计事件（通过 engine.record_verification_warning 或等价路径），确保审计链与 hook rejection 一致。
+         - OBSERVE/WARN mode：照旧调 report_worker_started 但 log warning。
+      3. 自动 start 调用 report_worker_started 时使用 state.agent_id（当前分配的 agent），不使用 payload 的 agent_id。
+      这样确保 completer_mismatch BLOCK 检查基于原始分配，而非被改写后的值。
+      [Codex review CR-1] BLOCK 拒绝时必须写 ledger 事件，保持与 hook rejection 等价的审计证据。
+    acceptance_criteria: >
+      测试: 当 completer_mismatch=BLOCK 时，agent_B 对 agent_A 已分配的任务直接发 completed 被拒绝（accepted=False）；
+      BLOCK 拒绝时 ledger 中有对应的审计事件（verification_warning 或等价）；
+      当 completer_mismatch=OBSERVE 时，行为不变（仍自动 start + complete）；
+      自动 start 使用的 agent_id 是原始分配的 agent，不是 payload 的。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_workflow_state.py tests/test_foreman_workflow.py -q --tb=short -k 'mismatch or completer'"
+      checks:
+        - name: "mismatch_behavior_test"
+          command: "python -m pytest tests/test_foreman_workflow.py -q --tb=short -k 'mismatch'"
+      covers:
+        tasks: ["T1"]
+    provides:
+      - name: completer_mismatch_pre_check
+        kind: invariant
+        schema_hint: "Mismatch check runs against original assignment, not overwritten value"
+    addresses: ["FIX-27"]
+
+  - id: T2
+    title: "FIX-28: 区分 assignment_id 和 attempt_id，修复 CAS 误拒"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    awareness_paths:
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+      - "src/cccc/ports/web/routes/workflow.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      问题：process_batch_suggestion() 在 line 755 生成 random attempt_id 并存入 engine（approve_batch），
+      但外部 API（workflow_task_ops.py line 142）透传的是 assignment_id，两者是不同的值。
+      engine.report_worker_completion() (line 296-303) 把两者都当 CAS token，导致合法完成被误拒。
+
+      修复方案（采纳 Codex review CR-2 建议，避免 fallback 和 skip-CAS 自相矛盾）：
+      1. orchestrator apply_task_event() line 2486：attempt_id 和 assignment_id 分开传给 engine，
+         不做 fallback 替换。即：attempt_id = payload.get("attempt_id", ""), assignment_id = payload.get("assignment_id", "")。
+      2. engine.report_worker_completion()：
+         - 如果 incoming attempt_id 非空且与 engine 的 attempt_id 不匹配 → 拒绝（真正 stale）。
+         - 如果 incoming attempt_id 为空（外部 API 未贯通场景） → 跳过 CAS，log warning。
+         - 移除 evidence.assignment_id 的 fallback CAS 比较（line 301-303），因为 assignment_id 不是 CAS token。
+      3. 已知限制（不在本次修复范围）：assignment-only 客户端在 retry/reassign 后提交旧 assignment，
+         系统无法判断 stale，只能放行。未来需要全链路贯通 attempt_id 或在 engine 中持久化 assignment_id。
+    acceptance_criteria: >
+      测试: 外部 API 只传 assignment_id（不传 attempt_id）时，合法完成不被 CAS 拒绝；
+      传入正确的 attempt_id 时 CAS 正常工作；传入错误的 attempt_id 时被拒绝（真 stale）；
+      attempt_id 和 assignment_id 都为空时跳过 CAS；
+      orchestrator 不再把 assignment_id fallback 到 attempt_id 参数。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_workflow_state.py tests/test_foreman_workflow.py -q --tb=short -k 'attempt or cas or stale'"
+      checks:
+        - name: "cas_behavior_test"
+          command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'attempt or cas'"
+      covers:
+        tasks: ["T2"]
+    consumes:
+      - name: completer_mismatch_pre_check
+    provides:
+      - name: cas_graceful_degradation
+        kind: invariant
+        schema_hint: "CAS only rejects truly stale completions, not missing attempt_id"
+    addresses: ["FIX-28"]
+
+  # ===================================================================
+  # EFH-fix: High/Medium — sync/validate/suppress/hook 完整性
+  # ===================================================================
+
+  - id: T3
+    title: "FIX-29: sync_plan_state 按 plan task_ids 过滤，不跨 workflow 污染"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/plan_io.py"
+    awareness_paths:
+      - "src/cccc/ralph/models.py"
+    depends_on: []
+    goal_behavior: >
+      修改 sync_plan_state()（plan_io.py line 123-156）：
+      1. 加载 plan 后，提取 plan 中所有 task 的 id 集合（plan_task_ids）。
+      2. 在收集 completed_ids 时，只保留 plan_task_ids 中存在的 task_id。
+      3. [Codex review CR-3] 仅按 task_id 过滤不够——不同 workflow 的 task_id 可能重名（如 T1, T2）。
+         因此还应按 ledger 事件中的 workflow_id 过滤（如果 plan 有关联的 workflow_id），
+         或在 plan_task_ids 中仅保留"plan 中定义的 task_id 且 ledger 事件的 workflow_id 匹配"的交集。
+         如果 plan 没有关联 workflow_id（独立 validate 场景），则 fallback 到仅按 task_id 过滤。
+    acceptance_criteria: >
+      测试:
+      1. 构造含两个 workflow 的 ledger（task_id 不重叠），sync 后 completed_task_ids 只含 plan 中定义的 task_id。
+      2. [CR-3] 构造含两个 workflow 的 ledger（task_id 重名，如两个 workflow 都有 T1），sync 后只同步正确 workflow 的 T1。
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_ralph_standalone.py -q --tb=short -k 'sync_plan'"
+      checks:
+        - name: "sync_plan_filter_test"
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -q --tb=short -k 'sync_plan'"
+      covers:
+        tasks: ["T3"]
+        paths: ["tests/ralph/test_ralph_standalone.py"]
+    provides:
+      - name: sync_plan_filtered
+        kind: invariant
+        schema_hint: "sync_plan_state only syncs task_ids defined in the plan"
+    addresses: ["FIX-29"]
+
+  - id: T4
+    title: "FIX-30: validate --ledger 事件写入，异常不静默吞掉"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/cli.py"
+    awareness_paths:
+      - "src/cccc/kernel/ledger.py"
+    depends_on: []
+    goal_behavior: >
+      修改 _cmd_validate() 中的 ledger 写入代码（cli.py line 237-255）：
+      1. 移除 except Exception: pass，改为 except Exception as exc: logger.warning("Failed to write validation event to ledger", exc_info=True)。
+      2. [Codex review CR-4] 不要手工构造 data dict。改用 contracts/v1 的 serialize_validation_event_v1()
+         或等价的 v1 serializer 来生成符合 PlanValidatedData schema 的 payload。
+      3. [CR-4] 当 report.valid=False 时，event kind 应为 workflow.plan_validation_failed 而非 workflow.plan_validated。
+         如果 schema 不区分，至少 data 中应包含 valid=False 标记。
+    acceptance_criteria: >
+      测试:
+      1. ralph validate --ledger 对 valid plan 执行后，ledger 中存在 workflow.plan_validated 事件且 data 符合 v1 schema。
+      2. ralph validate --ledger 对 invalid plan 执行后，ledger 中存在正确的失败事件（plan_validation_failed 或 valid=False）。
+      3. append_event 失败时打印 warning 而非静默忽略。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_ralph_verification.py -q --tb=short -k 'validate and ledger'"
+      checks:
+        - name: "validate_ledger_test"
+          command: "python -m pytest tests/test_ralph_verification.py -q --tb=short -k 'validate'"
+      covers:
+        tasks: ["T4"]
+        paths: ["tests/test_ralph_verification.py"]
+    provides:
+      - name: validate_ledger_event_reliable
+        kind: invariant
+        schema_hint: "validate --ledger writes event reliably, errors are visible"
+    addresses: ["FIX-30"]
+
+  - id: T5
+    title: "FIX-31: validate_with_project 使用 effective_suppress_codes"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/validator.py"
+    awareness_paths:
+      - "src/cccc/ralph/models.py"
+    depends_on: []
+    goal_behavior: >
+      修改 validate_with_project()（validator.py）中的两处 _apply_suppression 调用：
+      1. line 258: _apply_suppression(structural_issues, plan.suppress_codes) → plan.effective_suppress_codes
+      2. line 278: _apply_suppression(all_issues, plan.suppress_codes) → plan.effective_suppress_codes
+      这样 validate_with_project() 和 validate() 对 suppress_instances 行为一致。
+    acceptance_criteria: >
+      测试:
+      1. 含 suppress_instances 的 plan 经 validate_with_project() 的 fatal short-circuit 路径（line 256-265）时，
+         对应 code 被正确抑制（使用 effective_suppress_codes）。
+      2. 含 suppress_instances 的 plan 经 validate_with_project() 的正常合并路径（line 267-279）时，
+         对应 code 被正确抑制。
+      3. [Codex review CR-5] 两条路径的 suppress 行为与 validate() 一致。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_ralph_verification.py -q --tb=short -k 'suppress'"
+      checks:
+        - name: "suppress_consistency_test"
+          command: "python -m pytest tests/test_ralph_verification.py -q --tb=short -k 'suppress'"
+      covers:
+        tasks: ["T5"]
+        paths: ["tests/test_ralph_verification.py"]
+    provides:
+      - name: suppress_codes_consistent
+        kind: invariant
+        schema_hint: "Both validate paths use effective_suppress_codes"
+    addresses: ["FIX-31"]
+
+  - id: T6
+    title: "FIX-32: BLOCK mode hook 异常 fail-closed，OBSERVE mode 落 ledger"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+    depends_on: []
+    goal_behavior: >
+      修改 _run_pre_transition_hooks()（workflow_state_engine.py line 47-74）中的 generic Exception handler（line 73-74）：
+      [Codex review CR-6a] 不使用"任意 BLOCK 就全局 fail-closed"策略，因为这会让无关 OBSERVE hook 的 bug 误拦所有转换。
+      改为：让每个 hook 函数通过属性或注册时声明自己关联的 invariant_id。
+      1. 当 hook 抛出未知异常时，检查该 hook 关联的 invariant_id 在 monitor config 中的 mode：
+         - 如果该 hook 的 invariant 处于 BLOCK mode → fail-closed（包装为 TransitionRejected 后 raise）。
+         - 如果该 hook 的 invariant 处于 OBSERVE/WARN mode → fail-open 但记录 ledger 事件。
+         - 如果 hook 没有声明 invariant_id → fail-open 但记录 ledger 事件。
+      2. 所有 hook 异常都通过 self.report_hook_alert 记录（包含异常类型和消息），不再静默吞掉。
+      [CR-6b] 同步修改 workflow_monitor.py 中的 create_*_hook() 工厂函数，
+      让生成的 hook 函数携带 invariant_id 属性（如 hook.invariant_id = "completer_mismatch"）。
+      [CR-6c] 确保 orchestrator apply_task_event() 能正确处理 TransitionRejected（不冒成 internal error）。
+      检查现有 except 链是否已覆盖 TransitionRejected → 如果未覆盖，添加映射到 accepted=False。
+    acceptance_criteria: >
+      测试:
+      1. BLOCK mode 下该 hook 自身抛出未知异常时，转换被阻止（TransitionRejected）。
+      2. OBSERVE mode 下 hook 异常时转换继续但有 ledger 记录。
+      3. 一个 OBSERVE hook 异常 + 另一个不相关的 BLOCK invariant 存在时，转换不被误拦。
+      4. [CR-6c] 从 orchestrator/ops 入口触发的 hook 异常被正确映射为 accepted=False，不冒成 500。
+      5. 所有 hook 异常都有 ledger 事件。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'hook'"
+      checks:
+        - name: "hook_fail_closed_test"
+          command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'hook'"
+      covers:
+        tasks: ["T6"]
+    provides:
+      - name: hook_fail_closed_block
+        kind: invariant
+        schema_hint: "BLOCK mode hooks fail-closed on unknown exceptions"
+    addresses: ["FIX-32"]
+
+  # ===================================================================
+  # Integration: 验证所有修复的组合正确性
+  # ===================================================================
+
+  - id: T7
+    title: "集成验证: 全部 FIX-27~32 修复后回归测试"
+    role: integration
+    claimed_paths:
+      - "tests/test_foreman_workflow.py"
+      - "tests/test_workflow_state.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/ralph/plan_io.py"
+      - "src/cccc/ralph/cli.py"
+      - "src/cccc/ralph/validator.py"
+    depends_on: ["T1", "T2", "T3", "T4", "T5", "T6"]
+    goal_behavior: >
+      运行完整测试套件，确认所有 FIX-27~32 修复没有引入回归：
+      1. 运行 163 个已有测试确认全部通过。
+      2. 运行各 fix 新增的测试确认修复生效。
+      3. 特别验证 FIX-27 + FIX-28 的组合场景：BLOCK mode 下错 agent 被拒 + 正确 agent 的 CAS 不被误拒。
+      4. [Codex review CR-7] 验证以下负向场景已被覆盖：
+         - 同名 task_id 跨 workflow 时 sync_plan_state 不误同步
+         - invalid validation 时 ledger 事件正确
+         - hook unknown exception 经 orchestrator 路径不冒 500
+    acceptance_criteria: >
+      所有已有测试通过（不低于 163 个）；所有新增测试通过；无回归。
+      [CR-7] 以下场景有明确测试用例：跨 workflow task_id 冲突、invalid plan 的 ledger 事件、hook 异常经 orchestrator 路径。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/test_workflow_state.py tests/test_foreman_workflow.py tests/test_ralph_verification.py tests/ralph/test_ralph_standalone.py -q --tb=short"
+      checks:
+        - name: "engine_orchestrator_regression"
+          command: "python -m pytest tests/test_workflow_state.py tests/test_foreman_workflow.py -q --tb=short"
+        - name: "ralph_regression"
+          command: "python -m pytest tests/test_ralph_verification.py tests/ralph/test_ralph_standalone.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]
+    consumes:
+      - name: completer_mismatch_pre_check
+      - name: cas_graceful_degradation
+      - name: sync_plan_filtered
+      - name: validate_ledger_event_reliable
+      - name: suppress_codes_consistent
+      - name: hook_fail_closed_block
+    addresses: ["FIX-27", "FIX-28", "FIX-29", "FIX-30", "FIX-31", "FIX-32"]
+
+critical_flows:
+  - id: CF1
+    name: "mismatch_block_protects_assignment"
+    description: "Wrong agent's completed event is blocked before overwriting assignment"
+    entrypoints:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    segment:
+      - "apply_task_event receives completed from agent_B"
+      - "check original agent_id != agent_B"
+      - "BLOCK mode → reject, OBSERVE → warn + proceed"
+    covered_by: ["T1", "T7"]
+
+  - id: CF2
+    name: "cas_graceful_on_missing_attempt_id"
+    description: "CAS doesn't reject when attempt_id not provided (pre-migration)"
+    entrypoints:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    segment:
+      - "external API sends assignment_id only"
+      - "engine skips CAS (no attempt_id to compare)"
+      - "completion proceeds normally"
+    covered_by: ["T2", "T7"]
+
+  - id: CF3
+    name: "hook_fail_closed_in_block"
+    description: "Unknown hook exception blocks transition in BLOCK mode"
+    entrypoints:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    segment:
+      - "pre-transition hook raises unexpected Exception"
+      - "engine checks monitor config for any BLOCK invariant"
+      - "wraps as TransitionRejected → transition vetoed"
+    covered_by: ["T6", "T7"]
+
+forbidden_flows:
+  - id: FF1
+    name: "mismatch_bypass_via_overwrite"
+    description: "report_worker_started must not overwrite agent_id before mismatch check"
+    segment:
+      - "ASSIGNED task receives completed from wrong agent"
+      - "report_worker_started(wrong_agent_id) overwrites task.agent_id"
+      - "mismatch check passes because agent_id now matches"
+    violated_by: "FIX-27 current behavior"
+    prevented_by: ["T1"]
+    negative_test: "tests/test_foreman_workflow.py::test_completer_mismatch_block_rejects"
+
+  - id: FF2
+    name: "cas_rejects_valid_completion"
+    description: "CAS must not reject when caller only has assignment_id"
+    segment:
+      - "external API sends assignment_id (no attempt_id)"
+      - "engine compares assignment_id against attempt_id"
+      - "mismatch → valid completion rejected"
+    violated_by: "FIX-28 current behavior"
+    prevented_by: ["T2"]
+    negative_test: "tests/test_workflow_state.py::test_cas_accepts_assignment_id_only"
+
+  - id: FF3
+    name: "hook_error_silently_passes"
+    description: "Hook exception in BLOCK mode must not allow transition to proceed"
+    segment:
+      - "pre-transition hook raises Exception in BLOCK mode"
+      - "except Exception: logger.warning(...) — no re-raise"
+      - "transition proceeds despite hook failure"
+    violated_by: "FIX-32 current behavior"
+    prevented_by: ["T6"]
+    negative_test: "tests/test_workflow_state.py::test_hook_error_block_mode_rejects"

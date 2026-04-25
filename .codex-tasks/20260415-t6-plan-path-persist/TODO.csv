@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect T6 spec and current plan_path flow,DONE,Current storage/replay gaps identified,,2026-04-15T02:20:00,0,Confirmed plan_path lived only in _active_workflows and was not restored into Ralph after replay
+2,Implement engine metadata persistence for plan_path,DONE,Engine stores plan_path in ledger event and restores on replay,,2026-04-15T02:25:00,0,Added WorkflowMeta plus engine get_plan_path and replay restore
+3,Switch orchestrator to engine-backed plan_path and restore Ralph context,DONE,_active_workflows no longer owns plan_path and restart re-registers contexts,,2026-04-15T02:27:00,0,register_and_suggest now forwards plan_path to engine and startup restores Ralph contexts from engine state
+4,Add or update tests for replay and Ralph restore,DONE,Tests cover engine replay plus orchestrator restart behavior,,2026-04-15T02:30:00,0,Added workflow_state replay coverage and foreman restart/context assertions
+5,Run requested verification,DONE,All requested pytest commands pass,"python -m pytest tests/test_workflow_state.py -k plan_path -v --tb=short && python -m pytest tests/test_workflow_state.py -v --tb=short && python -m pytest tests/test_foreman_workflow.py -k plan -v --tb=short",2026-04-15T02:31:00,0,All three requested pytest commands passed

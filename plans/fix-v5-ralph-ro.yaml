@@ -1,0 +1,591 @@
+# Plan: RO-7n~RO-19 — Ralph 问题清单 v5 待实施改进全量修复
+#
+# 来源：todo/问题清单-v5-ralph.md § 一 待实施改进（9 项）
+# 工作流：findings.md § 〇 经验证的工作流程
+#
+# 设计原则：
+#   - #2  按功能切片拆分，避免按文件拆分产生死代码
+#   - #9  波次推进，write-set 冲突由 ralph suggest 自动序列化
+#   - #11 verification 必须真正跑命令，不是 py_compile
+#   - #13 结构校验 + 代码审查互补
+#
+# 批次预期（由 ralph suggest 决定）：
+#   Batch 1: [T1, T2, T7, T8]  — 4 路并行（无文件冲突）
+#   Batch 2: T3               — validator.py + models.py (write-conflict serialized)
+#   Batch 3: T4               — models.py + validator.py + filesystem_validator.py
+#   Batch 4: T-int            — backend 集成测试（不含 T7 前端）
+
+schema_version: "1.0.0"
+
+required_issues:
+  - "RO-15"
+  - "RO-17"
+  - "RO-7n"
+  - "RO-14n"
+  - "RO-13n"
+  - "RO-16"
+  - "RO-12"
+  - "RO-19"
+  - "RO-18"
+
+semantic_mode: "off"
+auto_infer: false
+
+critical_entrypoints:
+  - src/cccc/ralph/validator.py
+  - src/cccc/ralph/filesystem_validator.py
+  - src/cccc/ralph/models.py
+  - src/cccc/ralph/cli.py
+
+critical_flows:
+  - id: validate_pipeline
+    description: "Plan YAML → structural checks → filesystem checks → suppression → report"
+    entrypoints:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/filesystem_validator.py
+    required_verification_level: integration
+
+forbidden_flows:
+  - id: FF_directory_crash
+    description: "IsADirectoryError must not occur when verification command contains directory paths"
+    required_verification_level: unit
+  - id: FF_shallow_silent_pass
+    description: "Plans with only compile/import checks must not pass without W_VERIFICATION_SHALLOW_CHECKS warning"
+    required_verification_level: unit
+
+# 本计划的新测试由 worker 创建，suppress 鸡生蛋假阳性
+# 继承的 ralph.yaml critical flows 与本计划无关（不改 daemon/CLI 基础设施）
+suppress_codes:
+  - "W_VERIFICATION_PYTEST_K_NO_MATCH"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "W_FLOW_OWNER_NO_VERIFICATION"
+  - "W_UNCLAIMED_TEST_FOR_SOURCE"
+  - "W_TEST_COVERAGE_GAP"
+
+# ═════════════════════════════════════════════════════════════════════════
+# Tasks
+# ═════════════════════════════════════════════════════════════════════════
+
+tasks:
+
+  # ─────────────────────────────────────────────────────────────────────
+  # T1: RO-15 — filesystem validator 目录路径崩溃修复 (P1)
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: T1
+    title: "RO-15: Fix filesystem validator IsADirectoryError crash on directory paths"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RO-15"]
+    claimed_paths:
+      - src/cccc/ralph/filesystem_validator.py
+      - tests/ralph/test_filesystem_validator.py
+    awareness_paths:
+      - src/cccc/ralph/workspace_index.py
+    goal_behavior: >
+      Fix IsADirectoryError crash when verification command contains directory
+      paths like `pytest tests/` or `pytest tests/ralph/`. The crash occurs
+      because filesystem_validator extracts paths from verification commands
+      and attempts file-level operations without checking if the path is a
+      directory.
+
+      Fix points in filesystem_validator.py:
+      1. In _load_issue_file_map_cached (line ~44): add IsADirectoryError to the
+         exception catch alongside FileNotFoundError, UnicodeDecodeError.
+      2. In _check_pytest (line ~720): after extracting file_path from target via
+         partition("::"), if file_path refers to a directory (check with
+         Path(workspace.project_root / file_path).is_dir()), skip _check_pytest_k
+         and node_part parsing — directory is a valid pytest target that collects
+         tests from all contained files.
+         NOTE: WorkspaceIndex does NOT have path_is_dir(); use
+         Path(workspace.project_root / file_path).is_dir() directly.
+      3. In _check_path_target (line ~802): when workspace.path_exists returns
+         True for a directory path, return [] (no issues) — same as for files.
+
+      Add tests in tests/ralph/test_filesystem_validator.py:
+      - test_directory_path_no_crash: verification command `pytest tests/ -q`
+        → validate produces no crash, no error
+      - test_directory_path_with_k: verification command `pytest tests/ -k foo`
+        → no crash (skip -k match check for directory targets)
+      - test_directory_path_nested: verification command `pytest tests/ralph/ -q`
+        → no crash
+    acceptance_criteria: >
+      1. `ralph validate` with verification `pytest tests/ -k pattern` does NOT crash
+      2. `ralph validate` with verification `pytest tests/ralph/ -q` does NOT crash
+      3. Directory paths produce no error (directory is valid pytest target)
+      4. File-path verification behavior unchanged — existing tests pass
+    failure_path: >
+      If directory detection fails, fall back to catching IsADirectoryError in
+      _load_issue_file_map_cached so the crash is eliminated at the lowest level.
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_filesystem_validator.py -k directory -q"
+      checks:
+        - name: dir_no_crash
+          command: "python -m pytest tests/ralph/test_filesystem_validator.py -k test_directory -q"
+          required: true
+        - name: existing_fsv_tests
+          command: "python -m pytest tests/ralph/test_filesystem_validator.py -q"
+          required: true
+      covers:
+        tasks: [T1]
+        flows: [FF_directory_crash]
+        paths: [tests/ralph/test_filesystem_validator.py]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # T2: RO-17 — W_VERIFICATION_SHALLOW_CHECKS 规则 (P1)
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: T2
+    title: "RO-17: Add W_VERIFICATION_SHALLOW_CHECKS rule for compile-only checks"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RO-17"]
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+      - tests/test_ralph_verification.py
+    goal_behavior: >
+      Add W_VERIFICATION_SHALLOW_CHECKS validation rule to catch tasks whose
+      verification.checks contain only shallow check types (compile, import,
+      help) without any behavioral test (pytest, assertion-based test).
+
+      Implementation in validator.py:
+      1. Add _check_verification_shallow_checks(plan) function.
+      2. Define shallow check classifier — a check is "shallow" if its name
+         matches patterns: compile, py_compile, import, help, cli_help, syntax,
+         or if its command is `python -m py_compile ...` or `python -c "from ..."`.
+         A check is "behavioral" if its name contains test/pytest/behavior or
+         its command invokes pytest.
+      3. For each task with verification.checks, if ALL checks are classified
+         as shallow, emit:
+         - code: W_VERIFICATION_SHALLOW_CHECKS
+         - severity: warning
+         - message: suggests adding at least one behavioral test check
+      4. Wire into _collect_structural_issues after _check_verification_no_checks.
+      5. Optional enhancement: when acceptance_criteria mentions keywords like
+         "concurrency", "error handling", "persistence", "race condition",
+         "lock", "atomic" but checks have no pytest, add evidence noting the gap.
+
+      Add tests in tests/test_ralph_verification.py:
+      - test_shallow_checks_only_compile: checks=[compile_check] → warning
+      - test_shallow_checks_with_pytest: checks=[compile_check, pytest_test] → no warning
+      - test_shallow_checks_empty: checks=[] → handled by W_VERIFICATION_NO_CHECKS, not this rule
+      - test_shallow_checks_acceptance_keyword_gap: acceptance mentions "concurrency",
+        checks only compile → warning with evidence
+    acceptance_criteria: >
+      1. Plan with checks=[compile_check, import_check] gets W_VERIFICATION_SHALLOW_CHECKS
+      2. Plan with checks=[compile_check, pytest_behavior_test] does NOT get the warning
+      3. Plan with checks=[] is handled by W_VERIFICATION_NO_CHECKS (not this rule)
+      4. Existing validation tests pass unchanged
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_ralph_verification.py -k shallow -q"
+      checks:
+        - name: shallow_checks_warning
+          command: "python -m pytest tests/test_ralph_verification.py -k test_shallow -q"
+          required: true
+        - name: existing_verification_tests
+          command: "python -m pytest tests/test_ralph_verification.py -q"
+          required: true
+      covers:
+        tasks: [T2]
+        flows: [FF_shallow_silent_pass]
+        paths: [tests/test_ralph_verification.py]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # T3: RO-7n + RO-14n + RO-13n — 流段所有权 + 关键入口范围 (P2)
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: T3
+    title: "RO-7n/14n/13n: Flow segment Python paths + leaf exemption + plan_scope"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RO-7n", "RO-14n", "RO-13n"]
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/models.py
+      - tests/ralph/test_ralph_standalone.py
+    awareness_paths:
+      - src/cccc/ralph/core.py
+    goal_behavior: >
+      Three related improvements to reduce false positives in flow/entrypoint
+      checking logic. All three modify validator.py; combining avoids 3 rounds
+      of write-set serialization.
+
+      RO-7n — Python symbol path support in _check_flow_segment_ownership:
+      When critical_flows.entrypoints use Python symbol paths (e.g.,
+      `workflow_orchestrator._start_assigned_agents` or
+      `agent_pool.AgentPoolManager.evaluate_for_task`), resolve them to file
+      paths before matching against claimed_paths.
+      Implementation:
+      1. Add helper _resolve_symbol_entrypoint(entrypoint: str, owned_paths: Set[str]) -> Optional[str]
+         that converts `module.Class.method` to file path candidates.
+         IMPORTANT: must receive the full owned_paths set (claimed + awareness),
+         NOT just claimed_paths — _task_owned_paths() already merges both, and
+         existing tests in test_ralph_standalone.py rely on awareness-path
+         ownership (see lines 512-526).
+         Detection: entrypoint does not contain `/`.
+         Resolution: split on `.`, take first part as module name, search
+         owned_paths for any path ending with `/<first_part>.py`.
+      2. Modify _claimed_flow_entrypoints to call _resolve_symbol_entrypoint
+         for non-path entrypoints and match the resolved path.
+
+      RO-14n — Leaf role exemption in _check_flow_segment_ownership:
+      When generating W_FLOW_OWNER_NO_VERIFICATION for a task that claims a
+      flow entrypoint but doesn't verify the flow: if task.role == "leaf"
+      AND there exists at least one COVERING TASK with role in ("integration",
+      "verification") (not just any covering task), downgrade to hint.
+      CRITICAL: filter covering_tasks by role — only integration/verification
+      roles count. If only other leaf tasks cover the flow, severity stays
+      "warning". Add a negative test for "only-leaf-covering" scenario.
+      Implementation:
+      In the second loop of _check_flow_segment_ownership (lines ~958-968):
+      1. Build integration_or_verification_covering = {t.id for t in covering_tasks
+         if t.role in ("integration", "verification")}
+      2. If task.role == "leaf" and integration_or_verification_covering is not empty,
+         set severity = "hint"; otherwise keep "warning".
+
+      RO-13n — plan_scope filtering for critical entrypoint checks:
+      Add `plan_scope: List[str] = Field(default_factory=list)` to Plan model.
+      In _check_critical_coverage, when plan.plan_scope is non-empty, skip
+      critical entrypoints whose parent_dir doesn't start with any plan_scope
+      prefix. Also skip critical_flows whose ALL entrypoints are outside scope.
+      Implementation:
+      1. Add plan_scope field to Plan in models.py.
+      2. Add _entrypoint_in_scope(ep: str, plan_scope: List[str]) -> bool helper.
+      3. In _check_critical_coverage, wrap entrypoint/flow checks with scope filter.
+
+      Add tests in tests/ralph/test_ralph_standalone.py (alongside existing
+      critical-flow/entrypoint tests at lines 475-670):
+      - test_python_symbol_path_resolves: entrypoint `orchestrator._start` matches
+        task claiming `src/cccc/daemon/foreman/orchestrator.py`
+      - test_symbol_path_via_awareness: entrypoint resolves via awareness_paths too
+      - test_path_entrypoint_unchanged: entrypoint with `/` still works
+      - test_leaf_exemption_with_integration: leaf + integration role covering → hint
+      - test_leaf_no_exemption_leaf_only: leaf + only leaf covering → warning
+      - test_leaf_no_exemption_without_covering: leaf, no covering → warning
+      - test_plan_scope_filters_entrypoints: plan_scope limits checks
+      - test_empty_plan_scope_checks_all: empty scope → all checked (backward compat)
+    acceptance_criteria: >
+      1. Python symbol entrypoint matches task claiming the resolved file path
+      2. Symbol resolution also works via awareness_paths (not just claimed_paths)
+      3. Path entrypoints still use path prefix matching (unchanged behavior)
+      4. Leaf task gets hint (not warning) when integration/verification role covers the flow
+      5. Leaf task gets WARNING when only other leaf tasks cover the flow
+      6. Leaf task gets warning when no task covers the flow at all
+      7. plan_scope filters critical entrypoints to scope-relevant ones only
+      8. Empty plan_scope checks all entrypoints (backward compatible)
+      9. Existing flow/entrypoint tests pass unchanged
+    failure_path: >
+      If symbol resolution is ambiguous (multiple files match), skip resolution
+      and fall back to existing path-only matching. If plan_scope filtering
+      is too aggressive, empty scope degrades to checking all entrypoints.
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_ralph_standalone.py -k 'symbol_path or leaf_exempt or plan_scope' -q"
+      checks:
+        - name: python_symbol_path
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -k test_python_symbol -q"
+          required: true
+        - name: leaf_exemption
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -k test_leaf_exempt -q"
+          required: true
+        - name: plan_scope
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -k test_plan_scope -q"
+          required: true
+        - name: existing_standalone_tests
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -q"
+          required: true
+      covers:
+        tasks: [T3]
+        paths: [tests/ralph/test_ralph_standalone.py]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # T4: RO-16 + RO-12 — 新模型字段 + 校验规则 (P2)
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: T4
+    title: "RO-16/12: test_created_by support + finding_refs validation"
+    role: leaf
+    type: backend
+    depends_on: [T1, T3]
+    addresses: ["RO-16", "RO-12"]
+    claimed_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/filesystem_validator.py
+      - tests/test_ralph_verification.py
+      - tests/ralph/test_filesystem_validator.py
+    goal_behavior: >
+      Two improvements adding new model fields and validation rules. Both
+      modify models.py and validator.py; combining avoids extra serialization.
+
+      RO-16 — test_created_by support:
+      Fix false positives when fix plans include tasks that CREATE new tests.
+      Currently Ralph checks if test files/functions exist, but for "add test"
+      plans the tests don't exist yet because tasks haven't run.
+      Implementation:
+      1. Add `test_created_by: List[str] = Field(default_factory=list)` to both
+         CriticalFlow and ForbiddenFlow models in models.py.
+      2. In validator.py _check_forbidden_flows: when forbidden_flow has
+         test_created_by set and at least one referenced task is NOT in
+         plan.state.completed_task_ids, downgrade E_FORBIDDEN_FLOW_UNCOVERED
+         to hint with message "[deferred] test will be created by T<n>".
+      3. In validator.py _check_critical_coverage: apply same logic for
+         E_CRITICAL_FLOW_UNCOVERED when critical_flow has test_created_by.
+      4. In filesystem_validator.py _check_pytest_k: when -k pattern doesn't
+         match and the test file_path is in some task's claimed_paths
+         (already partially handled via claims_target/plan_claims_target),
+         ensure the downgrade path works for test_created_by scenarios.
+
+      RO-12 — finding_refs field:
+      Add structured finding_refs field to plan YAML schema.
+      Implementation:
+      1. Add FindingRef model in models.py:
+         - id: str (e.g., "F16")
+         - mitigation: str (description)
+         - enforced_by: List[str] = [] (rule/monitor/state machine IDs)
+      2. Add `finding_refs: List[FindingRef] = Field(default_factory=list)` to Plan.
+      3. Add _check_finding_refs(plan) in validator.py:
+         - For each ref with empty id → W_FINDING_REF_INCOMPLETE warning
+         - For each ref with empty mitigation → W_FINDING_REF_INCOMPLETE warning
+         - For each ref with non-empty enforced_by: cross-check each ID against
+           known validation rule codes (all E_*/W_*/H_* codes emitted by Ralph).
+           If enforced_by references an unknown ID → W_FINDING_REF_UNKNOWN_ENFORCER hint.
+           This check is REQUIRED, not optional — RO-12 explicitly requires
+           "mitigation 是否绑定到可枚举的规则/monitor/状态机 ID".
+      4. Wire _check_finding_refs into _collect_structural_issues.
+
+      Add tests in tests/test_ralph_verification.py:
+      - test_test_created_by_defers_forbidden: forbidden_flow with test_created_by → hint
+      - test_test_created_by_enforces_after_completion: completed task → still error
+      - test_test_created_by_defers_critical: critical_flow with test_created_by → hint
+      - test_finding_refs_valid: well-formed finding_refs → no issues
+      - test_finding_refs_missing_id: empty id → W_FINDING_REF_INCOMPLETE
+      - test_finding_refs_missing_mitigation: empty mitigation → warning
+      - test_finding_refs_unknown_enforcer: enforced_by references unknown rule → hint
+      - test_finding_refs_valid_enforcer: enforced_by references known rule → no issue
+      - test_finding_refs_optional: no finding_refs → unchanged behavior
+    acceptance_criteria: >
+      1. forbidden_flow with test_created_by: ["T1"] → hint when T1 not completed
+      2. forbidden_flow with test_created_by: ["T1"] → error when T1 completed but test missing
+      3. critical_flow with test_created_by same behavior
+      4. Plan with well-formed finding_refs (id + mitigation + valid enforced_by) passes
+      5. Plan with finding_ref missing id/mitigation gets W_FINDING_REF_INCOMPLETE
+      6. Plan with finding_ref enforced_by referencing unknown rule gets W_FINDING_REF_UNKNOWN_ENFORCER
+      7. finding_refs is optional — plan without it behaves unchanged
+      8. Existing tests pass unchanged
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_ralph_verification.py -k 'test_created_by or finding_ref' -q"
+      checks:
+        - name: test_created_by
+          command: "python -m pytest tests/test_ralph_verification.py -k test_created_by -q"
+          required: true
+        - name: finding_refs
+          command: "python -m pytest tests/test_ralph_verification.py -k test_finding_ref -q"
+          required: true
+        - name: existing_tests
+          command: "python -m pytest tests/test_ralph_verification.py -q"
+          required: true
+      covers:
+        tasks: [T4]
+        paths: [tests/test_ralph_verification.py]
+    provides:
+      - name: test_created_by_field
+        kind: validation_rule
+      - name: finding_refs_field
+        kind: validation_rule
+
+  # ─────────────────────────────────────────────────────────────────────
+  # T7: RO-19 — 前端测试质量门 (P1)
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: T7
+    title: "RO-19: Frontend test quality gate — add vitest scripts to web"
+    role: leaf
+    type: frontend
+    depends_on: []
+    addresses: ["RO-19"]
+    claimed_paths:
+      - web/package.json
+      - web/vite.config.ts
+      - .github/workflows/ci.yml
+    goal_behavior: >
+      Add test scripts to web/package.json, vitest configuration to
+      vite.config.ts, and wire frontend tests into CI — so frontend tests
+      become a first-class quality gate. vitest 4.1.0 is already installed.
+
+      Implementation:
+      1. Add jsdom devDependency to web/package.json:
+         `npm -C web install -D jsdom` (required for vitest DOM environment;
+         currently NOT in package.json despite needing `test.environment: "jsdom"`)
+      2. Add scripts to web/package.json:
+         - "test": "vitest" (watch mode for development)
+         - "test:run": "vitest run" (single run for CI)
+         - "quality": "npm run lint && npm run typecheck && npm run test:run"
+      3. Add vitest test configuration to vite.config.ts:
+         - Add `/// <reference types="vitest/config" />` at top for type support
+         - Add test block: { globals: true, environment: "jsdom",
+           include: ["tests/**/*.test.{ts,tsx}", "src/**/*.test.{ts,tsx}"] }
+      4. Wire into CI: add `npm -C web run test:run` to .github/workflows/ci.yml
+         after the existing `npm -C web run build` step (line ~28).
+      5. Verify that existing test files are discovered and pass.
+
+      Existing test files (already in repo):
+      - web/tests/components/, web/tests/features/, web/tests/hooks/
+      - web/tests/services/api.test.ts, web/tests/stores/, web/tests/utils/
+      - web/src/stores/*.test.ts, web/src/utils/*.test.ts, web/src/components/*.test.ts
+    acceptance_criteria: >
+      1. `npm -C web run test:run` executes all existing vitest test files
+      2. `npm -C web run quality` runs lint + typecheck + test:run sequentially
+      3. Test failures cause non-zero exit code
+      4. jsdom is listed in devDependencies (required for DOM test environment)
+      5. CI workflow (.github/workflows/ci.yml) runs `npm -C web run test:run`
+      6. Existing tests pass (no new test failures introduced)
+    verification:
+      level: unit
+      command: "cd web && npm ci && npm run test:run"
+      checks:
+        - name: vitest_run
+          command: "cd web && npm run test:run"
+          required: true
+        - name: quality_gate
+          command: "cd web && npm run quality"
+          required: true
+      covers:
+        tasks: [T7]
+        paths: [web/package.json, web/vite.config.ts, .github/workflows/ci.yml]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # T8: RO-18 — 质量门 rollout 模式基础设施 (P2)
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: T8
+    title: "RO-18: Quality gate rollout mode infrastructure (shadow/warn/enforce)"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RO-18"]
+    claimed_paths:
+      - src/cccc/ralph/cli.py
+      - .cccc/quality-gate.yaml
+      - tests/ralph/test_ralph_standalone.py
+    awareness_paths:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/models.py
+    goal_behavior: >
+      Add quality gate rollout mode infrastructure so new Ralph rules can be
+      deployed progressively: shadow → warn → enforce. This allows observing
+      false-positive rates before upgrading rules to blocking.
+
+      Implementation:
+      1. Create .cccc/quality-gate.yaml configuration:
+         ```yaml
+         gates:
+           terminal:
+             mode: warn
+             overrides:
+               W_VERIFICATION_SHALLOW_CHECKS: shadow
+               W_FINDING_REF_INCOMPLETE: shadow
+           branch:
+             mode: warn
+           repo:
+             mode: enforce
+         ```
+      2. Add gate mode loading in cli.py:
+         - Add --gate parameter to `ralph validate` (choices: terminal, branch, repo)
+         - Load quality-gate.yaml from project .cccc/ directory
+         - Apply mode overrides to validation report:
+           * shadow: rule stays in output but issue.severity forced to "hint",
+             doesn't affect report.valid
+           * warn: natural severity (current behavior)
+           * enforce: issue.severity upgraded to "error" if currently warning/hint
+      3. CLI output: show gate mode banner when --gate is used.
+      4. Missing quality-gate.yaml → all rules at natural severity (no-op).
+
+      Add tests in tests/ralph/test_ralph_standalone.py:
+      - test_gate_shadow_mode: rule in shadow → hint, not error
+      - test_gate_enforce_mode: rule in enforce → error
+      - test_gate_missing_config: no quality-gate.yaml → unchanged
+      - test_gate_default_no_flag: no --gate → unchanged
+    acceptance_criteria: >
+      1. `ralph validate --gate terminal` uses terminal gate configuration
+      2. Rules in shadow mode appear in hints, don't cause validation failure
+      3. Rules in enforce mode cause validation failure (severity=error)
+      4. Default behavior (no --gate) is unchanged
+      5. Missing quality-gate.yaml is a no-op (all rules at natural severity)
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_ralph_standalone.py -k gate -q"
+      checks:
+        - name: gate_modes
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -k test_gate -q"
+          required: true
+        - name: existing_standalone_tests
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -q"
+          required: true
+      covers:
+        tasks: [T8]
+        paths: [tests/ralph/test_ralph_standalone.py]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # T-int: 集成测试 — 全部新规则 + 回归
+  # ─────────────────────────────────────────────────────────────────────
+
+  - id: T-int
+    title: "Integration: backend RO rules end-to-end + regression"
+    role: integration
+    type: backend
+    depends_on: [T1, T2, T3, T4, T8]
+    claimed_paths:
+      - tests/ralph/test_v5_ro_integration.py
+    awareness_paths:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/filesystem_validator.py
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/cli.py
+    goal_behavior: >
+      Create an integration test that exercises all new validation rules
+      together and verifies no regressions in existing functionality.
+
+      Test scenarios in tests/ralph/test_v5_ro_integration.py:
+      1. Plan with directory paths in verification → no crash, correct handling
+      2. Plan with shallow-only checks → W_VERIFICATION_SHALLOW_CHECKS
+      3. Plan with Python symbol entrypoints → correct resolution
+      4. Plan with plan_scope → correct filtering of out-of-scope entrypoints
+      5. Plan with test_created_by → correct downgrade to hint
+      6. Plan with finding_refs → correct validation
+      7. Complete validate_with_project call exercising new + existing rules
+      8. Regression: all existing Ralph test suites pass
+
+      The integration test builds a single comprehensive plan fixture that
+      triggers multiple new rules simultaneously, verifying they don't
+      interfere with each other.
+    acceptance_criteria: >
+      1. All 7 test scenarios pass
+      2. validate_with_project works end-to-end with new rules
+      3. All existing Ralph test suites pass (no regressions)
+      4. New rules interact correctly (e.g., plan_scope + flow segment ownership)
+    failure_path: >
+      If any new rule causes regression in existing tests, isolate the failing
+      rule and report which RO issue's implementation broke existing behavior.
+      Escalate to plan author for investigation.
+    verification:
+      level: integration
+      command: "python -m pytest tests/ralph/test_v5_ro_integration.py -q"
+      checks:
+        - name: integration_new_rules
+          command: "python -m pytest tests/ralph/test_v5_ro_integration.py -q"
+          required: true
+        - name: regression_ralph
+          command: "python -m pytest tests/ralph/ tests/test_ralph_verification.py -q"
+          required: true
+      covers:
+        tasks: [T1, T2, T3, T4, T8, T-int]
+        flows: [validate_pipeline, FF_directory_crash, FF_shallow_silent_pass]
+        paths:
+          - tests/ralph/test_v5_ro_integration.py

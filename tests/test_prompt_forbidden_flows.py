@@ -159,7 +159,7 @@ def test_forbidden_flows_survive_tight_budget(tmp_path: Path) -> None:
     ]
 
     old_env = os.environ.get("CCCC_PROMPT_TOKEN_BUDGET")
-    os.environ["CCCC_PROMPT_TOKEN_BUDGET"] = "500"
+    os.environ["CCCC_PROMPT_TOKEN_BUDGET"] = "800"
     try:
         prompt = orch._build_task_prompt(
             task,

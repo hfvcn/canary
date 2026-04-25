@@ -1,0 +1,165 @@
+# Phase 2: validate enhancement — new rules + semantic fingerprint + spine recommendation
+# Source: ralph-serena-proposals-evaluation.md §4.4 Phase 2
+
+plan_scope:
+  - src/cccc/ralph/
+
+tasks:
+  - id: T1-implicit-dep
+    title: "S_IMPLICIT_SYMBOL_DEPENDENCY rule"
+    role: leaf
+    depends_on: []
+    claimed_paths:
+      - src/cccc/ralph/semantic_validator.py
+    goal_behavior: |
+      Add new rule S_IMPLICIT_SYMBOL_DEPENDENCY:
+      When two tasks have NO depends_on relationship but one task's semantic targets
+      are referenced by code in another task's claimed_paths, emit a warning.
+      This catches hidden symbol-level dependencies not declared in the DAG.
+      Uses provider.find_references for each task's targets, cross-checks with
+      other tasks' claimed_paths.
+    acceptance_criteria: |
+      Two tasks without depends_on but with symbol reference across boundaries -> warning.
+      Two tasks with depends_on and the same reference -> no warning.
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.semantic_validator import validate_semantic\""
+          required: true
+
+  - id: T2-high-fanout
+    title: "S_HIGH_FANOUT_CHANGE rule"
+    role: leaf
+    depends_on: []
+    claimed_paths:
+      - src/cccc/ralph/semantic_validator.py
+    goal_behavior: |
+      Add new rule S_HIGH_FANOUT_CHANGE:
+      For any modify_body/modify_interface/rename target, if the symbol's total
+      reference count (via provider.find_references) exceeds a threshold (default 10),
+      emit a warning marking it as high-risk.
+      This is distinct from S_MASSIVE_REFACTOR (which checks uncovered refs outside scope).
+      S_HIGH_FANOUT_CHANGE fires on total fanout regardless of scope.
+    acceptance_criteria: |
+      Symbol with >10 total references -> warning.
+      Symbol with <=10 references -> no warning.
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.semantic_validator import validate_semantic\""
+          required: true
+
+  - id: T3-fingerprint
+    title: "Semantic fingerprint per task"
+    role: leaf
+    depends_on: [T1-implicit-dep, T2-high-fanout]
+    claimed_paths:
+      - src/cccc/ralph/semantic_validator.py
+      - src/cccc/ralph/models.py
+    goal_behavior: |
+      Add SemanticFingerprint model: touched_symbols (list of path:symbol),
+      total_fanout (int), dynamic_hotspots (list of path:symbol with opaque confidence),
+      risk_level (low/medium/high based on fanout thresholds).
+      Add function compute_semantic_fingerprint(task, provider) -> SemanticFingerprint.
+      Add fingerprints field to ValidationReport (dict[task_id, SemanticFingerprint]).
+      Fingerprints are computed during validate_semantic and included in the report.
+      This enables downstream consumers (Codex review, Agent) to see code facts per task.
+    acceptance_criteria: |
+      validate_semantic with provider produces fingerprints for tasks with semantic blocks.
+      Fingerprint includes correct touched_symbols and fanout counts.
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.models import SemanticFingerprint\""
+          required: true
+
+  - id: T4-spine
+    title: "Integration spine recommendation"
+    role: leaf
+    depends_on: [T1-implicit-dep]
+    claimed_paths:
+      - src/cccc/ralph/semantic_validator.py
+    goal_behavior: |
+      Add new hint-level rule S_INTEGRATION_SPINE_CANDIDATE:
+      When multiple tasks modify symbols along the same call chain (A calls B calls C,
+      and task T1 modifies A while task T2 modifies C), suggest they either be merged
+      or have an explicit integration task.
+      Uses provider.find_references to trace call chains.
+      Only emits hints (never errors or warnings) — this is advisory.
+    acceptance_criteria: |
+      Two tasks modifying symbols in the same reference chain -> hint.
+      Tasks with no reference chain overlap -> no hint.
+    verification:
+      level: unit
+      checks:
+        - name: import-check
+          command: "python -c \"from cccc.ralph.semantic_validator import validate_semantic\""
+          required: true
+
+  - id: T5-integrate
+    title: "Wire Phase 2 rules into validator"
+    role: integration
+    depends_on: [T1-implicit-dep, T2-high-fanout, T3-fingerprint, T4-spine]
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+    goal_behavior: |
+      Ensure validate_with_project includes all new Phase 2 rules from semantic_validator.
+      Fingerprints from compute_semantic_fingerprint are stored in the report.
+      All new S_ codes are suppressible.
+      Verify backward compatibility: without semantic_provider, no new fields appear.
+    acceptance_criteria: |
+      validate_with_project with provider produces S_IMPLICIT_SYMBOL_DEPENDENCY, S_HIGH_FANOUT_CHANGE,
+      fingerprints, and S_INTEGRATION_SPINE_CANDIDATE when applicable.
+      Without provider, report is identical to Phase 1.
+    verification:
+      level: integration
+      checks:
+        - name: backward-compat
+          command: "python -c \"from cccc.ralph.validator import validate_with_project; print('ok')\""
+          required: true
+      covers:
+        tasks: [T1-implicit-dep, T2-high-fanout, T3-fingerprint, T4-spine, T5-integrate]
+        flows: [phase2-enhance]
+
+  - id: T6-tests
+    title: "Tests for Phase 2 rules and fingerprint"
+    role: verification
+    depends_on: [T1-implicit-dep, T2-high-fanout, T3-fingerprint, T4-spine, T5-integrate]
+    claimed_paths:
+      - tests/test_ralph_semantic.py
+    goal_behavior: |
+      Add test cases for:
+      1. S_IMPLICIT_SYMBOL_DEPENDENCY: two tasks with undeclared symbol reference -> warning
+      2. S_IMPLICIT_SYMBOL_DEPENDENCY: same setup with depends_on -> no warning
+      3. S_HIGH_FANOUT_CHANGE: high fanout -> warning
+      4. S_HIGH_FANOUT_CHANGE: low fanout -> no warning
+      5. SemanticFingerprint computation: correct counts
+      6. S_INTEGRATION_SPINE_CANDIDATE: overlapping call chain -> hint
+      7. Integration: all Phase 2 rules work through validate_with_project
+    acceptance_criteria: |
+      All new tests pass. Existing tests still pass.
+    verification:
+      level: integration
+      checks:
+        - name: run-tests
+          command: "python -m pytest tests/test_ralph_semantic.py -v --tb=short"
+          required: true
+      covers:
+        tasks: [T1-implicit-dep, T2-high-fanout, T3-fingerprint, T4-spine, T5-integrate, T6-tests]
+        flows: [phase2-enhance]
+
+critical_flows:
+  - id: phase2-enhance
+    description: "New semantic rules and fingerprint are produced during validate --semantic"
+    entrypoints:
+      - src/cccc/ralph/semantic_validator.py
+      - src/cccc/ralph/validator.py
+    required_verification_level: unit
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED

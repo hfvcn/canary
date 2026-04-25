@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect heartbeat stall detection and sweep wiring,DONE,"Both target methods and get_orchestrator usage are confirmed","rg -n \"check_stalled_tasks|_run_heartbeat_sweep|get_orchestrator\" src/cccc/daemon","2026-04-18 02:51",0,"fast-context + code read confirmed last_beat fallback existed but was not reused consistently"
+2,Implement FIX-19 changes,DONE,"Both files contain the requested logic updates","python -m py_compile src/cccc/daemon/foreman/workflow_orchestrator.py src/cccc/daemon/automation/engine.py","2026-04-18 02:51",0,"stall summary + monitor timestamps now reuse last_beat; heartbeat sweep now resolves group orchestrator"
+3,Run import validation,DONE,"AutomationManager import command prints OK","python -c \"from cccc.daemon.automation.engine import AutomationManager; print('OK')\"","2026-04-18 02:51",0,"command output: OK"

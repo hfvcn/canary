@@ -454,4 +454,6 @@ cat ${PROJECT_DIR}/WORKFLOW_EVALUATION.md
 | v2 | 2026-04-02 | 3/5 | 2/5 | 3/5 | 2.7/5 | +文档指引 +能力指南 |
 | v3 | 2026-04-02 | 3/5 | 3/5 | 3/5 | 3.0/5 | +WF-1 metadata +WF-4 --plan +WF-6 warning |
 | v4 | 2026-04-03 | 2/5 | 4/5 | 4/5 | 3.3/5 | +FIX-8 auto-dispatch +FIX-6 DAG gating +FIX-10 path scoring |
-| v5 | — | — | — | — | — | 待执行：FIX-12 FK + verification 质量提升 |
+| v5 | 2026-04-19 | 2/5 | 1/5 | 4/5 | 2.3/5 | group 复用 task ID 冲突（环境问题） |
+| v13 | 2026-04-19 | 4/5 | 4/5 | 3.5/5 | 3.8/5 | +RO全量修复 +干净group +W_VERIFICATION_SHALLOW_CHECKS |
+| v14 | 2026-04-22 | 2/5 | 3/5 | 3.8/5 | 3.0/5 | +pool复用 +completion protocol +批次自动推进 +heartbeat指引; 前端CRITICAL bug拉低结果分 |

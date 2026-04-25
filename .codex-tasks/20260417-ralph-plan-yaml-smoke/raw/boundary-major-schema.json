@@ -1,0 +1,45 @@
+{
+  "valid": true,
+  "errors": [],
+  "warnings": [],
+  "hints": [
+    {
+      "code": "H_SEMANTIC_COVERAGE_DEGRADED",
+      "severity": "hint",
+      "message": "some analyzers were skipped: advisory_ast: project language 'unknown' not in ['python']; semantic: project language 'unknown' not in ['python']; semantic_serena: project language 'unknown' not in ['python']",
+      "task_ids": [],
+      "evidence": {
+        "active_analyzers": [
+          "structural",
+          "filesystem"
+        ],
+        "skipped_analyzers": [
+          {
+            "name": "advisory_ast",
+            "reason": "project language 'unknown' not in ['python']"
+          },
+          {
+            "name": "semantic",
+            "reason": "project language 'unknown' not in ['python']"
+          },
+          {
+            "name": "semantic_serena",
+            "reason": "project language 'unknown' not in ['python']"
+          }
+        ],
+        "project_language": "unknown"
+      },
+      "issue_instance_id": "079f60c2d3cceedc",
+      "confidence": "exact",
+      "source": "validator",
+      "action_owner": "author",
+      "worker_relevance": "none"
+    }
+  ],
+  "report_schema_version": "2.0.0",
+  "ruleset_digest": "bcce242d64de28d063db52d6a45d87251b142ba9925a87585764dc79b815afcb",
+  "ralph_version": "0.4.7",
+  "metadata": {
+    "project_root": "/Users/vfch/Documents/project/canary/cccc-main-git/.codex-tasks/20260417-ralph-plan-yaml-smoke/fixture/project"
+  }
+}

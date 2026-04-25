@@ -6,6 +6,8 @@ The plan file (YAML/JSON) is the single source of truth; Ralph never mutates it.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
@@ -113,6 +115,7 @@ class TaskSpec(BaseModel):
 
     goal_behavior: str = ""
     acceptance_criteria: str = ""
+    verification_mode: Literal["ralph", "agent"] = "ralph"
 
     verification: Optional[Verification] = None
 
@@ -120,6 +123,7 @@ class TaskSpec(BaseModel):
     consumes: List[Contract] = Field(default_factory=list)
 
     addresses: List[str] = Field(default_factory=list)  # issue IDs this task fixes
+    failure_path: str = ""
 
     semantic: Optional[SemanticBlock] = None
 
@@ -157,6 +161,7 @@ class TaskSpec(BaseModel):
             goal_behavior=self.goal_behavior,
             acceptance_criteria=self.acceptance_criteria,
             verification=verification_spec,
+            verification_mode=self.verification_mode,
             provides=[c.model_dump() for c in self.provides],
             consumes=[c.model_dump() for c in self.consumes],
             addresses=self.addresses,
@@ -173,6 +178,7 @@ class CriticalFlow(BaseModel):
     id: str
     description: str = ""
     entrypoints: List[str] = Field(default_factory=list)
+    test_created_by: List[str] = Field(default_factory=list)
     required_verification_level: VerificationLevel = "integration"
 
     model_config = ConfigDict(extra="ignore")
@@ -183,7 +189,18 @@ class ForbiddenFlow(BaseModel):
 
     id: str
     description: str = ""
+    test_created_by: List[str] = Field(default_factory=list)
     required_verification_level: VerificationLevel = "e2e"
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class FindingRef(BaseModel):
+    """Links a finding to its mitigation and enforcement mechanisms."""
+
+    id: str = ""
+    mitigation: str = ""
+    enforced_by: List[str] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="ignore")
 
@@ -218,6 +235,83 @@ class PlanState(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+# ---------------------------------------------------------------------------
+# Suppress lease (W8b)
+# ---------------------------------------------------------------------------
+
+# Placeholder strings that disqualify a field from being "real"
+_SUPPRESS_PLACEHOLDERS = frozenset({
+    "todo", "tbd", "fixme", "xxx", "placeholder", "changeme",
+    "tba", "n/a", "na", "none", "unknown",
+})
+
+# Maximum allowed expiry horizon from today (2 years)
+_MAX_EXPIRY_YEARS = 2
+
+
+class SuppressInstance(BaseModel):
+    """Per-code suppression with optional lease metadata.
+
+    A suppression is *managed* iff all three governance fields are non-empty
+    AND valid (no placeholder values, expiry within 2 years).
+    """
+
+    code: str
+    owner: str = ""
+    expiry: Optional[str] = None   # ISO date  e.g. "2026-12-31"
+    review_after: Optional[str] = None  # ISO date
+
+    model_config = ConfigDict(extra="ignore")
+
+    def is_managed(self) -> bool:
+        """True when all three governance fields are present and valid."""
+        if not self.owner or not self.expiry or not self.review_after:
+            return False
+        if self._is_placeholder(self.owner):
+            return False
+        if self._is_placeholder(self.expiry):
+            return False
+        if self._is_placeholder(self.review_after):
+            return False
+        if not self._is_valid_expiry(self.expiry):
+            return False
+        return True
+
+    def has_any_governance(self) -> bool:
+        """True when at least one governance field is non-empty and non-placeholder."""
+        for val in (self.owner, self.expiry, self.review_after):
+            if val and not self._is_placeholder(val):
+                return True
+        return False
+
+    @staticmethod
+    def _is_placeholder(value: str) -> bool:
+        return value.strip().lower() in _SUPPRESS_PLACEHOLDERS
+
+    @staticmethod
+    def _is_valid_expiry(value: str) -> bool:
+        """Check that expiry is a parseable date within 2 years of today."""
+        import datetime as _dt
+        try:
+            expiry_date = _dt.date.fromisoformat(value)
+        except (ValueError, TypeError):
+            return False
+        today = _dt.date.today()
+        max_date = today.replace(year=today.year + _MAX_EXPIRY_YEARS)
+        return expiry_date <= max_date
+
+    def is_expired(self) -> bool:
+        """True when expiry is a valid date in the past."""
+        import datetime as _dt
+        if not self.expiry:
+            return False
+        try:
+            expiry_date = _dt.date.fromisoformat(self.expiry)
+        except (ValueError, TypeError):
+            return False
+        return expiry_date < _dt.date.today()
+
+
 class Plan(BaseModel):
     """Top-level plan document — the file Ralph reads."""
 
@@ -226,13 +320,17 @@ class Plan(BaseModel):
     tasks: List[TaskSpec] = Field(default_factory=list)
     state: PlanState = Field(default_factory=PlanState)
 
+    plan_scope: List[str] = Field(default_factory=list)
     critical_entrypoints: List[str] = Field(default_factory=list)
     critical_flows: List[CriticalFlow] = Field(default_factory=list)
     forbidden_flows: List[ForbiddenFlow] = Field(default_factory=list)
+    finding_refs: List[FindingRef] = Field(default_factory=list)
     registration_invariants: List[RegistrationInvariant] = Field(default_factory=list)
+    suppress_flows: List[str] = Field(default_factory=list)
 
     required_issues: List[str] = Field(default_factory=list)  # issue IDs that must be addressed
     suppress_codes: List[str] = Field(default_factory=list)
+    suppress_instances: List["SuppressInstance"] = Field(default_factory=list)
 
     # Semantic validation config
     semantic_mode: str = "off"  # advisory, strict, off
@@ -247,6 +345,15 @@ class Plan(BaseModel):
     @property
     def provenance(self) -> Dict[str, str]:
         return self._provenance
+
+    @property
+    def effective_suppress_codes(self) -> List[str]:
+        """Union of suppress_codes + codes from suppress_instances (managed or legacy)."""
+        codes = list(self.suppress_codes)
+        for si in self.suppress_instances:
+            if si.code and si.code not in codes:
+                codes.append(si.code)
+        return codes
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +377,10 @@ class BatchResult(BaseModel):
     ready: List[str] = Field(default_factory=list)
     blocked: List[BlockedTask] = Field(default_factory=list)
     rationale: str = ""
+    task_metadata: Dict[str, Dict[str, str]] = Field(default_factory=dict)
+    batch_sequence: int = 0
+    batch_boundary: bool = True
+    task_summaries: Dict[str, str] = Field(default_factory=dict)
 
 
 IssueSeverity = Literal["error", "warning", "hint"]
@@ -284,11 +395,15 @@ class ValidationIssue(BaseModel):
     task_ids: List[str] = Field(default_factory=list)
     evidence: Dict[str, Any] = Field(default_factory=dict)
 
+    # W8a: deterministic instance identity — sha1(code + evidence_json + task_ids)[:16]
+    issue_instance_id: str = ""
+
     # W4 finding metadata — classification fields for downstream consumers
     confidence: Literal["exact", "best_effort", "opaque"] = "opaque"
     source: str = ""
     action_owner: Literal["author", "worker", "shared", "unknown"] = "unknown"
     worker_relevance: Literal["blocking", "execution_risk", "verification_risk", "none"] = "none"
+    beyond_scope: bool = False
 
 
 def classify_issue_metadata(issue: "ValidationIssue") -> "ValidationIssue":
@@ -324,6 +439,25 @@ def classify_issue_metadata(issue: "ValidationIssue") -> "ValidationIssue":
     return issue
 
 
+def compute_issue_instance_id(issue: "ValidationIssue") -> str:
+    """Compute a deterministic instance identity for a ValidationIssue.
+
+    Hash = sha1(code + canonical_evidence_json + tuple(sorted(task_ids)))[:16].
+    """
+    canonical_evidence = json.dumps(
+        issue.evidence, sort_keys=True, ensure_ascii=False,
+    )
+    sorted_task_ids = tuple(sorted(issue.task_ids))
+    data = f"{issue.code}|{canonical_evidence}|{sorted_task_ids}"
+    return hashlib.sha1(data.encode("utf-8")).hexdigest()[:16]
+
+
+def stamp_issue_ids(issues: "List[ValidationIssue]") -> None:
+    """Set issue_instance_id on every issue in the list (mutates in-place)."""
+    for issue in issues:
+        issue.issue_instance_id = compute_issue_instance_id(issue)
+
+
 class ValidationReport(BaseModel):
     """Output of ralph validate."""
 
@@ -331,3 +465,8 @@ class ValidationReport(BaseModel):
     errors: List[ValidationIssue] = Field(default_factory=list)
     warnings: List[ValidationIssue] = Field(default_factory=list)
     hints: List[ValidationIssue] = Field(default_factory=list)
+
+    # W8a provenance fields
+    report_schema_version: str = "1.0.0"
+    ruleset_digest: str = ""
+    ralph_version: str = ""

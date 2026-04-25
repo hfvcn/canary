@@ -313,5 +313,6 @@ def test_cli_complete_builds_canonical_task_event_request() -> None:
             "agent_id": AGENT_ID,
             "changed_files": [CLAIMED_PATH],
             "evidence": {"summary": "done"},
+            "override_stale_digest": False,
         },
     }

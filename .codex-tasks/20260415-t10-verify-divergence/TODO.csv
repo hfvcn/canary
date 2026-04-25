@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,审查现有完成-验证-失败-重试链路,DONE,确认不引入新状态且重试仍走 FAILED 路径,,,
+2,实现分歧事件与状态修正逻辑,DONE,worker success + verify fail 写入 divergence 事件并落 FAILED,,,
+3,补测试覆盖分歧事件和重试,DONE,tests/test_ralph_verification.py 覆盖 pass/fail/retry,,,
+4,运行指定 pytest 验证,DONE,两个指定 pytest 命令通过,,,"额外回归通过：tests/test_workflow_state.py -k \"verification or retry\"；tests/test_canonical_task_ops_integration.py -k \"retry or complete\""

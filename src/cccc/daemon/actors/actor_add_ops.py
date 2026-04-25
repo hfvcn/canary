@@ -272,6 +272,7 @@ def handle_actor_add(
         pass
 
     maybe_reset_automation_on_foreman_change(group, before_foreman_id=before_foreman)
+
     start_actor_id = str(actor.get("id") or actor_id).strip() or actor_id
     start_runtime = str(actor.get("runtime") or runtime).strip() or runtime
     start_runner = str(actor.get("runner") or runner).strip() or runner

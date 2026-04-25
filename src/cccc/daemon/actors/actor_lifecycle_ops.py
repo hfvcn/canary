@@ -169,6 +169,17 @@ def handle_actor_stop(
     return DaemonResponse(ok=True, result={"actor": actor, "event": event})
 
 
+def _mark_actor_stopped_on_exit(group_id: str, actor_id: str) -> None:
+    """Mark actor as desired_state=stopped when its process exits."""
+    group = load_group(group_id)
+    if group is None:
+        return
+    try:
+        update_actor(group, actor_id, {"desired_state": "stopped", "runtime_state": "stopped"})
+    except Exception:
+        pass
+
+
 def handle_actor_restart(
     args: Dict[str, Any],
     *,

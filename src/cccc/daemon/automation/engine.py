@@ -36,6 +36,7 @@ from ...kernel.messaging import enabled_recipient_actor_ids
 from ...runners import pty as pty_runner
 from ...runners import headless as headless_runner
 from ..messaging.delivery import flush_pending_messages, queue_system_notify
+from ..foreman.workflow_orchestrator import get_orchestrator
 from ...util.conv import coerce_bool
 from ...util.fs import atomic_write_json, read_json
 from ...util.time import parse_utc_iso, utc_now_iso
@@ -793,7 +794,7 @@ class AutomationManager:
 
         if self._should_run_heartbeat_sweep(now):
             handler_name = str(_HEARTBEAT_SWEEP_TASK["handler"])
-            getattr(self, handler_name)()
+            getattr(self, handler_name)(group)
 
     def _should_run_heartbeat_sweep(self, now: datetime) -> bool:
         last_run = self._last_heartbeat_sweep_at
@@ -804,11 +805,11 @@ class AutomationManager:
         self._last_heartbeat_sweep_at = now
         return True
 
-    def _run_heartbeat_sweep(self) -> None:
+    def _run_heartbeat_sweep(self, group: Group) -> None:
         """Periodic sweep to detect stalled/offline workers."""
-        # Existing automation uses _tick_group() as its periodic registration path.
-        # Full heartbeat sweep wiring still needs orchestrator access.
-        pass
+        orch = get_orchestrator(group.group_id)
+        if orch is not None:
+            orch.check_stalled_tasks(threshold_seconds=300)
 
     def _check_nudge(self, group: Group, cfg: AutomationConfig, now: datetime) -> None:
         """Check pending obligations/unread and send one digest nudge per actor."""

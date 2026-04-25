@@ -26,6 +26,7 @@ jobs:
           npm -C web run lint
           npm -C web run typecheck
           npm -C web run build
+          npm -C web run test:run
           test -f src/cccc/ports/web/dist/index.html
 
       - name: Set up Python

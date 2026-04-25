@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,梳理 Ralph agent 相关入口与约束,IN_PROGRESS,确认实现文件与关键符号,rg -n "verification_mode|beyond_scope|review|agent|suggest" src/cccc tests/ralph tests | head -n 50,,0,
+2,实现 RA-1 到 RA-4,TODO,代码完成且接口打通,python -m pytest tests/ralph -q -k "agent or verification or suggest" --maxfail=1,,0,
+3,补测试与样例,TODO,新增或调整测试覆盖关键行为,python -m pytest tests/ralph tests -q -k "agent or verification_mode or beyond_scope or suggest" --maxfail=1,,0,
+4,执行验证并处理审查意见,TODO,目标测试通过且审查结论已处理,python -m pytest tests/ralph tests -q --maxfail=1,,0,

@@ -1,0 +1,892 @@
+# Plan: INNVOX Flutter — Questionnaire + Voice Status + BLE Audio + Data Management
+#
+# Context: The INNVOX Flutter app needs four interconnected enhancements:
+#   1. Questionnaire persistence + name input
+#   2. Post-training voice status dialog (paired with pre-training Q4)
+#   3. BLE raw audio recording during pre/post sampling phases → WAV
+#   4. Training data management: store sessions (WAV+CSV+metadata), browse/delete/share as ZIP
+#
+# Project root: /Users/vfch/Documents/project/INNVOX-flutter
+#
+# These are additive features. Audio recording is best-effort — must never block training.
+#
+# Implementation order: 1A → 1B → 2A+2B (parallel) → 2C → 2D → 3A+3B (parallel)
+#   → 3C → 3D → 3E → 4A → 4B+4C+4D (parallel) → 4E
+#
+# Codex review applied (2026-04-16):
+#   - T2B: reset() EXISTS and must include new fields (plan incorrectly said "no reset")
+#   - T2C: onFinish is VoidCallback, not async — need wrapper approach
+#   - T2D: postVoiceStatus not available at save time (dialog is after save) — split into
+#     initial save + post-dialog update. Also must be nullable for backward compat.
+#     Added warmup_practice_new.dart to claimed_paths (goal_behavior modifies it).
+#   - T3B: StreamControllers close in dispose() not _cleanup() (singleton lifecycle).
+#     Added capture-mode gating flag to prevent 0xA2 collision with VoiceBlePacket.
+#   - T3D: _finishSampling() is shared pre/post — pre audio stop must be in non-post branch only
+#   - T4C: DataManagementPage has extensive dual-tab hardcoding beyond TabController length
+
+plan_scope:
+  - "lib/"
+  - "INNVOX-debug/lib/"
+
+critical_flows:
+  - id: questionnaire-name-persistence
+    description: >
+      First launch → name input page → Q1–Q4 → relaunch → name page skipped,
+      answers preserved. QuestionnaireService persists name and answers via
+      SharedPreferences.
+    entrypoints:
+      - "lib/core/settings/questionnaire_service.dart"
+      - "lib/pages/questionnaire_page.dart"
+    required_verification_level: unit
+
+  - id: training-voice-status-pair
+    description: >
+      Pre-training voice status read from Q4 → training runs → post-training
+      dialog shown → both statuses saved to session record and detail JSON.
+    entrypoints:
+      - "lib/pages/training_v4/warmup_practice_new.dart"
+      - "lib/core/warmup/warmup_session_service.dart"
+      - "lib/core/history/warmup_training_history_store.dart"
+    required_verification_level: integration
+
+  - id: ble-audio-capture-lifecycle
+    description: >
+      Pre-sampling start → BLE 0x10 → audio chunks accumulate → BLE 0x11 →
+      hardware sends 0x92 → WAV built. Same for post-sampling. Graceful
+      degradation if hardware doesn't support audio.
+    entrypoints:
+      - "lib/core/bluetooth/bluetooth_service.dart"
+      - "lib/pages/training_v4/warmup_practice_new.dart"
+    required_verification_level: integration
+
+  - id: session-save-and-share
+    description: >
+      After training completes: WAVs + CSV + metadata.json saved to session
+      directory → DataManagementPage lists sessions → user selects → share as ZIP.
+    entrypoints:
+      - "lib/pages/training_v4/warmup_practice_new.dart"
+      - "lib/pages/data_management_page.dart"
+    required_verification_level: integration
+
+forbidden_flows:
+  - id: audio-failure-blocks-training
+    description: >
+      Audio capture failure must NEVER block or interrupt the training flow.
+      All audio operations must be try/catch wrapped and best-effort.
+    required_verification_level: unit
+
+  - id: frame-type-collision-0xA0
+    description: >
+      A normal 58-byte VoiceBlePacket must NEVER be misidentified as a control
+      event frame (0xA0). The 0xA0 dispatch must include a length==2 guard.
+    required_verification_level: unit
+
+  - id: frame-type-collision-0xA2
+    description: >
+      When audio capture is NOT active, a VoiceBlePacket whose first byte
+      happens to be 0xA2 must NOT be routed to the audio stream. Frame dispatch
+      for 0xA2 must be gated by a _isAudioCaptureActive flag.
+    required_verification_level: unit
+
+suppress_codes:
+  - "E_CLAIMED_PATH_MISSING"      # New files don't exist yet (lib/core/audio/*, lib/widgets/*, lib/core/services/*)
+  - "E_CRITICAL_FLOW_UNCOVERED"   # daemon_startup and cli_workflow are CCCC-specific default flows, not applicable to this Flutter project
+
+finding_refs:
+  - id: finding-1
+    mitigation: "Verification commands test actual behavior, not just compilation"
+    enforced_by: ["T3D-wire-audio", "T2C-wire-voice-status", "T4E-register-route"]
+  - id: finding-2
+    mitigation: "Tasks split by functional slice (not by file), integration tasks wire pieces together"
+    enforced_by: ["T2C-wire-voice-status", "T3D-wire-audio", "T3E-session-csv"]
+  - id: finding-9
+    mitigation: "Phase 1 (questionnaire) is independently testable before Phase 2–4 build on it"
+    enforced_by: ["T1A-questionnaire-name", "T1B-name-input-page"]
+  - id: finding-6
+    mitigation: "Verification at each task, not just final E2E"
+    enforced_by: ["T1A-questionnaire-name", "T2A-voice-dialog", "T3A-audio-capture-infra", "T3C-training-audio-service"]
+
+tasks:
+  # ══════════════════════════════════════════════════════════════════════
+  # Phase 1: Questionnaire Enhancements
+  # ══════════════════════════════════════════════════════════════════════
+
+  - id: T1A-questionnaire-name
+    title: "Add userName persistence to QuestionnaireService"
+    role: leaf
+    claimed_paths:
+      - "lib/core/settings/questionnaire_service.dart"
+    depends_on: []
+    goal_behavior: >
+      Add _keyUserName constant, getUserName() and saveUserName(String) methods
+      to QuestionnaireService. Both use SharedPreferences, matching existing
+      pattern for questionnaire answers.
+    acceptance_criteria: >
+      QuestionnaireService().saveUserName("test") persists and
+      QuestionnaireService().getUserName() returns "test" after re-instantiation.
+    verification:
+      level: unit
+      checks:
+        - name: api-exists
+          command: >
+            grep -q "getUserName" lib/core/settings/questionnaire_service.dart &&
+            grep -q "saveUserName" lib/core/settings/questionnaire_service.dart &&
+            grep -q "_keyUserName" lib/core/settings/questionnaire_service.dart
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/core/settings/questionnaire_service.dart --no-fatal-infos"
+          required: true
+    provides:
+      - name: user_name_persistence_api
+        kind: api_endpoint
+        schema_hint: "getUserName() → Future<String?>, saveUserName(String) → Future<void>"
+
+  - id: T1B-name-input-page
+    title: "Add name input page to questionnaire UI"
+    role: leaf
+    claimed_paths:
+      - "lib/pages/questionnaire_page.dart"
+    depends_on: ["T1A-questionnaire-name"]
+    consumes:
+      - name: user_name_persistence_api
+        from: T1A-questionnaire-name
+    goal_behavior: >
+      Add name input as first page in questionnaire flow. On first launch (no
+      saved name): show name page with TextField + confirm → saveUserName().
+      On subsequent launches (name exists): skip name page, go to Q1.
+      Progress bar: 5 segments when name shown, 4 when skipped.
+      Skip button leaves name empty and proceeds to Q1.
+    acceptance_criteria: >
+      First launch shows 5-step progress (name → Q1 → Q2 → Q3 → Q4).
+      After name saved, next launch shows 4-step progress (Q1 → Q4 only).
+    verification:
+      level: unit
+      checks:
+        - name: name-page-ui
+          command: >
+            grep -q "_nameController" lib/pages/questionnaire_page.dart &&
+            grep -q "getUserName" lib/pages/questionnaire_page.dart &&
+            grep -q "saveUserName" lib/pages/questionnaire_page.dart
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/pages/questionnaire_page.dart --no-fatal-infos"
+          required: true
+      covers:
+        flows: ["questionnaire-name-persistence"]
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Phase 2: Post-Training Voice Status
+  # ══════════════════════════════════════════════════════════════════════
+
+  - id: T2A-voice-dialog
+    title: "Create PostTrainingVoiceStatusDialog widget"
+    role: leaf
+    claimed_paths:
+      - "lib/widgets/post_training_voice_status_dialog.dart"
+    depends_on: []
+    goal_behavior: >
+      New bottom sheet dialog widget. Title: "你当前的嗓音状态如何？"
+      5 radio button options matching Q4 from questionnaire_page.dart (lines 85-90).
+      Confirm button returns selected option string. Dismiss returns null.
+      Static method: PostTrainingVoiceStatusDialog.show(context) → Future<String?>.
+      UI style consistent with existing questionnaire.
+    acceptance_criteria: >
+      PostTrainingVoiceStatusDialog.show(context) displays a bottom sheet
+      with 5 options and returns the selected string on confirm, null on dismiss.
+    verification:
+      level: unit
+      checks:
+        - name: widget-structure
+          command: >
+            grep -q "PostTrainingVoiceStatusDialog" lib/widgets/post_training_voice_status_dialog.dart &&
+            grep -q "show" lib/widgets/post_training_voice_status_dialog.dart &&
+            grep -q "你当前的嗓音状态如何" lib/widgets/post_training_voice_status_dialog.dart
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/widgets/post_training_voice_status_dialog.dart --no-fatal-infos"
+          required: true
+    provides:
+      - name: voice_status_dialog_widget
+        kind: artifact
+        schema_hint: "PostTrainingVoiceStatusDialog.show(BuildContext) → Future<String?>"
+
+  - id: T2B-session-voice-fields
+    title: "Add voice status fields to WarmupSessionService"
+    role: leaf
+    claimed_paths:
+      - "lib/core/warmup/warmup_session_service.dart"
+    depends_on: []
+    goal_behavior: >
+      Add two nullable String fields: preTrainingVoiceStatus and
+      postTrainingVoiceStatus. IMPORTANT: WarmupSessionService.reset() exists
+      (line 333) and is called in warmup_practice_new initState() at line 158.
+      The "再练一轮" (retry) flow calls _startTraining() without re-entering
+      initState(), so reset() is the only reliable clearing mechanism.
+      New fields MUST be added to reset() to prevent cross-session leakage.
+    acceptance_criteria: >
+      WarmupSessionService().preTrainingVoiceStatus and
+      .postTrainingVoiceStatus are accessible, nullable String fields.
+    verification:
+      level: unit
+      checks:
+        - name: fields-exist
+          command: >
+            grep -q "preTrainingVoiceStatus" lib/core/warmup/warmup_session_service.dart &&
+            grep -q "postTrainingVoiceStatus" lib/core/warmup/warmup_session_service.dart
+          required: true
+        - name: reset-clears-new-fields
+          command: >
+            cd /Users/vfch/Documents/project/INNVOX-flutter &&
+            sed -n '/void reset/,/^  [^ ]/p' lib/core/warmup/warmup_session_service.dart |
+            grep -q "preTrainingVoiceStatus" &&
+            sed -n '/void reset/,/^  [^ ]/p' lib/core/warmup/warmup_session_service.dart |
+            grep -q "postTrainingVoiceStatus"
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/core/warmup/warmup_session_service.dart --no-fatal-infos"
+          required: true
+    provides:
+      - name: voice_status_session_fields
+        kind: runtime_capability
+        schema_hint: "String? preTrainingVoiceStatus, String? postTrainingVoiceStatus"
+
+  - id: T2C-wire-voice-status
+    title: "Wire voice status into training flow (pre + post)"
+    role: integration
+    claimed_paths:
+      - "lib/pages/training_v4/warmup_practice_new.dart"
+    awareness_paths:
+      - "lib/core/settings/questionnaire_service.dart"
+      - "lib/core/warmup/warmup_session_service.dart"
+      - "lib/widgets/post_training_voice_status_dialog.dart"
+    depends_on:
+      - "T1A-questionnaire-name"
+      - "T2A-voice-dialog"
+      - "T2B-session-voice-fields"
+    consumes:
+      - name: user_name_persistence_api
+        from: T1A-questionnaire-name
+      - name: voice_status_dialog_widget
+        from: T2A-voice-dialog
+      - name: voice_status_session_fields
+        from: T2B-session-voice-fields
+    goal_behavior: >
+      When training starts: read Q4 from QuestionnaireService().getAnswers()
+      ['currentCondition'] → assign to WarmupSessionService().preTrainingVoiceStatus.
+      CRITICAL: _TrainingSummarySheet.onFinish is typed as VoidCallback (line 3927),
+      not an async callback. Two correct approaches:
+      (a) Change onFinish in the sheet to use a fire-and-forget async wrapper:
+          onFinish: () { _handleTrainingFinish(); } where _handleTrainingFinish
+          is an async method that shows the dialog, saves result, then navigates.
+      (b) Or pop the summary sheet first, then show the voice dialog from the
+          parent widget before navigating.
+      The dialog result goes to WarmupSessionService().postTrainingVoiceStatus.
+      Also load userName from QuestionnaireService and store as _sessionUserName.
+      Set _sessionStartTime = DateTime.now() when training starts.
+    acceptance_criteria: >
+      After training completes, voice status dialog appears. Pre voice status
+      is populated from Q4. Both values accessible on WarmupSessionService.
+    verification:
+      level: integration
+      checks:
+        - name: pre-status-wired
+          command: >
+            grep -q "preTrainingVoiceStatus" lib/pages/training_v4/warmup_practice_new.dart &&
+            grep -q "currentCondition" lib/pages/training_v4/warmup_practice_new.dart
+          required: true
+        - name: post-dialog-wired
+          command: >
+            grep -q "PostTrainingVoiceStatusDialog" lib/pages/training_v4/warmup_practice_new.dart &&
+            grep -q "postTrainingVoiceStatus" lib/pages/training_v4/warmup_practice_new.dart
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/pages/training_v4/warmup_practice_new.dart --no-fatal-infos"
+          required: true
+      covers:
+        flows: ["training-voice-status-pair"]
+
+  - id: T2D-persist-voice-history
+    title: "Persist voice status in session history records"
+    role: leaf
+    claimed_paths:
+      - "lib/core/history/warmup_training_history_store.dart"
+      - "lib/pages/training_v4/warmup_practice_new.dart"
+    awareness_paths:
+      - "lib/core/warmup/warmup_session_service.dart"
+    depends_on: ["T2B-session-voice-fields", "T2C-wire-voice-status"]
+    consumes:
+      - name: voice_status_session_fields
+        from: T2B-session-voice-fields
+    goal_behavior: >
+      Add preVoiceStatus and postVoiceStatus as NULLABLE String? fields to
+      WarmupTrainingSessionRecord. BACKWARD COMPAT: fromJson() must default
+      these to null when missing — existing records in SharedPreferences
+      lack these fields. Non-nullable fields would cause parse errors and
+      silently drop all historical records.
+      TIMING: _saveSessionDetail() and _addWarmupHistoryRecord() run inside
+      _finishPostSampling() (lines 1101-1128), which is BEFORE the summary
+      sheet's onFinish callback where the post-voice dialog is shown. This
+      means postVoiceStatus is NOT available at save time. Two options:
+      (a) preVoiceStatus is saved in the initial record; postVoiceStatus is
+          written in a separate update step AFTER the dialog completes (add
+          an updateSessionVoiceStatus method to WarmupTrainingHistoryStore).
+      (b) Move the voice dialog to fire BEFORE _finishPostSampling() saves,
+          which requires restructuring the post-sampling flow.
+      Option (a) is less invasive — T2C's onFinish handler calls an update
+      method after the dialog returns.
+      In warmup_practice_new.dart: update _saveSessionDetail() to include
+      preTrainingVoiceStatus in saved JSON. Update _addWarmupHistoryRecord()
+      to pass preVoiceStatus. Add post-dialog update for postVoiceStatus.
+    acceptance_criteria: >
+      WarmupTrainingSessionRecord includes nullable preVoiceStatus/postVoiceStatus
+      fields. fromJson() handles missing fields gracefully (defaults to null).
+      Serialization round-trips correctly. Existing saved records load without error.
+    verification:
+      level: unit
+      checks:
+        - name: fields-in-record
+          command: >
+            grep -q "preVoiceStatus" lib/core/history/warmup_training_history_store.dart &&
+            grep -q "postVoiceStatus" lib/core/history/warmup_training_history_store.dart
+          required: true
+        - name: json-serialization
+          command: >
+            grep -q "preVoiceStatus" lib/core/history/warmup_training_history_store.dart &&
+            grep "toJson\|fromJson" lib/core/history/warmup_training_history_store.dart | grep -q "VoiceStatus\|voiceStatus\|voice_status"
+          required: false
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/core/history/warmup_training_history_store.dart --no-fatal-infos"
+          required: true
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Phase 3: BLE Audio Recording
+  # ══════════════════════════════════════════════════════════════════════
+
+  - id: T3A-audio-capture-infra
+    title: "Port BLE audio capture infrastructure from INNVOX-debug"
+    role: leaf
+    claimed_paths:
+      - "lib/core/audio/ble_audio_capture.dart"
+    awareness_paths:
+      - "INNVOX-debug/lib/audio_wav_support.dart"
+    depends_on: []
+    goal_behavior: >
+      Create lib/core/audio/ble_audio_capture.dart by porting from
+      INNVOX-debug/lib/audio_wav_support.dart (~93 lines, self-contained).
+      Contains: BleAudioFormat class (sampleRate, channels, bitsPerSample),
+      BleAudioCaptureBuffer class (accumulate raw PCM chunks, build WAV),
+      buildPcmWaveFile() function (44-byte WAV header + data).
+      Define analysisAudioFormat constant: 44100 Hz, mono, 16-bit.
+      Add hasData getter to BleAudioCaptureBuffer.
+      Add buildWavBytes() → Uint8List method.
+    acceptance_criteria: >
+      BleAudioCaptureBuffer can accumulate byte chunks and produce a valid
+      WAV file with correct 44-byte header (RIFF/WAVE/fmt /data markers).
+    verification:
+      level: unit
+      checks:
+        - name: wav-builder-exists
+          command: >
+            grep -q "BleAudioFormat" lib/core/audio/ble_audio_capture.dart &&
+            grep -q "BleAudioCaptureBuffer" lib/core/audio/ble_audio_capture.dart &&
+            grep -q "buildPcmWaveFile\|buildWavBytes" lib/core/audio/ble_audio_capture.dart &&
+            grep -q "analysisAudioFormat" lib/core/audio/ble_audio_capture.dart
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/core/audio/ble_audio_capture.dart --no-fatal-infos"
+          required: true
+    provides:
+      - name: wav_builder
+        kind: artifact
+        schema_hint: "BleAudioCaptureBuffer: append(List<int>), buildWavBytes() → Uint8List, hasData → bool"
+
+  - id: T3B-ble-audio-frames
+    title: "Extend bluetooth_service for audio frame dispatch + commands"
+    role: leaf
+    claimed_paths:
+      - "lib/core/bluetooth/bluetooth_service.dart"
+    depends_on: []
+    goal_behavior: >
+      Add constants: startRawAudioCommand=0x10, stopRawAudioCommand=0x11,
+      mainDataControlEventFrameType=0xA0, rawAudioFrameType=0xA2.
+      Add StreamControllers: _rawAudioController → rawAudioStream (List<int>),
+      _audioControlEventController → audioControlEventStream (int).
+      Modify _dataSubscription handler (~line 412): BEFORE the existing
+      `if (value.length >= 45)` VoiceBlePacket parsing, add frame-type dispatch:
+        if (value.length == 2 && value[0] == 0xA0) → _audioControlEventController.add(value[1])
+        else if (value.length > 1 && value[0] == 0xA2) → _rawAudioController.add(value.sublist(1))
+        else if (value.length >= 45) → existing VoiceBlePacket parsing
+      CRITICAL: The length==2 check on 0xA0 prevents collision with normal
+      58-byte packets whose first float byte might be 0xA0.
+      Add methods: startAudioCapture() writes [0x10] to control characteristic,
+      stopAudioCapture() writes [0x11] to control characteristic.
+      LIFECYCLE: existing BLE service puts StreamController.close() in dispose()
+      (line 498-504), NOT _cleanup(). _cleanup() is called on every disconnect
+      and only cancels subscriptions. If new audio controllers are closed in
+      _cleanup(), reconnection will fail because controllers can't be reopened.
+      New audio StreamControllers MUST be closed in dispose() to match existing
+      pattern. In _cleanup(): only cancel audio-related _subscriptions_ (not
+      close controllers).
+      0xA2 COLLISION RISK: The 0xA2 frame-type guard `value.length > 1 &&
+      value[0] == 0xA2` could match a normal VoiceBlePacket if the first byte
+      happens to be 0xA2. Add a capture-mode gating flag: only route to audio
+      stream when _isAudioCaptureActive is true. When not capturing, fall
+      through to normal packet parsing. This eliminates false dispatch.
+    acceptance_criteria: >
+      rawAudioStream and audioControlEventStream are publicly accessible.
+      Frame dispatch correctly routes 0xA0 (len==2) to control events,
+      0xA2 to audio chunks, and 45+ byte packets to VoiceBlePacket.
+      startAudioCapture/stopAudioCapture write correct bytes to control char.
+    verification:
+      level: unit
+      checks:
+        - name: streams-exist
+          command: >
+            grep -q "rawAudioStream" lib/core/bluetooth/bluetooth_service.dart &&
+            grep -q "audioControlEventStream" lib/core/bluetooth/bluetooth_service.dart
+          required: true
+        - name: frame-dispatch
+          command: >
+            grep -q "0xA0" lib/core/bluetooth/bluetooth_service.dart &&
+            grep -q "0xA2" lib/core/bluetooth/bluetooth_service.dart &&
+            grep -q "length == 2" lib/core/bluetooth/bluetooth_service.dart
+          required: true
+        - name: audio-commands
+          command: >
+            grep -q "startAudioCapture" lib/core/bluetooth/bluetooth_service.dart &&
+            grep -q "stopAudioCapture" lib/core/bluetooth/bluetooth_service.dart &&
+            grep -q "0x10" lib/core/bluetooth/bluetooth_service.dart &&
+            grep -q "0x11" lib/core/bluetooth/bluetooth_service.dart
+          required: true
+        - name: capture-mode-gate
+          command: >
+            grep -q "_isAudioCaptureActive\|_audioCapturing\|_captureMode" lib/core/bluetooth/bluetooth_service.dart
+          required: true
+        - name: controllers-in-dispose-not-cleanup
+          command: >
+            cd /Users/vfch/Documents/project/INNVOX-flutter &&
+            sed -n '/void dispose/,/^  [^ ]/p' lib/core/bluetooth/bluetooth_service.dart |
+            grep -q "rawAudio\|audioControl"
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/core/bluetooth/bluetooth_service.dart --no-fatal-infos"
+          required: true
+      covers:
+        flows: ["frame-type-collision-0xA0"]
+    provides:
+      - name: ble_audio_streams
+        kind: runtime_capability
+        schema_hint: "rawAudioStream: Stream<List<int>>, audioControlEventStream: Stream<int>, startAudioCapture(), stopAudioCapture()"
+
+  - id: T3C-training-audio-service
+    title: "Create TrainingAudioService (capture lifecycle manager)"
+    role: leaf
+    claimed_paths:
+      - "lib/core/audio/training_audio_service.dart"
+    depends_on:
+      - "T3A-audio-capture-infra"
+      - "T3B-ble-audio-frames"
+    consumes:
+      - name: wav_builder
+        from: T3A-audio-capture-infra
+      - name: ble_audio_streams
+        from: T3B-ble-audio-frames
+    goal_behavior: >
+      Singleton that manages audio capture lifecycle. startCapture(): creates
+      BleAudioCaptureBuffer, subscribes to rawAudioStream (append chunks) and
+      audioControlEventStream (listen for 0x92 transferCompleted), calls
+      startAudioCapture() on BLE service.
+      stopAndGetWav(timeout: 10s): calls stopAudioCapture(), waits for 0x92
+      event via Completer, then builds WAV. On timeout: builds WAV from
+      available data (best-effort). On error: returns null.
+      _cleanup(): cancel subscriptions, null out fields, reset state.
+      All operations are best-effort — failures return null, never throw.
+    acceptance_criteria: >
+      TrainingAudioService().startCapture() begins capture.
+      stopAndGetWav() returns Uint8List? WAV data. Timeout fallback works.
+      Cleanup is thorough (no dangling subscriptions).
+    verification:
+      level: unit
+      checks:
+        - name: lifecycle-api
+          command: >
+            grep -q "startCapture" lib/core/audio/training_audio_service.dart &&
+            grep -q "stopAndGetWav" lib/core/audio/training_audio_service.dart &&
+            grep -q "Completer" lib/core/audio/training_audio_service.dart &&
+            grep -q "_cleanup" lib/core/audio/training_audio_service.dart
+          required: true
+        - name: timeout-fallback
+          command: >
+            grep -q "timeout" lib/core/audio/training_audio_service.dart &&
+            grep -q "hasData" lib/core/audio/training_audio_service.dart
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/core/audio/training_audio_service.dart --no-fatal-infos"
+          required: true
+    provides:
+      - name: training_audio_lifecycle
+        kind: runtime_capability
+        schema_hint: "startCapture() → Future<void>, stopAndGetWav({Duration timeout}) → Future<Uint8List?>"
+
+  - id: T3D-wire-audio
+    title: "Wire audio capture into training pre/post sampling"
+    role: integration
+    claimed_paths:
+      - "lib/pages/training_v4/warmup_practice_new.dart"
+    awareness_paths:
+      - "lib/core/audio/training_audio_service.dart"
+    depends_on:
+      - "T2C-wire-voice-status"
+      - "T3C-training-audio-service"
+    consumes:
+      - name: training_audio_lifecycle
+        from: T3C-training-audio-service
+    goal_behavior: >
+      Add state variables: _preWavBytes (Uint8List?), _postWavBytes (Uint8List?).
+      CRITICAL: _finishSampling() (line 354) is a shared function — it checks
+      _isPostSamplingPhase at line 356 and immediately delegates to
+      _finishPostSampling() if true. Audio stop for pre-sampling MUST be placed
+      in the non-post branch only (after line 358 early return), NOT at the top.
+      Pre-sampling audio start: at voice detection → _startSamplingTimer (~line 327),
+        try { await TrainingAudioService().startCapture(); } catch (_) {}
+      Pre-sampling audio stop: in _finishSampling() AFTER the `_isPostSamplingPhase`
+        early-return (i.e. only in the pre-sampling path, around line 361):
+        try { _preWavBytes = await TrainingAudioService().stopAndGetWav(); } catch (_) {}
+      Post-sampling audio start: at post-sampling voice detection.
+      Post-sampling audio stop: in _finishPostSampling() (~line 1070):
+        try { _postWavBytes = await TrainingAudioService().stopAndGetWav(); } catch (_) {}
+      ALL audio calls wrapped in try/catch — training flow continues regardless.
+    acceptance_criteria: >
+      Pre and post WAV bytes are captured during respective sampling phases.
+      If audio capture fails at any point, training completes normally.
+    verification:
+      level: integration
+      checks:
+        - name: audio-wired
+          command: >
+            grep -q "_preWavBytes" lib/pages/training_v4/warmup_practice_new.dart &&
+            grep -q "_postWavBytes" lib/pages/training_v4/warmup_practice_new.dart &&
+            grep -q "TrainingAudioService" lib/pages/training_v4/warmup_practice_new.dart
+          required: true
+        - name: best-effort-guards
+          command: >
+            grep -c "catch" lib/pages/training_v4/warmup_practice_new.dart | awk '{if($1>=2) exit 0; else exit 1}'
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/pages/training_v4/warmup_practice_new.dart --no-fatal-infos"
+          required: true
+      covers:
+        flows: ["ble-audio-capture-lifecycle", "audio-failure-blocks-training"]
+
+  - id: T3E-session-csv
+    title: "Generate session CSV after post-sampling"
+    role: integration
+    claimed_paths:
+      - "lib/pages/training_v4/warmup_practice_new.dart"
+    awareness_paths:
+      - "lib/core/warmup/warmup_session_service.dart"
+    depends_on:
+      - "T3D-wire-audio"
+    goal_behavior: >
+      After post-sampling completes in _finishPostSampling(): build CSV string
+      with UTF-8 BOM (\uFEFF) for Excel compatibility (matching INNVOX-debug pattern).
+      Columns: testTime, userName, prePressureMean, preDbMean, postPressureMean,
+      postDbMean, preVoiceStatus, postVoiceStatus.
+      File naming: {userName}_{yyyyMMdd_HHmmss}.csv (userName defaults to
+      "unknown" if empty). Store as _sessionCsvContent (String) for later saving.
+    acceptance_criteria: >
+      CSV string generated with BOM prefix, correct column headers, and
+      populated data from session. File name follows naming convention.
+    verification:
+      level: unit
+      checks:
+        - name: csv-generation
+          command: >
+            grep -q "\\\\uFEFF\|utf-8 BOM\|BOM" lib/pages/training_v4/warmup_practice_new.dart &&
+            grep -q "testTime\|userName\|prePressureMean" lib/pages/training_v4/warmup_practice_new.dart
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/pages/training_v4/warmup_practice_new.dart --no-fatal-infos"
+          required: true
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Phase 4: Data Management & Sharing
+  # ══════════════════════════════════════════════════════════════════════
+
+  - id: T4A-training-data-manager
+    title: "Create TrainingDataManager (session storage model)"
+    role: leaf
+    claimed_paths:
+      - "lib/core/services/training_data_manager.dart"
+    awareness_paths:
+      - "lib/core/history/warmup_session_detail_store.dart"
+      - "lib/pages/training_v4/file_history_screen.dart"
+    depends_on:
+      - "T3E-session-csv"
+    goal_behavior: >
+      Storage layout: {documents}/training_data/{sessionId}/ containing
+      {name}_{time}_pre.wav, {name}_{time}_post.wav, {name}_{time}.csv,
+      metadata.json (timestamp, userName, grade, pre/post metrics, voice statuses).
+      Class methods: saveSession(...) creates directory and writes all files.
+      listSessions() → Future<List<TrainingSessionInfo>> scans directories.
+      deleteSession(String id), deleteSessions(List<String> ids).
+      shareSession(String id) → ZIP single session → Share.shareXFiles().
+      shareSessions(List<String> ids) → nested ZIP → share.
+      ZIP pattern follows file_history_screen.dart ZipFileEncoder usage.
+      Clean up temp files after sharing.
+    acceptance_criteria: >
+      saveSession writes WAV, CSV, and metadata.json to correct directory.
+      listSessions returns all saved sessions with metadata.
+      deleteSession removes directory. shareSession creates valid ZIP.
+    verification:
+      level: unit
+      checks:
+        - name: storage-api
+          command: >
+            grep -q "saveSession" lib/core/services/training_data_manager.dart &&
+            grep -q "listSessions" lib/core/services/training_data_manager.dart &&
+            grep -q "deleteSession" lib/core/services/training_data_manager.dart &&
+            grep -q "shareSession" lib/core/services/training_data_manager.dart
+          required: true
+        - name: zip-sharing
+          command: >
+            grep -q "ZipFileEncoder\|ZipEncoder" lib/core/services/training_data_manager.dart &&
+            grep -q "Share\|shareXFiles\|ShareParams" lib/core/services/training_data_manager.dart
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/core/services/training_data_manager.dart --no-fatal-infos"
+          required: true
+    provides:
+      - name: training_data_storage
+        kind: runtime_capability
+        schema_hint: "saveSession(), listSessions(), deleteSession(), shareSession(), shareSessions()"
+
+  - id: T4B-home-entry-point
+    title: "Add data management button to home page"
+    role: leaf
+    claimed_paths:
+      - "lib/pages/home.dart"
+    depends_on:
+      - "T4A-training-data-manager"
+    goal_behavior: >
+      Repurpose the disabled "训练模式" button (top=658 area) to "数据管理"
+      with folder icon, enabled=true. BOTH HomeTabContent (~line 253-260) AND
+      _HomeTestViewState (~line 589-596) have identical button layouts — update
+      both. onTap: Navigator.pushNamed(context, '/data_management').
+    acceptance_criteria: >
+      Home page shows "数据管理" button that navigates to /data_management.
+      Both HomeTabContent and _HomeTestViewState layouts are updated.
+    verification:
+      level: unit
+      checks:
+        - name: button-updated
+          command: >
+            grep -q "数据管理" lib/pages/home.dart &&
+            grep -q "/data_management\|data_management" lib/pages/home.dart
+          required: true
+        - name: both-layouts
+          command: >
+            test $(grep -c "数据管理" lib/pages/home.dart) -ge 2
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/pages/home.dart --no-fatal-infos"
+          required: true
+
+  - id: T4C-data-management-training-tab
+    title: "Add training data tab to DataManagementPage"
+    role: leaf
+    claimed_paths:
+      - "lib/pages/data_management_page.dart"
+    depends_on:
+      - "T4A-training-data-manager"
+    consumes:
+      - name: training_data_storage
+        from: T4A-training-data-manager
+    goal_behavior: >
+      Add third tab "完整训练" (Complete Training) to DataManagementPage.
+      SCOPE: Not just TabController length — the page has multiple hardcoded
+      dual-tab structures that ALL need updating:
+      - TabController(length: 2 → 3) at line 34
+      - TabBar children (add "完整训练" Tab)
+      - TabBarView children (add third tab body)
+      - _currentTabSelectionCount getter (add training session count case)
+      - _isAllSelected getter (add training case)
+      - _toggleSelectAll() (add training toggle case)
+      - _exportSelected() / delete logic (add training case)
+      - Bottom action bar visibility (must account for third tab selection)
+      Add List<TrainingSessionInfo> _trainingSessions and
+      Set<String> _selectedTrainingIds.
+      Load training sessions in _loadData() via TrainingDataManager.listSessions().
+      Session cards show: date, name, grade, pre/post dB and pressure values.
+      Support selection mode → batch delete and share via TrainingDataManager.
+    acceptance_criteria: >
+      DataManagementPage shows 3 tabs. Third tab lists training sessions.
+      Selection → delete and share work correctly.
+    verification:
+      level: integration
+      checks:
+        - name: third-tab
+          command: >
+            grep -q "完整训练" lib/pages/data_management_page.dart &&
+            grep -q "length: 3" lib/pages/data_management_page.dart
+          required: true
+        - name: training-data-integration
+          command: >
+            grep -q "TrainingDataManager" lib/pages/data_management_page.dart &&
+            grep -q "TrainingSessionInfo\|_trainingSessions" lib/pages/data_management_page.dart
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/pages/data_management_page.dart --no-fatal-infos"
+          required: true
+      covers:
+        flows: ["session-save-and-share"]
+
+  - id: T4D-save-session-on-complete
+    title: "Save complete training session via TrainingDataManager"
+    role: integration
+    claimed_paths:
+      - "lib/pages/training_v4/warmup_practice_new.dart"
+    awareness_paths:
+      - "lib/core/services/training_data_manager.dart"
+    depends_on:
+      - "T3E-session-csv"
+      - "T4A-training-data-manager"
+    consumes:
+      - name: training_data_storage
+        from: T4A-training-data-manager
+    goal_behavior: >
+      After _finishPostSampling() completes (post voice status dialog and CSV
+      generation done): call TrainingDataManager().saveSession() with
+      _preWavBytes, _postWavBytes, _sessionCsvContent, metadata from
+      WarmupSessionService (scores, metrics, voice statuses), _sessionUserName,
+      _sessionStartTime. Best-effort — wrap in try/catch.
+    acceptance_criteria: >
+      After training completes, a session directory is created under
+      training_data/ containing WAV files, CSV, and metadata.json.
+    verification:
+      level: integration
+      checks:
+        - name: save-wired
+          command: >
+            grep -q "TrainingDataManager" lib/pages/training_v4/warmup_practice_new.dart &&
+            grep -q "saveSession" lib/pages/training_v4/warmup_practice_new.dart
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/pages/training_v4/warmup_practice_new.dart --no-fatal-infos"
+          required: true
+      covers:
+        flows: ["session-save-and-share"]
+
+  - id: T4E-register-route
+    title: "Register /data_management route in main.dart"
+    role: integration
+    claimed_paths:
+      - "lib/main.dart"
+    awareness_paths:
+      - "lib/pages/data_management_page.dart"
+    depends_on:
+      - "T4C-data-management-training-tab"
+    goal_behavior: >
+      Verify that /data_management route exists in main.dart route table.
+      If it already exists (pointing to DataManagementPage), no change needed.
+      If missing, add it following existing route pattern.
+    acceptance_criteria: >
+      Navigator.pushNamed(context, '/data_management') navigates to
+      DataManagementPage without error.
+    verification:
+      level: unit
+      checks:
+        - name: route-exists
+          command: >
+            grep -q "data_management" lib/main.dart
+          required: true
+        - name: compile-check
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/main.dart --no-fatal-infos"
+          required: true
+
+  # ══════════════════════════════════════════════════════════════════════
+  # E2E Verification
+  # ══════════════════════════════════════════════════════════════════════
+
+  - id: T5-e2e-verify
+    title: "End-to-end verification: full training flow with all features"
+    role: verification
+    claimed_paths:
+      - "lib/pages/training_v4/"
+    awareness_paths:
+      - "lib/pages/questionnaire_page.dart"
+      - "lib/pages/data_management_page.dart"
+      - "lib/pages/home.dart"
+      - "lib/core/audio/training_audio_service.dart"
+      - "lib/core/services/training_data_manager.dart"
+      - "lib/core/bluetooth/bluetooth_service.dart"
+      - "lib/core/history/warmup_training_history_store.dart"
+      - "lib/main.dart"
+    depends_on:
+      - "T1B-name-input-page"
+      - "T2D-persist-voice-history"
+      - "T4B-home-entry-point"
+      - "T4C-data-management-training-tab"
+      - "T4D-save-session-on-complete"
+      - "T4E-register-route"
+    goal_behavior: >
+      Verify all four feature areas work together end-to-end:
+      1. Questionnaire: fresh launch shows name input → Q1–Q4 → relaunch skips name
+      2. Voice status: complete training → voice status dialog appears → both
+         pre (from Q4) and post (from dialog) saved in session record
+      3. Audio: BLE audio capture starts/stops during sampling phases; graceful
+         degradation without audio-capable hardware
+      4. Data management: home → "数据管理" → "完整训练" tab → sessions listed →
+         select → share ZIP is valid
+      Run flutter analyze on full project to catch cross-file issues.
+    acceptance_criteria: >
+      flutter analyze passes. All four critical flows verified manually on
+      device or simulator. Training session saved with WAVs + CSV + metadata.
+      Data management page lists and shares sessions correctly.
+    verification:
+      level: e2e
+      checks:
+        - name: full-project-analyze
+          command: "cd /Users/vfch/Documents/project/INNVOX-flutter && dart analyze lib/ --no-fatal-infos"
+          required: true
+        - name: route-accessible
+          command: >
+            grep -q "data_management" lib/main.dart &&
+            grep -q "数据管理" lib/pages/home.dart &&
+            grep -q "完整训练" lib/pages/data_management_page.dart
+          required: true
+        - name: audio-best-effort
+          command: >
+            grep -c "catch" lib/pages/training_v4/warmup_practice_new.dart | awk '{if($1>=4) exit 0; else exit 1}'
+          required: true
+      covers:
+        tasks:
+          - "T1A-questionnaire-name"
+          - "T1B-name-input-page"
+          - "T2A-voice-dialog"
+          - "T2B-session-voice-fields"
+          - "T2C-wire-voice-status"
+          - "T2D-persist-voice-history"
+          - "T3A-audio-capture-infra"
+          - "T3B-ble-audio-frames"
+          - "T3C-training-audio-service"
+          - "T3D-wire-audio"
+          - "T3E-session-csv"
+          - "T4A-training-data-manager"
+          - "T4B-home-entry-point"
+          - "T4C-data-management-training-tab"
+          - "T4D-save-session-on-complete"
+          - "T4E-register-route"
+        flows:
+          - "questionnaire-name-persistence"
+          - "training-voice-status-pair"
+          - "ble-audio-capture-lifecycle"
+          - "session-save-and-share"
+          - "audio-failure-blocks-training"
+          - "frame-type-collision-0xA0"
+          - "frame-type-collision-0xA2"
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

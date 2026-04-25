@@ -1,0 +1,5 @@
+id,task,status,completed_at,notes
+1,Read task spec and relevant code,DONE,2026-04-15,Reviewed task definition and existing ledger/event/replay paths
+2,Implement schema versioning changes,DONE,2026-04-15,Added registry/constants and switched append/replay to schema-aware flow
+3,Add and run tests,DONE,2026-04-15,Added tests/test_ledger_versioning.py and updated affected assertions
+4,Run requested verification commands,DONE,2026-04-15,Requested import check and pytest targets passed

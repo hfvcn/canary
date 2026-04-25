@@ -1,0 +1,1686 @@
+# Phase 4 Remediation v3 — wire daemon production main path through ralph.core
+#
+# Codex review history:
+#   v1: block — see /codex:result task-mnpku7sg-8d8hdk (7 findings + 2 ST)
+#   v2: needs-attention — see /codex:result task-mnpljq5k-ter3dd (5 findings + 4 ST)
+#   v3: this version — addresses all v2 findings + ST
+#
+# v2 → v3 changes (each maps to a Codex v2 finding):
+#   F-new-1 (T0b wrong contract layer): T0b now claims contracts/v1/ipc.py too;
+#     T3 forwards validation_* fields through ralph_ipc_handler into
+#     DaemonResponse.result. Documented contract on result reserved keys.
+#   F-new-2 (T4 verification result has nowhere to land): T4 now claims
+#     contracts/v1/ralph_ipc.py and extends VerificationResult with semantic_details
+#     optional dict carrying consistency_report + recommended_tests.
+#   F-new-3 (RPROMPT-1 production callsite): T5 explicitly modifies
+#     workflow_orchestrator.py:871-875 to pass workflow_id; T6 E7 verifies via
+#     full assignment path, not direct _build_task_prompt call.
+#   F-new-4 (verification scripts unowned): all script references removed;
+#     verification commands are either inline single-line python -c or pytest
+#     invocations on test files claimed by the same task.
+#   F-new-5 (auto-label evidence too weak + schema unclaimed): T1c extends
+#     record_semantic_outcome with `evidence` keyword; T5 captures pre-state
+#     at register and labels only on state DELTA + file overlap.
+#   ST-new-1 (runtime_plan host inconsistency): runtime_plan is a method on
+#     PlanContext, not RalphService. T3/T4/T5 all use ctx.runtime_plan(engine).
+#   ST-new-2 (live disk drift): PlanContext PINS plan source bytes at register
+#     time. ctx.runtime_plan() re-parses pinned bytes (no disk read post-register).
+#     E4 test updated to verify pinning, not hot-reload.
+#   ST-new-3 (semantic-gate liveness): T4 commits to wiring _resolve_auto_gate
+#     based on compute_gate_readiness; no follow-up. RARCH-2 added to T4 addresses.
+#   ST-new-4 (T6 monkeypatch enforcement is grep): T6 uses AST-based check via
+#     inline python -c (validated to execute correctly).
+#
+# v1 → v2 changes (Codex review of v1 issued VERDICT: block — see /codex:result
+# task-mnpku7sg-8d8hdk):
+#   - F1 (T4 runtime state projection): NEW T0a-engine-projection task defines explicit
+#     engine TaskState → Plan.state mapping covering all 10 states; T3/T4 consume it.
+#   - F2 / ST1 (three authority sources): T3 PlanContext no longer caches the Plan
+#     instance — only plan_path + semantic_provider. resolve_runtime_plan() reloads
+#     from disk + applies T0a projection on every call.
+#   - F3 (RDEAD-1 + RARCH-4 split): RDEAD-1 moved to T1a (delete the unused field);
+#     T4 explicitly handles `recommended_tests` from semantic_validator.recommend_tests
+#     in addition to consistency_report from core.verify.
+#   - F4 (T5 fail-fast breaks existing flows): NEW T0b-handler-contract extends the
+#     IPC response shape with structured validation_errors. T5 surfaces validation
+#     errors via the new field WITHOUT hard-refusing the workflow — caller decides.
+#   - F5 (auto-label evidence): T5 auto-labeler now requires changed_files to contain
+#     the target path/symbol; rules without runtime evidence are not labeled.
+#   - F6 (broken python -c): every multi-line python -c verification command is now
+#     either a single-line semicolon expression or a heredoc-style here-script in
+#     scripts/verify_phase4_remediation/*.py — never literal `\n` inside python -c.
+#   - F7 (T6 over-broad monkeypatch ban): no-monkeypatch-of-production constraint
+#     applies ONLY to the new tests/e2e/test_phase4_remediation_e2e.py file, not to
+#     existing seam-level tests.
+#
+# Source: todo/问题清单-v5-ralph.md (unresolved P1/P2/P3 items)
+# Order: per "一-C Phase 4 整改优先级" (Codex review of phase4-deep-integration)
+#
+# Findings pre-check (§十九):
+#   - Finding 1 (编译通过≠功能可用): T6 ends in real daemon e2e
+#   - Finding 9 (先跑通一条路径): T0a establishes the projection contract first;
+#     T3 plumbs without behavior change; T4 delegates one rail at a time
+#   - Finding 13 (结构校验≠语义正确): plan demands Ralph validate AND Codex review
+#   - Finding 16 (负向不变量): forbidden_flows enforce key invariants
+#   - Finding 17 (silent fallback): T4 surfaces delegation errors instead of silent
+#     fallback to legacy; T5 surfaces validation errors via structured response
+#   - Finding 18 (虚假繁荣): T6 is plan-backed E2E, not new pure-function tests
+
+plan_scope:
+  - src/cccc/ralph/
+  - src/cccc/daemon/foreman/
+  - src/cccc/daemon/ralph_ipc_handler.py
+  - src/cccc/contracts/v1/ralph_ipc.py
+  - tests/
+
+semantic_mode: strict
+auto_infer: false  # this plan declares targets explicitly
+
+required_issues:
+  - RARCH-1
+  - RARCH-2
+  - RARCH-3
+  - RARCH-4
+  - RBOUND-1
+  - RAUTO-1
+  - RAUTO-2
+  - RPROMPT-1
+  - RTEST-1
+  - RDEAD-1
+  - RBUG-1
+  - RBUG-2
+  - RBUG-3
+  - RUX-1
+  - RUX-2
+  - RUX-3
+
+tasks:
+  # ════════════════════════════════════════════
+  # Wave 1 — independent foundations (5 parallel)
+  # ════════════════════════════════════════════
+
+  - id: T0a-engine-projection
+    title: "Define engine TaskState → Plan.state projection contract (new module)"
+    role: leaf
+    depends_on: []
+    addresses: [RARCH-3, RBOUND-1]
+    claimed_paths:
+      - src/cccc/daemon/foreman/runtime_plan.py
+      - tests/test_runtime_plan_projection.py
+    awareness_paths:
+      - src/cccc/kernel/workflow_state_types.py
+      - src/cccc/kernel/workflow_state_engine.py
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/core.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+    goal_behavior: |
+      Codex F1 root-cause: T4 cannot safely call ralph.core.suggest(plan) until we
+      decide how every engine TaskState maps into Plan.state, because core.suggest
+      treats anything not in completed/running/failed as a candidate. Today
+      _resuggest_ready_tasks (workflow_orchestrator.py:1271-1292) explicitly drops
+      ASSIGNED/BLOCKED/DEFERRED from the candidate list — this implicit projection
+      must be made explicit before delegation.
+
+      Create a new module `src/cccc/daemon/foreman/runtime_plan.py` with:
+
+        from cccc.ralph.models import Plan, PlanState, RunningTask
+        from cccc.kernel.workflow_state_types import WorkflowTaskStatus, TaskState
+        from typing import Iterable
+
+        def project_engine_state(
+            base_plan: Plan,
+            engine_tasks: Iterable[TaskState],
+            workflow_id: str,
+        ) -> Plan:
+            """Return a fresh Plan with state synthesised from engine task states.
+
+            base_plan is NEVER mutated. The returned Plan is a model_copy with a
+            replaced PlanState. Use this immediately before calling core.suggest
+            or core.verify so semantic decisions see runtime truth.
+
+            Mapping (every WorkflowTaskStatus is handled explicitly):
+              COMPLETED, ARCHIVED  -> completed_task_ids
+              RUNNING, VERIFYING   -> running_tasks (carries claimed_paths)
+              ASSIGNED             -> running_tasks (worker may already be writing)
+              FAILED               -> failed_task_ids
+              BLOCKED              -> failed_task_ids (not schedulable; equivalent to
+                                       "this task is currently a no-go")
+              DEFERRED             -> failed_task_ids (deferred = batch backoff,
+                                       same effect: do not propose)
+              PLANNED, READY       -> no bucket (default candidate)
+
+            Filter engine_tasks to workflow_id == workflow_id before mapping.
+
+            For tasks present in engine but NOT in base_plan.tasks:
+              - RUNNING, VERIFYING, ASSIGNED: their claimed_paths ARE added to
+                running_tasks of the returned Plan (write-set conflict detection
+                must see concurrent ad-hoc writes). They are excluded from the
+                candidate pool because core.suggest only proposes tasks in
+                base_plan.tasks.
+              - All other statuses for non-plan tasks: fully ignored.
+            This preserves the no-plan / ad-hoc test path while ensuring
+            concurrent ad-hoc write sets are never invisible to scheduler.
+
+            Codex F-new-ad-hoc: the previous spec said "ignored" for all non-plan
+            tasks. This was a latent bug: switching to plan-backed suggest would
+            have silently dropped write-set protection for manual / ad-hoc tasks
+            running concurrently in the same workflow.
+            """
+            ...
+
+      Also export:
+        def derive_running_write_sets(engine_tasks, workflow_id) -> List[List[str]]
+          For RalphService.suggest_ready_batch's existing API where running_write_sets
+          is passed separately. Returns ALL write sets for RUNNING/VERIFYING/ASSIGNED
+          tasks in the workflow, regardless of whether they appear in base_plan.tasks.
+          T3/T4 callers can use either projection or this helper depending on whether
+          they call core.suggest(plan) or the legacy API.
+
+      Tests (tests/test_runtime_plan_projection.py): one test per WorkflowTaskStatus
+      asserting the mapping. One test that BLOCKED tasks NEVER appear as candidates
+      after projection. One test that base_plan is not mutated. One test that a
+      RUNNING engine task not present in base_plan.tasks still contributes its
+      claimed_paths to running_tasks of the projected Plan (write-set protection
+      for ad-hoc tasks running concurrently).
+    acceptance_criteria: |
+      runtime_plan.py exposes project_engine_state() and derive_running_write_sets().
+      project_engine_state(base, [task with each of the 10 statuses], wf) returns a
+      Plan whose state buckets match the documented mapping for every status.
+      base_plan.state is unchanged after the call (deep equality with the input).
+      A task in BLOCKED/DEFERRED status is in failed_task_ids of the returned Plan
+      (consequence: core.suggest will not propose it).
+      ASSIGNED tasks contribute their claimed_paths to running_tasks of the returned
+      Plan (consequence: core.suggest will see the write-set conflict).
+      A RUNNING/ASSIGNED engine task that is NOT in base_plan.tasks still appears
+      in running_tasks of the returned Plan with its claimed_paths (write-set
+      protection — core.suggest cannot propose a plan task that conflicts with it).
+      tests/test_runtime_plan_projection.py exists and all tests pass.
+    verification:
+      level: integration
+      checks:
+        - name: import-and-signature
+          command: 'python -c "import inspect; from cccc.daemon.foreman.runtime_plan import project_engine_state, derive_running_write_sets; assert ''base_plan'' in inspect.signature(project_engine_state).parameters; print(''PASS'')"'
+          required: true
+        - name: pytest
+          command: "python -m pytest tests/test_runtime_plan_projection.py -v --tb=short"
+          required: true
+      covers:
+        tasks: [T0a-engine-projection]
+        flows: []
+    provides:
+      - name: engine_to_plan_projection
+        kind: artifact
+
+  - id: T0b-handler-contract
+    title: "Extend IPC + DaemonResponse with structured validation fields"
+    role: leaf
+    depends_on: []
+    addresses: [RARCH-2, RBOUND-1]
+    claimed_paths:
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - src/cccc/contracts/v1/ipc.py
+      - tests/test_ralph_ipc_validation_errors.py
+      - tests/test_ralph_ipc.py  # backward-compat additions for new field defaults
+    awareness_paths:
+      - src/cccc/daemon/ralph_ipc_handler.py
+      - src/cccc/ralph/models.py
+    goal_behavior: |
+      Codex v2 F-new-1 fix: v2 only added validation_errors to ralph_ipc.py, but
+      ralph_register_and_suggest actually returns DaemonResponse.result (defined in
+      contracts/v1/ipc.py), not a Ralph typed message. handle_ralph_register_and_suggest
+      currently only puts {workflow_id, registered_count, submitted_count, ready_task_ids}
+      into the result dict, dropping anything orchestrator passes alongside. T5 cannot
+      surface validation errors without this contract layer being extended.
+
+      v3 changes:
+
+      1. Add to `src/cccc/contracts/v1/ralph_ipc.py`:
+
+        class IpcValidationError(BaseModel):
+            """One validation issue surfaced through the IPC boundary."""
+            code: str
+            severity: Literal["error", "warning", "hint"]
+            message: str
+            task_ids: List[str] = Field(default_factory=list)
+            evidence: Dict[str, Any] = Field(default_factory=dict)
+
+        # Extend the existing register-and-suggest response model. If there is
+        # already a typed model (e.g., RegisterAndSuggestResponse), add the field;
+        # otherwise extend the model used by handle_ralph_register_and_suggest.
+        # The field MUST be optional and default to empty list so existing
+        # callers/tests are unaffected.
+        validation_errors: List[IpcValidationError] = Field(default_factory=list)
+        validation_warnings: List[IpcValidationError] = Field(default_factory=list)
+        validation_hints: List[IpcValidationError] = Field(default_factory=list)
+
+      Also add string constants:
+        WORKFLOW_PLAN_VALIDATION_FAILED = "workflow.plan_validation_failed"
+
+        # Fatal structural codes recognized by T5's hard-fail guard.
+        # These must be defined in ralph_ipc.py (or imported from validator) so
+        # T5 can reference them without importing the validator directly.
+        FATAL_IPC_VALIDATION_CODES = frozenset({
+            "E_DUPLICATE_TASK_ID",
+            "E_DEP_UNKNOWN",
+            "E_DEP_SELF",
+            "E_DEP_CYCLE",
+            "E_SEMANTIC_PROVIDER_UNAVAILABLE",  # strict-mode provider failure (T3)
+        })
+
+      2. Codex v3 F-v3-1 / ST-v3-1 fix: introduce a typed response model
+         (NOT documented-by-convention). Add `RalphRegisterResponse(BaseModel)`
+         to ralph_ipc.py:
+
+           class RalphRegisterResponse(BaseModel):
+               workflow_id: str
+               registered_count: int
+               submitted_count: int
+               ready_task_ids: List[str] = Field(default_factory=list)
+               validation_errors: List[IpcValidationError] = Field(default_factory=list)
+               validation_warnings: List[IpcValidationError] = Field(default_factory=list)
+               validation_hints: List[IpcValidationError] = Field(default_factory=list)
+               plan_validation_failed_event_emitted: bool = False
+
+         contracts/v1/ipc.py changes: NO DaemonResponse schema change. The
+         documented invariant is: when handle_ralph_register_and_suggest succeeds,
+         DaemonResponse.result == RalphRegisterResponse(...).model_dump(). This
+         is a runtime guarantee enforced by T3's handler implementation
+         (handler must call RalphRegisterResponse.model_validate(...) before
+         dumping into result, so any drift in field types raises immediately
+         instead of passing through silently).
+
+         T3 must validate the orchestrator return value through this model
+         before assigning to DaemonResponse.result. T5 producers must construct
+         instances of IpcValidationError, not raw dicts.
+
+      3. T0b does NOT modify ralph_ipc_handler.py — that is T3's responsibility
+         (T3 already claims the handler for register_plan_context, and per-call
+         field forwarding goes there as part of the same write). T0b just provides
+         the contract types.
+
+      Tests: round-trip serialise/deserialise an IpcValidationError; assert defaults
+      are empty; assert backward compat (old payloads without validation_errors
+      still parse).
+    acceptance_criteria: |
+      contracts/v1/ralph_ipc.py defines IpcValidationError with the listed fields.
+      The register-and-suggest response model has validation_errors,
+      validation_warnings, validation_hints fields all defaulting to empty list.
+      WORKFLOW_PLAN_VALIDATION_FAILED constant is defined and importable.
+      Old IPC payloads without these fields parse without error (backward compat).
+      tests/test_ralph_ipc_validation_errors.py covers serialise/deserialise +
+      defaults + backward compat.
+    verification:
+      level: integration
+      checks:
+        - name: import
+          command: 'python -c "from cccc.contracts.v1.ralph_ipc import IpcValidationError; e = IpcValidationError(code=''X'', severity=''error'', message=''m''); assert e.code == ''X''; print(''PASS'')"'
+          required: true
+        - name: backward-compat
+          command: 'python -c "from cccc.contracts.v1.ralph_ipc import TaskRef; t = TaskRef.model_validate({''id'': ''T1''}); assert t.id == ''T1''; print(''PASS'')"'
+          required: true
+        - name: pytest-new
+          command: "python -m pytest tests/test_ralph_ipc_validation_errors.py -v --tb=short"
+          required: true
+        - name: pytest-existing-ipc
+          command: "python -m pytest tests/test_ralph_ipc.py -v --tb=short"
+          required: true
+      covers:
+        tasks: [T0b-handler-contract]
+        paths:
+          - src/cccc/contracts/v1/ralph_ipc.py
+          - src/cccc/contracts/v1/ipc.py
+          - tests/test_ralph_ipc.py
+        flows: []
+    provides:
+      - name: ipc_validation_error_contract
+        kind: artifact
+
+  - id: T1a-semvalidator-fixes
+    title: "Semantic validator: return effective_plan, fix scope direction, delete dead field"
+    role: leaf
+    depends_on: []
+    addresses: [RBUG-1, RBUG-3, RDEAD-1]
+    claimed_paths:
+      - src/cccc/ralph/semantic_validator.py
+      - src/cccc/ralph/models.py
+    awareness_paths:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/graph_utils.py
+    semantic:
+      mode: strict
+      targets:
+        - path: src/cccc/ralph/semantic_validator.py
+          symbol: validate_semantic
+          op: modify_interface
+        - path: src/cccc/ralph/semantic_validator.py
+          symbol: _compute_task_scope
+          op: modify_body
+        - path: src/cccc/ralph/models.py
+          symbol: ValidationReport
+          op: modify_interface
+    goal_behavior: |
+      RBUG-1: validate_semantic must return effective tasks alongside issues so the
+      caller (validator.validate_with_project) can compute fingerprints from the
+      same input. Today the auto-infer code path mutates a copy of `task` for
+      issue emission, but fingerprints are still computed from the original plan.
+
+      Required signature change:
+        def validate_semantic(
+            plan: Plan,
+            provider: SemanticProvider,
+            suggest_deps: bool = False,
+        ) -> tuple[List[ValidationIssue], Dict[str, List[str]], List[TaskSpec]]:
+
+      Third element is the effective tasks list in plan.tasks order. When auto_infer
+      is disabled, the elements are identity-equal to plan.tasks. _prepare_tasks_for_validation
+      already produces this list internally; just propagate it.
+
+      RBUG-3: _compute_task_scope() comment claims "downstream" but the implementation
+      uses `transitive_deps()` which returns upstream. The intended semantic for
+      S_INTERFACE_REFS_OUTSIDE_SCOPE / S_MASSIVE_REFACTOR is downstream — "what code
+      my changes can affect". Build a reverse-edge transitive closure helper (add
+      `transitive_dependents` to graph_utils.py if missing — but graph_utils.py is
+      NOT in this task's claimed_paths, so import-only) and use it. Update the
+      docstring/comment to match.
+
+      If transitive_dependents does not exist in graph_utils.py and we cannot add
+      it (out of scope), implement the closure inline in semantic_validator.py and
+      add a TODO referencing a follow-up to move it to graph_utils.py.
+
+      RDEAD-1: ValidationReport.consistency_reports field (models.py:350) is defined
+      but never populated and never read by any production code path. Codex review
+      v1 confirmed populating it would require circular work in T4. Decision:
+      delete the field. Existing semantic tests reference the default value via
+      model defaults — search for `consistency_reports` callers and update; the
+      field is referenced in tests/test_ralph_semantic.py:171 (default value
+      assertion) — that test must be updated to remove the assertion.
+    acceptance_criteria: |
+      validate_semantic returns 3-tuple (issues, suggested_deps, effective_tasks).
+      effective_tasks has the same length as plan.tasks.
+      _compute_task_scope returns the union of task.claimed_paths AND every
+      transitively dependent (downstream) task's claimed_paths.
+      ValidationReport no longer has consistency_reports field; no code in
+      src/cccc/ralph/ references it; tests have been updated.
+      All existing semantic tests still pass after fixture updates for the scope
+      direction change and the deleted field.
+    verification:
+      level: integration
+      checks:
+        - name: signature
+          command: 'python -c "import inspect; from cccc.ralph.semantic_validator import validate_semantic; sig = inspect.signature(validate_semantic); print(sig); assert ''effective'' in str(sig.return_annotation).lower() or ''Tuple'' in str(sig.return_annotation); print(''PASS'')"'
+          required: true
+        - name: scope-direction
+          command: 'python -c "from cccc.ralph.semantic_validator import _compute_task_scope; from cccc.ralph.models import TaskSpec; t1 = TaskSpec(id=''T1'', claimed_paths=[''a.py'']); t2 = TaskSpec(id=''T2'', claimed_paths=[''b.py''], depends_on=[''T1'']); t3 = TaskSpec(id=''T3'', claimed_paths=[''c.py''], depends_on=[''T2'']); m = {''T1'': t1, ''T2'': t2, ''T3'': t3}; scope = _compute_task_scope(t1, m); assert ''a.py'' in scope and ''b.py'' in scope and ''c.py'' in scope, scope; print(''PASS'')"'
+          required: true
+        - name: dead-field-removed
+          command: 'python -c "from cccc.ralph.models import ValidationReport; assert not hasattr(ValidationReport(), ''consistency_reports''), ''consistency_reports must be deleted''; print(''PASS'')"'
+          required: true
+        - name: regression-pytest
+          command: "python -m pytest tests/test_ralph_semantic.py -v --tb=short -x"
+          required: true
+      covers:
+        tasks: [T1a-semvalidator-fixes]
+        flows: []
+    failure_path: |
+      If transitive_dependents helper is missing from graph_utils.py and adding it
+      would expand claimed_paths beyond this task's scope, implement inline with a
+      TODO. Do not skip the direction fix.
+
+  - id: T1b-plan-loader-ux
+    title: "Plan loader: actionable error messages with field-level diagnostics"
+    role: leaf
+    depends_on: []
+    addresses: [RUX-1, RUX-3]
+    claimed_paths:
+      - src/cccc/ralph/plan_io.py
+      - tests/ralph/test_plan_loader_ux.py
+    awareness_paths:
+      - src/cccc/ralph/models.py
+    goal_behavior: |
+      RUX-1: When Plan.model_validate raises ValidationError on a known compound
+      field (provides, consumes, semantic, forbidden_flows), translate the Pydantic
+      error into a Ralph-level diagnostic that includes the correct format example.
+
+      load_plan() catches pydantic.ValidationError, walks err.errors() entries, and
+      for each error whose loc contains a known field name, replaces the message
+      with a Ralph-formatted line:
+        "task '<id>': <field>[<idx>] expects <FormatName>, e.g. <example>"
+
+      Format examples:
+        provides:    {name: "my_api", kind: "artifact"}
+        consumes:    {name: "upstream_api", kind: "artifact"}
+        semantic:    {mode: "strict", targets: [{path: "x.py", symbol: "X", op: "modify_body"}]}
+        forbidden_flows: [{id: "no-X", description: "...", required_verification_level: "unit"}]
+
+      RUX-3: when top-level Plan.model_validate fails because of multiple task
+      errors, attempt a per-task fallback: iterate plan_dict["tasks"] and try
+      TaskSpec.model_validate(task_dict) individually, accumulating per-task errors
+      with task ID and field name. Raise a single PlanLoadError listing each
+      problematic task ID with the offending field path.
+
+      Add `class PlanLoadError(Exception)` carrying `errors: List[PlanLoadIssue]`
+      where PlanLoadIssue has task_id, field_path, message, suggested_format.
+
+      No silent recovery: load_plan still fails on invalid plans, just with a
+      better message. No format change to plan.yaml.
+    acceptance_criteria: |
+      load_plan called on a plan with `provides: ["foo"]` raises an error whose
+      message contains both "Contract" and an example like
+      `{name: "foo", kind: "artifact"}`.
+      load_plan called on a plan with three malformed tasks (one with bad provides,
+      one with bad semantic, one with bad forbidden_flows) raises a single error
+      that lists all three tasks with their respective field paths.
+      load_plan on every existing plans/*.yaml still loads successfully (backward
+      compat smoke test).
+      Existing tests for load_plan continue to pass.
+    verification:
+      level: integration
+      checks:
+        - name: pytest-loader-ux
+          command: "python -m pytest tests/ralph/test_plan_loader_ux.py -v --tb=short"
+          required: true
+        - name: existing-plans-load-smoke
+          command: 'python -c "import pathlib, sys; from cccc.ralph.plan_io import load_plan; ok=0; bad=[]; [ (lambda p: (load_plan(p) and None)) for p in pathlib.Path(''plans'').glob(''*.yaml'') ]; print(''PASS'')"'
+          required: false
+      covers:
+        tasks: [T1b-plan-loader-ux]
+        flows: []
+    awareness_paths:
+      - src/cccc/ralph/models.py
+
+  - id: T1c-metrics-path
+    title: "semantic_metrics: anchor path to project_root, not cwd"
+    role: leaf
+    depends_on: []
+    addresses: [RAUTO-2]
+    claimed_paths:
+      - src/cccc/ralph/semantic_metrics.py
+    semantic:
+      mode: strict
+      targets:
+        - path: src/cccc/ralph/semantic_metrics.py
+          symbol: record_semantic_outcome
+          op: modify_interface
+        - path: src/cccc/ralph/semantic_metrics.py
+          symbol: compute_gate_readiness
+          op: modify_interface
+        - path: src/cccc/ralph/semantic_metrics.py
+          symbol: format_gate_report
+          op: modify_interface
+    goal_behavior: |
+      RAUTO-2: DEFAULT_METRICS_PATH = Path(".ralph/semantic_metrics.jsonl") is
+      relative; CLI in project root, daemon in group dir, tests in tmp_path each
+      see a different file. Result: gate readiness is unstable across processes,
+      auto-label data fragments, RAUTO-1 cannot land safely.
+
+      Required changes:
+        1. New module-level helper:
+             def resolve_metrics_path(metrics_path=None, project_root=None) -> Path
+           Resolution order:
+             a. explicit metrics_path arg (relative resolves against project_root
+                if given, else cwd as today)
+             b. CCCC_RALPH_METRICS_PATH env var
+             c. project_root / ".ralph/semantic_metrics.jsonl"
+             d. Path(".ralph/semantic_metrics.jsonl") (legacy fallback for tests)
+
+        2. record_semantic_outcome, compute_gate_readiness, format_gate_report all
+           gain a keyword-only arg `project_root: Path | None = None` and call
+           resolve_metrics_path(metrics_path, project_root) instead of using
+           DEFAULT_METRICS_PATH directly.
+
+        3. Internal _resolve_metrics_path helper either becomes resolve_metrics_path
+           or wraps it. Internal callers (_filter_records, etc.) updated.
+
+        4. Backward compat: existing call sites that pass only metrics_path keep
+           working. project_root=None falls through to legacy behavior.
+           DEFAULT_METRICS_PATH constant stays exported.
+
+      Note: this task only changes the metrics module surface. Daemon/CLI/validator
+      callers are updated in T2 / T4 / T5 to avoid write conflicts.
+
+      Codex v2 F-new-5 follow-through: also extend record_semantic_outcome to
+      accept an optional `evidence: Dict[str, Any] | None = None` parameter.
+      When provided, the JSONL record carries an "evidence" key with the dict.
+      This is consumed by T5's auto-labeler to make labels auditable.
+
+      Updated signature:
+        def record_semantic_outcome(
+            plan_name: str,
+            task_id: str,
+            rule_code: str,
+            predicted_severity: str,
+            confidence: ConfidenceLevel,
+            actual_outcome: ActualOutcome,
+            metrics_path: Path | str | None = None,
+            project_root: Path | None = None,
+            evidence: Dict[str, Any] | None = None,
+        ) -> None
+    acceptance_criteria: |
+      resolve_metrics_path(None, Path("/tmp/foo")) returns
+      Path("/tmp/foo/.ralph/semantic_metrics.jsonl").
+      resolve_metrics_path(None, None) with no env var returns the legacy relative path.
+      resolve_metrics_path(None, None) with CCCC_RALPH_METRICS_PATH=/tmp/x.jsonl
+      returns Path("/tmp/x.jsonl").
+      record_semantic_outcome(..., project_root=Path("/tmp/p")) writes to
+      /tmp/p/.ralph/semantic_metrics.jsonl.
+      compute_gate_readiness(..., project_root=Path("/tmp/p")) reads from the
+      same file.
+      record_semantic_outcome(..., evidence={"changed_files": ["a.py"]}) appends
+      a record whose JSON has an "evidence" key matching the dict.
+      All existing semantic_metrics tests pass without modification.
+    verification:
+      level: integration
+      checks:
+        - name: signature
+          command: 'python -c "import inspect; from cccc.ralph.semantic_metrics import record_semantic_outcome, compute_gate_readiness, resolve_metrics_path; assert ''project_root'' in inspect.signature(record_semantic_outcome).parameters; assert ''project_root'' in inspect.signature(compute_gate_readiness).parameters; print(''PASS'')"'
+          required: true
+        - name: project-root-resolution
+          command: 'python -c "import tempfile, pathlib; from cccc.ralph.semantic_metrics import record_semantic_outcome, compute_gate_readiness; d = pathlib.Path(tempfile.mkdtemp()); record_semantic_outcome(''p'', ''T1'', ''S_TEST'', ''warning'', ''exact'', ''true_positive'', project_root=d); f = d / ''.ralph/semantic_metrics.jsonl''; assert f.exists(), str(f); g = compute_gate_readiness(''S_TEST'', 0.5, project_root=d); assert g.total_predictions == 1, g.total_predictions; print(''PASS'')"'
+          required: true
+        - name: env-var-override
+          command: 'python -c "import tempfile, pathlib, os; from cccc.ralph.semantic_metrics import resolve_metrics_path; d = pathlib.Path(tempfile.mkdtemp()) / ''m.jsonl''; os.environ[''CCCC_RALPH_METRICS_PATH''] = str(d); p = resolve_metrics_path(None, None); del os.environ[''CCCC_RALPH_METRICS_PATH'']; assert p == d, (p, d); print(''PASS'')"'
+          required: true
+        - name: evidence-field
+          command: 'python -c "import tempfile, pathlib, json; from cccc.ralph.semantic_metrics import record_semantic_outcome; d = pathlib.Path(tempfile.mkdtemp()); record_semantic_outcome(''p'', ''T1'', ''S_X'', ''warning'', ''exact'', ''true_positive'', project_root=d, evidence={''changed_files'': [''a.py''], ''pre_state'': {}, ''post_state'': {}}); f = d / ''.ralph/semantic_metrics.jsonl''; rec = json.loads(f.read_text().strip()); assert rec.get(''evidence'', {}).get(''changed_files'') == [''a.py''], rec; print(''PASS'')"'
+          required: true
+        - name: regression-pytest
+          command: "python -m pytest tests/test_ralph_semantic.py -k metric -v --tb=short"
+          required: true
+      covers:
+        tasks: [T1c-metrics-path]
+        flows: [no-cwd-anchored-metrics]
+    provides:
+      - name: metrics_path_with_project_root
+        kind: artifact
+
+  # ════════════════════════════════════════════
+  # Wave 2 — depends on Wave 1
+  # ════════════════════════════════════════════
+
+  - id: T2-validator-cleanup
+    title: "Validator + CLI: consume effective_tasks, fix whitelist + forbidden_flow hint, propagate project_root"
+    role: integration
+    depends_on: [T1a-semvalidator-fixes, T1b-plan-loader-ux, T1c-metrics-path]
+    addresses: [RBUG-1, RBUG-2, RUX-2]
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/cli.py
+    semantic:
+      mode: strict
+      targets:
+        - path: src/cccc/ralph/validator.py
+          symbol: validate_with_project
+          op: modify_body
+        - path: src/cccc/ralph/cli.py
+          symbol: _cmd_validate
+          op: modify_body
+        - path: src/cccc/ralph/cli.py
+          symbol: _cmd_suggest
+          op: modify_body
+        - path: src/cccc/ralph/cli.py
+          symbol: _cmd_verify
+          op: modify_body
+    goal_behavior: |
+      RBUG-1 consumer side: validator.validate_with_project must consume the
+      effective_tasks tuple element returned by validate_semantic (T1a) and use
+      it for both issue reporting AND fingerprint computation. Fingerprints are
+      computed from a Plan whose tasks list has been swapped for effective_tasks
+      via plan.model_copy(update={"tasks": effective_tasks}). NEVER mutate plan.
+
+      RBUG-2: semantic_codes whitelist at validator.py:242-248 must include
+      S_AUTO_INFER_NOT_READY and S_TARGETS_AUTO_INFERRED so they appear in
+      ValidationReport.semantic_findings.
+
+      RUX-2: when emitting E_FORBIDDEN_FLOW_UNCOVERED, append a hint string:
+        "hint: add '<flow_id>' to a task's verification.covers.flows to mark as covered"
+
+      CLI propagation (RAUTO-2 follow-through): _cmd_validate, _cmd_suggest,
+      _cmd_verify already compute project_root via _resolve_project_root. After
+      T1c, the metrics functions accept project_root — wire it through. Where
+      validate_with_project calls compute_gate_readiness internally, it must also
+      accept and forward project_root from the caller. Add a
+      `project_root: Path | None = None` parameter to validate_with_project
+      (default preserves backward compat) and forward it.
+    acceptance_criteria: |
+      validator.validate_with_project has a project_root parameter that defaults to
+      None. When provided, it is forwarded to all internal compute_gate_readiness
+      calls.
+      ValidationReport.semantic_findings includes any S_AUTO_INFER_NOT_READY or
+      S_TARGETS_AUTO_INFERRED issue when those are emitted.
+      An E_FORBIDDEN_FLOW_UNCOVERED message contains the substring
+      "verification.covers.flows".
+      All existing tests pass.
+    verification:
+      level: integration
+      checks:
+        - name: whitelist-codes-present
+          command: 'python -c "import pathlib; src = pathlib.Path(''src/cccc/ralph/validator.py'').read_text(); assert ''S_AUTO_INFER_NOT_READY'' in src; assert ''S_TARGETS_AUTO_INFERRED'' in src; print(''PASS'')"'
+          required: true
+        - name: validate-signature
+          command: 'python -c "import inspect; from cccc.ralph.validator import validate_with_project; assert ''project_root'' in inspect.signature(validate_with_project).parameters; print(''PASS'')"'
+          required: true
+        - name: forbidden-flow-hint
+          command: 'python -c "import tempfile, pathlib; from cccc.ralph.plan_io import load_plan; from cccc.ralph.validator import validate_with_project; d = pathlib.Path(tempfile.mkdtemp()); pp = d / ''p.yaml''; pp.write_text(''tasks:\n  - id: T1\n    claimed_paths: [a.py]\nforbidden_flows:\n  - id: no-x\n    description: forbidden\n    required_verification_level: unit\n''); plan = load_plan(pp); rep = validate_with_project(plan, project_root=d); msgs = [i.message for i in (rep.errors + rep.warnings)]; assert any(''verification.covers.flows'' in m for m in msgs), msgs; print(''PASS'')"'
+          required: true
+        - name: regression-pytest
+          command: "python -m pytest tests/test_ralph_semantic.py tests/ralph/ -v --tb=short -x"
+          required: true
+      covers:
+        tasks: [T2-validator-cleanup, T1a-semvalidator-fixes, T1b-plan-loader-ux, T1c-metrics-path]
+        flows: []
+    consumes:
+      - name: metrics_path_with_project_root
+        kind: artifact
+
+  # ════════════════════════════════════════════
+  # Wave 3 — daemon plumbing (depends T0a, T0b)
+  # ════════════════════════════════════════════
+
+  - id: T3-plan-context-threading
+    title: "Daemon: thread plan_path through orchestrator + RalphService PlanContext (no caching)"
+    role: leaf
+    depends_on: [T0a-engine-projection, T0b-handler-contract, T1b-plan-loader-ux]
+    addresses: [RARCH-3, RBOUND-1]
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/ralph_ipc_handler.py
+      - src/cccc/ralph/plan_io.py
+    awareness_paths:
+      - src/cccc/cli/workflow_cmds.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - src/cccc/ralph/serena_adapter.py
+      - src/cccc/ralph/models.py
+      - src/cccc/daemon/foreman/runtime_plan.py
+    semantic:
+      mode: strict
+      targets:
+        - path: src/cccc/daemon/foreman/ralph_service.py
+          symbol: RalphService
+          op: modify_interface
+        - path: src/cccc/daemon/foreman/workflow_orchestrator.py
+          symbol: register_and_suggest
+          op: modify_body
+    goal_behavior: |
+      Codex F2 / ST1 + Codex v2 ST-new-2 (live disk drift): v1 cached the loaded
+      Plan inside PlanContext (drift). v2 reloaded from disk every call (live
+      drift / partial-write race). v3 splits the difference: PlanContext PINS
+      the plan source bytes at register time, then re-parses from those bytes
+      on each call. The disk file is read exactly once at register; subsequent
+      runtime_plan() calls operate on the pinned source. This:
+        - eliminates engine ↔ disk race conditions during a workflow
+        - guarantees reproducibility of semantic decisions for a given workflow
+        - explicitly REJECTS hot-reload of plan files mid-workflow (caller must
+          re-register if they want to update)
+
+      Required changes:
+
+      1. RalphService gains a PlanContext registry:
+
+           @dataclass
+           class PlanContext:
+               plan_path: Path                       # absolute, for audit only
+               plan_source: bytes                    # immutable snapshot at register
+               plan_digest: str                      # sha256 of plan_source
+               registered_at: float                  # epoch seconds
+               semantic_provider: SemanticProvider | None
+               semantic_failure_reason: str | None   # set when provider init fails
+               workflow_id: str
+
+               def runtime_plan(self, engine) -> Plan:
+                   """Re-parse the pinned source + apply engine projection.
+
+                   MUST use the canonical loader (load_plan_from_bytes) so that
+                   _merge_repo_defaults() applies .cccc/ralph.yaml constraints
+                   identically to the initial smoke-test load. Using raw
+                   yaml.safe_load + model_validate would produce a weaker Plan
+                   that silently drops critical_flows, critical_entrypoints, and
+                   registration_invariants from repo defaults — causing verify /
+                   suggest to operate on a different constraint set than the
+                   one that passed validation.
+                   """
+                   from cccc.ralph.plan_io import load_plan_from_bytes
+                   from cccc.daemon.foreman.runtime_plan import project_engine_state
+                   plan = load_plan_from_bytes(self.plan_source, source_path=self.plan_path)
+                   return project_engine_state(plan, list(engine.list_tasks()), self.workflow_id)
+
+         T3 must ADD `load_plan_from_bytes(source: bytes, source_path: Path) -> Plan`
+         to src/cccc/ralph/plan_io.py. This function must reuse the full load_plan
+         pipeline (including _tag_initial_plan_provenance + _merge_repo_defaults)
+         but read from a bytes buffer rather than disk. Implementation sketch:
+
+           def load_plan_from_bytes(source: bytes, source_path: Path) -> Plan:
+               import io, yaml
+               raw = yaml.safe_load(io.BytesIO(source)) or {}
+               plan = Plan.model_validate(raw)
+               _tag_initial_plan_provenance(plan, source_path)
+               _merge_repo_defaults(plan, source_path.parent)
+               return plan
+
+         If _tag_initial_plan_provenance or _merge_repo_defaults are private and
+         cannot be reused directly, refactor them to accept a Plan + root_path
+         so both load_plan and load_plan_from_bytes share the same logic.
+
+         RalphService methods:
+           self._plan_contexts: Dict[str, PlanContext] = {}   # workflow_id -> ctx
+
+           register_plan_context(workflow_id, plan_path: Path | str) -> None
+             - Resolves plan_path to absolute, asserts file exists.
+             - Reads the file bytes ONCE (open(plan_path, 'rb').read()).
+             - Computes sha256 digest.
+             - Calls plan_io.load_plan(plan_path) once eagerly as a fail-fast
+               smoke test (the loaded Plan is DISCARDED — verification only).
+             - Best-effort builds a SemanticProvider via the same pattern
+               ralph/cli.py uses.
+             - Stores PlanContext(plan_path=..., plan_source=..., plan_digest=...,
+               registered_at=time(), semantic_provider=..., workflow_id=workflow_id).
+
+           get_plan_context(workflow_id) -> PlanContext | None
+             Returns stored context or None.
+
+         CRITICAL Codex v2 ST-new-1 (host consistency): runtime_plan is a method
+         of PlanContext, NOT RalphService. Callers in T4 / T5 always do:
+           ctx = self.ralph.get_plan_context(workflow_id)
+           if ctx is not None:
+               runtime = ctx.runtime_plan(self.engine)
+         Never `self.ralph.runtime_plan(workflow_id, engine)` — that signature
+         does NOT exist. T3 must NOT add a duplicate runtime_plan on RalphService.
+
+         CRITICAL Codex F2: there is NO Plan instance caching. Plan source bytes
+         are pinned but the Plan object is reconstructed on every call so engine
+         state projection is fresh. Mutating the plan file on disk after register
+         does NOT affect runtime_plan() output (pinning semantic). Caller must
+         call register_plan_context again to refresh.
+
+      2. WorkflowOrchestrator.register_and_suggest:
+         Already accepts plan_path kwarg. After storing in workflow_data, ALSO
+         call self.ralph.register_plan_context(workflow_id, plan_path).
+         This task does NOT change suggest_ready_batch or verify_completion
+         behavior — only adds the registration call.
+
+      3. ralph_ipc_handler.handle_ralph_register_and_suggest (Codex v2 F-new-1):
+         Already passes plan_path to orchestrator.register_and_suggest. ALSO must
+         forward validation_errors / validation_warnings / validation_hints from
+         the orchestrator return value into DaemonResponse.result. Today the
+         handler explicitly constructs result with only
+         {workflow_id, registered_count, submitted_count, ready_task_ids}; T3
+         must extend that dict construction to include the new fields when
+         orchestrator returns them. The fields default to empty lists for
+         backward compat (callers that don't read them are unaffected).
+
+         Pseudocode (Codex v3 F-v3-1 — typed validation at the boundary):
+           from cccc.contracts.v1.ralph_ipc import RalphRegisterResponse, IpcValidationError
+           orch_result = orchestrator.register_and_suggest(...)
+           # Convert raw issue dicts to typed IpcValidationError instances first.
+           # Any shape drift here raises ValidationError instead of passing through.
+           typed_errors = [IpcValidationError(**i) for i in orch_result.get("validation_errors", [])]
+           typed_warnings = [IpcValidationError(**i) for i in orch_result.get("validation_warnings", [])]
+           typed_hints = [IpcValidationError(**i) for i in orch_result.get("validation_hints", [])]
+           response = RalphRegisterResponse(
+               workflow_id=str(args["workflow_id"]),
+               registered_count=int(orch_result["registered"]),
+               submitted_count=int(orch_result["submitted"]),
+               ready_task_ids=list(orch_result["ready_task_ids"]),
+               validation_errors=typed_errors,
+               validation_warnings=typed_warnings,
+               validation_hints=typed_hints,
+               plan_validation_failed_event_emitted=bool(
+                   orch_result.get("plan_validation_failed_event_emitted", False)),
+           )
+           return DaemonResponse(ok=True, result=response.model_dump())
+
+         Note: T5 is the PRODUCER of these fields (it runs validate at register
+         time and stuffs the lists into orchestrator's return dict). T3 only
+         plumbs the field forwarding so the producer has somewhere to put them.
+         The forwarding default of [] keeps T3's backward-compat invariant.
+
+      Backward compat:
+        - When workflow submit --tasks is used (no plan_path), register_plan_context
+          is not called; runtime_plan() returns None; legacy paths run unchanged.
+        - All existing tests that monkeypatch suggest_ready_batch / verify_completion
+          continue to work because we are NOT yet changing those methods.
+    acceptance_criteria: |
+      RalphService has register_plan_context(workflow_id, plan_path) and
+      get_plan_context(workflow_id) methods. RalphService does NOT have a
+      runtime_plan method (host consistency — Codex v2 ST-new-1).
+      PlanContext is a dataclass with plan_path, plan_source (bytes),
+      plan_digest, registered_at, semantic_provider, workflow_id, and a
+      runtime_plan(engine) method.
+      register_plan_context reads the plan file bytes ONCE, computes sha256,
+      runs load_plan once for fail-fast validation (then discards the Plan
+      object), and stores the bytes.
+      ctx.runtime_plan(engine) calls plan_io.load_plan_from_bytes (NOT yaml.safe_load
+      directly) so repo defaults from .cccc/ralph.yaml are applied identically to
+      the initial smoke-test load. The Plan object is fresh on every call;
+      the source bytes are pinned.
+      plan_io.load_plan_from_bytes exists and applies _merge_repo_defaults.
+      Mutating the plan file on disk AFTER register does NOT affect
+      ctx.runtime_plan() output (pinning semantic — Codex v2 ST-new-2).
+      WorkflowOrchestrator.register_and_suggest, when called with plan_path,
+      invokes RalphService.register_plan_context exactly once.
+      RalphService.suggest_ready_batch and RalphService.verify_completion
+      behavior is byte-identical to before (no change in this task).
+      ralph_ipc_handler.handle_ralph_register_and_suggest forwards
+      validation_errors / validation_warnings / validation_hints from the
+      orchestrator return value into DaemonResponse.result (defaults to []).
+      Existing tests/test_foreman_workflow.py tests pass without modification.
+    verification:
+      level: integration
+      checks:
+        - name: import-and-attrs
+          command: 'python -c "from cccc.daemon.foreman.ralph_service import RalphService; assert hasattr(RalphService, ''register_plan_context''); assert hasattr(RalphService, ''get_plan_context''); assert not hasattr(RalphService, ''runtime_plan''), ''runtime_plan must live on PlanContext, not RalphService''; print(''PASS'')"'
+          required: true
+        - name: pinned-source-not-cached-plan
+          command: "python -m pytest tests/test_foreman_workflow.py -k plan_context -v --tb=short"
+          required: true
+        - name: regression-tests
+          command: "python -m pytest tests/test_foreman_workflow.py tests/test_workflow_state.py -v --tb=short -x"
+          required: true
+      covers:
+        tasks: [T3-plan-context-threading]
+        flows: [no-stripped-semantic-data, no-cached-plan-instance]
+    consumes:
+      - name: engine_to_plan_projection
+        kind: artifact
+      - name: ipc_validation_error_contract
+        kind: artifact
+    provides:
+      - name: ralph_plan_context
+        kind: artifact
+    failure_path: |
+      If Serena adapter cannot be imported in daemon context (different deps):
+        - If plan.semantic_mode is NOT "strict" (or plan has no semantic targets):
+          log a warning and store PlanContext with semantic_provider=None.
+          Downstream T4/T5 handle the None case gracefully (T5 will skip pre-state
+          capture and auto-label per the GUARD in section F).
+        - If plan.semantic_mode == "strict": register_plan_context MUST store
+          PlanContext with semantic_provider=None AND set
+          semantic_failure_reason: str on PlanContext (e.g. "SerenaAdapterImportError").
+          T5's register_and_suggest detects this via ctx.semantic_failure_reason
+          and adds an IpcValidationError(code="E_SEMANTIC_PROVIDER_UNAVAILABLE",
+          severity="error", message=...) to validation_errors — this triggers the
+          fatal-code hard-fail path (Fix 3), preventing the workflow from silently
+          proceeding with all Phase 4 capabilities offline.
+
+      This prevents the scenario where plan.semantic_mode="strict" workflows appear
+      to succeed while gate/prompt/consistency/metrics have all silently failed.
+
+  # ════════════════════════════════════════════
+  # Wave 4 — service delegation (depends T2 + T3)
+  # ════════════════════════════════════════════
+
+  - id: T4-service-delegate
+    title: "RalphService.suggest/verify delegate to ralph.core via runtime_plan; emit consistency_report + recommended_tests"
+    role: integration
+    depends_on: [T2-validator-cleanup, T3-plan-context-threading]
+    addresses: [RARCH-1, RARCH-2, RARCH-4]
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+    awareness_paths:
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/semantic_validator.py
+      - src/cccc/ralph/models.py
+      - src/cccc/daemon/foreman/runtime_plan.py
+      # semantic_metrics.py intentionally NOT in awareness_paths to avoid
+      # spurious flow ownership; T4 reads compute_gate_readiness via the
+      # public API only.
+    semantic:
+      mode: strict
+      targets:
+        - path: src/cccc/daemon/foreman/ralph_service.py
+          symbol: suggest_ready_batch
+          op: modify_body
+        - path: src/cccc/daemon/foreman/ralph_service.py
+          symbol: verify_completion
+          op: modify_body
+        - path: src/cccc/contracts/v1/ralph_ipc.py
+          symbol: VerificationResult
+          op: modify_interface
+    goal_behavior: |
+      Codex F1 fix: now that T0a's projection contract exists and T3's PlanContext
+      provides ctx.runtime_plan(engine), T4 can safely delegate.
+
+      Codex v2 F-new-2 fix: VerificationResult is extra="forbid" so consistency_report
+      and recommended_tests have nowhere to land. T4 extends VerificationResult.
+
+      Codex v2 ST-new-3 fix (semantic-gate liveness): T4 commits to wiring
+      _resolve_auto_gate now — no follow-up.
+
+      RARCH-1 — suggest delegation:
+        ctx = self.get_plan_context(workflow_id)
+        if ctx is None:
+            return self._legacy_suggest_ready_batch(tasks, ...)   # rename current body
+
+        runtime = ctx.runtime_plan(self.workflow_engine)
+        # runtime is a fresh Plan with state correctly projected per T0a contract.
+        # ASSIGNED/BLOCKED/DEFERRED tasks are in failed_task_ids or running_tasks.
+
+        gate = self._resolve_auto_gate(ctx)
+        result: BatchResult = ralph_core.suggest(
+            runtime,
+            semantic_provider=ctx.semantic_provider,
+            semantic_gate=gate,
+        )
+        # Map result.ready (TaskSpec ids) back to TaskRef for IPC.
+        ready_specs = [t for t in runtime.tasks if t.id in result.ready]
+        return ReadyBatchSuggestion(
+            suggestion_id=...,
+            workflow_id=workflow_id,
+            tasks=[s.to_task_ref() for s in ready_specs],
+            rationale=f"Ralph: core.suggest -> {len(ready_specs)} ready, "
+                      f"{len(result.blocked_by_semantic)} blocked by semantic",
+            estimated_parallelism=len(ready_specs),
+        )
+
+        Legacy method preserved as _legacy_suggest_ready_batch for the no-plan path.
+
+      RARCH-4 — verify delegation + consistency_report + recommended_tests:
+        ctx = self.get_plan_context(workflow_id)
+        if ctx is None:
+            return self._legacy_verify_completion(task_id, changed_files, ...)
+
+        runtime = ctx.runtime_plan(self.workflow_engine)
+        task_spec = next((t for t in runtime.tasks if t.id == task_id), None)
+        if task_spec is None:
+            return self._legacy_verify_completion(...)
+
+        core_result = ralph_core.verify(
+            task_spec,
+            changed_files=changed_files,
+            project_root=self.project_root,
+            plan=runtime,
+            semantic_provider=ctx.semantic_provider,
+        )
+        # core_result already includes consistency_report when provider is given.
+
+        # Codex F3 fix: also produce recommended_tests if provider available.
+        # core.verify does NOT call recommend_tests by default (CLI-only).
+        if ctx.semantic_provider is not None:
+            from cccc.ralph.semantic_validator import recommend_tests
+            from dataclasses import asdict
+            try:
+                rec = recommend_tests(task_spec, ctx.semantic_provider)
+                core_result["recommended_tests"] = asdict(rec)
+            except Exception as e:
+                self._log(f"recommend_tests failed for {task_id}: {e}")
+
+        return self._coerce_core_verify_to_ipc(core_result, task_id, workflow_id)
+
+      VerificationResult extension (Codex v2 F-new-2):
+        Add a new optional field to VerificationResult in
+        src/cccc/contracts/v1/ralph_ipc.py:
+
+          class VerificationResult(BaseModel):
+              ... existing fields ...
+              # T4 (Phase 4 remediation): semantic verification details surfaced
+              # by ralph.core.verify when a SemanticProvider is available.
+              semantic_details: Optional[Dict[str, Any]] = None
+
+        semantic_details carries:
+          {
+              "consistency_report": {...},   # from core.verify
+              "recommended_tests": {...},    # from semantic_validator.recommend_tests
+          }
+
+        Default None preserves backward compat. record_verification_result in
+        workflow_state_engine.py uses model_dump(); the new field will appear in
+        the engine ledger automatically.
+
+      _resolve_auto_gate(ctx) helper (RARCH-2 commitment, Codex v2 ST-new-3):
+        Returns "off" / "advisory" / "hard" based on metrics gate readiness.
+        Implementation:
+          if ctx.semantic_provider is None:
+              return "off"
+          from cccc.ralph.semantic_metrics import compute_gate_readiness
+          # Use S_SUGGEST_CONFLICT exact-confidence gate; fall back to advisory
+          # if metrics file is empty or gate not ready.
+          readiness = compute_gate_readiness(
+              "S_SUGGEST_CONFLICT", 0.05,
+              confidence_filter="exact",
+              project_root=self.project_root,
+          )
+          if readiness.gate_ready:
+              return "hard"
+          return "advisory"
+        Cached per (workflow_id, ctx.semantic_provider) — recompute when ctx
+        changes (e.g., on every register_plan_context).
+
+      Forbidden flow no-silent-fallback-to-legacy: when ctx is NOT None and
+      ralph_core.suggest / ralph_core.verify raises, the daemon MUST surface the
+      error (raise or return an error VerificationResult). Silent fallback to
+      legacy is forbidden in the ctx-present case. Only the ctx-is-None case
+      uses legacy intentionally.
+
+      Engine projection guarantee (Codex F1): all tests must verify that ASSIGNED,
+      BLOCKED, DEFERRED tasks NEVER appear in suggest_ready_batch's result when
+      a plan_context is registered.
+    acceptance_criteria: |
+      With a registered plan_context, RalphService.suggest_ready_batch returns
+      tasks consistent with what ralph_core.suggest(runtime_plan) would return,
+      where runtime_plan is built via T0a projection.
+      ASSIGNED/BLOCKED/DEFERRED tasks NEVER appear in the ready set when a
+      plan_context is registered (Codex F1 invariant).
+      With no plan_context, legacy behavior is byte-identical to before (existing
+      raw --tasks tests still pass).
+      RalphService.verify_completion result, for plans with semantic blocks and
+      Serena available, contains BOTH a consistency_report dict AND a
+      recommended_tests dict (carried via the existing IPC type or workflow_data).
+      A test asserts that monkeypatching ralph_core.suggest to raise causes the
+      ctx-present path to surface the error.
+      All existing tests pass.
+    verification:
+      level: integration
+      checks:
+        - name: import-and-attrs
+          command: 'python -c "from cccc.daemon.foreman.ralph_service import RalphService; assert hasattr(RalphService, ''_legacy_suggest_ready_batch'') or hasattr(RalphService, ''_legacy_verify_completion''); print(''PASS'')"'
+          required: true
+        - name: regression-no-plan
+          command: "python -m pytest tests/test_foreman_workflow.py -v --tb=short -x"
+          required: true
+        - name: regression-workflow-state
+          command: "python -m pytest tests/test_workflow_state.py -v --tb=short -x"
+          required: true
+      covers:
+        tasks: [T4-service-delegate, T3-plan-context-threading, T0a-engine-projection]
+        flows:
+          - no-silent-fallback-to-legacy
+          - no-cli-only-phase4
+          - plan-backed-suggest
+          - plan-backed-verify
+          - worker-semantic-context
+    consumes:
+      - name: ralph_plan_context
+        kind: artifact
+      - name: engine_to_plan_projection
+        kind: artifact
+    failure_path: |
+      If ralph_core.verify return shape (dict) does not map cleanly to
+      VerificationResult, document the mapping in a small private helper
+      _coerce_core_verify_to_ipc(...). Do not silently drop fields. If a mapping
+      is lossy, add a TODO with a specific test reference.
+
+  # ════════════════════════════════════════════
+  # Wave 5 — daemon Phase 4 wiring (depends T4)
+  # ════════════════════════════════════════════
+
+  - id: T5-daemon-phase4-wiring
+    title: "Orchestrator: surface validation, inject semantic prompt context, evidence-gated auto-label"
+    role: integration
+    depends_on: [T4-service-delegate]
+    addresses: [RARCH-2, RPROMPT-1, RAUTO-1]
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - tests/test_t5_phase4_wiring.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/semantic_validator.py
+      - src/cccc/ralph/semantic_metrics.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+    semantic:
+      mode: strict
+      targets:
+        - path: src/cccc/daemon/foreman/workflow_orchestrator.py
+          symbol: register_and_suggest
+          op: modify_body
+        - path: src/cccc/daemon/foreman/workflow_orchestrator.py
+          symbol: _build_task_prompt
+          op: modify_body
+    goal_behavior: |
+      Codex F4 fix: T5 does NOT hard-refuse workflow start on validation errors.
+      Instead, it surfaces errors via the structured response shape from T0b.
+      Caller decides what to do.
+
+      RARCH-2 — capability automation:
+
+      A. validate at register_and_suggest (soft, not hard-refuse):
+         After RalphService.register_plan_context, call:
+           validation_report = validator.validate_with_project(
+               ctx.runtime_plan(self.engine),  # Codex v3 F-v3-2: ctx-bound, no workflow_id arg
+               project_root=self.project_root,
+               semantic_provider=ctx.semantic_provider,
+               suggest_deps=True,
+           )
+         Then attach to the response payload (uses the IpcValidationError contract
+         from T0b):
+           response["validation_errors"] = [serialize(i) for i in validation_report.errors]
+           response["validation_warnings"] = [serialize(i) for i in validation_report.warnings]
+           response["validation_hints"] = [serialize(i) for i in validation_report.hints]
+         and persist them in workflow_data["validation"].
+
+         Codex F4 fix (non-fatal validation only): for non-fatal validation issues
+         (warnings/hints/semantic suggestions), the workflow ALWAYS proceeds with
+         suggest. Caller (Foreman AI / CLI) sees them in the response and decides.
+
+         EXCEPTION — fatal structural codes (Codex new F-crit-1): BEFORE calling
+         engine.register_task() for any task, check validation_report.errors for
+         any issue whose code is in FATAL_STRUCTURAL_CODES:
+           FATAL_STRUCTURAL_CODES = {
+               "E_DUPLICATE_TASK_ID", "E_DEP_UNKNOWN", "E_DEP_SELF", "E_DEP_CYCLE",
+               "E_SEMANTIC_PROVIDER_UNAVAILABLE",  # strict-mode provider failure
+           }
+         If any fatal code is present, do NOT register tasks and do NOT suggest.
+         Return the response immediately with:
+           - validation_errors populated (via T0b contract)
+           - plan_validation_failed_event_emitted = True
+           - ready_task_ids = []
+           - registered_count = 0, submitted_count = 0
+         Emit WORKFLOW_PLAN_VALIDATION_FAILED event to the ledger.
+
+         Existing minimal-plan tests that use plans WITHOUT these fatal codes are
+         unaffected. Any test with a plan triggering a fatal code must now expect
+         a structured error response instead of a success.
+
+         If validation_report.errors is non-empty but contains NO fatal codes,
+         emit WORKFLOW_PLAN_VALIDATION_FAILED to the ledger for auditability —
+         but this is informational, not a halt signal.
+
+      B. semantic-gate auto-resolution:
+         OWNED ENTIRELY BY T4 (Codex v3 ST-v3-2). T4 implements
+         RalphService._resolve_auto_gate(ctx) and wires it into the suggest
+         delegation. T5 does NOT need to do anything for semantic-gate — it is
+         already live by the time T5 runs. Do NOT re-discuss the helper here.
+
+      C. auto-infer at register: if ctx.runtime_plan(...).auto_infer is True,
+         validator already runs auto-infer prep — no extra work beyond not
+         blocking on S_AUTO_INFER_NOT_READY (which is a hint).
+
+      D. consistency-check at completion: T4 already wires this via core.verify
+         + recommend_tests. T5 reads the result in on_task_completed and persists
+         consistency_report + recommended_tests in workflow_data.
+
+      E. gate-report: workflow_data["validation"]["gate_summary"] populated via
+         format_gate_report at register-time for auditability.
+
+      F. semantic-weight ranking: automatic via core.suggest in T4.
+
+      RPROMPT-1 — _build_task_prompt + production callsite (Codex v2 F-new-3):
+        Add a workflow_id keyword arg (default ""). When workflow_id is set:
+          ctx = self.ralph.get_plan_context(workflow_id)
+          if ctx and ctx.semantic_provider:
+              runtime = ctx.runtime_plan(self.engine)
+              task_spec = next((t for t in runtime.tasks if t.id == task.id), None)
+              if task_spec is not None:
+                  from cccc.ralph.semantic_validator import format_semantic_context
+                  context_block = format_semantic_context(task_spec, ctx.semantic_provider)
+                  prompt += "\n\n[Semantic Context]\n" + context_block
+        Graceful degradation when ctx/provider/task_spec is None.
+
+        CRITICAL Codex v2 F-new-3: also modify the PRODUCTION CALLSITE in
+        workflow_orchestrator.py around line 871-875 (the existing call inside
+        the task assignment / process_batch_suggestion path) to pass workflow_id
+        through. Today the callsite is something like:
+            prompt = self._build_task_prompt(task, worker_prompt=..., runtime=...)
+        Change to:
+            prompt = self._build_task_prompt(
+                task, worker_prompt=..., runtime=...,
+                workflow_id=current_workflow_id,
+            )
+        E7 in T6 must verify the prompt content via the FULL assignment path
+        (process_batch_suggestion → _build_task_prompt → captured prompt sent
+        to agent), not by calling _build_task_prompt directly.
+
+      RAUTO-1 — auto-label semantic outcomes (Codex v2 F-new-5: state-delta evidence):
+        Add private method _auto_label_semantic_outcomes(workflow_id, task_id,
+        core_verify_result, ctx, changed_files, pre_states). Called from
+        on_task_completed AFTER verify result is in.
+
+        Codex v2 F-new-5 critique: file-overlap alone is insufficient; the same
+        file may be touched for unrelated reasons. v3 strengthens evidence by
+        REQUIRING a state DELTA between register-time and completion-time, not
+        just a current-state check.
+
+        Pre-state capture (at register_and_suggest, in T5):
+          if ctx.semantic_provider is None:   # Codex v3 F-v3-4
+              workflow_data["validation"]["pre_semantic_states"] = {}
+              workflow_data["validation"]["pre_state_capture_skipped_reason"] = \
+                  "semantic_provider unavailable (Serena import failed at register)"
+              # The auto-labeler MUST then SKIP every label — no metrics writes.
+          else:
+              For each task in plan, for each semantic.target, capture
+                pre_states[task_id][target_key] = {
+                    "exists": ctx.semantic_provider.symbol_exists(target.path, target.symbol),
+                    "ref_count": len(ctx.semantic_provider.find_references(target.path, target.symbol)),
+                }
+              Store in workflow_data["validation"]["pre_semantic_states"].
+
+        EVIDENCE-GATED RULES (Codex v2 F-new-5 — state delta + file overlap):
+
+          GUARD (Codex v3 F-v3-4): if ctx.semantic_provider is None OR
+          workflow_data["validation"]["pre_semantic_states"] is empty, SKIP
+          ALL labeling and return without writing metrics. Log a single line
+          to the orchestrator log noting the skip reason. Add a test
+          (test_auto_label_skips_when_provider_none in tests/test_t5_phase4_wiring.py)
+          that verifies no metrics records are written when the provider is
+          unavailable.
+
+          For each warning the validator emitted earlier for THIS task:
+
+            S_SYMBOL_TARGET_MISSING:
+              evidence required: ALL of:
+                a. changed_files contains target.path
+                b. pre_states[task_id][target_key]["exists"] == False
+                c. ctx.semantic_provider.symbol_exists(target.path, target.symbol) at completion
+              -> true_positive (state changed False→True, this task touched the file)
+              ELSE if (a) AND pre False AND post False:
+              -> false_positive (task touched the file but didn't create the symbol)
+              ELSE: SKIP
+
+            S_DELETE_STILL_REFERENCED:
+              evidence required: ALL of:
+                a. changed_files contains target.path
+                b. pre_states[task_id][target_key]["ref_count"] > 0
+                c. post ref_count == 0
+              -> true_positive (refs cleared by this task)
+              ELSE: SKIP (do NOT mark false_positive even if refs persist)
+
+            All other rules: SKIP (no runtime truth).
+
+          Each label is recorded via record_semantic_outcome with
+          project_root=self.project_root and an `evidence` keyword carrying
+          {"changed_files": [...matching files...], "pre_state": {...}, "post_state": {...}}.
+
+          CRITICAL F-new-5 invariant: NEVER label without (a) file overlap AND
+          (b) state delta from pre to post. The metrics record must be
+          auditable: every record carries `evidence_changed_files` listing the
+          matched files and `evidence_state_delta` showing pre vs post.
+
+          NOTE: T1c must extend record_semantic_outcome to accept an `evidence`
+          dict parameter (see T1c update). If not yet done, pass via the metadata
+          field convention or temporarily store in workflow_data and skip the
+          metrics write — metrics records are auditability gold and missing the
+          schema extension is a hard blocker.
+
+      tests/test_t5_phase4_wiring.py (this task's claimed test file) must contain:
+
+        test_register_hard_fails_on_fatal_structural_error
+          - register_and_suggest with a plan that triggers E_DEP_CYCLE
+          - assert returned dict has validation_errors populated with E_DEP_CYCLE
+          - assert ready_task_ids == [] and registered_count == 0
+          - assert no engine tasks were registered
+          - assert WORKFLOW_PLAN_VALIDATION_FAILED event in ledger
+
+        test_register_attaches_validation_errors_to_response
+          - register_and_suggest with a plan that triggers validation warnings
+          - assert returned dict has validation_warnings populated
+          - assert workflow proceeds (suggest still runs)
+
+        test_register_validation_errors_event_emitted
+          - plan with validation errors
+          - assert WORKFLOW_PLAN_VALIDATION_FAILED event in ledger
+          - assert workflow_data["validation"]["errors"] populated
+
+        test_build_task_prompt_includes_semantic_section
+          - call _build_task_prompt with workflow_id of a registered plan_context
+          - assert "[Semantic Context]" in returned prompt
+
+        test_build_task_prompt_callsite_passes_workflow_id
+          - AST check on workflow_orchestrator.py source: confirm the production
+            call site (around process_batch_suggestion's prompt build) passes
+            workflow_id keyword arg
+
+        test_auto_label_skips_when_no_evidence
+          - validator emits S_SYMBOL_TARGET_MISSING for symbol "Foo" in "src/foo.py"
+          - simulate task completion with changed_files=["other.py"]
+          - assert no metrics record written
+
+        test_auto_label_writes_true_positive_with_state_delta_and_file_overlap
+          - same setup, pre_state shows symbol does not exist
+          - changed_files=["src/foo.py"], post-state symbol exists
+          - assert metrics record with actual_outcome="true_positive" and
+            evidence containing changed_files=["src/foo.py"]
+
+        test_auto_label_writes_false_positive_when_task_didnt_create
+          - pre symbol absent, changed_files=["src/foo.py"], post still absent
+          - assert metrics record actual_outcome="false_positive"
+    acceptance_criteria: |
+      register_and_suggest, when called with plan_path, runs validate_with_project
+      and ATTACHES validation_errors/warnings/hints to the response payload.
+      For non-fatal validation issues, register_and_suggest does NOT halt the
+      workflow — suggest still runs. (Existing test_plan_path_stored_and_auto_syncs
+      and similar minimal-plan tests that use structurally valid plans still pass.)
+      For fatal structural codes (E_DUPLICATE_TASK_ID, E_DEP_UNKNOWN, E_DEP_SELF,
+      E_DEP_CYCLE, E_SEMANTIC_PROVIDER_UNAVAILABLE), register_and_suggest does NOT
+      register tasks, does NOT suggest, and returns validation_errors with
+      ready_task_ids == [] and registered_count == 0.
+      validation_errors is persisted in workflow_data["validation"].
+      A WORKFLOW_PLAN_VALIDATION_FAILED event is emitted to the ledger when
+      validation_errors is non-empty.
+      _build_task_prompt with a workflow_id whose plan_context has semantic_provider
+      includes a "[Semantic Context]" section in the prompt with format_semantic_context
+      output.
+      _auto_label_semantic_outcomes never writes a label without changed_files
+      evidence matching the target path.
+      An explicit test exercises:
+        - validator emits S_SYMBOL_TARGET_MISSING for target X in path P.
+        - Task completes with changed_files NOT containing P → no metrics record.
+        - Task completes with changed_files containing P + symbol exists →
+          true_positive record.
+        - Task completes with changed_files containing P + symbol does not exist →
+          false_positive record.
+      All existing tests pass.
+    verification:
+      level: integration
+      checks:
+        - name: import-check
+          command: 'python -c "from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator; assert hasattr(WorkflowOrchestrator, ''_build_task_prompt''); print(''PASS'')"'
+          required: true
+        - name: prompt-includes-semantic-section
+          command: 'python -c "import pathlib; src = pathlib.Path(''src/cccc/daemon/foreman/workflow_orchestrator.py'').read_text(); assert ''format_semantic_context'' in src; assert ''[Semantic Context]'' in src; print(''PASS'')"'
+          required: true
+        - name: t5-wiring-tests
+          command: "python -m pytest tests/test_t5_phase4_wiring.py -v --tb=short"
+          required: true
+        - name: regression-tests
+          command: "python -m pytest tests/test_foreman_workflow.py tests/test_workflow_state.py -v --tb=short -x"
+          required: true
+      covers:
+        tasks: [T5-daemon-phase4-wiring, T0b-handler-contract]
+        flows:
+          - no-cli-only-phase4
+          - worker-semantic-context
+          - auto-label-cycle
+          - no-unevidenced-auto-label
+          - plan-backed-suggest
+          - plan-backed-verify
+    consumes:
+      - name: ralph_plan_context
+        kind: artifact
+      - name: ipc_validation_error_contract
+        kind: artifact
+      - name: metrics_path_with_project_root
+        kind: artifact
+    failure_path: |
+      Codex F4 (applies to non-fatal validation errors): do NOT reintroduce
+      hard-refusal for non-fatal errors. If validation_errors are non-empty but
+      contain no fatal structural code, surface them in the response and emit
+      the audit event, then ALWAYS proceed with suggest.
+      EXCEPTION: fatal codes (E_DUPLICATE_TASK_ID, E_DEP_UNKNOWN, E_DEP_SELF,
+      E_DEP_CYCLE, E_SEMANTIC_PROVIDER_UNAVAILABLE) hard-fail per Fix 3 above.
+      A future task can add caller-configurable strict mode — out of scope here.
+
+  # ════════════════════════════════════════════
+  # Wave 6 — real e2e tests (depends T5)
+  # ════════════════════════════════════════════
+
+  - id: T6-real-e2e-tests
+    title: "Real e2e tests covering plan-backed daemon workflow without monkeypatching production main path"
+    role: verification
+    depends_on: [T5-daemon-phase4-wiring]
+    addresses: [RTEST-1]
+    claimed_paths:
+      - tests/e2e/test_phase4_remediation_e2e.py
+      - tests/test_ralph_semantic.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/runtime_plan.py
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/semantic_metrics.py
+      - src/cccc/cli/workflow_cmds.py
+      # Repo-level critical flow entrypoints — T6 exercises both via pytest tests/
+      - src/cccc/daemon/server.py
+      - src/cccc/cli/main.py
+    goal_behavior: |
+      RTEST-1: add real e2e tests that exercise the daemon production main path
+      without monkeypatching suggest_ready_batch / verify_completion in the new
+      e2e file. The goal is to lock in semantic data flow from plan file to:
+         (a) ralph.core.suggest decisions (RARCH-1)
+         (b) ralph.core.verify decisions + consistency_report + recommended_tests (RARCH-4)
+         (c) worker prompt semantic context (RPROMPT-1)
+         (d) evidence-gated auto-labeled metrics (RAUTO-1)
+         (e) engine state projection correctness (Codex F1)
+         (f) no Plan caching in PlanContext (Codex F2 / ST1)
+         (g) no silent fallback to legacy (Codex F4 + finding 17)
+         (h) no auto-label without evidence (Codex F5)
+
+      File: tests/e2e/test_phase4_remediation_e2e.py (NEW)
+
+      Codex F7 fix: this constraint applies ONLY to the new e2e file. Existing
+      tests/test_foreman_workflow.py and tests/test_workflow_state.py KEEP their
+      monkeypatches — they have legitimate seam-level testing reasons (notification
+      text, context rollover, deterministic ordering). T6 does NOT migrate them.
+
+      Required test cases (each creates a tmp_path project with .ralph/, writes a
+      small plan.yaml with semantic blocks, spins up an in-process
+      WorkflowOrchestrator + RalphService bound to a real workflow engine):
+
+        E1. test_plan_backed_register_attaches_validation
+            - plan has 2 tasks, T1 with valid semantic targets, T2 with missing symbol
+            - register_and_suggest response includes validation_warnings
+            - workflow proceeds (Codex F4: no halt)
+            - workflow_data["validation"] has the report
+
+        E2. test_suggest_delegates_to_core_when_plan_registered
+            - plan has 3 tasks, T2 depends on T1, T3 independent
+            - register, then orchestrator.ralph.suggest_ready_batch with current
+              engine state (T1 not done)
+            - assert ready set matches ralph_core.suggest(runtime) where runtime
+              is the same projection
+            - assert rationale contains "core.suggest"
+
+        E3. test_engine_state_projection_excludes_assigned_blocked_deferred
+            - Codex F1 invariant. Set up plan with 4 tasks. Mark T2 as ASSIGNED,
+              T3 as BLOCKED, T4 as DEFERRED via the engine. Call suggest.
+            - assert T2/T3/T4 NEVER appear in result.tasks
+
+        E4. test_plan_context_pins_source_at_register_time
+            - register_plan_context with plan A
+            - mutate plan A on disk to add a task
+            - call ctx.runtime_plan(engine)
+            - assert returned Plan reflects the REGISTER-TIME version (new task
+              NOT present) — confirms pinning semantic from Codex v2 ST-new-2
+            - call register_plan_context again with the same path
+            - call ctx.runtime_plan(engine)
+            - assert NOW returned Plan reflects the new task — refresh requires
+              explicit re-registration
+
+        E5. test_suggest_no_plan_uses_legacy
+            - Submit raw --tasks JSON (no plan_path)
+            - assert legacy ready set; rationale does NOT contain "core.suggest"
+
+        E6. test_verify_populates_consistency_report_and_recommended_tests
+            - plan has T1 with semantic.targets (modify_interface)
+            - simulate task completion via report_worker_completion
+            - inspect workflow_data: BOTH consistency_report AND recommended_tests
+              present for T1
+            - verification result outcome = "passed"
+
+        E7. test_worker_prompt_contains_semantic_context_via_production_path
+            (Codex v3 F-v3-3: NO direct call to _build_task_prompt — must drive
+             the actual production assignment path so the workflow_id passes
+             through the real callsite at workflow_orchestrator.py:871-875.)
+            - plan has T1 with semantic.targets and a non-empty goal_behavior
+            - register_and_suggest with the plan
+            - capture prompts sent to agents by either:
+                a. monkey-patching the agent runner's send method (NOT a
+                   production main path method — this is a transport boundary,
+                   allowed) to record outgoing prompts
+                b. OR by inspecting the engine ledger for assignment events
+                   that carry the prompt body
+            - drive process_batch_suggestion (or whatever method actually emits
+              assignments) on the suggested batch
+            - assert at least one captured prompt contains "[Semantic Context]"
+            - assert the prompt contains a symbol name from t1.semantic.targets
+            - explicitly NO direct call to _build_task_prompt
+
+        E8. test_auto_label_requires_evidence
+            - Codex F5 invariant.
+            - prepare plan with T1 emitting S_SYMBOL_TARGET_MISSING for symbol
+              "Foo" in path "src/foo.py"
+            - simulate completion with changed_files=["src/other.py"] → assert
+              metrics file is empty (no label without evidence)
+            - simulate second completion with changed_files=["src/foo.py"] AND
+              symbol_exists=True → assert metrics file has true_positive
+            - simulate third completion with changed_files=["src/foo.py"] AND
+              symbol_exists=False → assert metrics file has false_positive
+
+        E9. test_silent_fallback_forbidden_when_ctx_present
+            - register a plan_context successfully
+            - monkeypatch ralph_core.suggest to raise RuntimeError("boom")
+              (this monkeypatches the LIBRARY function, not the daemon production
+              main path — explicitly allowed even in this file)
+            - call orchestrator.ralph.suggest_ready_batch
+            - assert RuntimeError is surfaced (not silently re-routed to legacy)
+
+       E10. test_metrics_path_anchored_to_project_root
+            - run the daemon with project_root=A and another with project_root=B,
+              each writing one outcome
+            - assert each project_root has its own metrics file; cwd has none
+
+      tests/test_ralph_semantic.py additions:
+        - assert validate_semantic returns 3-tuple including effective_tasks (RBUG-1)
+        - assert ValidationReport no longer has consistency_reports field (RDEAD-1)
+        - assert S_AUTO_INFER_NOT_READY appears in semantic_findings when emitted (RBUG-2)
+        - assert _compute_task_scope returns downstream closure (RBUG-3)
+
+      Negative-invariant coverage (forbidden flows):
+        - E9 covers no-silent-fallback-to-legacy
+        - E10 covers no-cwd-anchored-metrics
+        - E7 covers no-stripped-semantic-data
+        - E2 covers no-cli-only-phase4
+        - E4 covers no-cached-plan-instance
+        - E8 covers no-unevidenced-auto-label
+        - The new e2e file's lack of monkeypatch on suggest_ready_batch /
+          verify_completion (asserted via a simple grep verification check)
+          covers no-monkeypatched-production-path
+    acceptance_criteria: |
+      tests/e2e/test_phase4_remediation_e2e.py exists with the 10 test cases
+      listed and all 10 pass under pytest.
+      The new e2e file does NOT call monkeypatch.setattr(orchestrator.ralph,
+      "suggest_ready_batch", ...) or monkeypatch.setattr(orchestrator.ralph,
+      "verify_completion", ...) anywhere. (Library-level monkeypatch of
+      ralph_core.suggest in E9 is allowed.)
+      tests/test_ralph_semantic.py contains the new 4 assertions covering
+      RBUG-1/2/3 + RDEAD-1.
+      Existing tests/test_foreman_workflow.py and tests/test_workflow_state.py
+      are NOT modified by this task (Codex F7 — leave seam-level tests alone).
+      All tests across tests/ continue to pass.
+    verification:
+      level: e2e
+      checks:
+        - name: e2e-file-exists
+          command: "test -f tests/e2e/test_phase4_remediation_e2e.py && echo PASS"
+          required: true
+        - name: no-production-monkeypatch-ast-check
+          command: 'python -c "import ast, pathlib; src = pathlib.Path(''tests/e2e/test_phase4_remediation_e2e.py'').read_text(); tree = ast.parse(src); banned = {''suggest_ready_batch'', ''verify_completion''}; hits = [(n.lineno, getattr(a, ''value'', getattr(a, ''s'', None))) for n in ast.walk(tree) if isinstance(n, ast.Call) for a in n.args if (isinstance(a, ast.Constant) and a.value in banned) or (isinstance(a, ast.Str) and a.s in banned)]; assert not hits, ''production main path monkeypatched: '' + str(hits); print(''PASS'')"'
+          required: true
+        - name: e2e-tests-pass
+          command: "python -m pytest tests/e2e/test_phase4_remediation_e2e.py -v --tb=short"
+          required: true
+        - name: full-test-suite
+          command: "python -m pytest tests/ -x --tb=short -q"
+          required: true
+      covers:
+        tasks: [T6-real-e2e-tests, T5-daemon-phase4-wiring, T4-service-delegate, T3-plan-context-threading, T2-validator-cleanup, T1c-metrics-path, T1b-plan-loader-ux, T1a-semvalidator-fixes, T0a-engine-projection, T0b-handler-contract]
+        flows:
+          - plan-backed-suggest
+          - plan-backed-verify
+          - worker-semantic-context
+          - auto-label-cycle
+          - no-stripped-semantic-data
+          - no-cwd-anchored-metrics
+          - no-cli-only-phase4
+          - no-monkeypatched-production-path
+          - no-silent-fallback-to-legacy
+          - no-cached-plan-instance
+          - no-unevidenced-auto-label
+          - daemon_startup
+          - cli_workflow
+
+# ════════════════════════════════════════════
+# Critical flows
+# ════════════════════════════════════════════
+
+critical_flows:
+  - id: plan-backed-suggest
+    description: "workflow submit --plan -> register_and_suggest -> RalphService.suggest_ready_batch -> runtime_plan -> ralph.core.suggest -> ReadyBatchSuggestion"
+    entrypoints:
+      - src/cccc/cli/workflow_cmds.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/daemon/foreman/runtime_plan.py
+      - src/cccc/ralph/core.py
+    required_verification_level: e2e
+
+  - id: plan-backed-verify
+    description: "task completion -> on_task_completed -> RalphService.verify_completion -> runtime_plan -> ralph.core.verify -> consistency_report + recommended_tests stored"
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/daemon/foreman/runtime_plan.py
+      - src/cccc/ralph/core.py
+    required_verification_level: e2e
+
+  - id: worker-semantic-context
+    description: "task assignment -> _build_task_prompt -> runtime_plan -> format_semantic_context -> worker prompt body"
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/runtime_plan.py
+      - src/cccc/ralph/semantic_validator.py
+    required_verification_level: integration
+
+  - id: auto-label-cycle
+    description: "task verify result -> evidence check (changed_files) -> _auto_label_semantic_outcomes -> record_semantic_outcome -> <project_root>/.ralph/semantic_metrics.jsonl"
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/ralph/semantic_metrics.py
+    required_verification_level: integration
+
+# ════════════════════════════════════════════
+# Forbidden flows — negative invariants (findings §十六 + Codex review additions)
+# ════════════════════════════════════════════
+
+forbidden_flows:
+  - id: no-stripped-semantic-data
+    description: "TaskSpec.semantic data MUST remain reachable via ctx.runtime_plan(engine).tasks where ctx = RalphService.get_plan_context(workflow_id); the IPC TaskRef strip is intentional but the daemon-side PlanContext re-parse preserves the semantic block"
+    required_verification_level: integration
+
+  - id: no-cwd-anchored-metrics
+    description: "semantic_metrics MUST resolve its file path relative to project_root (or env override), never the process cwd; CLI / daemon / tests must see the same file when given the same project_root"
+    required_verification_level: unit
+
+  - id: no-cli-only-phase4
+    description: "every Phase 4 capability (suggest-deps, auto-infer, semantic-gate, consistency-check, recommended-tests, semantic-weight) MUST be reachable from the daemon production path; manual CLI invocation by Foreman AI MUST NOT be the only activation channel"
+    required_verification_level: integration
+
+  - id: no-monkeypatched-production-path
+    description: "tests/e2e/test_phase4_remediation_e2e.py MUST NOT monkeypatch RalphService.suggest_ready_batch or RalphService.verify_completion; these are the production main path. Library-level monkeypatch of ralph.core.suggest IS allowed (it tests the daemon's response to library failures). Existing tests/test_foreman_workflow.py and tests/test_workflow_state.py are out of scope for this rule — their seam-level tests have legitimate reasons (Codex F7)."
+    required_verification_level: integration
+
+  - id: no-silent-fallback-to-legacy
+    description: "when ralph.core.suggest or ralph.core.verify raises an error AND a plan_context is registered, the daemon MUST surface the error to the caller; silent fallback to the pre-T4 legacy path is forbidden in the ctx-present case (it hides bugs introduced in the new path — finding 17). The ctx-is-None case uses legacy intentionally and is NOT covered by this rule."
+    required_verification_level: unit
+
+  - id: no-cached-plan-instance
+    description: "RalphService PlanContext MUST NOT cache the loaded Plan instance; ctx.runtime_plan(engine) MUST re-parse from pinned source bytes + apply T0a engine projection on every call. The plan source is pinned at register_plan_context time (Codex v2 ST-new-2) so engine + pinned source cannot drift via concurrent disk edits."
+    required_verification_level: integration
+
+  - id: no-unevidenced-auto-label
+    description: "_auto_label_semantic_outcomes MUST NOT write a metrics record without task-local runtime evidence; specifically, S_SYMBOL_TARGET_MISSING and S_DELETE_STILL_REFERENCED labels require changed_files to contain the target path (Codex F5)"
+    required_verification_level: integration
+
+# ════════════════════════════════════════════
+# Suppress codes — reasoning inline
+# ════════════════════════════════════════════
+
+suppress_codes:
+  # This plan touches files outside src/cccc/ralph/ (daemon, tests). plan_scope
+  # widens checks, but some critical_entrypoint coverage rules will still fire
+  # for daemon files we own across multiple tasks.
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+
+state:
+  completed_task_ids:
+    - T6-real-e2e-tests
+    - T5-daemon-phase4-wiring
+    - T4-service-delegate
+    - T3-plan-context-threading
+    - T2-validator-cleanup
+    - T1c-metrics-path
+    - T1b-plan-loader-ux
+    - T1a-semvalidator-fixes
+    - T0b-handler-contract
+    - T0a-engine-projection

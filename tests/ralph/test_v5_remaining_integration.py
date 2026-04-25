@@ -352,10 +352,14 @@ class TestVerificationEventContract:
         the contract: when overall_outcome is 'skipped' the notification_outcome is
         set to 'skipped' (not coerced to 'passed' or 'failed').
         """
-        # Simulate the orchestrator logic from lines 1342–1360
+        # Simulate the orchestrator logic — skipped is preserved as notification
+        # outcome (not coerced to "passed" or "failed"), even though it now
+        # routes to on_task_failed in the state engine.
         def _map_notification_outcome(overall_outcome: str) -> str:
-            if overall_outcome in ("passed", "skipped"):
-                return overall_outcome  # preserves "passed" or "skipped"
+            if overall_outcome == "passed":
+                return "passed"
+            elif overall_outcome == "skipped":
+                return "skipped"  # preserved for notification, but task is FAILED
             return "failed"
 
         assert _map_notification_outcome("passed") == "passed"

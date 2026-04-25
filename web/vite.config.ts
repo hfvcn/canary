@@ -1,9 +1,14 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   plugins: [react()],
   base: "/ui/",
+  test: {
+    globals: true,
+    environment: "jsdom",
+  },
   resolve: {
     // Prefer the CJS build for xterm to avoid a minification bug that can break
     // the ESM build's `requestMode` handler (seen as `ReferenceError: i is not defined`).

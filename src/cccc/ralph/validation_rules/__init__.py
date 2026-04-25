@@ -1,0 +1,137 @@
+"""Validation rules split into focused modules (RO-31).
+
+This package re-exports all check functions so that validator.py can import
+them from a single location.
+"""
+
+from .structural import (
+    _check_graph_structure,
+    _check_covers_graph,
+    _check_field_completeness,
+    _check_implicit_serialization,
+    _check_shared_file_verification,
+    _check_integration_spine,
+    _check_role_constraints,
+    _check_early_integration_checkpoint,
+    _is_cross_task_verifier,
+)
+
+from .coverage import (
+    _check_verification_strength,
+    _check_verification_no_checks,
+    _check_verification_shallow_checks,
+    _check_integration_task_shallow_verification,
+    _check_dead_verification_command,
+    _check_covers_not_exercised,
+    _check_failure_path,
+    _check_verification_behavior_match,
+    _check_duplicate_verification_commands,
+    _check_verification_cross_scope,
+    _check_covers_verifiability,
+    _check_critical_coverage,
+    _check_flow_segment_ownership,
+    _check_critical_flow_levels,
+    _check_issue_coverage,
+    _check_forbidden_flows,
+    _check_finding_refs,
+    _check_suppress_flows,
+    _check_covers_unknown_flow,
+    _check_state_unknown_task_ref,
+    _check_duplicate_ids,
+    _check_critical_flow_no_entrypoints,
+    _check_suppress_unused,
+    _check_plan_scope_unused,
+    _has_issue_codes,
+)
+
+from .contracts import (
+    _check_contracts,
+    _check_contract_verification_coverage,
+    _check_contract_dep_alignment,
+)
+
+
+def get_all_rules():
+    """Return all rule functions for discovery/testing."""
+    return [
+        # structural
+        _check_graph_structure,
+        _check_covers_graph,
+        _check_field_completeness,
+        _check_implicit_serialization,
+        _check_shared_file_verification,
+        _check_integration_spine,
+        _check_role_constraints,
+        _check_early_integration_checkpoint,
+        # coverage
+        _check_verification_strength,
+        _check_verification_no_checks,
+        _check_verification_shallow_checks,
+        _check_integration_task_shallow_verification,
+        _check_dead_verification_command,
+        _check_covers_not_exercised,
+        _check_failure_path,
+        _check_verification_behavior_match,
+        _check_duplicate_verification_commands,
+        _check_verification_cross_scope,
+        _check_covers_verifiability,
+        _check_critical_coverage,
+        _check_flow_segment_ownership,
+        _check_critical_flow_levels,
+        _check_issue_coverage,
+        _check_forbidden_flows,
+        _check_finding_refs,
+        _check_suppress_flows,
+        _check_covers_unknown_flow,
+        _check_state_unknown_task_ref,
+        _check_duplicate_ids,
+        _check_critical_flow_no_entrypoints,
+        _check_suppress_unused,
+        _check_plan_scope_unused,
+        # contracts
+        _check_contracts,
+        _check_contract_verification_coverage,
+        _check_contract_dep_alignment,
+    ]
+
+
+__all__ = [
+    "get_all_rules",
+    "_check_graph_structure",
+    "_check_covers_graph",
+    "_check_field_completeness",
+    "_check_implicit_serialization",
+    "_check_shared_file_verification",
+    "_check_integration_spine",
+    "_check_role_constraints",
+    "_check_early_integration_checkpoint",
+    "_is_cross_task_verifier",
+    "_check_verification_strength",
+    "_check_verification_no_checks",
+    "_check_verification_shallow_checks",
+    "_check_integration_task_shallow_verification",
+    "_check_dead_verification_command",
+    "_check_covers_not_exercised",
+    "_check_failure_path",
+    "_check_verification_behavior_match",
+    "_check_duplicate_verification_commands",
+    "_check_verification_cross_scope",
+    "_check_covers_verifiability",
+    "_check_critical_coverage",
+    "_check_flow_segment_ownership",
+    "_check_critical_flow_levels",
+    "_check_issue_coverage",
+    "_check_forbidden_flows",
+    "_check_finding_refs",
+    "_check_suppress_flows",
+    "_check_covers_unknown_flow",
+    "_check_state_unknown_task_ref",
+    "_check_duplicate_ids",
+    "_check_critical_flow_no_entrypoints",
+    "_check_suppress_unused",
+    "_check_plan_scope_unused",
+    "_has_issue_codes",
+    "_check_contracts",
+    "_check_contract_verification_coverage",
+    "_check_contract_dep_alignment",
+]

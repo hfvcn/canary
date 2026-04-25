@@ -71,11 +71,15 @@ def test_pycompile_redundant(tmp_path):
 def test_pycompile_missing_target_warning(tmp_path):
     issues = _validate(tmp_path, "python -m py_compile src/demo.py", claimed_paths=["src/other.py"])
 
-    assert [issue.code for issue in issues] == [
+    codes = [issue.code for issue in issues]
+    assert codes == [
+        "W_COVERS_PATHS_UNVERIFIED",
         "W_VERIFICATION_REDUNDANT_PYCOMPILE",
         "W_VERIFICATION_TARGET_MISSING",
     ]
-    assert issues[1].severity == "warning"
+    assert issues[0].severity == "warning"
+    assert issues[0].evidence["path"] == "src/demo.py"
+    assert issues[2].severity == "warning"
 
 
 def test_pycompile_missing_target_self_claimed_warning(tmp_path):
@@ -206,8 +210,12 @@ def test_python_c_stdlib_import_ok(tmp_path):
 def test_pytest_missing_file_warning(tmp_path):
     issues = _validate(tmp_path, "pytest tests/test_demo.py -q", claimed_paths=["src/demo.py"])
 
-    assert [issue.code for issue in issues] == ["W_VERIFICATION_TARGET_MISSING"]
-    assert issues[0].severity == "warning"
+    assert [issue.code for issue in issues] == [
+        "W_COVERS_PATHS_UNVERIFIED",
+        "W_VERIFICATION_TARGET_MISSING",
+    ]
+    assert issues[0].evidence["path"] == "tests/test_demo.py"
+    assert issues[1].severity == "warning"
 
 
 def test_pytest_missing_node(tmp_path):
@@ -253,6 +261,33 @@ def test_pytest_k_matching_pattern(tmp_path):
         "pytest tests/test_demo.py -k existing_test -q",
         claimed_paths=["tests/test_demo.py"],
     )
+
+    assert issues == []
+
+
+def test_directory_path_no_crash(tmp_path):
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir(parents=True)
+
+    issues = _validate(tmp_path, "pytest tests/ -q", claimed_paths=["tests/"])
+
+    assert issues == []
+
+
+def test_directory_path_with_k(tmp_path):
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir(parents=True)
+
+    issues = _validate(tmp_path, "pytest tests/ -k foo", claimed_paths=["tests/"])
+
+    assert issues == []
+
+
+def test_directory_path_nested(tmp_path):
+    tests_dir = tmp_path / "tests" / "ralph"
+    tests_dir.mkdir(parents=True)
+
+    issues = _validate(tmp_path, "pytest tests/ralph/ -q", claimed_paths=["tests/ralph/"])
 
     assert issues == []
 
@@ -339,8 +374,12 @@ def test_pytest_k_warning_when_not_claimed(tmp_path):
         claimed_paths=["src/demo.py"],
     )
 
-    assert [issue.code for issue in issues] == ["W_VERIFICATION_PYTEST_K_NO_MATCH"]
-    assert issues[0].severity == "warning"
+    assert [issue.code for issue in issues] == [
+        "W_COVERS_PATHS_UNVERIFIED",
+        "W_VERIFICATION_PYTEST_K_NO_MATCH",
+    ]
+    assert issues[0].evidence["path"] == "tests/test_demo.py"
+    assert issues[1].severity == "warning"
     assert "task claims this test file" not in issues[0].message
 
 
@@ -400,6 +439,38 @@ def test_pytest_k_with_node_id(tmp_path):
     )
 
     assert issues == []
+
+
+def test_pytest_k_with_test_created_by_context(tmp_path):
+    test_path = tmp_path / "tests" / "test_demo.py"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "def test_existing_test():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+
+    plan = Plan.model_validate({
+        "tasks": [{
+            "id": "T1",
+            "claimed_paths": ["tests/test_demo.py"],
+            "verification": {
+                "level": "unit",
+                "command": "pytest tests/test_demo.py -k nonexistent -q",
+                "covers": {"tasks": ["T1"]},
+            },
+        }],
+        "critical_flows": [{
+            "id": "CF1",
+            "test_created_by": ["T1"],
+        }],
+    })
+    workspace = WorkspaceIndex(tmp_path)
+
+    issues = validate_filesystem(plan, project_root=tmp_path, workspace=workspace)
+
+    assert [issue.code for issue in issues] == ["W_VERIFICATION_PYTEST_K_NO_MATCH"]
+    assert issues[0].severity == "hint"
 
 
 def test_pytest_unwraps_runner_prefix(tmp_path):

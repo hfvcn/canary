@@ -1,0 +1,582 @@
+# 2026-04 ARCH-10 残留缺口 + 文档清理
+# 目标: 收敛 todo/问题清单.md v3 中真正剩余的工作
+#
+# 背景:
+#   2026-04-15 重新核对代码后发现：
+#   - ARCH-4 / FIX-13 / FIX-22 / FIX-25 已实现（清单未更新）
+#   - ARCH-10 框架已建好（schema_version=1, LedgerMigrator, WorkflowSnapshot, dry_run, rollback, snapshot 测试），
+#     但有两处真实缺口（snapshot 漏 _workflow_meta；CLI 传空 step list 无注册机制）
+#   - FIX-26 verification divergence 走 FAILED 是 deliberate；现有 record_verification_warning 已在
+#     completer mismatch 分支接线；缺的只是 divergence 通知 summary 含证据的回归断言
+#
+# 范围（5 task）:
+#   T1: WorkflowSnapshot 覆盖 _workflow_meta（修一个会让 FIX-13 在 snapshot/restore 后回退的真 bug）
+#   T2: ledger_migration MIGRATION_REGISTRY + CLI 改读 + MigrationReport.registered_steps
+#   T3: FIX-26 divergence 通知证据回归测试
+#   T4: integration spine — 端到端冒烟测试，串起 snapshot+migration+divergence
+#   T5: 清理 todo/问题清单.md（移除已关闭项，更新 ARCH-10/FIX-26 描述）
+#
+# 不在本批: ARCH-14/15/16（P5 蓝图能力，等 P0/P1 全部清零后再开）
+#
+# 验证策略: 每个 T 独立 pytest，T4 是文档；最后跑一遍冒烟测试避免回归
+# Finding 对照: #12（中间状态误诊→已通过这次核对避免）#13（结构性校验+代码审查互补→已对齐）
+
+tasks:
+  # === T1: ARCH-10a — WorkflowSnapshot 覆盖 _workflow_meta ===
+
+  - id: T1
+    title: "WorkflowSnapshot 序列化/恢复 _workflow_meta（修复 plan_path 在 snapshot/restore 后丢失）"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_snapshot.py"
+      - "tests/test_workflow_snapshot.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/kernel/ledger_migration.py"
+    depends_on: []
+    goal_behavior: >
+      **背景**: WorkflowSnapshot._serialize_engine_state()
+      （src/cccc/kernel/workflow_snapshot.py:102）当前只序列化
+      _tasks / _processed_completion_keys / _monitor_config / _pending_hook_alerts。
+      但 WorkflowEngine 还有 self._workflow_meta: Dict[str, WorkflowMeta]
+      （workflow_state_engine.py:37），里面存着 plan_path（FIX-13 的持久化依据）。
+      Snapshot 不覆盖 → restore 后 engine.get_plan_path(wf) 返回空 →
+      _auto_sync_plan_state() 静默跳过 → plan.yaml 自动回写链路被打穿。
+
+      **修改**:
+      1. _serialize_engine_state()（line 102）新增 "workflow_meta" 字段：
+         遍历 self._engine._workflow_meta，每条序列化为
+         {"workflow_id": meta.workflow_id, "plan_path": meta.plan_path}。
+         排序按 workflow_id 保证 hash 稳定。
+      2. restore_snapshot()（line 62）反序列化 workflow_meta：
+         self._engine._workflow_meta = {
+             item["workflow_id"]: WorkflowMeta(
+                 workflow_id=item["workflow_id"],
+                 plan_path=item.get("plan_path", ""),
+             )
+             for item in state.get("workflow_meta", [])
+             if isinstance(item, dict) and item.get("workflow_id")
+         }
+      3. verify_snapshot()（line 83）无需修改——它已经做的是 dict 完整对比。
+      4. 旧 snapshot（无 workflow_meta 键）restore 时 graceful：
+         state.get("workflow_meta", []) 返回 []，restore 后 _workflow_meta 为空 dict，
+         不报错。
+      5. SNAPSHOT_FORMAT_VERSION 不需要 bump：新增字段是向后兼容的（旧 snapshot 仍可 restore，
+         只是 plan_path 上下文为空）。但需要在 _serialize_engine_state 的 docstring 或
+         注释里说明新增字段，避免下次再漏。
+
+      **测试** (tests/test_workflow_snapshot.py 新建或追加):
+      - test_snapshot_round_trip_preserves_workflow_meta:
+        engine.register_task(..., plan_path="/tmp/plan.yaml") → take_snapshot →
+        新 engine.restore_snapshot → engine.get_plan_path(wf) == "/tmp/plan.yaml"
+      - test_snapshot_state_hash_stable_across_workflow_meta:
+        两次 take_snapshot 同一 engine，state_hash 相同
+      - test_legacy_snapshot_without_workflow_meta_restores:
+        手写一个无 workflow_meta 键的 snapshot dict → restore 不报错，
+        engine._workflow_meta == {}
+      - test_multiple_workflows_meta_preserved:
+        两个不同 workflow_id，plan_path 不同 → snapshot/restore → 两个都恢复
+    acceptance_criteria: >
+      _serialize_engine_state 输出含 workflow_meta；restore_snapshot 反序列化并恢复；
+      4 个测试场景全部通过；旧 snapshot 仍能 restore（向后兼容）；
+      state_hash 在内容相同时稳定；ledger migration 的 snapshot/rollback 路径不再因
+      plan_path 丢失而打穿 FIX-13 链路。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_snapshot.py tests/test_ledger_migration.py -q --tb=short -k 'workflow_meta or round_trip or legacy_snapshot or multiple_workflows'"
+      checks:
+        - name: snapshot_meta_round_trip_unit
+          command: "python -m pytest tests/test_workflow_snapshot.py -q --tb=short -k 'workflow_meta or round_trip'"
+      covers:
+        tasks: ["T1"]
+        flows: ["snapshot_workflow_meta_round_trip"]
+    provides:
+      - name: snapshot_workflow_meta_coverage
+        kind: module
+        schema_hint: "WorkflowSnapshot serialize/restore _workflow_meta dict"
+    addresses: ["ARCH-10"]
+
+  # === T2: ARCH-10b — MIGRATION_REGISTRY + CLI 接入 + report 字段 ===
+
+  - id: T2
+    title: "ledger_migration 暴露 MIGRATION_REGISTRY，CLI 改读 registry，MigrationReport 加 registered_steps"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/ledger_migration.py"
+      - "src/cccc/cli/messaging_cmds.py"
+      - "tests/test_ledger_migration.py"
+    awareness_paths:
+      - "src/cccc/contracts/v1/event.py"
+    depends_on: []
+    goal_behavior: >
+      **背景**: 当前 src/cccc/cli/messaging_cmds.py:215 `LedgerMigrator(group.path, [], engine)`
+      硬编码空 step 列表。CURRENT_SCHEMA_VERSION=1 是初始版本，所以"无 step"在功能上正确，
+      但有两个问题：
+      (a) 未来 v1→v2 时，CLI 不知道去哪里发现新 step
+      (b) 用户跑 dry_run 看到 "0 steps"，分不清"无需迁移"还是"忘了注册"
+
+      **修改**:
+      1. src/cccc/kernel/ledger_migration.py 顶部新增模块级常量:
+         ```python
+         # Registry of registered migration steps.
+         # When a new ledger schema version is introduced (e.g. v1 → v2), append the
+         # corresponding MigrationStep subclass instance here. v1 is the initial schema
+         # so the registry starts empty — empty registry means "no migration needed",
+         # not "forgot to register".
+         MIGRATION_REGISTRY: list[MigrationStep] = []
+         ```
+         放在 LedgerMigrator 类定义之后（line ~258 之后），导出符号。
+      2. MigrationReport（line 27-37）新增字段:
+         registered_steps: int = 0
+         注意是默认值 0，避免破坏现有 dataclass 调用方。
+      3. LedgerMigrator._build_report() 在构造 report 时填充
+         registered_steps=len(self._steps)。
+      4. src/cccc/cli/messaging_cmds.py:215 改为:
+         ```python
+         from ..kernel.ledger_migration import LedgerMigrator, MIGRATION_REGISTRY
+         migrator = LedgerMigrator(group.path, MIGRATION_REGISTRY, engine)
+         ```
+         不要改动其他逻辑（dry_run / execute / 报错路径）。
+      5. dry_run 输出现在会包含 `"registered_steps": 0`，用户可据此区分两种情况。
+         无需新增 CLI flag 或新文案。
+
+      **测试** (tests/test_ledger_migration.py 追加，不要新建 tests/cli/ 目录):
+      - test_migration_registry_default_empty: import MIGRATION_REGISTRY，断言为空 list
+      - test_migration_report_includes_registered_steps:
+        构造空 LedgerMigrator → dry_run → report.registered_steps == 0
+      - test_migration_report_registered_steps_with_steps:
+        构造 LedgerMigrator(steps=[FakeStep()]) → dry_run → report.registered_steps == 1
+        （FakeStep 用最小 MigrationStep 子类，from_version=1, to_version=2）
+      - test_cli_cmd_uses_registry:
+        调用 cccc.cli.messaging_cmds.cmd_ledger_migrate(args) — 用 SimpleNamespace
+        构造 args(dry_run=True, group=group_id, by="user")，搭配 stub stdout 捕获 JSON。
+        断言输出 result.registered_steps == 0。这是验证 CLI 真的走了 registry，
+        不是验证 import 语句。
+    acceptance_criteria: >
+      MIGRATION_REGISTRY 在 ledger_migration.py 模块层导出，初始为空 list；
+      MigrationReport 含 registered_steps 字段；CLI 改用 registry；
+      3 个新测试通过；现有 ledger_migration 测试不回归；现有 CLI 测试不回归。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_ledger_migration.py -q --tb=short"
+      checks:
+        - name: migration_registry_unit
+          command: "python -m pytest tests/test_ledger_migration.py -q --tb=short -k 'registry or registered_steps'"
+        - name: cli_cmd_uses_registry
+          command: "python -m pytest tests/test_ledger_migration.py::test_cli_cmd_uses_registry -q --tb=short"
+      covers:
+        tasks: ["T2"]
+        flows: ["migration_registry_discoverable"]
+    provides:
+      - name: migration_registry
+        kind: module
+        schema_hint: "MIGRATION_REGISTRY module-level constant + MigrationReport.registered_steps"
+    addresses: ["ARCH-10"]
+
+  # === T3: FIX-26 — divergence 通知证据回归测试 ===
+
+  - id: T3
+    title: "FIX-26: divergence FAILED 通知 summary 含 verification checks 证据回归测试"
+    role: verification
+    claimed_paths:
+      - "tests/test_ralph_verification.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    depends_on: []
+    goal_behavior: >
+      **背景**: verification divergence（worker 自报 success 但 verify 命令 fail）当前
+      统一标 FAILED — 这是 deliberate 决策（divergence = trust 问题，不能软化）。
+      `_handle_verification_divergence()` 已经先记 `workflow.task_verify_divergence`
+      事件再发 `failed` 通知，notification summary 还会追加 verification checks 证据。
+
+      但现有测试（tests/test_ralph_verification.py:199 起）只断言"会 notify"，
+      没钉死"summary 含 checks 证据" — 这意味着如果未来重构把证据从 summary 里
+      去掉，回归测试不会捕获。FIX-26 的真正剩余工作就是补这个回归断言。
+
+      **修改**:
+      1. 找到 test_orchestrator_verify_divergence_marks_failed_and_records_event
+         （tests/test_ralph_verification.py:199）。这个测试已经 capture 了
+         notifications。
+      2. 在测试末尾追加断言：
+         - 至少一条 notification new_status == "failed"
+         - 该 notification.summary 字符串中含有**独特的失败证据 token**，
+           不允许用 "verification"/"check"/"exit" 这类高频词（它们在普通 failed 通知里
+           本来就出现，断言不能区分"带证据"和"丢证据"）
+         - 推荐做法：构造 verification command 让 stdout/stderr 含一个独特字符串
+           如 "FIX26_EVIDENCE_TOKEN_alpha"，断言 summary 含这个 token
+      3. 新增独立测试 test_orchestrator_verify_divergence_summary_contains_evidence:
+         - 与现有 divergence 测试结构相同
+         - 构造 verification 含一个 check name "fix26_check_marker_beta"
+           （或类似独特 token），让 verify command 输出含此 marker
+         - 触发 divergence
+         - 断言 summary 含 "fix26_check_marker_beta"
+         - 断言 status == FAILED
+         （这是把"summary 携带 check 证据"作为 contract 钉死，
+           独特 token 保证未来重构如果丢证据，断言会立刻失败）
+      ⚠️ 编写测试前先实跑一次 _handle_verification_divergence 看看 summary 实际包含
+      什么字段（check name？command output？exit code？stderr？），选一个"渲染层删了
+      就一定丢"的字段来钉，避免把 token 钉在边缘字段上。
+      4. 顺手在 todo/问题清单.md 中注明 FIX-26 关闭依据：notify 路径已带证据 + 回归测试已固定。
+         注意：todo 文件的清理整体由 T4 负责，T3 只在 plan 内 reference 这一点，不直接改 todo。
+
+      **不要做**:
+      - 不要修改 _handle_verification_divergence 的语义（不要软化 FAILED）
+      - 不要增加新的 warning 状态分流
+      - 不要为了让 summary 包含 substring 而修改 summary 渲染代码（除非现有渲染就没带证据，
+        那样的话就是真 bug 不是 FIX-26 范围）
+    acceptance_criteria: >
+      tests/test_ralph_verification.py 的 divergence 测试现在断言 notify summary 含证据；
+      新增的 test_orchestrator_verify_divergence_summary_contains_evidence 通过；
+      未修改 orchestrator/engine 业务逻辑（仅在确实发现 summary 不含证据时才修一行渲染）；
+      现有 divergence 测试不回归。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_ralph_verification.py -q --tb=short -k 'divergence'"
+      checks:
+        - name: divergence_evidence_in_summary
+          command: "python -m pytest tests/test_ralph_verification.py::test_orchestrator_verify_divergence_summary_contains_evidence -q --tb=short"
+        - name: divergence_remains_failed
+          command: "python -m pytest tests/test_ralph_verification.py::test_orchestrator_verify_divergence_marks_failed_and_records_event -q --tb=short"
+      covers:
+        tasks: ["T3"]
+        flows:
+          - "verification_divergence_evidence"
+          - "no_silent_warn_for_divergence"
+    provides:
+      - name: divergence_evidence_regression
+        kind: test
+        schema_hint: "Regression: divergence FAILED notification summary contains check evidence"
+    addresses: ["FIX-26"]
+
+  # === T4: integration spine — 串起 snapshot+migration+divergence ===
+
+  - id: T4
+    title: "Integration spine: snapshot 含 _workflow_meta + LedgerMigrator 用 registry + divergence FAILED 仍带证据 端到端冒烟"
+    role: integration
+    claimed_paths:
+      - "tests/e2e/test_arch10_residual_smoke.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_snapshot.py"
+      - "src/cccc/kernel/ledger_migration.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/contracts/v1/event.py"
+    depends_on: ["T1", "T2", "T3"]
+    goal_behavior: >
+      新建 tests/e2e/test_arch10_residual_smoke.py，把 T1/T2/T3 的修复结果在
+      一个进程内串起来跑通，确保三块改动协同工作。每个测试都使用真实的 group
+      和 ledger（temp dir），不用 mock。
+
+      **场景 1: snapshot/restore 后 plan_path 仍能驱动 auto-sync (覆盖 T1)**
+      - test_snapshot_restore_preserves_plan_path
+        a. 创建 group + WorkflowEngine
+        b. engine.register_task(..., plan_path="/tmp/test-plan.yaml")
+        c. 通过 WorkflowSnapshot.take_snapshot(snap_path)
+        d. 创建第二个 engine，调用 WorkflowSnapshot(engine2).restore_snapshot(snap_path)
+        e. 断言 engine2.get_plan_path(workflow_id) == "/tmp/test-plan.yaml"
+        f. 断言 engine2._workflow_meta 非空且包含正确条目
+
+      **场景 2: 真实 CLI 入口 cmd_ledger_migrate 走 MIGRATION_REGISTRY (覆盖 T2)**
+      - test_cli_cmd_ledger_migrate_uses_registry_and_reports_steps
+        a. 用 stop_daemon_helper 模式或直接构造 args（SimpleNamespace 含
+           group/dry_run/by 等）
+        b. 调用 cccc.cli.messaging_cmds.cmd_ledger_migrate(args)
+        c. capture stdout（_print_json 输出），解析 JSON
+        d. 断言 ok is True
+        e. 断言 result.registered_steps == 0（空 MIGRATION_REGISTRY）
+        f. 断言 result.dry_run is True
+        g. 断言 result.migrated_events == 0
+        （这是真正"CLI 路径"验证，不是 new LedgerMigrator）
+
+      **场景 3: 带步骤的 migrator.execute() 时 snapshot 含 _workflow_meta (T1+T2 集成)**
+      - test_migrator_execute_snapshot_includes_workflow_meta
+        a. 在测试文件内定义最小 FakeMigrationStep(from_version=1, to_version=2)，
+           migrate_event 直接返回 dict（schema_version 由 migrator 自己改）
+        b. engine.register_task with plan_path
+        c. 写一条带 schema_version=1 的事件到 ledger（让 migrated_count > 0，
+           走真正的 execute 而非 early return）
+        d. migrator = LedgerMigrator(group.path, [FakeMigrationStep()], engine)
+        e. report = migrator.execute(backup_dir)
+        f. 断言 report.snapshot_path 非空
+        g. 读 snapshot 文件 JSON，断言 state.workflow_meta 列表非空，
+           包含 workflow_id 和正确 plan_path
+        （这把"snapshot 经过 migration 真实写入"作为契约钉死）
+
+      **场景 4: divergence FAILED 通知含证据 + 不被软化 (覆盖 T3 + 禁止流)**
+      - test_divergence_notification_contains_evidence_and_remains_failed
+        a. 完整 workflow setup（参考 tests/test_ralph_verification.py:199）
+        b. 触发 divergence: worker 自报 success + verify command 含独特 check name
+           "arch10_smoke_check" 且退出码 1
+        c. 用 _capture_notification 收集通知
+        d. 断言至少一条 notification new_status == "failed"
+        e. 断言该 notification.summary **含字符串 "arch10_smoke_check"**
+           （独特 token，不会偶然命中）
+        f. 断言 engine.get_task(tid).status == FAILED（不是 COMPLETED-with-warning）
+        g. 这同时覆盖 forbidden flow no_silent_warn_for_divergence
+
+      **场景 5: snapshot/restore 后 orchestrator 真能恢复 plan context 并触发 auto-sync (T1 + FIX-13 链路集成)**
+      - test_orchestrator_restored_from_snapshot_runs_auto_sync
+        a. 写一个最小 plan.yaml 到 temp 目录（含 1 个 task + state.completed_task_ids: []）
+        b. 创建 engine_a，engine_a.register_task(task_ref, workflow_id, plan_path=plan_yaml)
+        c. WorkflowSnapshot(engine_a).take_snapshot(snap_path)
+        d. 创建 engine_b（新实例），WorkflowSnapshot(engine_b).restore_snapshot(snap_path)
+        e. 构造 WorkflowOrchestrator on engine_b（或直接调用其 _restore_plan_contexts_from_engine
+           等价路径，参考 src/cccc/daemon/foreman/workflow_orchestrator.py:187）
+        f. 断言 engine_b.get_plan_path(workflow_id) == plan_yaml 路径
+        g. 触发 task complete + verification passed 路径，让 _auto_sync_plan_state 跑
+        h. 重新读 plan.yaml，断言 state.completed_task_ids 含该 task id
+        （这是把 T1 的修复价值证给 FIX-13 — 没有 T1 这条链路就在 restore 后断掉）
+
+      **不要做**:
+      - 不要修改任何 src 文件
+      - 不要 mock kernel 模块（必须真实跑通）
+      - 不要重复 T1/T2/T3 的单元测试，spine 只验证三者协同
+    acceptance_criteria: >
+      5 个场景全部通过；test 文件用真实 engine/ledger/group，不 mock kernel；
+      场景 1 证明 plan_path 经过 snapshot/restore 后存活；
+      场景 2 证明 cmd_ledger_migrate (真实 CLI 入口) 走 MIGRATION_REGISTRY 并报告 registered_steps；
+      场景 3 证明 migrator.execute() 走 take_snapshot 时 snapshot 文件含 _workflow_meta（用 FakeStep 让 migrated_count > 0 触发真实 execute 路径）；
+      场景 4 证明 divergence 失败时既不软化也带独特 check name 证据；
+      场景 5 证明 snapshot/restore 后 orchestrator 仍能恢复 plan context 并自动 sync plan.yaml（T1 修复对 FIX-13 链路的实际价值）。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/e2e/test_arch10_residual_smoke.py -q --tb=short"
+      checks:
+        - name: spine_smoke_e2e
+          command: "python -m pytest tests/e2e/test_arch10_residual_smoke.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4"]
+        flows:
+          - "snapshot_workflow_meta_round_trip"
+          - "migration_registry_discoverable"
+          - "verification_divergence_evidence"
+          - "no_silent_warn_for_divergence"
+    consumes:
+      - name: snapshot_workflow_meta_coverage
+        from: T1
+      - name: migration_registry
+        from: T2
+      - name: divergence_evidence_regression
+        from: T3
+    provides:
+      - name: arch10_residual_e2e
+        kind: runtime_capability
+        schema_hint: "End-to-end smoke proving snapshot/migration/divergence fixes coexist"
+    addresses: ["ARCH-10", "FIX-26"]
+
+  # === T5: 文档清理 ===
+
+  - id: T5
+    title: "清理 todo/问题清单.md：移除已关闭项，更新 ARCH-10/FIX-26 描述"
+    role: leaf
+    claimed_paths:
+      - "todo/问题清单.md"
+      - "todo/问题清单-full.md"
+      - "tests/test_issue_list_alignment.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/kernel/workflow_snapshot.py"
+      - "src/cccc/kernel/ledger_migration.py"
+    depends_on: ["T4"]
+    goal_behavior: >
+      把 4-15 写的 todo/问题清单.md 和真实代码状态对齐，并把本批 T1-T3 的修复结论也
+      反映进去。文档清理放在最后是为了让所有代码事实都已落地后再写。
+
+      **从问题清单.md 移除（移到 todo/问题清单-full.md "已验证/已实施"小节）**:
+      - ARCH-4: TaskState 已完整承载 provenance（agent_id/assigned_by/assigned_at/attempt_id），
+        _active_workflows 已清掉这些字段，engine 是唯一权威。
+        证据: src/cccc/kernel/workflow_state_types.py:44, workflow_orchestrator.py:254
+      - FIX-13: on_task_completed() 已接 _auto_sync_plan_state()，plan_path 已通过
+        WorkflowMeta 持久化到 ledger，daemon 重启后 engine.get_plan_path 可恢复。
+        证据: workflow_orchestrator.py:1549, workflow_state_engine.py:362
+      - FIX-22: _resuggest_ready_tasks 已显式跳过 RUNNING。
+        证据: workflow_orchestrator.py:1681
+      - FIX-25: retry_and_assign 已是单步原子操作。
+        证据: workflow_orchestrator.py:2341, cli/workflow_cmds.py:207
+
+      **更新 ARCH-10 描述**: 框架已建好（schema_version, LedgerMigrator, WorkflowSnapshot,
+      dry_run, rollback, snapshot 测试），剩余仅两点，且本批已修：
+      - (a) WorkflowSnapshot 漏 _workflow_meta — T1 已修
+      - (b) LedgerMigrator 步骤注册机制 — T2 已建立 MIGRATION_REGISTRY
+      建议同步移到 full（"已实施"），主清单只留对未来 v1→v2 时的注册步骤说明。
+
+      **更新 FIX-26 描述**: divergence FAILED 是 deliberate；通知 summary 已含证据；
+      T3 已加回归测试钉住。同步移到 full（"已实施"），主清单不再保留。
+
+      **主清单剩余内容**: 只有 ARCH-14/15/16（P5 蓝图能力），其余全部清空到 full。
+      在主清单顶部更新"当前剩余问题速览"到 P5 only 状态，并写一句"P0/P1 在 2026-04 已清零"。
+
+      **新建 tests/test_issue_list_alignment.py**（用于 verification，纯 Python 脚本）:
+
+      校验目标（按重要度排序）：
+      1. 主清单结构完整：必须能解析出三个标题"## 一、核心待解决"、
+         "## 二、次级待解决"、"## 三、蓝图对齐"或"## 三、"前缀。任何一个缺失即 FAIL。
+         禁止"section 缺失被静默当成空 section"——必须显式断言 split 成功。
+      2. ARCH-4/FIX-13 不再出现在"## 一、核心待解决"section 内。
+      3. FIX-22/FIX-25/FIX-26 不再出现在"## 二、次级待解决"section 内。
+      4. ARCH-10 在主清单中不再作为 P0 出现：要么完全移除，要么仅以"已实施"摘要形式
+         出现（断言主清单中不再有"### ARCH-10 ... P0"形式的小节标题）。
+      5. todo/问题清单-full.md 必须新增"已验证/已实施"区域条目，
+         且**为每个被移走的 ID 检查它在 full 中的"已实施/已验证"小节里出现**——
+         不仅是"出现在文件任意位置"。检查方式：找包含 "已验证" 或 "已实施" 的章节标题，
+         在该章节后续 N 行内查 ID。
+      6. 主清单"## 四、已移入 Full 的条目"列表必须更新含本次移走的 ID。
+      7. Markdown 表格完整性：主清单和 full 都不应出现表格行不对齐的迹象
+         （简单启发：若文件含 "|" 行，相邻 "|" 行的 "|" 列数必须一致；不一致 → FAIL）。
+         不必完美，至少能抓"我手抖删了一行表头"这类破坏。
+      8. 内部链接完整性：所有 [text](file.md) 形式的相对链接，目标文件必须存在
+         （在 todo/ 目录下查）。
+
+      脚本结构示意：
+      ```python
+      import pathlib, sys, re
+      ROOT = pathlib.Path('todo')
+      doc = (ROOT / '问题清单.md').read_text(encoding='utf-8')
+      full = (ROOT / '问题清单-full.md').read_text(encoding='utf-8')
+
+      errors = []
+
+      # 1. 三个标题必须存在
+      for header in ['## 一、核心待解决', '## 二、次级待解决']:
+          if header not in doc:
+              errors.append(f'missing header: {header}')
+
+      # 解析 sections（split 时严格断言）
+      def section(text, start, end_prefixes):
+          if start not in text:
+              return None
+          tail = text.split(start, 1)[1]
+          for end in end_prefixes:
+              if end in tail:
+                  tail = tail.split(end, 1)[0]
+                  break
+          return tail
+
+      core = section(doc, '## 一、核心待解决', ['## 二'])
+      sec = section(doc, '## 二、次级待解决', ['## 三'])
+      if core is None: errors.append('core section unparseable')
+      if sec is None: errors.append('secondary section unparseable')
+
+      # 2/3. 移除断言
+      if core is not None:
+          for tid in ['ARCH-4', 'FIX-13']:
+              if tid in core:
+                  errors.append(f'{tid} still in core section')
+      if sec is not None:
+          for tid in ['FIX-22', 'FIX-25', 'FIX-26']:
+              if tid in sec:
+                  errors.append(f'{tid} still in secondary section')
+
+      # 4. ARCH-10 P0 标记不应再出现
+      if re.search(r'### ARCH-10[^\n]*P0', doc):
+          errors.append('ARCH-10 still marked as P0 in main list')
+
+      # 5. full 中"已实施/已验证"区域必须含被移走的 ID
+      if not re.search(r'已验证|已实施', full):
+          errors.append('full archive missing 已验证/已实施 section')
+      else:
+          archived_section = full[max(full.find('已验证'), full.find('已实施')):]
+          for tid in ['ARCH-4', 'FIX-13', 'FIX-22', 'FIX-25', 'FIX-26']:
+              if tid not in archived_section:
+                  errors.append(f'{tid} missing from full archive section')
+
+      # 6. 已移入 Full 列表更新
+      moved_section = section(doc, '## 四、已移入 Full', ['## 五']) or section(doc, '已移入 Full', [])
+      if moved_section is None:
+          errors.append('main list missing 已移入 Full section')
+      else:
+          for tid in ['ARCH-4', 'FIX-13', 'FIX-22', 'FIX-25', 'FIX-26']:
+              if tid not in moved_section:
+                  errors.append(f'{tid} not listed in 已移入 Full section')
+
+      # 7. 表格列数一致性（启发式）
+      for name, text in [('main', doc), ('full', full)]:
+          rows = [line for line in text.splitlines() if line.strip().startswith('|') and line.strip().endswith('|')]
+          col_counts = [line.count('|') for line in rows]
+          if col_counts and len(set(col_counts)) > 3:  # 容忍轻微不均
+              errors.append(f'{name} markdown tables look broken (column counts: {sorted(set(col_counts))[:5]})')
+
+      # 8. 链接目标存在
+      for name, text in [('main', doc), ('full', full)]:
+          for m in re.finditer(r'\[[^\]]+\]\(([^)]+\.md)\)', text):
+              target = m.group(1)
+              if target.startswith('http'):
+                  continue
+              path = (ROOT / target).resolve()
+              if not path.exists():
+                  errors.append(f'{name} broken link: {target}')
+
+      if errors:
+          print('FAIL:'); [print('  - ' + e) for e in errors]; sys.exit(1)
+      print('issue list alignment OK')
+      ```
+      退出 0 表示对齐，非 0 列出所有问题。
+
+      **不要做**:
+      - 不要删除任何 ARCH/FIX 编号——只移到 full
+      - 不要修改 findings.md（教训记录与本批修复无关）
+      - 不要新增"已关闭"列表之外的章节
+    acceptance_criteria: >
+      问题清单.md 顶部速览反映 P5 only；ARCH-4/FIX-13/FIX-22/FIX-25/ARCH-10/FIX-26 不再出现在主清单的"待解决"小节；
+      问题清单-full.md "已验证/已实施"区域含上述 6 项及简短证据；
+      主清单底部"已移入 Full 的条目"列表更新；
+      文件 markdown 渲染正常（无悬挂表格、无破损链接）。
+    verification:
+      level: unit
+      command: "python tests/test_issue_list_alignment.py"
+      checks:
+        - name: issue_list_alignment_check
+          command: "python tests/test_issue_list_alignment.py"
+      covers:
+        tasks: ["T5"]
+    provides:
+      - name: issue_list_aligned
+        kind: doc
+        schema_hint: "todo/问题清单.md aligned with code reality after T1-T3 land"
+    addresses: ["ARCH-10", "FIX-26"]
+
+critical_entrypoints:
+  - src/cccc/kernel/workflow_snapshot.py
+  - src/cccc/kernel/ledger_migration.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+
+critical_flows:
+  - id: snapshot_workflow_meta_round_trip
+    description: "WorkflowEngine._workflow_meta survives take_snapshot → restore_snapshot, preserving plan_path so FIX-13 auto-sync chain is not broken by ledger migration rollback"
+    entrypoints:
+      - "src/cccc/kernel/workflow_snapshot.py"
+    required_verification_level: unit
+  - id: migration_registry_discoverable
+    description: "LedgerMigrator step registration via module-level MIGRATION_REGISTRY; CLI uses registry instead of hardcoded empty list; report exposes registered_steps so dry-run output disambiguates 'no migration needed' vs 'forgot to register'"
+    entrypoints:
+      - "src/cccc/kernel/ledger_migration.py"
+      - "src/cccc/cli/messaging_cmds.py"
+    required_verification_level: unit
+  - id: verification_divergence_evidence
+    description: "verification divergence path marks task FAILED AND emits foreman notification whose summary contains check evidence; regression test pins this contract"
+    entrypoints:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    required_verification_level: integration
+
+forbidden_flows:
+  - id: no_silent_warn_for_divergence
+    description: "verification divergence MUST NOT be downgraded from FAILED to a soft warning — divergence is a trust problem and should remain a hard failure"
+    required_verification_level: integration
+
+required_issues:
+  - "ARCH-10"
+  - "FIX-26"
+
+suppress_codes:
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"  # 本批不触碰 daemon_startup / cli_workflow 子系统，本批自有 flows 通过 covers.flows 显式覆盖
+
+state:
+  completed_task_ids: ["T1", "T2", "T3", "T4", "T5"]
+  running_tasks: []
+  failed_task_ids: []

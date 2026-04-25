@@ -1,0 +1,377 @@
+# Batch G+H: Ralph 规则增强 + CLI/审计完整性
+# 可验证结论: "ralph validate 对空 checks 和缺失 failure_path 报警；CLI actor add 支持 --worker-prompt；
+#              validate 写 ledger 事件；daemon 自动检测 stalled worker；verification_skipped summary 含原因"
+#
+# 对应问题清单:
+#   Batch G: RO-9n (P1) + RO-11 (P1)
+#   Batch H: ARCH-5 (P2) + FIX-15 (P2) + FIX-19 (P1) + FIX-20 (P1)
+# Finding 对照: #1(编译通过≠功能可用) #13(结构校验和代码审查互补) #17(失败必须暴露)
+#
+# 依赖: Batch D 已完成（engine 状态完整），E/F 已完成（engine guard + truth source）
+# 验证方法:
+#   G: ralph validate 对 checks=[] 报 W_VERIFICATION_NO_CHECKS；对缺 failure_path 的 assignment 任务报 W_NO_FAILURE_PATH
+#   H: actor add --worker-prompt 生效；validate 后 ledger 有 workflow.plan_validated 事件；
+#      daemon 自动 stall sweep；verification skip summary 含可区分原因
+#
+# 设计决策:
+# 1. RO-9n: 新增 _check_verification_no_checks()，遍历 task，verification.command 非空但 checks=[] 时报 warning
+# 2. RO-11: 新增 _check_failure_path()，只对涉及 assignment/actor/worker/agent 关键词的任务检查
+#    （Codex C3: 不扩展到所有 depends_on 任务，收窄回原始边界）
+# 3. ARCH-5: CLI cmd_actor_add 在 daemon request args 中加 worker_prompt，argparse 加 --worker-prompt
+# 4. FIX-15: _cmd_validate 后写 ledger 事件，复用 sync-state 的 --ledger/--group 契约
+#    （Codex S2: 优先 --ledger，--group 做便利入口）
+# 5. FIX-19: automation engine._run_heartbeat_sweep 改为接收 group 参数，
+#    通过 get_orchestrator(group_id) 获取 orchestrator（无循环导入）
+#    同时修复 check_stalled_tasks() 中 last_heartbeat=None 时使用原始字段的 crash
+#    （Codex C1: 不走 call_daemon/IPC 避免循环导入）
+# 6. FIX-20: 审查所有 verification skip 路径，确保 summary 含具体原因
+#    （Codex C2: 不把 checks=[]+command 变成 skip，保留原执行行为，只补充 summary）
+#
+# Codex 审查后修正（2026-04-07）：
+# C1: T6 不走 call_daemon/IPC，直接 import get_orchestrator，传 group 参数
+# C2: T4 不新增 skip 路径，只在现有 skip 路径上确保 summary 含具体原因
+# C3: T2 收窄到 assignment/actor/worker 任务，不覆盖普通 depends_on 任务
+# C4: T2 claimed_paths 加入 models.py（failure_path 字段）
+# C5: T6 同时修复 check_stalled_tasks() line 1445 的 last_heartbeat=None crash
+# C6: T5 复用 --ledger/--group 契约（和 sync-state 一致）
+
+tasks:
+  # === T1: RO-9n — W_VERIFICATION_NO_CHECKS 规则 ===
+
+  - id: T1
+    title: "新增 W_VERIFICATION_NO_CHECKS 规则：verification.checks 为空时报警"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/validator.py"
+    awareness_paths:
+      - "src/cccc/ralph/models.py"
+    depends_on: []
+    goal_behavior: >
+      1. 在 validator.py 新增 `_check_verification_no_checks(plan: Plan) -> List[ValidationIssue]`：
+         遍历所有 task，如果 task.verification 存在且 task.verification.command 非空，
+         但 task.verification.checks 为空列表，则报 W_VERIFICATION_NO_CHECKS warning。
+         message 建议拆分为至少 compile + test 两个 check。
+      2. 在 `_collect_structural_issues()` 中注册此函数（在 _check_verification_strength 之后）。
+      3. 不修改任何现有规则的行为。
+    acceptance_criteria: >
+      plan 中 verification.command 存在但 checks=[] 的 task 触发 W_VERIFICATION_NO_CHECKS warning；
+      checks 非空或无 verification 的 task 不触发；
+      现有测试不受影响。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_ralph_verification.py -x -q"
+      checks:
+        - name: "existing tests pass"
+          command: "python -m pytest tests/test_ralph_verification.py -x -q"
+          required: true
+      covers:
+        tasks: ["T1"]
+    provides:
+      - name: w_verification_no_checks_rule
+        kind: validation_rule
+        schema_hint: "W_VERIFICATION_NO_CHECKS warning when verification.checks is empty"
+    addresses: ["RO-9n"]
+
+  # === T2: RO-11 — W_NO_FAILURE_PATH 规则 ===
+
+  - id: T2
+    title: "新增 W_NO_FAILURE_PATH 规则：assignment/actor 任务缺失 failure_path 声明时报警"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/validator.py"
+      - "src/cccc/ralph/models.py"
+    awareness_paths:
+      - "tests/ralph/sample_good_plan.yaml"
+    depends_on: ["T1"]
+    goal_behavior: >
+      1. 在 models.py 的 TaskSpec 中新增可选字段 `failure_path: str = ""`。
+         如果该字段非空则视为已声明失败路径，不报警。
+      2. 在 validator.py 新增 `_check_failure_path(plan: Plan) -> List[ValidationIssue]`：
+         只对满足以下条件的 task 检查（收窄到 RO-11 原始边界）：
+         - goal_behavior 中包含 assignment/actor/worker/agent/external/async 关键词
+         - 或 role == "integration"（集成任务涉及跨组件协调）
+         不对普通 depends_on 任务报警（Codex C3）。
+         检查方式：如果 failure_path 非空则通过；
+         否则检查 goal_behavior 或 acceptance_criteria 中是否包含
+         failure/error/fallback/rollback/blocked/escalat 等关键词。
+         完全没有失败处理描述，报 W_NO_FAILURE_PATH warning。
+      3. 在 `_collect_structural_issues()` 中注册此函数。
+      4. 不修改任何现有规则的行为。确保 sample_good_plan.yaml 不触发此规则
+         （它的 depends_on 任务不涉及 assignment 关键词）。
+    acceptance_criteria: >
+      goal_behavior 含 assignment/actor 但无 failure 描述的 task 触发 W_NO_FAILURE_PATH warning；
+      普通 depends_on 任务（不含 assignment 关键词）不触发；
+      goal_behavior 中含 failure/rollback 描述的 task 不触发；
+      failure_path 字段非空的 task 不触发；
+      现有 sample_good_plan.yaml 验证无回归。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_ralph_verification.py -x -q"
+      checks:
+        - name: "existing tests pass"
+          command: "python -m pytest tests/test_ralph_verification.py -x -q"
+          required: true
+      covers:
+        tasks: ["T2"]
+    consumes:
+      - name: w_verification_no_checks_rule
+        kind: validation_rule
+        from: T1
+    provides:
+      - name: w_no_failure_path_rule
+        kind: validation_rule
+        schema_hint: "W_NO_FAILURE_PATH warning when assignment/actor task lacks failure handling"
+    addresses: ["RO-11"]
+
+  # === T3: ARCH-5 — CLI actor add --worker-prompt ===
+
+  - id: T3
+    title: "CLI actor add 新增 --worker-prompt 参数并透传到 daemon"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/cli/actor_cmds.py"
+    awareness_paths:
+      - "src/cccc/daemon/actors/actor_add_ops.py"
+      - "src/cccc/cli/main.py"
+    depends_on: []
+    goal_behavior: >
+      1. 在 actor add 的 argparse 注册处（可能在 main.py 或 actor_cmds.py，
+         需确认 --worker-prompt 参数加到正确位置）新增 `--worker-prompt` 可选参数。
+      2. 在 cmd_actor_add 的 daemon request args dict 中加入
+         `"worker_prompt": worker_prompt`（当 worker_prompt 非 None 时）。
+      3. 在 local fallback path 的 add_actor() 调用中也传入 worker_prompt。
+      4. daemon 层 actor_add_ops.py 已支持 worker_prompt，无需修改。
+    acceptance_criteria: >
+      `cccc actor add --runtime claude --worker-prompt "test prompt" test-actor` 成功创建 actor；
+      daemon 模式下 worker_prompt 出现在 daemon request 中；
+      local fallback 模式下 worker_prompt 传入 add_actor()；
+      不带 --worker-prompt 时行为不变。
+    verification:
+      level: unit
+      command: "python -m pytest tests/ -x -q -k 'actor_add' 2>/dev/null || python -c \"from cccc.cli.actor_cmds import cmd_actor_add; print('import OK')\""
+      checks:
+        - name: "module imports cleanly"
+          command: "python -c \"from cccc.cli.actor_cmds import cmd_actor_add; print('OK')\""
+          required: true
+      covers:
+        tasks: ["T3"]
+        flows:
+          - "cli_actor_worker_prompt"
+    addresses: ["ARCH-5"]
+
+  # === T4: FIX-20 — verification skip summary 含原因 ===
+
+  - id: T4
+    title: "确保所有 verification_skipped 路径的 summary 包含可区分的跳过原因"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/ralph_service.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+    depends_on: []
+    goal_behavior: >
+      1. 审查 ralph_service.py 中所有构造 VerificationResult(overall_outcome="skipped") 的路径。
+         当前已有路径（line ~425-427）：summary="verification skipped: no command configured"。
+         确认该描述足够区分。
+      2. 审查 workflow_task_ops.py 中是否有其他直接构造 skip result 的路径，
+         如有则确保 summary 含具体原因。
+      3. 不改变任何执行行为（Codex C2：checks=[] + command 仍然正常执行验证，不降级为 skip）。
+      4. 如果发现其他 skip 路径 summary 为空或过于泛化，修改为包含具体原因。
+         原因字符串格式："verification skipped: <具体原因>"。
+    acceptance_criteria: >
+      所有 verification_skipped 事件的 summary 字段包含 "verification skipped:" 前缀 + 具体原因；
+      Foreman 可根据 summary 区分"功能未配置"和其他跳过原因；
+      现有执行行为不变（不新增 skip 路径）。
+    verification:
+      level: unit
+      command: "python -m pytest tests/ -x -q -k 'verification' 2>/dev/null || python -c \"from cccc.daemon.foreman.ralph_service import RalphService; print('import OK')\""
+      checks:
+        - name: "module imports cleanly"
+          command: "python -c \"from cccc.daemon.foreman.ralph_service import RalphService; print('OK')\""
+          required: true
+      covers:
+        tasks: ["T4"]
+        flows:
+          - "no_silent_verification_skip"
+    addresses: ["FIX-20"]
+
+  # === T5: FIX-15 — ralph validate 写 ledger 事件 ===
+
+  - id: T5
+    title: "ralph validate 完成后写 workflow.plan_validated ledger 事件"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/ralph/cli.py"
+    awareness_paths:
+      - "src/cccc/kernel/ledger.py"
+      - "src/cccc/kernel/group.py"
+    depends_on: []
+    goal_behavior: >
+      1. 在 validate subparser 中新增 --ledger 和 --group 可选参数
+         （复用 sync-state 的契约：--ledger PATH 直接指定，--group GROUP_ID 从 group 解析。Codex S2）。
+      2. 在 _cmd_validate() 中，验证完成后（report 生成后），如果 --ledger 或 --group 已指定：
+         - 解析 ledger_path（同 sync-state 逻辑）
+         - 调用 append_event(ledger_path, kind="workflow.plan_validated",
+             group_id=group_id or "", scope_key="", by="ralph",
+             data={"plan_path": str(args.plan), "valid": report.valid,
+                    "errors": len(report.errors), "warnings": len(report.warnings)})
+      3. 如果两者都未指定，跳过 ledger 写入（纯 CLI 模式，向后兼容）。
+      4. 不影响 validate 的返回值（仍按 report.valid 决定 exit code）。
+    acceptance_criteria: >
+      `ralph validate plan.yaml --ledger path/to/ledger.jsonl` 后 ledger 出现 workflow.plan_validated 事件；
+      `ralph validate plan.yaml --group GROUP_ID` 也能工作；
+      不带 --ledger/--group 时行为完全不变；
+      事件 data 包含 plan path、valid、error/warning 数量。
+    verification:
+      level: unit
+      command: "python -c \"from cccc.ralph.cli import main; print('import OK')\""
+      checks:
+        - name: "module imports cleanly"
+          command: "python -c \"from cccc.ralph.cli import main; print('OK')\""
+          required: true
+      covers:
+        tasks: ["T5"]
+        flows:
+          - "validate_writes_ledger_event"
+    addresses: ["FIX-15"]
+
+  # === T6: FIX-19 — daemon 自动 stall detection ===
+
+  - id: T6
+    title: "daemon automation engine heartbeat sweep 接入 stall detection + 修复 null heartbeat crash"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/automation/engine.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+    depends_on: []
+    goal_behavior: >
+      1. 修复 check_stalled_tasks() 中 line 1445 的 crash（Codex C5）：
+         `idle_seconds=int(now - task.last_heartbeat)` 在 last_heartbeat=None 时 TypeError。
+         改为使用前面计算的 `last_beat` 变量（line 1431-1436 已做 fallback）。
+         同样修复 line 1453-1454 对 task.last_heartbeat 的直接使用。
+      2. 修改 _run_heartbeat_sweep 签名为接受 group 参数（Codex C1）。
+         修改 _tick_group 中的调用，传入当前 group。
+         由于 _HEARTBEAT_SWEEP_TASK handler 名是动态 getattr 调用，
+         需要改为直接调用 self._run_heartbeat_sweep(group) 而不是 getattr。
+      3. 在 _run_heartbeat_sweep(group) 中：
+         - from ..foreman.workflow_orchestrator import get_orchestrator
+           （无循环导入：workflow_orchestrator 不 import automation）
+         - orchestrator = get_orchestrator(group.group_id)
+         - if orchestrator: orchestrator.check_stalled_tasks(threshold_seconds=300)
+         - log stalled IDs
+      4. 不改变 heartbeat_sweep 的触发周期（30 秒）。
+    acceptance_criteria: >
+      check_stalled_tasks() 在 last_heartbeat=None 时不 crash；
+      _run_heartbeat_sweep 实际调用 check_stalled_tasks；
+      daemon 自动 stall sweep 每 30 秒触发（有 active workflow 时）；
+      现有测试不受影响。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_foreman_workflow.py tests/test_worker_collaboration_integration.py -x -q -k 'stall'"
+      checks:
+        - name: "stall detection tests pass"
+          command: "python -m pytest tests/ -x -q -k 'stall' 2>/dev/null || python -c \"from cccc.daemon.automation.engine import AutomationManager; print('OK')\""
+          required: true
+      covers:
+        tasks: ["T6"]
+        flows:
+          - "auto_stall_detection"
+    addresses: ["FIX-19"]
+
+  # === T7: 集成验证 — Batch G 规则验证 ===
+
+  - id: T7
+    title: "集成验证：新增 pytest 用例验证两条新 Ralph 规则"
+    role: integration
+    claimed_paths:
+      - "tests/test_ralph_verification.py"
+    awareness_paths:
+      - "src/cccc/ralph/validator.py"
+      - "src/cccc/ralph/models.py"
+    depends_on: ["T1", "T2"]
+    goal_behavior: >
+      1. 在 tests/test_ralph_verification.py 中新增测试用例：
+         - test_w_verification_no_checks：构造 checks=[] 但 command 非空的 plan，
+           验证报 W_VERIFICATION_NO_CHECKS
+         - test_w_verification_no_checks_silent_when_checks_present：
+           构造 checks 非空的 plan，验证不报
+         - test_w_no_failure_path_on_assignment_task：
+           构造 goal_behavior 含 "assign worker" 但无 failure 描述的 plan，
+           验证报 W_NO_FAILURE_PATH
+         - test_w_no_failure_path_silent_on_regular_depends：
+           构造普通 depends_on 任务（不含 assignment 关键词），验证不报
+         - test_w_no_failure_path_with_field：
+           构造 failure_path="escalate to foreman" 的 plan，验证不报
+         - test_w_no_failure_path_with_description：
+           构造 goal_behavior 含 "on failure rollback" 的 plan，验证不报
+      2. 确保所有新增和现有测试通过。
+    acceptance_criteria: >
+      6 个新测试全部通过；现有测试不受影响；
+      sample_good_plan.yaml 验证无回归。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_ralph_verification.py -x -q"
+      checks:
+        - name: "new validation tests pass"
+          command: "python -m pytest tests/test_ralph_verification.py -x -q -k 'no_checks or no_failure_path'"
+          required: true
+        - name: "all validation tests pass"
+          command: "python -m pytest tests/test_ralph_verification.py -x -q"
+          required: true
+      covers:
+        tasks: ["T1", "T2", "T7"]
+        flows:
+          - "ralph_validate_no_checks"
+          - "ralph_validate_no_failure_path"
+    consumes:
+      - name: w_verification_no_checks_rule
+        kind: validation_rule
+        from: T1
+      - name: w_no_failure_path_rule
+        kind: validation_rule
+        from: T2
+    addresses: ["RO-9n", "RO-11"]
+
+critical_flows:
+  - id: ralph_validate_no_checks
+    description: "ralph validate 对 verification.checks=[] 报 W_VERIFICATION_NO_CHECKS warning"
+    entrypoints:
+      - "src/cccc/ralph/validator.py"
+    required_verification_level: integration
+  - id: ralph_validate_no_failure_path
+    description: "ralph validate 对 assignment/actor 任务缺 failure_path 报 W_NO_FAILURE_PATH warning"
+    entrypoints:
+      - "src/cccc/ralph/validator.py"
+    required_verification_level: integration
+  - id: cli_actor_worker_prompt
+    description: "actor add --worker-prompt 从 CLI 透传到 daemon actor_add_ops"
+    entrypoints:
+      - "src/cccc/cli/actor_cmds.py"
+    required_verification_level: unit
+  - id: validate_writes_ledger_event
+    description: "ralph validate --ledger/--group 完成后写 workflow.plan_validated 事件到 ledger"
+    entrypoints:
+      - "src/cccc/ralph/cli.py"
+    required_verification_level: unit
+  - id: auto_stall_detection
+    description: "daemon automation heartbeat sweep 调用 orchestrator.check_stalled_tasks() + null heartbeat 修复"
+    entrypoints:
+      - "src/cccc/daemon/automation/engine.py"
+    required_verification_level: unit
+
+forbidden_flows:
+  - id: no_silent_verification_skip
+    description: "verification_skipped 事件不能有空的或泛化的 summary — 所有 skip 路径必须含具体原因"
+    required_verification_level: unit
+
+state:
+  completed_task_ids: ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]
+
+suppress_codes:
+  - "W_FLOW_SEGMENT_UNOWNED"
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"

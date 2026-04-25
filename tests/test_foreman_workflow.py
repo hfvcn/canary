@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -84,9 +85,9 @@ def pool_manager(temp_project_dir):
 def sample_tasks() -> List[TaskRef]:
     """Create sample tasks for testing."""
     return [
-        TaskRef(id="T1", title="Implement API endpoint", type="backend"),
-        TaskRef(id="T2", title="Create React component", type="frontend"),
-        TaskRef(id="T3", title="Write documentation", type="general"),
+        TaskRef(id="T1", title="Implement API endpoint", type="backend", claimed_paths=["src/api"]),
+        TaskRef(id="T2", title="Create React component", type="frontend", claimed_paths=["src/ui"]),
+        TaskRef(id="T3", title="Write documentation", type="general", claimed_paths=["docs"]),
     ]
 
 
@@ -162,19 +163,50 @@ def _prepare_project_root(project_root: Path) -> Path:
     return project_root
 
 
+def _read_ledger_events(ledger_path: Path, *, kind: str = "") -> List[dict]:
+    events: List[dict] = []
+    for raw in ledger_path.read_text(encoding="utf-8", errors="strict").splitlines():
+        if not raw.strip():
+            continue
+        event = json.loads(raw)
+        if kind and str(event.get("kind") or "") != kind:
+            continue
+        events.append(event)
+    return events
+
+
+def _register_assigned_task(
+    orchestrator,
+    task: TaskRef,
+    *,
+    workflow_id: str = "wf-test",
+    agent_id: str = "worker-1",
+    attempt_id: str = "",
+) -> None:
+    """Register a task and advance it to ASSIGNED for event testing."""
+    orchestrator.engine.register_task(task, workflow_id)
+    orchestrator.engine.register_batch(f"b-{task.id}", [task.id])
+    orchestrator.engine.approve_batch(
+        f"b-{task.id}",
+        [{"task_id": task.id, "agent_id": agent_id, "claimed_paths": [], "attempt_id": attempt_id}],
+    )
+
+
 def _register_running_task(
     orchestrator,
     task: TaskRef,
     *,
     workflow_id: str = "wf-test",
     agent_id: str = "worker-1",
+    attempt_id: str = "",
 ) -> None:
     """Register a task and advance it to RUNNING for event testing."""
-    orchestrator.engine.register_task(task, workflow_id)
-    orchestrator.engine.register_batch(f"b-{task.id}", [task.id])
-    orchestrator.engine.approve_batch(
-        f"b-{task.id}",
-        [{"task_id": task.id, "agent_id": agent_id, "claimed_paths": []}],
+    _register_assigned_task(
+        orchestrator,
+        task,
+        workflow_id=workflow_id,
+        agent_id=agent_id,
+        attempt_id=attempt_id,
     )
     orchestrator.engine.report_worker_started(task.id, agent_id)
 
@@ -619,8 +651,9 @@ class TestWorkflowOrchestratorDaemonBridge:
         assert "Backend only." in prompt
         assert "Report back to Foreman with:" in prompt
         assert "changed files or evidence" in prompt
-        assert 'cccc task complete T9 --changed-file <path> --evidence "summary"' in prompt
-        assert 'cccc send --to @foreman --text "..."' in prompt
+        assert "COMPLETION PROTOCOL (REQUIRED):" in prompt
+        assert "cccc task complete T9 --changed-file <path>" in prompt
+        assert "cccc send --to @foreman" in prompt
         assert "cccc_message_send" not in prompt
 
     def test_context_inject_first_run(self, tmp_path):
@@ -705,18 +738,17 @@ class TestWorkflowOrchestratorDaemonBridge:
         assert task_create_ops[0]["status"] in {"active", "blocked"}
         assert "ralph_batch=sug-test-001" in task_create_ops[0]["notes"]
 
-    def test_process_batch_suggestion_rejected_stays_rejected(
+    def test_process_batch_suggestion_rejected_stays_rejected_without_peer_actors(
         self,
         temp_project_dir,
         sample_suggestion,
         monkeypatch,
     ):
-        """ARCH-2: Rejected batches must stay rejected — no silent fallback."""
+        """Rejected batches should stay rejected when no peer actors are available."""
         from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
 
         monkeypatch.setenv("CCCC_HOME", tempfile.mkdtemp())
         group_id = _create_group_with_foreman("lead")
-        _add_group_actor(group_id, "peer1", title="Peer 1", runtime="codex")
 
         orchestrator = WorkflowOrchestrator(
             project_root=temp_project_dir,
@@ -739,10 +771,57 @@ class TestWorkflowOrchestratorDaemonBridge:
             auto_start_agents=False,
         )
 
-        # ARCH-2: rejected must stay rejected, no fallback override
         assert result.decision == "rejected"
         assert len(result.rejected_tasks) == 3
         assert result.approved_tasks == []
+
+    def test_auto_process_falls_back_to_group_actors(
+        self,
+        temp_project_dir,
+        sample_suggestion,
+        monkeypatch,
+    ):
+        """Pool rejection falls back to group peer actors when explicitly authorized."""
+        from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+
+        monkeypatch.setenv("CCCC_HOME", tempfile.mkdtemp())
+        group_id = _create_group_with_foreman("lead")
+        _add_group_actor(group_id, "peer1", title="Peer 1", runtime="codex")
+        _add_group_actor(group_id, "peer2", title="Peer 2", runtime="claude")
+
+        orchestrator = WorkflowOrchestrator(
+            project_root=temp_project_dir,
+            group_id=group_id,
+        )
+
+        # Explicitly authorize fallback (bypass Pydantic extra="forbid")
+        object.__setattr__(sample_suggestion, "fallback_allowed", True)
+
+        def fake_process_batch_suggestion(_suggestion, *, auto_approve=True, notify_feishu=False):
+            return BatchEvaluationResult(
+                suggestion=sample_suggestion,
+                assignments=[TaskAssignment(task=task, agent_id="", agent_name="") for task in sample_suggestion.tasks],
+                rejected_tasks=list(sample_suggestion.tasks),
+                decision="rejected",
+                reason="No suitable agents found for any task",
+            )
+
+        monkeypatch.setattr(orchestrator.foreman, "process_batch_suggestion", fake_process_batch_suggestion)
+
+        result = orchestrator.process_batch_suggestion(
+            sample_suggestion,
+            auto_start_agents=False,
+        )
+
+        assert result.decision == "approved"
+        assert result.rejected_tasks == []
+        assert result.approved_tasks == list(sample_suggestion.tasks)
+        assert result.reason == "Assigned to 2 group peer actors (pool fallback)"
+        assert [assignment.agent_id for assignment in result.assignments] == ["peer1", "peer2", "peer1"]
+        assert [assignment.agent_name for assignment in result.assignments] == ["Peer 1", "Peer 2", "Peer 1"]
+        assert [assignment.model_runtime for assignment in result.assignments] == ["codex", "claude", "codex"]
+        assert all(assignment.assignment_reason == "group_actor_fallback" for assignment in result.assignments)
+        assert all(not assignment.is_new_agent for assignment in result.assignments)
 
     def test_on_task_completed_notifies_foreman_via_daemon_send(self, temp_project_dir, monkeypatch):
         """Task completion should notify foreman through daemon chat send."""
@@ -1043,6 +1122,197 @@ class TestWorkflowOrchestratorDaemonBridge:
         assert captured["auto_start_agents"] is False
 
 
+class TestCompleterMismatchCompletion:
+    @staticmethod
+    def _make_orchestrator(temp_project_dir, monkeypatch):
+        from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+
+        orchestrator = WorkflowOrchestrator(
+            project_root=temp_project_dir,
+            group_id="test-group",
+        )
+        monkeypatch.setattr(orchestrator.reporter, "on_task_completed", lambda *args, **kwargs: True)
+        return orchestrator
+
+    @staticmethod
+    def _passing_verification(task_id: str, workflow_id: str):
+        from cccc.contracts.v1.ralph_ipc import VerificationResult
+
+        return VerificationResult(
+            verification_id=f"ver-{task_id}",
+            workflow_id=workflow_id,
+            task_id=task_id,
+            overall_outcome="passed",
+            checks=[],
+            summary="ok",
+        )
+
+    def test_completer_mismatch_block_rejects(self, temp_project_dir, monkeypatch):
+        from cccc.contracts.v1.ralph_ipc import TaskEvent
+        from cccc.daemon.foreman.workflow_monitor import MonitorMode
+        from cccc.kernel.workflow_state import WorkflowTaskStatus
+
+        orchestrator = self._make_orchestrator(temp_project_dir, monkeypatch)
+        task = TaskRef(id="T-mismatch-block", title="Mismatch blocked", type="backend")
+        _register_assigned_task(orchestrator, task, workflow_id="wf-mismatch-block", agent_id="worker-a")
+        orchestrator.engine.set_monitor_mode("completer_mismatch", MonitorMode.BLOCK)
+
+        def fail_verify(*args, **kwargs):
+            raise AssertionError("verify_completion should not run when mismatch is blocked")
+
+        monkeypatch.setattr(orchestrator.ralph, "verify_completion", fail_verify)
+
+        result = orchestrator.apply_task_event(
+            TaskEvent(
+                task_id=task.id,
+                event_type="completed",
+                payload={
+                    "agent_id": "worker-b",
+                    "duration_seconds": 7,
+                    "changed_files": ["src/mismatch.py"],
+                },
+            )
+        )
+
+        state = orchestrator.engine.get_task(task.id)
+        warning_events = _read_ledger_events(
+            orchestrator.group.ledger_path,
+            kind="workflow.verification_warning",
+        )
+
+        assert result["accepted"] is False
+        assert result["reason"] == "completer_mismatch_blocked"
+        assert state is not None
+        assert state.status == WorkflowTaskStatus.ASSIGNED
+        assert _read_ledger_events(orchestrator.group.ledger_path, kind="workflow.task_started") == []
+        assert any(
+            event.get("data", {}).get("warning_type") == "completer_mismatch"
+            and event.get("data", {}).get("task_id") == task.id
+            for event in warning_events
+        )
+
+    def test_completer_mismatch_observe_allows(self, temp_project_dir, monkeypatch, caplog):
+        import logging
+
+        from cccc.contracts.v1.ralph_ipc import TaskEvent
+        from cccc.daemon.foreman.workflow_monitor import MonitorMode
+        from cccc.kernel.workflow_state import WorkflowTaskStatus
+
+        orchestrator = self._make_orchestrator(temp_project_dir, monkeypatch)
+        task = TaskRef(id="T-mismatch-observe", title="Mismatch observed", type="backend")
+        _register_assigned_task(orchestrator, task, workflow_id="wf-mismatch-observe", agent_id="worker-a")
+        orchestrator.engine.set_monitor_mode("completer_mismatch", MonitorMode.OBSERVE)
+        monkeypatch.setattr(
+            orchestrator.ralph,
+            "verify_completion",
+            lambda *args, **kwargs: self._passing_verification(task.id, "wf-mismatch-observe"),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="cccc.daemon.foreman.orchestrator"):
+            result = orchestrator.apply_task_event(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="completed",
+                    payload={
+                        "agent_id": "worker-b",
+                        "duration_seconds": 5,
+                        "changed_files": ["src/observe.py"],
+                    },
+                )
+            )
+
+        state = orchestrator.engine.get_task(task.id)
+
+        assert result["accepted"] is True
+        assert state is not None
+        assert state.status == WorkflowTaskStatus.COMPLETED
+        assert any("observed pre-start completer mismatch" in record.message for record in caplog.records)
+
+    def test_auto_start_uses_assigned_agent(self, temp_project_dir, monkeypatch):
+        from cccc.contracts.v1.ralph_ipc import TaskEvent
+
+        orchestrator = self._make_orchestrator(temp_project_dir, monkeypatch)
+        task = TaskRef(id="T-mismatch-autostart", title="Auto-start agent", type="backend")
+        _register_assigned_task(orchestrator, task, workflow_id="wf-mismatch-autostart", agent_id="worker-a")
+        monkeypatch.setattr(
+            orchestrator.ralph,
+            "verify_completion",
+            lambda *args, **kwargs: self._passing_verification(task.id, "wf-mismatch-autostart"),
+        )
+
+        started_agents: List[str] = []
+        original_report_worker_started = orchestrator.engine.report_worker_started
+
+        def capture_started_agent(task_id, agent_id, *, hook_ctx=None):
+            started_agents.append(agent_id)
+            return original_report_worker_started(task_id, agent_id, hook_ctx=hook_ctx)
+
+        monkeypatch.setattr(orchestrator.engine, "report_worker_started", capture_started_agent)
+
+        result = orchestrator.apply_task_event(
+            TaskEvent(
+                task_id=task.id,
+                event_type="completed",
+                payload={
+                    "agent_id": "worker-b",
+                    "duration_seconds": 6,
+                    "changed_files": ["src/autostart.py"],
+                },
+            )
+        )
+
+        assert result["accepted"] is True
+        assert started_agents == ["worker-a"]
+
+    def test_completed_event_does_not_fallback_assignment_id_to_attempt_id(self, temp_project_dir, monkeypatch):
+        from cccc.contracts.v1.ralph_ipc import TaskEvent
+        from cccc.kernel.workflow_state import WorkflowTaskStatus
+
+        orchestrator = self._make_orchestrator(temp_project_dir, monkeypatch)
+        task = TaskRef(id="T-attempt-separation", title="Attempt separation", type="backend")
+        _register_running_task(
+            orchestrator,
+            task,
+            workflow_id="wf-attempt-separation",
+            agent_id="worker-a",
+            attempt_id="attempt-123",
+        )
+        monkeypatch.setattr(
+            orchestrator.ralph,
+            "verify_completion",
+            lambda *args, **kwargs: self._passing_verification(task.id, "wf-attempt-separation"),
+        )
+
+        seen_attempt_ids: List[str] = []
+        original_report_worker_completion = orchestrator.engine.report_worker_completion
+
+        def capture_completion(task_id, evidence, *, hook_ctx=None, attempt_id=""):
+            seen_attempt_ids.append(attempt_id)
+            return original_report_worker_completion(task_id, evidence, hook_ctx=hook_ctx, attempt_id=attempt_id)
+
+        monkeypatch.setattr(orchestrator.engine, "report_worker_completion", capture_completion)
+
+        result = orchestrator.apply_task_event(
+            TaskEvent(
+                task_id=task.id,
+                event_type="completed",
+                payload={
+                    "agent_id": "worker-a",
+                    "assignment_id": "assignment-999",
+                    "duration_seconds": 4,
+                    "changed_files": ["src/attempt.py"],
+                },
+            )
+        )
+
+        state = orchestrator.engine.get_task(task.id)
+
+        assert result["accepted"] is True
+        assert seen_attempt_ids == [""]
+        assert state is not None
+        assert state.status == WorkflowTaskStatus.COMPLETED
+
+
 class TestRalphServiceSweepStalledTasks:
     """Tests for RalphService.sweep_stalled_tasks."""
 
@@ -1239,12 +1509,33 @@ class TestCheckStalledTasks:
 
 
 class TestRalphServiceGetSnapshot:
-    """Tests for RalphService.get_snapshot with real task status counts."""
+    """Tests for RalphService.get_snapshot with real task status counts.
+
+    RO-26: snapshot now derives counts from the workflow engine (single truth
+    source) instead of the removed ``_task_statuses`` dict.
+    """
 
     def _make_service(self, temp_project_dir):
         from cccc.daemon.foreman.ralph_service import RalphService
 
         return RalphService(project_root=temp_project_dir, group_id="test-snapshot")
+
+    def _make_service_with_engine(self, temp_project_dir):
+        """Create a RalphService backed by a mock workflow engine (RO-26)."""
+        from types import SimpleNamespace
+        from cccc.daemon.foreman.ralph_service import RalphService
+
+        class _MockEngine:
+            def __init__(self):
+                self._tasks = []
+
+            def list_tasks(self, status=None):
+                if status is None:
+                    return list(self._tasks)
+                return [t for t in self._tasks if t.status == status]
+
+        engine = _MockEngine()
+        return RalphService(project_root=temp_project_dir, group_id="test-snapshot", workflow_engine=engine), engine
 
     def test_ralph_service_get_snapshot_idle(self, temp_project_dir):
         """RalphService with no task events should return kind='idle'."""
@@ -1259,17 +1550,27 @@ class TestRalphServiceGetSnapshot:
         assert snap["snapshot"]["tasks"]["failed"] == 0
         assert snap["snapshot"]["tasks"]["pending"] == 0
 
-    def test_ralph_service_get_snapshot_with_tasks(self, temp_project_dir):
-        """RalphService with applied task events should return real counts."""
-        from cccc.contracts.v1.ralph_ipc import TaskEvent
+    def test_ralph_service_get_snapshot_with_engine(self, temp_project_dir):
+        """RO-26: snapshot derives counts from workflow engine."""
+        from types import SimpleNamespace
+        from cccc.kernel.workflow_state_types import WorkflowTaskStatus
 
-        service = self._make_service(temp_project_dir)
+        service, engine = self._make_service_with_engine(temp_project_dir)
 
-        service.apply_task_event(TaskEvent(task_id="T1", event_type="started"))
-        service.apply_task_event(TaskEvent(task_id="T2", event_type="completed"))
-        service.apply_task_event(TaskEvent(task_id="T3", event_type="completed"))
-        service.apply_task_event(TaskEvent(task_id="T4", event_type="failed"))
-        service.apply_task_event(TaskEvent(task_id="T5", event_type="assigned"))
+        def _task(tid, status):
+            return SimpleNamespace(
+                task=SimpleNamespace(id=tid),
+                status=status,
+                workflow_id="wf-1",
+            )
+
+        engine._tasks = [
+            _task("T1", WorkflowTaskStatus.RUNNING),
+            _task("T2", WorkflowTaskStatus.COMPLETED),
+            _task("T3", WorkflowTaskStatus.COMPLETED),
+            _task("T4", WorkflowTaskStatus.FAILED),
+            _task("T5", WorkflowTaskStatus.ASSIGNED),
+        ]
 
         snap = service.get_snapshot()
 
@@ -1506,12 +1807,14 @@ class TestVerificationEventSemantics:
     def test_verification_outcome_mapping(self):
         """Contract test: notification outcome must preserve the original verification outcome."""
         for outcome in ("passed", "skipped", "failed"):
-            if outcome in ("passed", "skipped"):
-                # The fixed code uses verification.overall_outcome directly
-                expected_notification = outcome  # NOT always "passed"
+            if outcome == "passed":
+                expected_notification = "passed"
+            elif outcome == "skipped":
+                # skipped is treated as failure but notification preserves "skipped"
+                expected_notification = "skipped"
             else:
                 expected_notification = "failed"
-            assert expected_notification == outcome or outcome == "failed"
+            assert expected_notification == outcome
 
     def test_verification_skipped_preserves_outcome(self):
         """Mock a skipped verification and confirm notification_outcome is 'skipped', not 'passed'."""
@@ -1519,9 +1822,11 @@ class TestVerificationEventSemantics:
 
         verification = SimpleNamespace(overall_outcome="skipped", summary="no checks defined")
 
-        # Reproduce the fixed conditional from workflow_orchestrator.py / workflow_task_ops.py
-        if verification.overall_outcome in ("passed", "skipped"):
-            notification_outcome = verification.overall_outcome  # fixed line
+        # Reproduce the fixed conditional from workflow_orchestrator.py
+        if verification.overall_outcome == "passed":
+            notification_outcome = "passed"
+        elif verification.overall_outcome == "skipped":
+            notification_outcome = "skipped"
         else:
             notification_outcome = "failed"
 
@@ -1536,8 +1841,10 @@ class TestVerificationEventSemantics:
 
         verification = SimpleNamespace(overall_outcome="passed", summary="all checks passed")
 
-        if verification.overall_outcome in ("passed", "skipped"):
-            notification_outcome = verification.overall_outcome  # fixed line
+        if verification.overall_outcome == "passed":
+            notification_outcome = "passed"
+        elif verification.overall_outcome == "skipped":
+            notification_outcome = "skipped"
         else:
             notification_outcome = "failed"
 
@@ -1549,8 +1856,10 @@ class TestVerificationEventSemantics:
 
         verification = SimpleNamespace(overall_outcome="failed", summary="check failed")
 
-        if verification.overall_outcome in ("passed", "skipped"):
-            notification_outcome = verification.overall_outcome
+        if verification.overall_outcome == "passed":
+            notification_outcome = "passed"
+        elif verification.overall_outcome == "skipped":
+            notification_outcome = "skipped"
         else:
             notification_outcome = "failed"
 

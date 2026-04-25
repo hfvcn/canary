@@ -1,0 +1,720 @@
+# Batch E: 非法转换被 Engine 拦截
+# 可验证结论: "非法状态变更被 Engine pre-transition hook 拒绝 + 拒绝记录在 ledger + block 级联从 engine 层触发"
+#
+# 对应问题清单: ARCH-12 (P1) + ARCH-9 observe→block (P0) + FIX-16 (P1)
+# Finding 对照: #1(编译通过≠功能可用) #16(负向不变量) #17(失败必须暴露)
+#
+# 依赖: Batch D 已完成（ARCH-7/8/11, 6 tasks, 117 tests）
+# 验证方法: 非法状态变更被 Engine 拒绝 + ledger 记录拒绝事件 + cascade 从 engine 层面触发
+#
+# 设计决策:
+# 1. Pre-transition hooks 在 engine._append() 之前执行，拒绝时不产生任何副作用
+# 2. 三个 invariant 适合做 pre-transition hook: unauthorized_subagent, completer_mismatch, file_overstepping
+#    （silent_agent 是 timer-based 不是 transition；path_deviation 是事件关键词匹配非状态转换）
+# 3. 监控模式存储在 engine 中，通过 ledger 事件持久化，replay 可恢复
+# 4. cascade_block 下沉到 engine（engine 有 _tasks + depends_on 可建反向依赖图）
+#    engine 只做纯状态级联，通知/shadow 仍由 orchestrator 处理
+# 5. evidence dict 已含 agent_id + changed_files（apply_task_event line 1607-1612），hooks 可直接读取
+#
+# Codex 审查后修正（2026-04-06）：
+# C1: unauthorized_subagent hook 改用 group 持久化 actor registry，不依赖 _task_to_agent 影子映射
+# C2: cascade 返回结构化 List[Dict] 含 previous_status，orchestrator 可据此发取消通知
+# C3: hook 不直接写 ledger；通过 engine.report_hook_alert() 缓存，engine 在 transition 后统一 flush
+# C4: 保留 on_task_completed 中 WF-6 verification_warning 行为，不删除现有 monitor checks
+# C5: hook unexpected exception 在 BLOCK 模式 invariant 下 log.warning（非 debug），提高可观测性
+
+tasks:
+  # === T1: ARCH-12 基础 — TransitionRejected 异常 + Hook 类型定义 ===
+
+  - id: T1
+    title: "TransitionRejected 异常 + pre-transition hook 类型 + 新事件常量"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    depends_on: []
+    goal_behavior: >
+      1. 在 workflow_state_types.py 新增 TransitionRejected 异常类：
+         ```python
+         class TransitionRejected(Exception):
+             """Engine pre-transition hook rejected a state transition."""
+             def __init__(self, alert_type: str, message: str, evidence: Optional[Dict[str, Any]] = None):
+                 self.alert_type = alert_type
+                 self.message = message
+                 self.evidence = evidence or {}
+                 super().__init__(message)
+         ```
+      2. 新增事件常量：
+         - KIND_TRANSITION_REJECTED = "workflow.transition_rejected"
+         - KIND_MONITOR_MODE_CHANGED = "workflow.monitor_mode_changed"
+      3. 新增类型别名（用于 engine hook 注册）：
+         ```python
+         from typing import Callable, TYPE_CHECKING
+         if TYPE_CHECKING:
+             from .workflow_state_engine import WorkflowEngine
+         # Hook signature: (kind: str, data: dict, engine: WorkflowEngine) -> None
+         # Raise TransitionRejected to block. Call engine.report_hook_alert() for observe.
+         PreTransitionHook = Callable[[str, Dict[str, Any], "WorkflowEngine"], None]
+         ```
+      4. 所有新增放在文件末尾（TaskState 之后）。不修改现有类型。
+    acceptance_criteria: >
+      TransitionRejected 可被 import 并携带 alert_type/message/evidence；
+      KIND_TRANSITION_REJECTED 和 KIND_MONITOR_MODE_CHANGED 常量存在；
+      PreTransitionHook 类型可被 import 用于类型标注；
+      现有 import 和测试不受影响。
+    verification:
+      level: unit
+      command: "python -c \"from cccc.kernel.workflow_state_types import TransitionRejected, KIND_TRANSITION_REJECTED, KIND_MONITOR_MODE_CHANGED, PreTransitionHook; print('OK')\""
+      covers:
+        tasks: ["T1"]
+    provides:
+      - name: transition_rejected_type
+        kind: module
+        schema_hint: "TransitionRejected exception + PreTransitionHook type + new event KIND constants"
+    addresses: ["ARCH-12"]
+
+  # === T2: ARCH-12 + ARCH-9 — Engine hook 机制 + 监控模式持久化 ===
+
+  - id: T2
+    title: "Engine pre-transition hook 机制 + 监控模式持久化 + alert 缓存"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    depends_on: ["T1"]
+    goal_behavior: >
+      **新增 Engine 属性（__init__，line 17-20）：**
+      1. self._pre_transition_hooks: List[PreTransitionHook] = []
+      2. self._monitor_config: MonitorConfig = get_default_config()
+         （import MonitorConfig, get_default_config, MonitorMode from workflow_monitor）
+      3. self._pending_hook_alerts: List[Dict[str, Any]] = []
+         （Codex C3: hooks 不直接写 ledger，通过此缓存，engine 统一 flush）
+
+      **新增公开方法：**
+      4. register_pre_transition_hook(self, hook: PreTransitionHook) -> None：
+         - 追加到 self._pre_transition_hooks
+      5. get_monitor_config(self) -> MonitorConfig：
+         - 返回 self._monitor_config
+      6. set_monitor_mode(self, invariant_id: str, mode: MonitorMode) -> None：
+         - 校验 invariant_id 是有效的 MonitorConfig 字段名
+           （"silent_agent", "path_deviation", "unauthorized_subagent",
+            "completer_mismatch", "file_overstepping"）
+         - 校验 mode 是有效的 MonitorMode 值
+         - 更新 self._monitor_config 对应字段
+         - 写 ledger 事件：self._append(kind=KIND_MONITOR_MODE_CHANGED,
+           data={"invariant_id": invariant_id, "mode": mode.value})
+      7. report_hook_alert(self, alert_data: Dict[str, Any]) -> None：
+         - 将 alert_data 追加到 self._pending_hook_alerts
+         - （Codex C3: hooks 调用此方法报告 observe-mode violations，不直接写 ledger）
+
+      **新增内部方法：**
+      8. _run_pre_transition_hooks(self, kind: str, data: Dict[str, Any]) -> None：
+         - 清空 self._pending_hook_alerts
+         - 遍历 self._pre_transition_hooks，逐个调用 hook(kind, data, self)
+         - 如果 hook raise TransitionRejected：
+           a. 记录 rejection 事件到 ledger：
+              self._append(kind=KIND_TRANSITION_REJECTED, data={
+                "original_kind": kind,
+                "alert_type": exc.alert_type,
+                "message": exc.message,
+                "evidence": exc.evidence,
+                "task_id": data.get("task_id", ""),
+              })
+           b. re-raise TransitionRejected（让调用方处理）
+         - 如果 hook 抛出其他异常（非 TransitionRejected）：
+           logger.warning("Pre-transition hook error: %s", exc, exc_info=True)
+           （Codex C5: warning 而非 debug，提高可观测性。不阻塞转换但可被监控发现）
+
+      9. _flush_pending_hook_alerts(self) -> None：
+         - 遍历 self._pending_hook_alerts，对每个 alert_data：
+           try:
+               scope_key = str(self._group.doc.get("active_scope_key") or "").strip()
+               from cccc.kernel.ledger import append_event
+               from cccc.contracts.v1.event import MonitorViolationData
+               append_event(self._group.ledger_path, kind=KIND_MONITOR_VIOLATION,
+                 group_id=self._group.group_id, scope_key=scope_key, by="monitor",
+                 data=MonitorViolationData(
+                   alert_type=alert_data["alert_type"],
+                   severity=alert_data.get("severity", "warning"),
+                   task_id=alert_data.get("task_id", ""),
+                   message=alert_data.get("message", ""),
+                   evidence=alert_data.get("evidence", {}),
+                   monitor_mode=alert_data.get("mode", "observe"),
+                   invariant_id=alert_data.get("alert_type", ""),
+                 ).model_dump())
+           except Exception:
+               logger.debug("Failed to flush hook alert", exc_info=True)
+         - 清空 self._pending_hook_alerts
+         （Codex C3: violation 事件在 transition 事件之后写入，保证 ledger 顺序正确）
+
+      **修改现有方法——插入 hook 调用：**
+      10. report_worker_started（line 81-91）：
+          在 _append 调用之前插入：
+          data_dict = {"workflow_id": prev.workflow_id, "task_id": tid, "agent_id": aid, "started_at": now}
+          self._run_pre_transition_hooks(KIND_TASK_STARTED, data_dict)
+          在 _append 和状态更新之后插入：
+          self._flush_pending_hook_alerts()
+      11. report_worker_completion（line 114-139）：
+          在 _append 调用之前插入：
+          data_dict = {"workflow_id": prev.workflow_id, "task_id": tid,
+                        "idempotency_key": idem, "evidence": ev}
+          self._run_pre_transition_hooks(KIND_TASK_REPORTED_COMPLETED, data_dict)
+          在 _append 和状态更新之后插入：
+          self._flush_pending_hook_alerts()
+
+      **Replay handler：**
+      12. _apply_monitor_mode_changed(self, data: Dict[str, Any]) -> None：
+          - 读取 invariant_id 和 mode
+          - 用 MonitorMode(mode) 构建枚举
+          - 通过 setattr(self._monitor_config, invariant_id, enum_val) 更新
+      13. _apply_transition_rejected(self, data: Dict[str, Any]) -> None：
+          - 空实现（纯审计事件，不影响状态）
+      14. 在 _apply_event() 的 handlers dict（line 273-292）中注册：
+          - KIND_MONITOR_MODE_CHANGED → self._apply_monitor_mode_changed
+          - KIND_TRANSITION_REJECTED → self._apply_transition_rejected
+    acceptance_criteria: >
+      register_pre_transition_hook 成功注册 hook；
+      _run_pre_transition_hooks 在 report_worker_started 和 report_worker_completion 的 _append 之前被调用；
+      hook raise TransitionRejected 时：rejection 事件写入 ledger、原始状态转换不写入 ledger、
+      TransitionRejected 被 re-raise；
+      hook 报告 observe-mode alert 时：transition 事件先写入，violation 事件后写入（顺序正确）；
+      hook 抛出 unexpected 异常时：log.warning 记录，transition 照常进行；
+      set_monitor_mode 更新 config 并写 ledger 事件；
+      replay_from_ledger 后 monitor config 恢复正确模式；
+      无 hook 注册时，现有行为完全不变。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'hook or monitor_mode or transition_rejected'"
+      covers:
+        tasks: ["T1", "T2"]
+    consumes:
+      - name: transition_rejected_type
+        from: T1
+    provides:
+      - name: engine_hook_mechanism
+        kind: module
+        schema_hint: "Engine pre-transition hooks + alert buffer + MonitorConfig persistence + TransitionRejected flow"
+    addresses: ["ARCH-12", "ARCH-9"]
+
+  # === T3: FIX-16 — Engine 级联 block ===
+
+  - id: T3
+    title: "Engine block_task 支持 cascade，返回结构化结果"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    depends_on: ["T2"]
+    goal_behavior: >
+      **新增内部方法：**
+      1. _build_reverse_deps(self) -> Dict[str, List[str]]：
+         - 遍历 self._tasks，对每个 task_state：
+           for dep_id in task_state.task.depends_on:
+               reverse[dep_id].append(task_state.task.id)
+         - 返回 {upstream_task_id: [downstream_task_id, ...]}
+
+      **修改 block_task 签名和实现（line 195-208）：**
+      2. 新签名：block_task(self, task_id: str, reason: str, cascade: bool = False) -> List[Dict[str, Any]]
+         - 原有逻辑不变（终态保护、幂等、_append、状态更新）
+         - 新增：如果 cascade=True，在 block 成功后调用 _cascade_block_downstream
+         - 返回值：结构化 cascaded 列表，每项为：
+           {"task_id": str, "previous_status": str, "blocked_reason": str}
+           （Codex C2: 包含 previous_status 以便 orchestrator 判断哪些原来在 RUNNING）
+         - cascade=False 时返回空列表
+
+      3. _cascade_block_downstream(self, blocked_task_id: str, reason: str) -> List[Dict[str, Any]]：
+         - 构建反向依赖图 reverse_deps = self._build_reverse_deps()
+         - visited: set[str] = {blocked_task_id}
+         - cascaded: List[Dict[str, Any]] = []
+         - BFS 遍历下游：
+           queue = list(reverse_deps.get(blocked_task_id, []))
+           while queue:
+               tid = queue.pop(0)
+               if tid in visited: continue
+               visited.add(tid)
+               prev = self._tasks.get(tid)
+               if prev is None: continue
+               # 终态保护：COMPLETED/ARCHIVED 不可覆盖
+               if prev.status in {COMPLETED, ARCHIVED}: continue
+               # 幂等：已 BLOCKED 跳过
+               if prev.status == BLOCKED: continue
+               previous_status = prev.status.value  # 记录 block 前状态
+               cascade_reason = f"upstream {blocked_task_id} blocked: {reason}"
+               self._append(kind=KIND_TASK_BLOCKED, data={
+                   "workflow_id": prev.workflow_id, "task_id": tid, "reason": cascade_reason
+               })
+               self._tasks[tid] = replace(prev, status=BLOCKED, blocked_reason=cascade_reason)
+               cascaded.append({
+                   "task_id": tid,
+                   "previous_status": previous_status,
+                   "blocked_reason": cascade_reason,
+               })
+               # 继续向下游递归
+               queue.extend(reverse_deps.get(tid, []))
+         - 返回 cascaded
+
+      **注意事项：**
+      - _cascade_block_downstream 不调用 _run_pre_transition_hooks（级联是 engine 内部操作）
+      - 级联中对每个 task 独立写 ledger 事件（与 Batch D 的 orchestrator cascade 一致）
+      - previous_status 在 block 前捕获，可靠标识哪些 task 原来在 RUNNING
+    acceptance_criteria: >
+      block_task(cascade=False) 行为与之前完全一致，返回空列表；
+      block_task(cascade=True) 返回 List[Dict] 且每项含 task_id、previous_status、blocked_reason；
+      菱形 DAG 中 fan-in 节点只 block 一次（visited 去重）；
+      COMPLETED/ARCHIVED 下游不被覆盖；
+      已 BLOCKED 下游被跳过（幂等）；
+      previous_status 正确反映 block 前状态（特别是 RUNNING）；
+      ledger 中每个被级联 block 的 task 有且仅有一条 task_blocked 事件。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py -q --tb=short -k 'cascade or reverse_dep'"
+      covers:
+        tasks: ["T3"]
+    consumes:
+      - name: engine_hook_mechanism
+        from: T2
+    provides:
+      - name: engine_cascade_block
+        kind: module
+        schema_hint: "block_task(cascade=True) returns structured results with previous_status"
+    addresses: ["FIX-16"]
+
+  # === T4: ARCH-12 + ARCH-9 — 不变量 pre-transition hooks 实现 ===
+
+  - id: T4
+    title: "三个不变量的 pre-transition hook 实现（mode-aware，不写 ledger）"
+    role: leaf
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+    depends_on: ["T2"]
+    goal_behavior: >
+      在 workflow_monitor.py 末尾新增以下工厂函数。
+
+      **设计原则（Codex C3）：**
+      - hooks 不直接写 ledger
+      - BLOCK 模式: raise TransitionRejected（engine 写 rejection 事件）
+      - OBSERVE 模式: 调用 engine.report_hook_alert(alert_data)（engine 在 transition 后 flush）
+      - hooks 只做判定，所有 ledger 写入由 engine 控制
+
+      **Hook 工厂：**
+      1. create_completer_mismatch_hook() -> PreTransitionHook：
+         ```python
+         def hook(kind: str, data: dict, engine) -> None:
+             if kind != KIND_TASK_REPORTED_COMPLETED:
+                 return
+             task_id = str(data.get("task_id") or "")
+             task_state = engine.get_task(task_id)
+             if not task_state:
+                 return
+             completing_agent = str((data.get("evidence") or {}).get("agent_id") or "")
+             assigned_agent = task_state.agent_id
+             alert = check_completer_mismatch(task_id, assigned_agent, completing_agent)
+             if not alert:
+                 return
+             mode = engine.get_monitor_config().completer_mismatch
+             if mode == MonitorMode.BLOCK:
+                 raise TransitionRejected(
+                     alert_type=alert.alert_type,
+                     message=alert.message,
+                     evidence=alert.evidence,
+                 )
+             # OBSERVE: report to engine buffer, don't write ledger
+             engine.report_hook_alert({
+                 "alert_type": alert.alert_type,
+                 "severity": alert.severity,
+                 "task_id": alert.task_id,
+                 "message": alert.message,
+                 "evidence": alert.evidence,
+                 "mode": mode.value,
+             })
+         return hook
+         ```
+
+      2. create_file_overstepping_hook() -> PreTransitionHook：
+         ```python
+         def hook(kind: str, data: dict, engine) -> None:
+             if kind != KIND_TASK_REPORTED_COMPLETED:
+                 return
+             task_id = str(data.get("task_id") or "")
+             task_state = engine.get_task(task_id)
+             if not task_state:
+                 return
+             changed_files = list((data.get("evidence") or {}).get("changed_files") or [])
+             claimed_paths = list(task_state.task.claimed_paths or [])
+             alert = check_file_overstepping(task_id, changed_files, claimed_paths)
+             if not alert:
+                 return
+             mode = engine.get_monitor_config().file_overstepping
+             if mode == MonitorMode.BLOCK:
+                 raise TransitionRejected(
+                     alert_type=alert.alert_type,
+                     message=alert.message,
+                     evidence=alert.evidence,
+                 )
+             engine.report_hook_alert({
+                 "alert_type": alert.alert_type,
+                 "severity": alert.severity,
+                 "task_id": alert.task_id,
+                 "message": alert.message,
+                 "evidence": alert.evidence,
+                 "mode": mode.value,
+             })
+         return hook
+         ```
+
+      3. create_unauthorized_subagent_hook(known_actors_fn: Callable[[], Set[str]]) -> PreTransitionHook：
+         （Codex C1: 参数名改为 known_actors_fn，绑定持久化 actor registry 而非影子映射）
+         ```python
+         def hook(kind: str, data: dict, engine) -> None:
+             if kind != KIND_TASK_STARTED:
+                 return
+             agent_id = str(data.get("agent_id") or "")
+             known = known_actors_fn()
+             alert = check_unauthorized_subagent(agent_id, known)
+             if not alert:
+                 return
+             mode = engine.get_monitor_config().unauthorized_subagent
+             if mode == MonitorMode.BLOCK:
+                 raise TransitionRejected(
+                     alert_type=alert.alert_type,
+                     message=alert.message,
+                     evidence=alert.evidence,
+                 )
+             engine.report_hook_alert({
+                 "alert_type": alert.alert_type,
+                 "severity": alert.severity,
+                 "task_id": alert.task_id,
+                 "message": alert.message,
+                 "evidence": alert.evidence,
+                 "mode": mode.value,
+             })
+         return hook
+         ```
+
+      **需要的 import：**
+      - from cccc.kernel.workflow_state_types import (TransitionRejected, PreTransitionHook,
+        KIND_TASK_STARTED, KIND_TASK_REPORTED_COMPLETED)
+    acceptance_criteria: >
+      create_completer_mismatch_hook 在 BLOCK 模式 + mismatch 时 raise TransitionRejected；
+      create_completer_mismatch_hook 在 OBSERVE 模式 + mismatch 时调用 engine.report_hook_alert + return；
+      hooks 不直接调用 append_event 或写 ledger；
+      create_file_overstepping_hook 同理对 changed_files 检查；
+      create_unauthorized_subagent_hook 通过 known_actors_fn 获取持久化 actor 列表；
+      所有 hook 对不相关的 kind 直接 return（零开销）。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_state.py tests/test_worker_collaboration_integration.py -q --tb=short -k 'hook'"
+      covers:
+        tasks: ["T4"]
+    consumes:
+      - name: engine_hook_mechanism
+        from: T2
+    provides:
+      - name: invariant_hooks
+        kind: module
+        schema_hint: "Three mode-aware pre-transition hook factories, no direct ledger writes"
+    addresses: ["ARCH-12", "ARCH-9"]
+
+  # === T5: Orchestrator 集成 ===
+
+  - id: T5
+    title: "Orchestrator 注册 hooks + 使用 engine cascade + 处理 TransitionRejected"
+    role: integration
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+    depends_on: ["T3", "T4"]
+    goal_behavior: >
+      **1. 注册 hooks（__init__ 或 engine 初始化后）：**
+      在 self._monitor_config = get_default_config() 之后（line 187），新增：
+      ```python
+      from ..workflow_monitor import (
+          create_completer_mismatch_hook,
+          create_file_overstepping_hook,
+          create_unauthorized_subagent_hook,
+      )
+      self.engine.register_pre_transition_hook(create_completer_mismatch_hook())
+      self.engine.register_pre_transition_hook(create_file_overstepping_hook())
+      # Codex C1: 使用 group 持久化 actor registry，不依赖 _task_to_agent 影子映射
+      # self.group.actors 返回持久化的 actor 列表，daemon 重启后仍可用
+      self.engine.register_pre_transition_hook(
+          create_unauthorized_subagent_hook(
+              lambda: {str(a.get("actor_id") or a.get("id") or "") for a in (self.group.doc.get("actors") or [])}
+          )
+      )
+      ```
+      注意：lambda 读取 self.group.doc["actors"]——这是持久化在 group 文档中的 actor 列表，
+      daemon 重启 + replay 后仍可用。比 _task_to_agent（纯内存映射）可靠得多。
+
+      **2. 修改 block_task（line 1735-1759）：**
+      - 改为调用 self.engine.block_task(tid, why, cascade=True)
+      - engine 返回 List[Dict]（结构化 cascaded 列表，含 previous_status）
+      - 对 cascaded 列表中的每个 entry：
+        a. 调用 self._update_shadow_blocked(entry["task_id"], entry["blocked_reason"])
+        b. 如果 entry["previous_status"] == "running"：
+           发 cancel 通知到 Foreman
+           self._notify_foreman_task_update(
+               task_id=entry["task_id"],
+               new_status="cancelled",
+               summary=f"Task {entry['task_id']} cancelled: {entry['blocked_reason']}. Running worker should be stopped.",
+           )
+      - 删除 self._cascade_block() 调用
+      - 构建 result dict 时 cascaded_task_ids = [e["task_id"] for e in cascaded]
+      （Codex C2: previous_status 直接从 engine 结构化结果获取，无需 re-read engine state）
+
+      **3. 标记 _cascade_block deprecated：**
+      - 在方法开头加 logger.warning("_cascade_block is deprecated, use engine.block_task(cascade=True)")
+      - 保留原有实现作为 fallback 直到 Batch F 清理
+
+      **4. 处理 TransitionRejected（apply_task_event，line 1540-1708）：**
+      在 engine.report_worker_started 和 engine.report_worker_completion 调用处
+      包裹 try/except TransitionRejected：
+      ```python
+      try:
+          self.engine.report_worker_completion(task_id, evidence_dict, attempt_id=event_attempt_id)
+      except TransitionRejected as exc:
+          logger.warning("Transition rejected: %s — %s", exc.alert_type, exc.message)
+          result["accepted"] = False
+          result["reason"] = f"transition_rejected:{exc.alert_type}"
+          result["rejection_message"] = exc.message
+          # 通知 Foreman
+          self._notify_foreman_task_update(
+              task_id=task_id,
+              new_status="rejected",
+              summary=f"Engine rejected transition: {exc.message}",
+          )
+          return result
+      ```
+      对 report_worker_started 同理处理。
+
+      **5. 保留 on_task_completed 中的 WF-6 monitor checks（Codex C4）：**
+      不删除 on_task_completed 中的 check_completer_mismatch / check_file_overstepping /
+      check_unauthorized_subagent 调用及 record_verification_warning。
+      原因：
+      a. 这些 checks 是 WF-6 的验证证据——删除会导致现有测试回归
+      b. pre-transition hooks 先于 on_task_completed 执行，在 BLOCK 模式下已拦截，
+         on_task_completed 不会被到达
+      c. 在 OBSERVE 模式下，hooks 缓存 alert + engine flush violation 后，
+         on_task_completed 的 check 会重复记录——这是可接受的冗余，
+         不如强行删除导致 WF-6 回归。Batch F 中统一清理。
+      添加注释：# TODO: Batch F — deduplicate with engine pre-transition hooks
+    acceptance_criteria: >
+      hooks 在 orchestrator 初始化时注册到 engine；
+      unauthorized_subagent hook 使用 group.doc["actors"] 持久化数据源；
+      block_task 使用 engine.block_task(cascade=True)，不再调用 _cascade_block；
+      engine cascade 返回结构化结果，orchestrator 据 previous_status 发通知；
+      RUNNING 下游被 block 后 Foreman 收到取消通知；
+      TransitionRejected 在 apply_task_event 中被捕获并返回 accepted=False；
+      Foreman 收到 rejection 通知；
+      on_task_completed 中现有 monitor checks 和 WF-6 verification_warning 保留不变。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_workflow_state.py tests/test_worker_collaboration_integration.py tests/test_foreman_workflow.py -q --tb=short"
+      covers:
+        tasks: ["T2", "T3", "T4", "T5"]
+        flows:
+          - "hook_rejects_unauthorized_start"
+          - "hook_rejects_completer_mismatch"
+          - "engine_cascade_via_orchestrator"
+    consumes:
+      - name: engine_cascade_block
+        from: T3
+      - name: invariant_hooks
+        from: T4
+    provides:
+      - name: orchestrator_engine_guard_integration
+        kind: runtime_capability
+        schema_hint: "Hooks registered via persistent actor registry, cascade delegated with structured results, TransitionRejected handled, WF-6 preserved"
+    addresses: ["ARCH-12", "ARCH-9", "FIX-16"]
+
+  # === T6: E2E 验证 ===
+
+  - id: T6
+    title: "E2E 验证：Engine 拦截非法转换 + cascade + 模式切换"
+    role: verification
+    claimed_paths:
+      - "tests/e2e/test_batch_e_engine_guard.py"
+    awareness_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/foreman/workflow_monitor.py"
+    depends_on: ["T5"]
+    goal_behavior: >
+      新建 tests/e2e/test_batch_e_engine_guard.py：
+
+      **Hook 基础验证：**
+      1. test_hook_blocks_completer_mismatch_in_block_mode：
+         - 创建 engine + 注册 completer_mismatch hook
+         - set_monitor_mode("completer_mismatch", MonitorMode.BLOCK)
+         - 注册 task → register_batch → approve → start(agent_A) → RUNNING
+         - 尝试 report_worker_completion(evidence={"agent_id": "agent_B", ...})
+         - 断言 raise TransitionRejected
+         - 断言 task 状态仍为 RUNNING（未被改变）
+         - 断言 ledger 中有 KIND_TRANSITION_REJECTED 事件
+         - 断言 ledger 中无 KIND_TASK_REPORTED_COMPLETED 事件
+
+      2. test_hook_allows_completer_mismatch_in_observe_mode：
+         - 同上，但 mode=OBSERVE
+         - report_worker_completion 成功，task 状态变为 VERIFYING
+         - 断言 ledger 中有 KIND_MONITOR_VIOLATION（engine flush 的 observe violation）
+         - 断言 KIND_MONITOR_VIOLATION 在 KIND_TASK_REPORTED_COMPLETED 之后
+           （Codex C3: 验证 ledger 事件顺序正确）
+
+      3. test_hook_allows_matching_completer：
+         - mode=BLOCK
+         - agent_A start → agent_A complete
+         - 无 TransitionRejected，正常完成
+
+      4. test_hook_blocks_file_overstepping_in_block_mode：
+         - task claimed_paths=["src/foo.py"]
+         - complete with changed_files=["src/bar.py"]
+         - mode=BLOCK → raise TransitionRejected
+         - task 状态不变
+
+      5. test_hook_blocks_unauthorized_agent_start：
+         - 注册 unauthorized_subagent hook（known_actors={"agent_A"}）
+         - mode=BLOCK
+         - start(agent_id="agent_X") → raise TransitionRejected
+         - task 状态仍为 ASSIGNED
+
+      6. test_hook_unexpected_exception_does_not_block：
+         - 注册一个故意抛 RuntimeError 的 hook
+         - transition 仍然成功（hook error 不阻塞）
+         - （Codex C5: 验证 unexpected exception 处理路径）
+
+      **模式切换验证：**
+      7. test_monitor_mode_persists_via_ledger：
+         - set_monitor_mode("completer_mismatch", MonitorMode.BLOCK)
+         - 创建新 engine 对同一 group
+         - replay_from_ledger
+         - 断言 get_monitor_config().completer_mismatch == MonitorMode.BLOCK
+
+      8. test_mode_switch_from_observe_to_block：
+         - 初始 OBSERVE → mismatch 允许
+         - 切到 BLOCK → mismatch 拒绝
+         - 同一 engine 实例内两种行为
+
+      **Engine cascade 验证：**
+      9. test_engine_cascade_linear_dag：
+         - DAG: T-A → T-B → T-C
+         - block_task("T-A", "reason", cascade=True)
+         - 断言 T-B, T-C 均 BLOCKED
+         - 返回的 cascaded 列表长度 = 2
+
+      10. test_engine_cascade_diamond_dag_dedup：
+          - 菱形 DAG: T-A → T-B, T-A → T-C, T-B → T-D, T-C → T-D
+          - block_task("T-A", ..., cascade=True)
+          - 断言 T-B, T-C, T-D 各 BLOCKED 一次
+          - ledger 中恰好 4 条 KIND_TASK_BLOCKED（T-A + T-B + T-C + T-D）
+
+      11. test_engine_cascade_skips_completed：
+          - T-A → T-B, T-A → T-C
+          - T-B 已 COMPLETED
+          - block_task("T-A", ..., cascade=True)
+          - T-C BLOCKED, T-B 仍 COMPLETED
+
+      12. test_engine_cascade_returns_previous_status：
+          - T-A → T-B (RUNNING), T-A → T-C (READY)
+          - block_task("T-A", ..., cascade=True)
+          - 返回 cascaded 中 T-B 的 previous_status == "running"
+          - 返回 cascaded 中 T-C 的 previous_status == "ready"
+          （Codex C2: 验证结构化返回值含 previous_status）
+
+      **全生命周期 replay：**
+      13. test_full_lifecycle_with_hooks_and_cascade_replay：
+          - register tasks → batch → approve → start → set mode → complete (observe violation) →
+            verify → block a task (cascade) → replay
+          - replay 后：所有状态正确、monitor config 正确、cascaded tasks blocked
+    acceptance_criteria: >
+      13 个场景全部通过：
+      BLOCK 模式拒绝 3 种违规、OBSERVE 模式允许但记录（顺序正确）、
+      合法操作不受影响、unexpected exception 不阻塞、模式切换持久化、
+      engine cascade 线性/菱形/跳过完成态/结构化返回、
+      全生命周期 replay 正确。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/e2e/test_batch_e_engine_guard.py -q --tb=short"
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5", "T6"]
+        flows:
+          - "hook_rejects_unauthorized_start"
+          - "hook_rejects_completer_mismatch"
+          - "hook_allows_observe_mode"
+          - "engine_cascade_via_orchestrator"
+          - "mode_persistence_via_ledger"
+          - "full_lifecycle_replay"
+          - "no_state_change_on_rejection"
+          - "no_duplicate_cascade_events"
+          - "no_cascade_overwrite_terminal"
+
+critical_entrypoints:
+  - src/cccc/kernel/workflow_state_engine.py
+  - src/cccc/daemon/foreman/workflow_monitor.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+
+critical_flows:
+  - id: hook_rejects_unauthorized_start
+    description: "Unknown agent tries to start task → hook in BLOCK mode raises TransitionRejected → engine state unchanged → rejection logged"
+    entrypoints:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    required_verification_level: e2e
+  - id: hook_rejects_completer_mismatch
+    description: "Wrong agent tries to complete task → hook in BLOCK mode raises TransitionRejected → engine state unchanged → rejection logged"
+    entrypoints:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    required_verification_level: e2e
+  - id: hook_allows_observe_mode
+    description: "Violation detected in OBSERVE mode → transition proceeds → violation flushed to ledger AFTER transition event (correct ordering)"
+    entrypoints:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    required_verification_level: e2e
+  - id: engine_cascade_via_orchestrator
+    description: "block_task(cascade=True) → engine cascades via reverse deps → returns structured results with previous_status → orchestrator updates shadow + notifies foreman for RUNNING tasks"
+    entrypoints:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+    required_verification_level: e2e
+  - id: mode_persistence_via_ledger
+    description: "set_monitor_mode → ledger event → new engine replay → config restored"
+    entrypoints:
+      - "src/cccc/kernel/workflow_state_engine.py"
+    required_verification_level: e2e
+
+forbidden_flows:
+  - id: no_state_change_on_rejection
+    description: "When TransitionRejected is raised, the original state transition MUST NOT appear in ledger and in-memory state MUST NOT change"
+    required_verification_level: e2e
+  - id: no_duplicate_cascade_events
+    description: "Diamond DAG cascade MUST NOT produce duplicate task_blocked events for fan-in nodes"
+    required_verification_level: e2e
+  - id: no_cascade_overwrite_terminal
+    description: "Cascade MUST NOT overwrite COMPLETED or ARCHIVED tasks"
+    required_verification_level: e2e
+
+required_issues:
+  - "ARCH-12"
+  - "ARCH-9"
+  - "FIX-16"
+
+suppress_codes:
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+
+state:
+  completed_task_ids: ["T1", "T2", "T3", "T4", "T5", "T6"]
+  running_tasks: []
+  failed_task_ids: []

@@ -1,0 +1,1984 @@
+# Plan: Ralph 加强方案 · 30 项全量执行（Wave 1-10）
+#
+# 来源：
+#   - 蓝图：todo/ralph-加强方案-2026-04-17.md（v2 定稿）
+#   - 决策：todo/ralph-加强方案-决策-2026-04-17.md
+#   - 开放问题决议：todo/ralph-加强方案-开放问题决议-2026-04-17.md（本轮落实）
+#
+# 执行原则（对照 findings）：
+#   - #2 按"功能切片"而非"文件"拆；多个 tier-1 共享 workflow_orchestrator._build_task_prompt
+#     时走串行依赖，避免 write-set 冲突
+#   - #9 波次推进，W_n+1 依赖 W_n 的 verify 任务
+#   - #11 每波 verification 必须真实跑命令，不是 py_compile
+#   - #15 禁止半迁移：每波自己闭合（新规则必须在同波有覆盖测试）
+#
+# 开放问题决议应用（决议文档 §摘要）：
+#   - Q1: W2 同时拦 on_task_completed + _auto_sync_plan_state
+#   - Q2: ValidationIssue.confidence = exact|heuristic|unknown；仅 exact + path 交集升 warning
+#   - Q3: W10 lease primary + heartbeat 300s；改 scheduler lane 事件
+#   - Q4: W8 ledger dual-read/single-write，90 天 3 阶段
+#   - Q5: W8 suppress lease phased migration
+#   - Q6: 本轮不做 worker-brief 第三输出，W3 预留扩展
+#   - 顺序修正: finding metadata 最小字段前置到 Wave 4，W8 做完整 provenance
+
+required_issues:
+  - "RA-ENHANCE-R1"             # 确定性排序
+  - "RA-ENHANCE-R4"             # daemon 缓存按 (path, mtime_ns)
+  - "RA-ENHANCE-7"              # Structured Internal Failure Envelope
+  - "RA-ENHANCE-1"              # W_REGISTERED_PLAN_STALE + completion digest guard
+  - "RA-ENHANCE-10"             # Prompt Budgeter
+  - "RA-ENHANCE-FINDING-META"   # ValidationIssue 元数据字段（§4.5 并入）
+  - "RA-ENHANCE-2"              # Prompt Task Issue Digest
+  - "RA-ENHANCE-4"              # Recommended Tests 投射
+  - "RA-ENHANCE-FORBIDDEN"      # Forbidden Flows 注入
+  - "RA-ENHANCE-3"              # Serialize Semantic Summary
+  - "RA-ENHANCE-11"             # Text Output Semantic Parity
+  - "RA-ENHANCE-5"              # W_VERIFY_PASSED_BUT_SEMANTIC_INCONSISTENT
+  - "RA-ENHANCE-R2"             # plan.schema_version + legacy banner
+  - "RA-ENHANCE-CMP1"           # E_COVERS_UNKNOWN_FLOW
+  - "RA-ENHANCE-CMP2"           # W_STATE_UNKNOWN_TASK_REF
+  - "RA-ENHANCE-CMP3"           # E_DUPLICATE_FLOW_ID / _FORBIDDEN_FLOW_ID / _INVARIANT_NAME
+  - "RA-ENHANCE-CMP4"           # W_CRITICAL_FLOW_NO_ENTRYPOINTS
+  - "RA-ENHANCE-CMP5"           # H_SUPPRESS_UNUSED
+  - "RA-ENHANCE-CMP6"           # W_COVERS_PATHS_UNVERIFIED
+  - "RA-ENHANCE-CMP7"           # W_PLAN_SCOPE_UNUSED
+  - "RA-ENHANCE-U6"             # summary banner
+  - "RA-ENHANCE-U1"             # ralph explain --code
+  - "RA-ENHANCE-6"              # Semantic Gate Cache Freshness
+  - "RA-ENHANCE-9"              # Validation Ledger Schema Parity
+  - "RA-ENHANCE-PROVENANCE"     # report_schema_version / ruleset_digest
+  - "RA-ENHANCE-ISSUE-ID"       # stable issue_instance_id + typed evidence
+  - "RA-ENHANCE-SUPPRESS-LEASE" # Suppression Lease
+  - "RA-ENHANCE-CAPABILITY"     # Analyzer Capability Manifest + H_SEMANTIC_COVERAGE_DEGRADED
+  - "RA-ENHANCE-U3"             # validate --diff
+  - "RA-ENHANCE-AUDIT"          # ralph audit + W_TASK_FLAPPING + H_COMPLETED_BUT_UNVERIFIED
+  - "RA-ENHANCE-8"              # cross-workflow scheduler pressure (lane event)
+  - "RA-ENHANCE-VERIFY-HARDENING" # W1-stub-guard: no skip-only stub passes verify
+
+# 非 Python 工作区可能不支持 semantic 层；本方案主工作区为 Python，保持 advisory
+semantic_mode: advisory
+
+# 计划运行时可能没有 Serena，所以 auto_infer 关闭
+auto_infer: false
+
+tasks:
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Wave 1 · provenance / robustness 基石
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - id: W1-stub-guard
+    title: "Guard: no wave verify passes on skip-only stub target"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "scripts/check_not_skip_only.py"
+      - "tests/test_stub_guard.py"
+    depends_on: []
+    addresses: ["RA-ENHANCE-VERIFY-HARDENING"]
+    goal_behavior: >
+      Codex review finding #5 fix. Verification files seeded as
+      @pytest.mark.skip stubs (per RVE-12 mitigation) must not be
+      accepted as valid verification targets — task implementers could
+      trivially make a narrow assertion and claim success while the
+      production path stays untested.
+
+      Create scripts/check_not_skip_only.py (AST-based). Codex round-2
+      re-review called out that "block all-skip/zero-test" is still
+      weak against "one trivial non-skip test". Guard implementation
+      therefore layers three checks:
+
+      Layer 1 — structure (blocks "all-skip / zero-test"):
+        - Parse each path with ast.parse.
+        - Fail (E_INTERNAL_STUB_ONLY) if every test_* function is
+          decorated @pytest.mark.skip OR module-level calls pytest.skip.
+        - Fail (E_INTERNAL_NO_TESTS) if no test_* functions.
+
+      Layer 2 — assertion density (blocks "trivial non-skip test"):
+        - Count ast.Assert nodes + pytest.raises/pytest.fail/pytest.xfail
+          invocations across non-skipped test bodies.
+        - Fail (E_INTERNAL_ZERO_ASSERTIONS) if count == 0.
+        - Fail (E_INTERNAL_LOW_ASSERTIONS) if module declares >=2
+          test functions but average assertions per non-skipped test < 1
+          (guards against "many trivial tests to pad count").
+
+      Layer 3 — production-path reference (blocks "test doesn't touch
+      implementation"; round-3 tightened):
+        - Each test module MUST import a specific submodule path
+          `cccc.<submodule>` (NOT bare `import cccc`).
+        - The imported symbol/alias MUST be referenced in at least one
+          non-skipped test function body (not just module-top import).
+        - Fail (E_INTERNAL_NO_PROD_IMPORT) if no qualifying import.
+        - Fail (E_INTERNAL_UNUSED_PROD_IMPORT) if import exists but
+          is never referenced in any test body.
+        - This prevents the trivial bypass of `import cccc` at module
+          top with nothing used (Codex round-3 finding).
+
+      Exit 0 only when all layers pass. Emit one structured JSON line
+      per failed file on stderr (matches W1-7 envelope style):
+      {path, layer:"structure"|"assertion"|"prod_import", error_code,
+       details}. These failures are NOT part of the plan's internal
+      error envelope — guard lives outside Ralph CLI.
+
+      Every wave verify task's verification.command MUST invoke this
+      guard before pytest: "python scripts/check_not_skip_only.py
+      <files> && pytest <files> -v" (see per-wave verify task
+      commands below; all updated in this plan).
+    acceptance_criteria: >
+      pytest covers all 3 layers:
+      Structure: (a) skip-only stub → non-zero; (b) module-level
+      pytest.skip → non-zero; (c) zero test_* functions → non-zero.
+      Assertion: (d) one non-skipped test with body `pass` → non-zero
+      E_INTERNAL_ZERO_ASSERTIONS; (e) non-skipped test with one assert
+      → exit zero; (f) five non-skipped tests averaging 0.2 asserts →
+      non-zero E_INTERNAL_LOW_ASSERTIONS.
+      Production-path: (g) test module with no `from cccc.` → non-zero
+      E_INTERNAL_NO_PROD_IMPORT; (g2) bare `import cccc` without
+      submodule → non-zero E_INTERNAL_NO_PROD_IMPORT (round-3);
+      (g3) `from cccc.ralph.models import Plan` present but `Plan`
+      not referenced in any test body → non-zero
+      E_INTERNAL_UNUSED_PROD_IMPORT; (h) `from cccc.ralph.validator
+      import validate_plan` referenced in test_validate() body →
+      exit zero.
+      Composite: (i) happy-path real test module passes all three
+      layers silently.
+    verification:
+      level: unit
+      command: "python scripts/check_not_skip_only.py tests/test_stub_guard.py && pytest tests/test_stub_guard.py -v"
+      covers:
+        tasks: ["W1-stub-guard"]
+        flows: ["no_skip_stub_verification"]
+    provides:
+      - name: stub_guard_cli
+        kind: runtime_capability
+        schema_hint: "python scripts/check_not_skip_only.py <paths...>"
+
+  - id: W1-r1-deterministic-sort
+    title: "R-1 · Deterministic issue ordering (complete task_ids + canonical evidence)"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/validator.py"
+      - "tests/test_validator_ordering.py"
+    awareness_paths:
+      - "src/cccc/ralph/models.py"
+      - "src/cccc/ralph/rules_advisory.py"
+    depends_on: []
+    addresses: ["RA-ENHANCE-R1"]
+    goal_behavior: >
+      Introduce deterministic sort key for every ValidationIssue produced by
+      validator.py and rules_advisory. Sort key = (severity_rank desc, code asc,
+      tuple(task_ids sorted) asc, canonical_evidence_json asc). Canonical
+      evidence is json.dumps with sort_keys=True and ensure_ascii=False.
+      Four-part key is required (review consensus): task_ids[0] alone flaps when
+      multi-task issues swap; raw str(evidence) flaps when dict iteration order
+      changes.
+    acceptance_criteria: >
+      New test tests/test_validator_ordering.py runs validate on a fixture plan
+      twice, asserts deepEqual of issue lists. A second fixture shuffles multi-
+      task issues input order; output must be identical across runs.
+    verification:
+      level: unit
+      command: "pytest tests/test_validator_ordering.py -v"
+      covers:
+        tasks: ["W1-r1-deterministic-sort"]
+        flows: ["deterministic_report_output"]
+    provides:
+      - name: deterministic_issue_sort
+        kind: runtime_capability
+        schema_hint: "sort key = (severity, code, tuple(task_ids), canonical_evidence_json)"
+
+  - id: W1-r4-mtime-cache
+    title: "R-4 · Daemon cache keyed by (path, size, mtime_ns) not path alone"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/filesystem_validator.py"
+      - "src/cccc/ralph/validator.py"
+      - "tests/test_ralph_cache_invalidation.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/ralph_service.py"
+    depends_on: []
+    addresses: ["RA-ENHANCE-R4"]
+    goal_behavior: >
+      Change _load_issue_file_map_cached and _scan_extra_forbid_models_cached
+      in filesystem_validator.py and validator.py to key by
+      (path, st_size, st_mtime_ns). Keep the in-process cache API identical;
+      only the key changes. This is the review-consensus form — mtime alone can
+      collide under fast edits, digest is too expensive per call.
+    acceptance_criteria: >
+      pytest asserts: (1) same-file same-mtime re-call returns cached value
+      (no disk re-read); (2) mutating file (write + flush) invalidates next
+      call; (3) replacing file to same size/content but different mtime_ns
+      invalidates.
+    verification:
+      level: unit
+      command: "pytest tests/test_ralph_cache_invalidation.py -v"
+      covers:
+        tasks: ["W1-r4-mtime-cache"]
+        flows: ["daemon_fresh_rules"]
+    provides:
+      - name: mtime_keyed_ralph_cache
+        kind: runtime_capability
+
+  - id: W1-7-error-envelope
+    title: "#7 · Structured Internal Failure Envelope (CLI + daemon + orchestrator)"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/cli.py"
+      - "src/cccc/ralph/agent.py"
+      - "src/cccc/daemon/foreman/ralph_service.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+      - "tests/test_ralph_error_envelope.py"
+    depends_on: []
+    addresses: ["RA-ENHANCE-7"]
+    goal_behavior: >
+      Codex review note: the original scope (CLI only) would let later waves
+      assume daemon-side errors also go through envelope — that assumption
+      breaks. Expand envelope to three surfaces, with shared enum in agent.py.
+
+      (1) CLI surface: wrap validator entry points (validate_with_project,
+          semantic provider, regex/AST internal calls). Exit 2 for internal
+          error, exit 1 for plan-level validation failure.
+      (2) Daemon surface: ralph_service internal exceptions and IPC handler
+          exceptions emit structured error dict to the IPC response envelope
+          (not raise through the wire) — matches existing
+          IpcValidationError shape. Add internal_error_code field.
+      (3) Orchestrator surface: apply_task_event, on_task_completed, and
+          register_and_suggest wrap internal failures and emit ledger event
+          workflow.ralph_internal_error (new kind) with stage +
+          internal_error_code + exception_type.
+
+      Stable enum for stage ∈ {"load","validate","semantic","ipc","completion",
+      "register","suggest","verify"} and internal_error_code (E_INTERNAL_*)
+      documented in src/cccc/ralph/agent.py as a single RULE_ERROR_REGISTRY
+      dict (not three copies).
+
+      JSON output adds top-level "error" object: {stage, internal_error_code,
+      exception_type, message, traceback_truncated (debug-only)}. Raw
+      traceback NOT in stderr/ledger unless CCCC_DEBUG_TRACEBACK=1 set.
+    acceptance_criteria: >
+      tests/test_ralph_error_envelope.py covers: (a) CLI malformed YAML →
+      exit 2 stage="load"; (b) simulated semantic provider crash via
+      monkeypatch → exit 2 stage="semantic"; (c) regular validation
+      failure → exit 1; (d) daemon handler with simulated internal
+      exception → IPC response with structured error, no traceback
+      leak; (e) orchestrator apply_task_event internal failure emits
+      workflow.ralph_internal_error ledger event with stable fields.
+    verification:
+      level: integration
+      command: "pytest tests/test_ralph_error_envelope.py -v"
+      covers:
+        tasks: ["W1-7-error-envelope"]
+        flows: ["internal_failure_envelope"]
+    provides:
+      - name: internal_failure_envelope
+        kind: api_endpoint
+        schema_hint: "JSON/IPC/ledger: {error: {stage, internal_error_code, exception_type, message}}"
+
+  - id: W1-verify
+    title: "Wave 1 integration · deterministic sort + cache + error envelope"
+    role: verification
+    type: backend
+    claimed_paths:
+      - "tests/test_ralph_wave1_integration.py"
+    depends_on:
+      - "W1-stub-guard"
+      - "W1-r1-deterministic-sort"
+      - "W1-r4-mtime-cache"
+      - "W1-7-error-envelope"
+    addresses: ["RA-ENHANCE-R1", "RA-ENHANCE-R4", "RA-ENHANCE-7", "RA-ENHANCE-VERIFY-HARDENING"]
+    goal_behavior: >
+      Integration test that exercises all three Wave 1 capabilities in one
+      session: load plan → run validate twice → assert byte-identical JSON;
+      corrupt plan → assert structured error envelope; mutate fixture file
+      mid-session → assert cache invalidates.
+    acceptance_criteria: >
+      pytest passes. No raw traceback leaks. Two subsequent validate runs of
+      unchanged plan produce identical stdout.
+    verification:
+      level: integration
+      command: "python scripts/check_not_skip_only.py tests/test_ralph_wave1_integration.py && pytest tests/test_ralph_wave1_integration.py -v"
+      covers:
+        tasks: ["W1-r1-deterministic-sort", "W1-r4-mtime-cache", "W1-7-error-envelope", "W1-verify"]
+        flows: ["deterministic_report_output", "daemon_fresh_rules", "internal_failure_envelope"]
+    consumes:
+      - name: deterministic_issue_sort
+        from: W1-r1-deterministic-sort
+      - name: mtime_keyed_ralph_cache
+        from: W1-r4-mtime-cache
+      - name: internal_failure_envelope
+        from: W1-7-error-envelope
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Wave 2 · plan 完整性封口
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - id: W2-1-pre-transition-digest-guard
+    title: "#1 · W_REGISTERED_PLAN_STALE + pre-transition digest hook (engine-level)"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/foreman/ralph_service.py"
+      - "src/cccc/daemon/ops/workflow_task_ops.py"
+      - "src/cccc/cli/workflow_cmds.py"
+      - "src/cccc/ralph/validator.py"
+      - "src/cccc/contracts/v1/event.py"
+      - "tests/test_ralph_plan_digest_guard.py"
+    awareness_paths:
+      - "src/cccc/ralph/plan_io.py"
+      - "tests/test_foreman_workflow.py"
+    depends_on: ["W1-verify"]
+    addresses: ["RA-ENHANCE-1"]
+    goal_behavior: >
+      Decision Q1 v2 (Codex review corrected). Original plan put guard at
+      on_task_completed / _auto_sync_plan_state — both are too late: call
+      chain apply_task_event → engine.report_worker_completion
+      → record_verification_result fires FIRST, writing ledger and engine
+      state; guard afterwards is post-hoc.
+
+      (1) Primary guard: add new pre-transition hook
+          create_plan_digest_freshness_hook(plan_context_ref) registered in
+          orchestrator __init__ alongside the existing 3 hooks
+          (workflow_orchestrator.py:202-204). Hook fires on ALL
+          non-reversible transition kinds (Codex round-3):
+            KIND_TASK_REPORTED_COMPLETED (workflow_state_types.py:17)
+            KIND_VERIFICATION_PASSED (:19)
+            KIND_VERIFICATION_FAILED (:21)
+            KIND_VERIFICATION_SKIPPED (:20)
+            KIND_TASK_FAILED (:18)
+          IMPORTANT implementation detail (Codex final review confirmed):
+          currently ONLY KIND_TASK_REPORTED_COMPLETED and KIND_TASK_STARTED
+          go through _run_pre_transition_hooks() before _append()
+          (workflow_state_engine.py:140,189). The other 4 kinds write
+          ledger directly:
+            - report_worker_failed() → _append at :203 (no hook)
+            - record_verification_result() passed → _append at :216
+            - record_verification_result() skipped → _append at :220
+            - record_verification_result() failed → _append at :223
+          THIS TASK MUST add _run_pre_transition_hooks() calls to
+          EACH of these 4 entry points BEFORE their _append() call.
+          Without this, registering the hook on 5 kinds has no effect
+          on 4 of them — the hook never fires.
+          On mismatch between current disk digest and
+          plan_context.plan_digest → hook raises PreTransitionVetoed.
+          Engine REFUSES the transition; the triggering ledger event
+          is NOT written. Instead, engine
+          writes new kind workflow.plan_digest_divergence carrying
+          {registered_digest, current_digest, task_id, override_used}.
+          New kind added to workflow_state_types.py and contracts/v1/event.py.
+      (2) Override path: apply_task_event entry (workflow_orchestrator.py:2137
+          and workflow_task_ops.py:142,185) accepts optional override flag
+          from caller, injects into event.data as override_stale_digest=True.
+          Hook reads flag; if True, allows transition but still writes
+          workflow.plan_digest_divergence with override_used=true.
+          CLI --force-stale-complete surface in cli/workflow_cmds.py.
+      (3) Validate-side warning: plan_io / validator keep emitting
+          W_REGISTERED_PLAN_STALE when disk digest differs from registered.
+          Non-blocking — exists for early visibility at planning time.
+      (4) Defense-in-depth: on_task_completed and _auto_sync_plan_state
+          still compare digests; mismatch emits advisory
+          workflow.plan_digest_divergence_post_hoc (hint, non-blocking) —
+          should never fire if hook works.
+      (5) Preservation: PlanContext.runtime_plan frozen-bytes behavior kept
+          unchanged; tests/test_foreman_workflow.py:1688 must still pass
+          byte-identical.
+    acceptance_criteria: >
+      pytest covers: (a) stale plan: task_reported_completed vetoed by
+      pre-transition hook — engine state unchanged, only
+      workflow.plan_digest_divergence in ledger; (a2) stale plan:
+      verification_passed vetoed — same veto behavior; (a3)
+      verification_failed vetoed; (a4) verification_skipped vetoed;
+      (a5) task_failed vetoed — all 5 non-reversible kinds confirmed
+      individually (each path has its own _run_pre_transition_hooks
+      call before _append, added by this task);
+      (b) --force-stale-complete
+      passes through; ledger contains both workflow.plan_digest_divergence
+      (override_used=true) AND the normal completion chain; (c)
+      validate-side W_REGISTERED_PLAN_STALE emitted for drifted plan;
+      (d) existing frozen-snapshot test
+      tests/test_foreman_workflow.py:1688 passes unchanged; (e) post-hoc
+      advisory never fires in normal runs (guaranteed via test fixture).
+    verification:
+      level: integration
+      command: "pytest tests/test_ralph_plan_digest_guard.py tests/test_foreman_workflow.py -k registered_plan_frozen -v"
+      covers:
+        tasks: ["W2-1-pre-transition-digest-guard"]
+        flows: ["plan_digest_freshness"]
+    provides:
+      - name: plan_digest_pre_transition_guard
+        kind: runtime_capability
+        schema_hint: "pre-transition hook on KIND_TASK_REPORTED_COMPLETED + workflow.plan_digest_divergence event"
+    consumes:
+      - name: internal_failure_envelope
+        from: W1-7-error-envelope
+
+  - id: W2-verify
+    title: "Wave 2 verify · two-layer plan digest guard end-to-end"
+    role: verification
+    type: backend
+    claimed_paths:
+      - "tests/test_ralph_wave2_integration.py"
+    depends_on: ["W2-1-pre-transition-digest-guard"]
+    addresses: ["RA-ENHANCE-1"]
+    goal_behavior: >
+      End-to-end integration: register plan, run workflow, edit plan mid-
+      workflow (add a task + a suppress), attempt task complete, assert hard-
+      block. Re-run with --force-stale-complete, assert pass + ledger event.
+      This is the reviewer's required scenario (dual-digest split-brain
+      prevention).
+    acceptance_criteria: >
+      pytest passes. Ledger scan after test shows exactly one
+      workflow.plan_digest_divergence event with override_used flag correct.
+    verification:
+      level: integration
+      command: "python scripts/check_not_skip_only.py tests/test_ralph_wave2_integration.py && pytest tests/test_ralph_wave2_integration.py -v"
+      covers:
+        tasks: ["W2-1-pre-transition-digest-guard", "W2-verify"]
+        flows: ["plan_digest_freshness", "silent_stale_plan_completion"]
+    consumes:
+      - name: plan_digest_pre_transition_guard
+        from: W2-1-pre-transition-digest-guard
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Wave 3 · 预算器（worker-facing 改动前置）
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - id: W3-10-prompt-budgeter
+    title: "#10 · Prompt Budgeter (token-aware, mandatory minima, omission manifest)"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/daemon/foreman/progress_report.py"
+      - "tests/test_prompt_budgeter.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/context_store.py"
+      - "src/cccc/ralph/models.py"
+    depends_on: ["W2-verify"]
+    addresses: ["RA-ENHANCE-10"]
+    goal_behavior: >
+      Wrap _build_task_prompt with PromptBudget:
+      (1) Unit: approximate tokens (tiktoken if available, else 4-char
+          fallback). Default budget CCCC_PROMPT_TOKEN_BUDGET=12000,
+          overridable per workflow.
+      (2) Mandatory minima (never truncated): Task ID, Title, Goal Behavior,
+          Acceptance Criteria, Verification Command, Do-Not-Ignore Issues,
+          Recommended Tests, Forbidden Actions. Slots reserved upfront; if
+          mandatory exceeds 40% of budget, raise E_PROMPT_MINIMA_OVERFLOW
+          (internal error envelope, W1 #7).
+      (3) Priority (gpp-8 derived): contract > blockers > verification_command
+          > recommended_tests > condensed_semantic_focus > raw_semantic_context
+          > context_store.
+      (4) Degradation ladder: first condense (symbol signatures only), then
+          truncate with [CONTEXT DEGRADED: <section>, <reason>] marker.
+      (5) Omission manifest as JSON list of {section, original_tokens,
+          included_tokens, strategy:"condensed"|"truncated"|"dropped"}.
+          Attached to ledger event workflow.prompt_built and return value;
+          structured so future ValidationPacket protocol can reuse (decision
+          Q6 hook).
+    acceptance_criteria: >
+      pytest covers: (a) synthetic huge semantic_context → condensed, mandatory
+      preserved byte-exact; (b) oversized goal_behavior itself → emits
+      E_PROMPT_MINIMA_OVERFLOW (internal error envelope, exit 2); (c)
+      omission_manifest schema stable across runs; (d) real fixture worker
+      prompt still renders readable sections with [CONTEXT DEGRADED] marker
+      only where applicable.
+    verification:
+      level: integration
+      command: "pytest tests/test_prompt_budgeter.py -v"
+      covers:
+        tasks: ["W3-10-prompt-budgeter"]
+        flows: ["prompt_budget_bounded"]
+    provides:
+      - name: prompt_budgeter
+        kind: runtime_capability
+        schema_hint: "omission_manifest: List[{section, original_tokens, included_tokens, strategy}]"
+    consumes:
+      - name: internal_failure_envelope
+        from: W1-7-error-envelope
+
+  - id: W3-verify
+    title: "Wave 3 verify · prompt budgeter under real fixtures"
+    role: verification
+    type: backend
+    claimed_paths:
+      - "tests/test_ralph_wave3_integration.py"
+    depends_on: ["W3-10-prompt-budgeter"]
+    addresses: ["RA-ENHANCE-10"]
+    goal_behavior: >
+      Integration test: feed real task + real semantic context + real
+      context_store snapshot; assert prompt stays under budget; mandatory
+      minima sections present byte-identical; omission_manifest lists all
+      degraded sections with non-zero original_tokens.
+    acceptance_criteria: >
+      pytest passes. Asserting prompt <= budget and all 8 mandatory minima
+      sections present as literal substrings.
+    verification:
+      level: integration
+      command: "python scripts/check_not_skip_only.py tests/test_ralph_wave3_integration.py && pytest tests/test_ralph_wave3_integration.py -v"
+      covers:
+        tasks: ["W3-10-prompt-budgeter", "W3-verify"]
+        flows: ["prompt_budget_bounded", "unbounded_prompt_growth", "char_based_truncation"]
+    consumes:
+      - name: prompt_budgeter
+        from: W3-10-prompt-budgeter
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Wave 4 · worker prompt 投射（serial on workflow_orchestrator.py）
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - id: W4-finding-metadata
+    title: "Finding metadata fields on ValidationIssue AND IpcValidationError (minimal)"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/models.py"
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+      - "src/cccc/ralph/rules_advisory.py"
+      - "src/cccc/ralph/semantic_validator.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "tests/test_issue_metadata.py"
+    awareness_paths:
+      - "src/cccc/ralph/validator.py"
+      - "src/cccc/ralph/filesystem_validator.py"
+      - "src/cccc/ralph/semantic_metrics.py"
+    depends_on: ["W3-verify"]
+    addresses: ["RA-ENHANCE-FINDING-META"]
+    goal_behavior: >
+      Decision Q2 v2 (Codex review corrected) + structural tension #1 fix.
+      Two changes:
+
+      (1) Taxonomy sync: use EXISTING `exact|best_effort|opaque` triad
+          (semantic_metrics.py:16 CONFIDENCE_LEVELS). Do NOT invent
+          `heuristic/unknown` — would break gate_readiness statistics and
+          audit consumers. All new issue metadata uses this triad only.
+
+      (2) Closed slice: Codex flagged that W4-2 reads issues through
+          IpcValidationError (contracts/v1/ralph_ipc.py:66-75) — a
+          serialized form of ValidationIssue. If we only extend
+          ValidationIssue, the serializer silently drops the new fields
+          and W4-2 ends up stuffing metadata back into `evidence`. Fix:
+          extend BOTH models and add a round-trip test.
+
+      Extend ValidationIssue (models.py) AND IpcValidationError
+      (contracts/v1/ralph_ipc.py) with (all default-empty):
+        confidence: Literal["exact","best_effort","opaque"] = "opaque"
+        source: str = ""            # module name e.g. "validator.py:CMP-1"
+        action_owner: Literal["author","worker","shared","unknown"] = "unknown"
+        worker_relevance: Literal["blocking","execution_risk","verification_risk","none"] = "none"
+      Update _serialize_validation_issue in workflow_orchestrator.py
+      (:307-312 area) to include the 4 new fields.
+
+      Populate at issue-emission time:
+        - CMP-* structural rules: action_owner="author", worker_relevance="none",
+          confidence="exact" (regex/AST based)
+        - S_* semantic: confidence = provider-reported (exact / best_effort /
+          opaque per current ConsistencyReport semantics)
+        - W_VERIFICATION_*: action_owner="shared", worker_relevance="verification_risk"
+
+      DO NOT yet add report_schema_version / ruleset_digest / issue_instance_id
+      (Wave 8 work).
+    acceptance_criteria: >
+      pytest covers: (a) all 3 confidence values produced by fixture plans
+      using existing taxonomy; (b) rule family × action_owner matrix sensible;
+      (c) ValidationIssue → IpcValidationError round-trip preserves all 4
+      new fields with no stuffing into evidence; (d) semantic_metrics.py
+      CONFIDENCE_LEVELS unchanged (no new enum values introduced).
+    verification:
+      level: unit
+      command: "pytest tests/test_issue_metadata.py -v"
+      covers:
+        tasks: ["W4-finding-metadata"]
+        flows: ["worker_sees_blockers"]
+    provides:
+      - name: finding_metadata_minimal
+        kind: artifact
+        schema_hint: "ValidationIssue.{confidence,source,action_owner,worker_relevance}"
+
+  - id: W4-2-issue-digest
+    title: "#2 · Prompt Task Issue Digest (actionability-first, action_owner filtered)"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "tests/test_prompt_issue_digest.py"
+    awareness_paths:
+      - "src/cccc/ralph/models.py"
+    depends_on: ["W4-finding-metadata"]
+    addresses: ["RA-ENHANCE-2"]
+    goal_behavior: >
+      Inject per-task issue digest into worker prompt via _build_task_prompt
+      (mandatory-minima section "Do-Not-Ignore Issues").
+      Inclusion policy (review consensus — actionability-first, not
+      severity-first):
+      (1) Filter by action_owner ∈ {"worker","shared"}; drop "author"
+          (CMP-* structural issues do NOT reach worker).
+      (2) Quota by worker_relevance: up to 1 blocking + 1 execution_risk +
+          1 verification_risk (gp-8-h spec). If quota unfilled, top up by
+          (severity desc, confidence desc, code asc).
+      (3) Within category, prefer "changes execution strategy" signals
+          (S_*, W_VERIFICATION_*, claimed_paths overlap) over organizational
+          hints.
+      (4) Each entry: 1 single-line action verb + brief evidence. Budgeter
+          (W3) decides final space.
+    acceptance_criteria: >
+      pytest covers: (a) task with mixed CMP-* and S_* issues → only S_*
+      reach prompt; (b) quota selection deterministic across runs; (c)
+      emitted prompt lines match stable snapshot fixture.
+    verification:
+      level: unit
+      command: "pytest tests/test_prompt_issue_digest.py -v"
+      covers:
+        tasks: ["W4-2-issue-digest"]
+        flows: ["worker_sees_blockers"]
+    provides:
+      - name: prompt_issue_digest
+        kind: runtime_capability
+    consumes:
+      - name: finding_metadata_minimal
+        from: W4-finding-metadata
+      - name: prompt_budgeter
+        from: W3-10-prompt-budgeter
+
+  - id: W4-4-recommended-tests
+    title: "#4 · Recommended Tests Reach The Worker"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "tests/test_prompt_recommended_tests.py"
+    awareness_paths:
+      - "src/cccc/ralph/semantic_validator.py"
+    depends_on: ["W4-2-issue-digest"]
+    addresses: ["RA-ENHANCE-4"]
+    goal_behavior: >
+      Surface semantic_validator.recommend_tests() output (pytest selectors
+      and path hints) into the mandatory-minima "Recommended Tests" section
+      of the worker prompt. Keep the existing _record_verification_semantic_
+      details pathway for post-hoc reporting; this PR adds the prompt
+      injection side only.
+    acceptance_criteria: >
+      pytest covers: (a) task with recommend_tests() returning 3 selectors →
+      prompt contains all 3 under "Recommended Tests"; (b) empty
+      recommendations → section omitted (not "Recommended Tests: (none)");
+      (c) budgeter never drops this section (mandatory minima).
+    verification:
+      level: unit
+      command: "pytest tests/test_prompt_recommended_tests.py -v"
+      covers:
+        tasks: ["W4-4-recommended-tests"]
+        flows: ["worker_sees_blockers"]
+    provides:
+      - name: prompt_recommended_tests
+        kind: runtime_capability
+    consumes:
+      - name: prompt_issue_digest
+        from: W4-2-issue-digest
+
+  - id: W4-forbidden-flows-inject
+    title: "Forbidden Flows Injection (review-merged Tier-1 item)"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "tests/test_prompt_forbidden_flows.py"
+    awareness_paths:
+      - "src/cccc/ralph/models.py"
+    depends_on: ["W4-4-recommended-tests"]
+    addresses: ["RA-ENHANCE-FORBIDDEN"]
+    goal_behavior: >
+      Project plan.forbidden_flows into the mandatory-minima section
+      "Forbidden Actions" of the worker prompt. Format: one line per flow
+      "[FORBIDDEN] <id>: <description>". Currently forbidden_flows is only
+      statically validated; worker has zero visibility into negative
+      constraints — this closes the loop.
+    acceptance_criteria: >
+      pytest covers: (a) fixture plan with 2 forbidden_flows → both appear
+      in prompt; (b) budgeter never drops this section; (c) plan without
+      forbidden_flows → section omitted.
+    verification:
+      level: unit
+      command: "pytest tests/test_prompt_forbidden_flows.py -v"
+      covers:
+        tasks: ["W4-forbidden-flows-inject"]
+        flows: ["worker_sees_blockers"]
+    provides:
+      - name: prompt_forbidden_flows
+        kind: runtime_capability
+    consumes:
+      - name: prompt_recommended_tests
+        from: W4-4-recommended-tests
+
+  - id: W4-verify
+    title: "Wave 4 verify · worker prompt projection end-to-end"
+    role: verification
+    type: backend
+    claimed_paths:
+      - "tests/test_ralph_wave4_integration.py"
+    depends_on:
+      - "W4-finding-metadata"
+      - "W4-2-issue-digest"
+      - "W4-4-recommended-tests"
+      - "W4-forbidden-flows-inject"
+    addresses:
+      - "RA-ENHANCE-FINDING-META"
+      - "RA-ENHANCE-2"
+      - "RA-ENHANCE-4"
+      - "RA-ENHANCE-FORBIDDEN"
+    goal_behavior: >
+      End-to-end integration: real plan with both CMP-* and S_* issues plus
+      recommend_tests output plus forbidden_flows; build prompt; assert all
+      mandatory sections present, CMP-* filtered out, issue digest within
+      quota, [CONTEXT DEGRADED] markers only where omission occurred.
+    acceptance_criteria: >
+      pytest passes. Snapshot of 8 mandatory-minima sections matches fixture.
+    verification:
+      level: integration
+      command: "python scripts/check_not_skip_only.py tests/test_ralph_wave4_integration.py && pytest tests/test_ralph_wave4_integration.py -v"
+      covers:
+        tasks: ["W4-finding-metadata", "W4-2-issue-digest", "W4-4-recommended-tests", "W4-forbidden-flows-inject", "W4-verify"]
+        flows: ["worker_sees_blockers", "worker_prompt_omits_mandatory_minima", "severity_first_digest_inclusion"]
+    consumes:
+      - name: prompt_forbidden_flows
+        from: W4-forbidden-flows-inject
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Wave 5 · semantic parity（避免 JSON / text / prompt 视图分叉）
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - id: W5-3-serialize-semantic-summary
+    title: "#3 · Serialize bounded, versioned semantic summary into IPC"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+      - "tests/test_semantic_summary_ipc.py"
+    awareness_paths:
+      - "src/cccc/ralph/models.py"
+      - "src/cccc/ralph/validator.py"
+    depends_on: ["W4-verify"]
+    addresses: ["RA-ENHANCE-3"]
+    goal_behavior: >
+      Add SemanticSummary model to contracts/v1/ralph_ipc.py with bounded
+      fields: {version:int, per_task:{task_id: {risk_level, total_fanout,
+      touched_symbol_count, suggested_deps_count, suggested_deps_digest:str
+      (sha256 prefix 12), confidence}}}. DO NOT expose SemanticFingerprintModel
+      internals directly (review: protocol must not be shape-bound to
+      internal provider objects). Modify _serialize_validation_report in
+      workflow_orchestrator.py to include "semantic_summary" field.
+    acceptance_criteria: >
+      pytest covers: (a) serialized report contains semantic_summary with
+      version field; (b) summary fields are bounded types (no dict leak,
+      no raw provider object); (c) same fingerprints → same digest.
+    verification:
+      level: unit
+      command: "pytest tests/test_semantic_summary_ipc.py -v"
+      covers:
+        tasks: ["W5-3-serialize-semantic-summary"]
+        flows: ["semantic_findings_surface"]
+    provides:
+      - name: semantic_summary_ipc
+        kind: api_endpoint
+        schema_hint: "SemanticSummary v1 with bounded fields"
+
+  - id: W5-11-text-output-parity
+    title: "#11 · Text output parity — semantic_findings + summary counts"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/cli.py"
+      - "tests/test_cli_text_parity.py"
+    awareness_paths:
+      - "src/cccc/ralph/models.py"
+    depends_on: ["W5-3-serialize-semantic-summary"]
+    addresses: ["RA-ENHANCE-11"]
+    goal_behavior: >
+      Extend cli.py text renderer (currently prints errors/warnings/hints
+      only) to include a "Semantic Findings" section with S_* findings,
+      plus a "Fingerprints" compact line per task (risk_level + fanout
+      total). Default-on in text mode; --no-semantic flag to suppress.
+      JSON output unchanged (already has these fields). Goal: eliminate the
+      human-default text view being strictly a subset of the machine view.
+    acceptance_criteria: >
+      pytest covers: (a) text output contains "Semantic Findings (N)" header
+      when semantic_findings non-empty; (b) --no-semantic flag suppresses
+      the section; (c) exit codes unchanged from previous behavior.
+    verification:
+      level: unit
+      command: "pytest tests/test_cli_text_parity.py -v"
+      covers:
+        tasks: ["W5-11-text-output-parity"]
+        flows: ["semantic_findings_surface"]
+    provides:
+      - name: text_semantic_parity
+        kind: runtime_capability
+
+  - id: W5-5-semantic-inconsistency
+    title: "#5 · W_VERIFY_PASSED_BUT_SEMANTIC_INCONSISTENT (confidence-gated)"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/core.py"
+      - "src/cccc/daemon/foreman/ralph_service.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "tests/test_verify_semantic_inconsistency.py"
+    awareness_paths:
+      - "src/cccc/ralph/models.py"
+    depends_on: ["W5-11-text-output-parity"]
+    addresses: ["RA-ENHANCE-5"]
+    goal_behavior: >
+      Decision Q2 v2 (Codex review corrected). Path intersection gate
+      DROPPED — it would miss the primary target of
+      _check_interface_consistency (semantic_validator.py:1086-1106)
+      which by design reports stale refs OUTSIDE task scope (external
+      callers of a renamed interface). Revised gate:
+
+      Primary (warning): ConsistencyReport.overall == "inconsistent"
+      (semantic_validator.py:1143-1152 _resolve_consistency_overall)
+      AND at least one stale_reference has confidence == "exact"
+      → emit W_VERIFY_PASSED_BUT_SEMANTIC_INCONSISTENT warning.
+      Evidence carries stale_refs (truncated) + target.op (e.g.
+      "modify_interface","rename") + highest_confidence.
+
+      Secondary (hint): report.overall == "inconsistent" but all stale
+      refs confidence == "best_effort" → hint only; upgrade to warning
+      requires ledger-observed repetition (implemented by Wave 9 audit
+      statistics, NOT here).
+
+      Inconclusive: report.overall == "inconclusive" (opaque detected)
+      → hint with "provider_degraded": true field in evidence. No warning.
+
+      Consistent: report.overall == "consistent" → no issue.
+
+      Taxonomy sanity: all code paths use existing exact/best_effort/opaque
+      triad; semantic_metrics.py:16 CONFIDENCE_LEVELS untouched. Worker-
+      facing wording is done in W4-2 prompt mapping layer (not here).
+    acceptance_criteria: >
+      pytest covers: (a) modify_interface task breaking external caller
+      NOT in claimed_paths → warning emitted (regression fixture for v1
+      gate); (b) inconsistent + all best_effort stale → hint only;
+      (c) inconclusive (opaque provider) → hint with provider_degraded
+      flag; (d) consistent → no issue; (e) semantic_metrics gate_readiness
+      still produces three-bucket output (no new confidence enum value
+      leaked).
+    verification:
+      level: integration
+      command: "pytest tests/test_verify_semantic_inconsistency.py -v"
+      covers:
+        tasks: ["W5-5-semantic-inconsistency"]
+        flows: ["semantic_findings_surface"]
+    provides:
+      - name: semantic_inconsistency_warning
+        kind: runtime_capability
+    consumes:
+      - name: finding_metadata_minimal
+        from: W4-finding-metadata
+      - name: semantic_summary_ipc
+        from: W5-3-serialize-semantic-summary
+
+  - id: W5-verify
+    title: "Wave 5 verify · semantic parity across JSON / text / prompt"
+    role: verification
+    type: backend
+    claimed_paths:
+      - "tests/test_ralph_wave5_integration.py"
+    depends_on:
+      - "W5-3-serialize-semantic-summary"
+      - "W5-11-text-output-parity"
+      - "W5-5-semantic-inconsistency"
+    addresses: ["RA-ENHANCE-3", "RA-ENHANCE-11", "RA-ENHANCE-5"]
+    goal_behavior: >
+      Integration test — same fixture runs JSON validate, text validate,
+      and prompt build; asserts semantic findings present in all three
+      surfaces. Also asserts #5 behavior against a stale-reference fixture
+      across all confidence levels.
+    acceptance_criteria: >
+      pytest passes. No "only in JSON" semantic findings remain.
+    verification:
+      level: integration
+      command: "python scripts/check_not_skip_only.py tests/test_ralph_wave5_integration.py && pytest tests/test_ralph_wave5_integration.py -v"
+      covers:
+        tasks: ["W5-3-serialize-semantic-summary", "W5-11-text-output-parity", "W5-5-semantic-inconsistency", "W5-verify"]
+        flows: ["semantic_findings_surface"]
+    consumes:
+      - name: semantic_inconsistency_warning
+        from: W5-5-semantic-inconsistency
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Wave 6 · 剩余完整性规则 + UX
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - id: W6-r2-schema-version
+    title: "R-2′ · plan.schema_version field + legacy banner + extra=forbid"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/models.py"
+      - "src/cccc/ralph/plan_io.py"
+      - "tests/test_plan_schema_version.py"
+    depends_on: ["W5-verify"]
+    addresses: ["RA-ENHANCE-R2"]
+    goal_behavior: >
+      Add Plan.schema_version: Optional[str] = None. When declared:
+      - Set model_config.extra = "forbid" on Plan and TaskSpec (strict mode);
+        typo fields raise error at load.
+      When undeclared (legacy):
+      - Keep model_config.extra = "ignore" (current).
+      - Emit explicit banner on stderr at load: "legacy schema parsing
+        active — plan.schema_version not declared. Future Ralph versions
+        may require it by 2026-07-17."
+      - Ralph continues to work.
+      Migration deadline documented in the banner text, not yet enforced.
+    acceptance_criteria: >
+      pytest: (a) plan with schema_version="1" + typo field → E_SCHEMA_UNKNOWN_FIELD
+      raised at load; (b) legacy plan without schema_version + typo field →
+      silently ignored (legacy) but banner emitted to stderr; (c) declared
+      schema_version persists through plan save roundtrip.
+    verification:
+      level: unit
+      command: "pytest tests/test_plan_schema_version.py -v"
+      covers:
+        tasks: ["W6-r2-schema-version"]
+        flows: ["plan_schema_completeness"]
+    provides:
+      - name: plan_schema_version_field
+        kind: artifact
+
+  - id: W6-cmp-bundle
+    title: "CMP-1/2/3/4/5/7 · Completeness rules sharing _covered_flow_summary fixture"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/validator.py"
+      - "tests/test_completeness_rules.py"
+    awareness_paths:
+      - "src/cccc/ralph/models.py"
+      - "src/cccc/ralph/rules_advisory.py"
+    depends_on: ["W6-r2-schema-version"]
+    addresses:
+      - "RA-ENHANCE-CMP1"
+      - "RA-ENHANCE-CMP2"
+      - "RA-ENHANCE-CMP3"
+      - "RA-ENHANCE-CMP4"
+      - "RA-ENHANCE-CMP5"
+      - "RA-ENHANCE-CMP7"
+    goal_behavior: >
+      Bundle because all six rules target validator.py and share helpers.
+      (1) Extract _covered_flow_summary(plan) helper returning
+          {covered_flow_ids, best_level_by_flow}. Replace ≥3 existing
+          ad-hoc iterations.
+      (2) CMP-1 E_COVERS_UNKNOWN_FLOW: task.verification.covers.flows
+          referencing undeclared flow id.
+      (3) CMP-2 W_STATE_UNKNOWN_TASK_REF: state.* lists contain unknown
+          task ids; evidence.state_field ∈ {"completed","failed","running"}.
+      (4) CMP-3 E_DUPLICATE_FLOW_ID, E_DUPLICATE_FORBIDDEN_FLOW_ID,
+          E_DUPLICATE_INVARIANT_NAME.
+      (5) CMP-4 W_CRITICAL_FLOW_NO_ENTRYPOINTS (warning, not error —
+          coverage/level still evaluate).
+      (6) CMP-5 H_SUPPRESS_UNUSED (current-run unused; worded to make clear
+          this is not "permanently redundant"; MUST run last so all other
+          rules complete first).
+      (7) CMP-7 W_PLAN_SCOPE_UNUSED: plan_scope has zero overlap with
+          claimed ∪ awareness ∪ critical_entrypoints ∪ flows.entrypoints.
+      All emit with action_owner="author", worker_relevance="none" (from W4).
+    acceptance_criteria: >
+      pytest: 6 rule-specific fixtures, each asserts exact issue code
+      and evidence shape. Snapshot total count of each code across test
+      plan matches expectation. CMP-5 proves its advisory wording
+      ("current-run unused", not "redundant").
+    verification:
+      level: unit
+      command: "pytest tests/test_completeness_rules.py -v"
+      covers:
+        tasks: ["W6-cmp-bundle"]
+        flows: ["plan_schema_completeness"]
+    provides:
+      - name: completeness_rules_bundle
+        kind: runtime_capability
+    consumes:
+      - name: finding_metadata_minimal
+        from: W4-finding-metadata
+
+  - id: W6-cmp6-covers-paths-unverified
+    title: "CMP-6 · W_COVERS_PATHS_UNVERIFIED (literal path extraction only)"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/filesystem_validator.py"
+      - "tests/test_covers_paths_unverified.py"
+    depends_on: ["W6-cmp-bundle"]
+    addresses: ["RA-ENHANCE-CMP6"]
+    goal_behavior: >
+      For compile/unit level verification commands, extract literal paths
+      from command + checks[*].command by scanning for path-like tokens
+      (endswith .py/.ts/.tsx/.js, or contains /). If an extracted path is
+      NOT a subset of claimed_paths ∪ verification.covers.paths, emit
+      W_COVERS_PATHS_UNVERIFIED. Skip the rule entirely when command
+      contains shell wrappers (make, tox, npm run, pytest -m, pytest -k
+      without explicit file, bash -c, sh -c) — per review, v1 only
+      handles literal cases to avoid false positives.
+    acceptance_criteria: >
+      pytest covers: (a) pytest tests/foo.py not in covers.paths → warning;
+      (b) `make test` → skipped (no warning); (c) explicit file IS in
+      covers.paths → no warning.
+    verification:
+      level: unit
+      command: "pytest tests/test_covers_paths_unverified.py -v"
+      covers:
+        tasks: ["W6-cmp6-covers-paths-unverified"]
+        flows: ["plan_schema_completeness"]
+    provides:
+      - name: covers_paths_rule
+        kind: runtime_capability
+
+  - id: W6-ux-cli
+    title: "U-6 summary banner + U-1′ ralph explain --code"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/cli.py"
+      - "tests/test_cli_ux_enhancements.py"
+    awareness_paths:
+      - "src/cccc/ralph/validator.py"
+    depends_on: ["W6-cmp6-covers-paths-unverified"]
+    addresses: ["RA-ENHANCE-U6", "RA-ENHANCE-U1"]
+    goal_behavior: >
+      (1) U-6 summary banner at top of text output:
+          "Validation: <status> (errors=N warnings=M hints=K semantic=S)"
+          where status = FAILED | PASSED_WITH_WARNINGS | PASSED.
+      (2) U-1′ extend existing `ralph explain` with --code CODE option:
+          - Print rule description, why it matters, fix template.
+          - Print preconditions (when the rule triggers).
+          - Print interaction with suppression (how to suppress if
+            intentional — per gpp-8 review).
+          Source-of-truth lives in src/cccc/ralph/agent.py as a RULE_DOCS
+          dict (new or extended); each rule code must be registered.
+    acceptance_criteria: >
+      pytest: (a) summary banner appears as first non-blank output line;
+      (b) `ralph explain --code E_COVERS_UNKNOWN_FLOW` prints 4-section
+      block (description / why / fix / suppress_interaction); (c) unknown
+      code returns non-zero exit with error envelope.
+    verification:
+      level: unit
+      command: "pytest tests/test_cli_ux_enhancements.py -v"
+      covers:
+        tasks: ["W6-ux-cli"]
+        flows: ["plan_schema_completeness"]
+    provides:
+      - name: cli_ux_v2
+        kind: runtime_capability
+
+  - id: W6-verify
+    title: "Wave 6 verify · all CMP-* + R-2′ + UX together"
+    role: verification
+    type: backend
+    claimed_paths:
+      - "tests/test_ralph_wave6_integration.py"
+    depends_on:
+      - "W6-r2-schema-version"
+      - "W6-cmp-bundle"
+      - "W6-cmp6-covers-paths-unverified"
+      - "W6-ux-cli"
+    addresses:
+      - "RA-ENHANCE-R2"
+      - "RA-ENHANCE-CMP1"
+      - "RA-ENHANCE-CMP2"
+      - "RA-ENHANCE-CMP3"
+      - "RA-ENHANCE-CMP4"
+      - "RA-ENHANCE-CMP5"
+      - "RA-ENHANCE-CMP6"
+      - "RA-ENHANCE-CMP7"
+      - "RA-ENHANCE-U6"
+      - "RA-ENHANCE-U1"
+    goal_behavior: >
+      One "problematic" fixture plan triggering every Wave 6 rule at least
+      once. Assert: each rule emits exactly once; summary banner reflects
+      counts; explain CLI prints documented output for each code.
+    acceptance_criteria: >
+      pytest passes. Explain CLI has non-zero docs for every new rule code.
+    verification:
+      level: integration
+      command: "python scripts/check_not_skip_only.py tests/test_ralph_wave6_integration.py && pytest tests/test_ralph_wave6_integration.py -v"
+      covers:
+        tasks: ["W6-r2-schema-version", "W6-cmp-bundle", "W6-cmp6-covers-paths-unverified", "W6-ux-cli", "W6-verify"]
+        flows: ["plan_schema_completeness"]
+    consumes:
+      - name: completeness_rules_bundle
+        from: W6-cmp-bundle
+      - name: covers_paths_rule
+        from: W6-cmp6-covers-paths-unverified
+      - name: cli_ux_v2
+        from: W6-ux-cli
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Wave 7 · semantic gate freshness
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - id: W7-6-gate-freshness
+    title: "#6 · Semantic Gate Cache Freshness (include metrics file mtime)"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/daemon/foreman/ralph_service.py"
+      - "src/cccc/ralph/semantic_metrics.py"
+      - "tests/test_semantic_gate_freshness.py"
+    depends_on: ["W6-verify"]
+    addresses: ["RA-ENHANCE-6"]
+    goal_behavior: >
+      Change _semantic_gate_cache key from (workflow_id, id(provider)) to
+      (workflow_id, id(provider), metrics_file_mtime_ns,
+      provider_capability_hash). metrics_file is whatever
+      semantic_metrics.py:146 actually loads — follow that path and
+      include its stat result. provider_capability_hash is derived from
+      provider.capabilities() if available, "noop" otherwise.
+      Missing metrics file → mtime = 0 (consistent key; no crash).
+      Add debug log emitting the key components to assist future
+      invalidation issues.
+    acceptance_criteria: >
+      pytest: (a) touching metrics file (update mtime) invalidates cache
+      on next _resolve_auto_gate call; (b) new workflow_id uses fresh
+      entry; (c) capability change in provider invalidates.
+    verification:
+      level: integration
+      command: "pytest tests/test_semantic_gate_freshness.py -v"
+      covers:
+        tasks: ["W7-6-gate-freshness"]
+        flows: ["daemon_fresh_rules"]
+    provides:
+      - name: gate_cache_mtime_keyed
+        kind: runtime_capability
+
+  - id: W7-verify
+    title: "Wave 7 verify · semantic gate cache never goes stale"
+    role: verification
+    type: backend
+    claimed_paths:
+      - "tests/test_ralph_wave7_integration.py"
+    depends_on: ["W7-6-gate-freshness"]
+    addresses: ["RA-ENHANCE-6"]
+    goal_behavior: >
+      End-to-end scenario: workflow registered → gate resolved "advisory"
+      → touch metrics file to simulate external update → next
+      _resolve_auto_gate re-computes (not returning cached "advisory").
+      Also asserts provider-level capability change invalidates.
+    acceptance_criteria: >
+      pytest passes. Log output shows cache miss on the second call.
+    verification:
+      level: integration
+      command: "python scripts/check_not_skip_only.py tests/test_ralph_wave7_integration.py && pytest tests/test_ralph_wave7_integration.py -v"
+      covers:
+        tasks: ["W7-6-gate-freshness", "W7-verify"]
+        flows: ["daemon_fresh_rules"]
+    consumes:
+      - name: gate_cache_mtime_keyed
+        from: W7-6-gate-freshness
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Wave 8 · provenance + fingerprint + diff
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - id: W8a-provenance-and-issue-id
+    title: "Validation provenance + stable issue_instance_id + typed evidence"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/models.py"
+      - "src/cccc/ralph/validator.py"
+      - "src/cccc/ralph/agent.py"
+      - "tests/test_validation_provenance.py"
+    awareness_paths:
+      - "src/cccc/ralph/rules_advisory.py"
+      - "src/cccc/ralph/filesystem_validator.py"
+    depends_on: ["W7-verify"]
+    addresses:
+      - "RA-ENHANCE-PROVENANCE"
+      - "RA-ENHANCE-ISSUE-ID"
+    goal_behavior: >
+      Extend ValidationReport with:
+        report_schema_version: str = "1.0.0"
+        ruleset_digest: str            # sha256 of rule registry + semantic
+                                        # mode + provider version; excludes
+                                        # timestamps and random state
+        ralph_version: str             # from package metadata
+      Extend ValidationIssue with:
+        issue_instance_id: str
+          = sha1(code + canonical_evidence_json + tuple(sorted(task_ids)))[:16]
+      Add RULE_REGISTRY dict in src/cccc/ralph/agent.py (one entry per rule
+      code with version int). Each rule bumps version on semantics change;
+      digest includes all versions.
+      Typed evidence: introduce EvidenceSchema per rule in agent.py; for
+      this PR enforce only that evidence is JSON-serializable + documented
+      field names per code.
+    acceptance_criteria: >
+      pytest: (a) same fixture plan twice → same issue_instance_ids;
+      (b) rule version bump on a rule code → ruleset_digest changes; (c)
+      report_schema_version + ruleset_digest present in both JSON and text;
+      (d) typed evidence field names match documented schema for each rule.
+    verification:
+      level: unit
+      command: "pytest tests/test_validation_provenance.py -v"
+      covers:
+        tasks: ["W8a-provenance-and-issue-id"]
+        flows: ["stable_report_provenance"]
+    provides:
+      - name: validation_provenance
+        kind: api_endpoint
+        schema_hint: "report_schema_version + ruleset_digest + issue_instance_id"
+
+  - id: W8b-suppress-lease
+    title: "Suppression Lease + W_SUPPRESS_EXPIRED + W_ORPHANED_SUPPRESSION"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/models.py"
+      - "src/cccc/ralph/validator.py"
+      - "src/cccc/ralph/plan_io.py"
+      - "tests/test_suppress_lease.py"
+    depends_on: ["W8a-provenance-and-issue-id"]
+    addresses: ["RA-ENHANCE-SUPPRESS-LEASE"]
+    goal_behavior: >
+      Decision Q5 v2 applied (identity = plan-fields, no `_provenance`).
+      Phase A only in this PR; Phase B/C deferred to follow-up.
+
+      Extend SuppressInstance (models.py; `reason` already exists at :232):
+        owner: str = ""
+        expiry: Optional[str] = None     # ISO date YYYY-MM-DD
+        review_after: Optional[str] = None
+
+      Identity rule (v2 + round-3 placeholder rejection): a suppress
+      entry is "managed/new" iff all three of {owner, reason, expiry}
+      are non-empty AND valid:
+        - owner/reason: lowercased not in {todo, tbd, unknown, n/a,
+          xxx, placeholder}
+        - expiry: parseable ISO date YYYY-MM-DD, ≤ 2 years from
+          declaration date (prevents "9999-12-31" permanent bypass)
+      Three non-empty but ANY invalid → E_SUPPRESS_LEASE_INCOMPLETE
+      (catches half-filled / placeholder states).
+      Derived PURELY from plan file content — no PrivateAttr, no
+      runtime hash set, no git history. Reload/restart safe.
+
+      Rules:
+      - Legacy suppress: silent load (Phase A).
+      - "Half-managed" suppress (one or two of the three set): loaded but
+        emit E_SUPPRESS_LEASE_INCOMPLETE — catches "user started adding
+        lease metadata but didn't finish".
+      - CLI `ralph suppress add` enforcement layer: refuses to write
+        without all three (CLI-side validation, not load-time).
+      - W_SUPPRESS_EXPIRED: suppress.expiry non-empty AND expiry < today.
+      - W_ORPHANED_SUPPRESSION: suppress.task non-empty AND
+        suppress.task ∈ state.completed_task_ids.
+
+      DO NOT touch Plan._provenance. DO NOT introduce a load-time hash
+      set for suppress identity.
+    acceptance_criteria: >
+      pytest covers: (a) fully legacy suppress (no lease fields) → silent
+      load (Phase A); (b) half-managed (owner set but expiry empty) →
+      E_SUPPRESS_LEASE_INCOMPLETE at load; (b2) owner="TODO",
+      reason="TBD", expiry="9999-12-31" → E_SUPPRESS_LEASE_INCOMPLETE
+      (placeholder rejection, round-3); (b3) expiry="2024-01-01"
+      (parseable but past) → managed + W_SUPPRESS_EXPIRED (not rejected
+      — past date is valid-but-expired, not placeholder);
+      (c) fully managed with valid fields → silent load,
+      W_SUPPRESS_EXPIRED fires if expiry past; (d) CLI
+      `ralph suppress add` without one of the three fields → exit code 2
+      refusing write (CLI-side); (e) W_ORPHANED_SUPPRESSION when
+      suppress.task already in completed_task_ids; (f) reload-roundtrip:
+      save → reload → state identical (proves identity persists).
+    verification:
+      level: integration
+      command: "pytest tests/test_suppress_lease.py -v"
+      covers:
+        tasks: ["W8b-suppress-lease"]
+        flows: ["stable_report_provenance"]
+    provides:
+      - name: suppress_lease_phase_a
+        kind: runtime_capability
+    consumes:
+      - name: validation_provenance
+        from: W8a-provenance-and-issue-id
+
+  - id: W8c-capability-manifest
+    title: "Analyzer Capability Manifest + H_SEMANTIC_COVERAGE_DEGRADED"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/validator.py"
+      - "src/cccc/ralph/rules_advisory.py"
+      - "src/cccc/ralph/semantic_validator.py"
+      - "src/cccc/ralph/agent.py"
+      - "tests/test_capability_manifest.py"
+    depends_on: ["W8b-suppress-lease"]
+    addresses: ["RA-ENHANCE-CAPABILITY"]
+    goal_behavior: >
+      For each rule family, declare capability tags in agent.py RULE_REGISTRY:
+      {language: ["python"|"any"], requires: ["ast","semantic","filesystem",
+      "serena"]}. At validate time, compute active_analyzers / skipped_
+      analyzers based on: (a) project language detection (heuristic: presence
+      of pyproject.toml / package.json / etc.); (b) provider availability.
+      Emit in report: {active_analyzers: List[str], skipped_analyzers:
+      List[{name, reason}]}. If skipped_analyzers non-empty, emit
+      H_SEMANTIC_COVERAGE_DEGRADED hint with the manifest. Text / JSON /
+      prompt paths (from W5, W4) all surface the degraded state — no
+      silent cleanliness when analyzer pool shrinks.
+    acceptance_criteria: >
+      pytest: (a) Python project with Serena available → all declared
+      analyzers active; (b) TS-only project → python-only rules skipped,
+      H_SEMANTIC_COVERAGE_DEGRADED emitted with reason list; (c) Serena
+      unavailable → semantic_validator rules skipped with reason "provider_
+      unavailable".
+    verification:
+      level: integration
+      command: "pytest tests/test_capability_manifest.py -v"
+      covers:
+        tasks: ["W8c-capability-manifest"]
+        flows: ["stable_report_provenance"]
+    provides:
+      - name: analyzer_capability_manifest
+        kind: runtime_capability
+    consumes:
+      - name: validation_provenance
+        from: W8a-provenance-and-issue-id
+
+  - id: W8d-ledger-schema-parity
+    title: "#9 · Validation ledger event reconciliation (two kinds → unified schema)"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/cli.py"
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/contracts/v1/event.py"
+      - "src/cccc/contracts/v1/ralph_ipc.py"
+      - "tests/test_ledger_schema_parity.py"
+    awareness_paths:
+      - "src/cccc/ralph/stats.py"
+    depends_on: ["W8c-capability-manifest"]
+    addresses: ["RA-ENHANCE-9"]
+    goal_behavior: >
+      Codex review structural tension #2 acknowledged: CLI today writes
+      workflow.plan_validated (cli.py:182-195 area); orchestrator writes
+      workflow.plan_validation_failed (ralph_ipc.py:53). These are NOT
+      v0/v1 of the same event — they are two different kinds with
+      different trigger semantics:
+        - workflow.plan_validated: emitted from CLI for ANY validate run
+          (pass OR fail), informational
+        - workflow.plan_validation_failed: emitted from orchestrator only
+          when validation blocks registration (error path)
+
+      Reconciliation plan (Q4 still applies, but with explicit two-kind
+      migration):
+      (1) Keep BOTH kinds — do not alias. Rename migration target to
+          "parity of SCHEMA fields within each kind", not "unify into
+          one kind".
+      (2) Canonical v1 field set (shared by both kinds, each carrying
+          them where applicable):
+            event_schema_version: 1
+            valid: bool
+            report_schema_version: str
+            ruleset_digest: str
+            errors / warnings / hints: list of {code, issue_instance_id,
+              confidence, action_owner, worker_relevance, summary}
+            counts: {errors, warnings, hints, semantic}
+          plan_validation_failed adds `blocking_code: str` (which
+          error triggered the block).
+      (3) Writers: CLI single-writes v1 shape under workflow.plan_validated
+          (pass path). Orchestrator single-writes v1 shape under
+          workflow.plan_validation_failed (fail path). Both share the
+          same renderer/serializer module.
+      (4) Readers: dual-read both kinds across v0/v1 field sets; unknown
+          version → log + treat as v0. Phase A only.
+      (5) Emit debug ralph.schema_stats event per ledger session
+          summarizing v0/v1 counts per kind (not aggregate).
+      (6) Decision Q4's 90-day retirement window applies to the v0 field
+          subset within each kind, NOT to the kinds themselves.
+    acceptance_criteria: >
+      pytest: (a) writer emits v1 schema exclusively; (b) reader accepts
+      fixture v0 events (historical) AND v1 events; (c) ralph.schema_stats
+      emitted with correct counts.
+    verification:
+      level: integration
+      command: "pytest tests/test_ledger_schema_parity.py -v"
+      covers:
+        tasks: ["W8d-ledger-schema-parity"]
+        flows: ["ledger_schema_compat"]
+    provides:
+      - name: ledger_schema_v1
+        kind: api_endpoint
+        schema_hint: "workflow.plan_validated v1 with provenance + counts"
+    consumes:
+      - name: validation_provenance
+        from: W8a-provenance-and-issue-id
+
+  - id: W8e-u3-validate-diff
+    title: "U-3 · ralph validate --diff BEFORE.json AFTER.json"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/cli.py"
+      - "tests/test_validate_diff.py"
+    awareness_paths:
+      - "src/cccc/ralph/models.py"
+    depends_on: ["W8d-ledger-schema-parity"]
+    addresses: ["RA-ENHANCE-U3"]
+    goal_behavior: >
+      New `ralph validate --diff BEFORE.json AFTER.json` subcommand. Diff
+      key = issue_instance_id (from W8a). Output sections:
+        Added:     issues in AFTER not in BEFORE
+        Removed:   issues in BEFORE not in AFTER
+        Unchanged: count only
+        Schema:    "schema_version_change: before=X after=Y" if different
+        Ruleset:   "ruleset_digest_change: before=D1 after=D2" if different
+      Refuse to diff if report_schema_version mismatch is "major" (e.g.
+      1.x vs 2.x) — exit 2 with internal error envelope.
+    acceptance_criteria: >
+      pytest: (a) identical reports → empty Added/Removed; (b) new
+      finding added → appears in Added; (c) reports from different rule
+      versions → Ruleset change line emitted; (d) major schema mismatch
+      → exit 2.
+    verification:
+      level: unit
+      command: "pytest tests/test_validate_diff.py -v"
+      covers:
+        tasks: ["W8e-u3-validate-diff"]
+        flows: ["stable_report_provenance"]
+    provides:
+      - name: validate_diff_cli
+        kind: runtime_capability
+    consumes:
+      - name: validation_provenance
+        from: W8a-provenance-and-issue-id
+
+  - id: W8-verify
+    title: "Wave 8 verify · provenance chain + diff + suppress lease + ledger"
+    role: verification
+    type: backend
+    claimed_paths:
+      - "tests/test_ralph_wave8_integration.py"
+    depends_on:
+      - "W8a-provenance-and-issue-id"
+      - "W8b-suppress-lease"
+      - "W8c-capability-manifest"
+      - "W8d-ledger-schema-parity"
+      - "W8e-u3-validate-diff"
+    addresses:
+      - "RA-ENHANCE-PROVENANCE"
+      - "RA-ENHANCE-ISSUE-ID"
+      - "RA-ENHANCE-SUPPRESS-LEASE"
+      - "RA-ENHANCE-CAPABILITY"
+      - "RA-ENHANCE-9"
+      - "RA-ENHANCE-U3"
+    goal_behavior: >
+      End-to-end provenance: run validate on fixture → save BEFORE.json →
+      edit plan.yaml (add a rule-triggering change) → run validate → save
+      AFTER.json → `ralph validate --diff BEFORE AFTER` → assert correct
+      Added/Removed partition by issue_instance_id; ledger recorded v1
+      events; suppress lease rules evaluated; capability manifest present.
+    acceptance_criteria: >
+      pytest passes. No issue_instance_id drift on unchanged issues.
+    verification:
+      level: integration
+      command: "python scripts/check_not_skip_only.py tests/test_ralph_wave8_integration.py && pytest tests/test_ralph_wave8_integration.py -v"
+      covers:
+        tasks: ["W8a-provenance-and-issue-id", "W8b-suppress-lease", "W8c-capability-manifest", "W8d-ledger-schema-parity", "W8e-u3-validate-diff", "W8-verify"]
+        flows: ["stable_report_provenance", "ledger_schema_compat"]
+    consumes:
+      - name: ledger_schema_v1
+        from: W8d-ledger-schema-parity
+      - name: validate_diff_cli
+        from: W8e-u3-validate-diff
+      - name: suppress_lease_phase_a
+        from: W8b-suppress-lease
+      - name: analyzer_capability_manifest
+        from: W8c-capability-manifest
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Wave 9 · 历史审计（独立命令）
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - id: W9-audit-cli
+    title: "ralph audit · W_TASK_FLAPPING + H_COMPLETED_BUT_UNVERIFIED"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/ralph/cli.py"
+      - "src/cccc/ralph/stats.py"
+      - "src/cccc/ralph/agent.py"
+      - "tests/test_ralph_audit.py"
+    awareness_paths:
+      - "src/cccc/contracts/v1/event.py"
+    depends_on: ["W8-verify"]
+    addresses: ["RA-ENHANCE-AUDIT"]
+    goal_behavior: >
+      New `ralph audit` subcommand. Does NOT modify plan; reads from ledger
+      + stats.py. Scope strictly limited (review: keep Ralph from becoming
+      auditor-general):
+      (1) W_TASK_FLAPPING: ledger shows same task_id with >=3 verification
+          failure events within rolling window (default 7 days).
+      (2) H_COMPLETED_BUT_UNVERIFIED: verification.skipped=true events
+          followed by completion event, no verification success between.
+      (3) Explicitly NOT in scope: H_PLAN_AGE (per review, requires
+          structured issue registry which we don't have).
+      Output shares text+JSON renderers with validate. issue_instance_id
+      computed from (code + ledger event hash + task_id).
+    acceptance_criteria: >
+      pytest: (a) synthetic ledger with 4 failures on task T1 → W_TASK_FLAPPING
+      for T1; (b) 2 failures → no emission; (c) task completed with
+      skipped=true and no subsequent success → H_COMPLETED_BUT_UNVERIFIED.
+    verification:
+      level: integration
+      command: "pytest tests/test_ralph_audit.py -v"
+      covers:
+        tasks: ["W9-audit-cli"]
+        flows: ["audit_retrospective"]
+    provides:
+      - name: audit_cli
+        kind: runtime_capability
+    consumes:
+      - name: ledger_schema_v1
+        from: W8d-ledger-schema-parity
+      - name: validation_provenance
+        from: W8a-provenance-and-issue-id
+
+  - id: W9-verify
+    title: "Wave 9 verify · audit on realistic ledger fixture"
+    role: verification
+    type: backend
+    claimed_paths:
+      - "tests/test_ralph_wave9_integration.py"
+    depends_on: ["W9-audit-cli"]
+    addresses: ["RA-ENHANCE-AUDIT"]
+    goal_behavior: >
+      Integration test: replay a realistic ledger (multi-workflow,
+      multi-task, mix of v0/v1 events); run `ralph audit`; assert
+      both rules fire correctly and only where expected.
+    acceptance_criteria: >
+      pytest passes. No false positives on healthy tasks.
+    verification:
+      level: integration
+      command: "python scripts/check_not_skip_only.py tests/test_ralph_wave9_integration.py && pytest tests/test_ralph_wave9_integration.py -v"
+      covers:
+        tasks: ["W9-audit-cli", "W9-verify"]
+        flows: ["audit_retrospective"]
+    consumes:
+      - name: audit_cli
+        from: W9-audit-cli
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Wave 10 · 跨 workflow 调度压力（非 validator warning，scheduler lane 事件）
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - id: W10-cross-workflow-pressure
+    title: "#8 · Cross-workflow write pressure via existing defer path + task heartbeat"
+    role: leaf
+    type: backend
+    claimed_paths:
+      - "src/cccc/daemon/foreman/workflow_orchestrator.py"
+      - "src/cccc/kernel/workflow_state_engine.py"
+      - "src/cccc/kernel/workflow_state_types.py"
+      - "src/cccc/contracts/v1/event.py"
+      - "tests/test_cross_workflow_pressure.py"
+    awareness_paths:
+      - "src/cccc/daemon/foreman/runtime_plan.py"
+      - "src/cccc/daemon/foreman/ralph_service.py"
+    depends_on: ["W9-verify"]
+    addresses: ["RA-ENHANCE-8"]
+    goal_behavior: >
+      Decision Q3 v2 (Codex review corrected). Original plan had three
+      virtual dependencies that don't exist:
+      - acquire_write_lease() — NOT an API in runtime_plan.py
+      - workflow.heartbeat event kind — ONLY task-level
+        KIND_TASK_HEARTBEAT (workflow_state_types.py:16) exists
+      - runtime_plan as defer authority — it's only a local projection;
+        real defer is in _defer_batch_for_single_writer
+        (workflow_orchestrator.py:687)
+
+      v2 implementation uses only existing primitives:
+
+      (1) Active-workflow signal (round-3 cold-start fix): reuse
+          task.last_heartbeat AND task.started_at
+          (workflow_state_engine.py:142,164,490; orchestrator:264,903).
+          A workflow is "active" iff workflow state is NOT terminal
+          (completed/failed/cancelled) AND any of its tasks has
+          max(started_at, last_heartbeat) updated within last 300s.
+          Using started_at (written by report_worker_started :142)
+          closes the cold-start window between dispatch and first
+          heartbeat — register_task/register_batch/approve_batch do
+          NOT write last_heartbeat (:58-110). If dispatch→start gap
+          also needs coverage, additionally check assigned_at
+          (workflow_state_types.py:51,58).
+
+      (2) Competing claim discovery: at scheduler decision time, query
+          the engine for all other active workflows and their
+          task.claimed_paths. Provide this snapshot as new optional
+          parameter to _defer_batch_for_single_writer:
+          external_competing_claims: Dict[path -> {workflow_id,
+            task_id, heartbeat_age_ms}].
+          Defer logic extends existing overlap check with this snapshot.
+
+      (3) No new event kind. Reuse workflow.task_deferred
+          (workflow_state_types.py:25 KIND_TASK_DEFERRED). Extend event
+          payload (contracts/v1/event.py TaskDeferredEvent model) with:
+            deferral_reason: Literal["internal_writer_conflict",
+              "external_workflow_pressure"]
+            competing_refs: List[{workflow_id, task_id,
+              overlapping_paths, heartbeat_age_ms}]
+          Existing consumers tolerate added fields (pydantic extra=ignore
+          on those models — verify).
+
+      (4) No lease primitive added. If long-running tasks need lock
+          beyond heartbeat window, document as §4.6 follow-up.
+
+      (5) No W_CROSS_WORKFLOW_* validator warning — per original
+          consensus, this is scheduler truth, not plan truth.
+    acceptance_criteria: >
+      pytest covers: (a) two active workflows claim overlapping paths,
+      one's task max(started_at, last_heartbeat) within 300s → pending task in the
+      other workflow gets deferred with workflow.task_deferred event
+      carrying deferral_reason="external_workflow_pressure" +
+      competing_refs non-empty; (a2) cold-start: workflow just dispatched
+      (started_at within 300s, no heartbeat yet) → still treated as
+      active → defer fires (round-3 fix); (b) competing workflow's
+      max(started_at, last_heartbeat) >300s → no defer;
+      (c) competing workflow in terminal state → no defer;
+      (d) no path overlap → no defer; (e) extend of
+      TaskDeferredEvent is backward-compatible (old consumers without
+      deferral_reason still parse).
+    verification:
+      level: integration
+      command: "pytest tests/test_cross_workflow_pressure.py -v"
+      covers:
+        tasks: ["W10-cross-workflow-pressure"]
+        flows: ["scheduler_defer_observable", "cross_workflow_warning_emission"]
+    provides:
+      - name: scheduler_lane_defer_event
+        kind: api_endpoint
+        schema_hint: "workflow.task_deferred_due_to_external_write_pressure"
+
+  - id: W10-final-e2e
+    title: "Final E2E · real daemon + Codex worker across whole enhancement surface"
+    role: verification
+    type: backend
+    claimed_paths:
+      - "tests/e2e/test_ralph_enhancement_e2e.py"
+    depends_on: ["W10-cross-workflow-pressure"]
+    addresses:
+      - "RA-ENHANCE-R1"
+      - "RA-ENHANCE-R4"
+      - "RA-ENHANCE-7"
+      - "RA-ENHANCE-1"
+      - "RA-ENHANCE-10"
+      - "RA-ENHANCE-FINDING-META"
+      - "RA-ENHANCE-2"
+      - "RA-ENHANCE-4"
+      - "RA-ENHANCE-FORBIDDEN"
+      - "RA-ENHANCE-3"
+      - "RA-ENHANCE-11"
+      - "RA-ENHANCE-5"
+      - "RA-ENHANCE-6"
+      - "RA-ENHANCE-9"
+      - "RA-ENHANCE-PROVENANCE"
+      - "RA-ENHANCE-ISSUE-ID"
+      - "RA-ENHANCE-SUPPRESS-LEASE"
+      - "RA-ENHANCE-CAPABILITY"
+      - "RA-ENHANCE-U3"
+      - "RA-ENHANCE-AUDIT"
+      - "RA-ENHANCE-8"
+      - "RA-ENHANCE-VERIFY-HARDENING"
+    goal_behavior: >
+      Spin up real daemon + register plan (which has deliberate issues of
+      each Wave 1-10 flavor) + start a real Codex worker + have it complete
+      a task. Assert:
+      (1) Worker prompt contains all 8 mandatory-minima sections (W3/W4).
+      (2) Validate JSON output contains report_schema_version,
+          ruleset_digest, issue_instance_id per issue (W8).
+      (3) Text output summary banner present (W6 U-6).
+      (4) Mid-workflow plan edit → completion blocked until
+          --force-stale-complete used; ledger records
+          workflow.plan_digest_divergence (W2).
+      (5) Parallel workflow with overlapping claims causes defer event
+          (W10).
+      (6) `ralph audit` finds no flapping in a healthy run; `ralph validate
+          --diff` between two runs shows expected Added/Removed.
+      This is the ONLY test allowed to drive real daemon + real worker.
+      Implements findings #1, #2, #6, #11 (verification is "can the system
+      do something it couldn't before").
+    acceptance_criteria: >
+      pytest passes. All 6 assertions in goal_behavior hold. No raw
+      traceback leaks anywhere. Prompt budget never exceeded. Ledger has
+      complete v1 events for validation + digest divergence + scheduler
+      defer.
+    verification:
+      level: e2e
+      command: "python scripts/check_not_skip_only.py tests/e2e/test_ralph_enhancement_e2e.py && pytest tests/e2e/test_ralph_enhancement_e2e.py -v"
+      covers:
+        tasks:
+          - "W1-stub-guard"
+          - "W1-r1-deterministic-sort"
+          - "W1-r4-mtime-cache"
+          - "W1-7-error-envelope"
+          - "W2-1-pre-transition-digest-guard"
+          - "W3-10-prompt-budgeter"
+          - "W4-finding-metadata"
+          - "W4-2-issue-digest"
+          - "W4-4-recommended-tests"
+          - "W4-forbidden-flows-inject"
+          - "W5-3-serialize-semantic-summary"
+          - "W5-11-text-output-parity"
+          - "W5-5-semantic-inconsistency"
+          - "W6-r2-schema-version"
+          - "W6-cmp-bundle"
+          - "W6-cmp6-covers-paths-unverified"
+          - "W6-ux-cli"
+          - "W7-6-gate-freshness"
+          - "W8a-provenance-and-issue-id"
+          - "W8b-suppress-lease"
+          - "W8c-capability-manifest"
+          - "W8d-ledger-schema-parity"
+          - "W8e-u3-validate-diff"
+          - "W9-audit-cli"
+          - "W10-cross-workflow-pressure"
+          - "W10-final-e2e"
+        flows:
+          - "deterministic_report_output"
+          - "daemon_fresh_rules"
+          - "internal_failure_envelope"
+          - "plan_digest_freshness"
+          - "prompt_budget_bounded"
+          - "worker_sees_blockers"
+          - "semantic_findings_surface"
+          - "plan_schema_completeness"
+          - "stable_report_provenance"
+          - "ledger_schema_compat"
+          - "audit_retrospective"
+          - "scheduler_defer_observable"
+          - "daemon_startup"
+          - "cli_workflow"
+          - "no_skip_stub_verification"
+    consumes:
+      - name: scheduler_lane_defer_event
+        from: W10-cross-workflow-pressure
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Critical declarations
+# ═══════════════════════════════════════════════════════════════════════════
+
+critical_entrypoints:
+  - src/cccc/ralph/cli.py
+  - src/cccc/ralph/validator.py
+  - src/cccc/ralph/core.py
+  - src/cccc/ralph/filesystem_validator.py
+  - src/cccc/ralph/semantic_validator.py
+  - src/cccc/ralph/semantic_metrics.py
+  - src/cccc/ralph/models.py
+  - src/cccc/ralph/plan_io.py
+  - src/cccc/ralph/stats.py
+  - src/cccc/ralph/agent.py
+  - src/cccc/ralph/rules_advisory.py
+  - src/cccc/daemon/foreman/ralph_service.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - src/cccc/daemon/foreman/runtime_plan.py
+  - src/cccc/daemon/foreman/progress_report.py
+  - src/cccc/cli/workflow_cmds.py
+  - src/cccc/contracts/v1/event.py
+  - src/cccc/contracts/v1/ralph_ipc.py
+
+critical_flows:
+  - id: no_skip_stub_verification
+    description: "scripts/check_not_skip_only.py must pass for every wave verify command; prevents task self-pass via stub"
+    entrypoints:
+      - scripts/check_not_skip_only.py
+    required_verification_level: unit
+
+  - id: deterministic_report_output
+    description: "Validate output is byte-identical across runs on unchanged plan"
+    entrypoints:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/cli.py
+    required_verification_level: unit
+
+  - id: daemon_fresh_rules
+    description: "Ralph caches (file map + semantic gate) invalidate when sources change"
+    entrypoints:
+      - src/cccc/ralph/filesystem_validator.py
+      - src/cccc/ralph/validator.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/semantic_metrics.py
+    required_verification_level: integration
+
+  - id: internal_failure_envelope
+    description: "Internal Ralph failures never leak raw tracebacks; stable stage/code enum"
+    entrypoints:
+      - src/cccc/ralph/cli.py
+      - src/cccc/ralph/agent.py
+    required_verification_level: unit
+
+  - id: plan_digest_freshness
+    description: "Stale plan writes blocked at both on_task_completed and _auto_sync_plan_state"
+    entrypoints:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/cli/workflow_cmds.py
+    required_verification_level: integration
+
+  - id: prompt_budget_bounded
+    description: "_build_task_prompt respects token budget; mandatory minima never truncated"
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+    required_verification_level: integration
+
+  - id: worker_sees_blockers
+    description: "Worker prompt contains issue digest + recommended tests + forbidden flows (all 8 mandatory)"
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/rules_advisory.py
+      - src/cccc/ralph/semantic_validator.py
+    required_verification_level: integration
+
+  - id: semantic_findings_surface
+    description: "JSON + text + worker prompt all surface semantic_findings and fingerprints"
+    entrypoints:
+      - src/cccc/ralph/cli.py
+      - src/cccc/ralph/core.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+    required_verification_level: integration
+
+  - id: plan_schema_completeness
+    description: "All CMP-* rules + schema_version + UX banner + explain CLI"
+    entrypoints:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/filesystem_validator.py
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/plan_io.py
+      - src/cccc/ralph/cli.py
+    required_verification_level: integration
+
+  - id: stable_report_provenance
+    description: "report_schema_version + ruleset_digest + issue_instance_id stable across runs"
+    entrypoints:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/agent.py
+      - src/cccc/ralph/cli.py
+    required_verification_level: integration
+
+  - id: ledger_schema_compat
+    description: "Readers accept both v0 and v1 workflow.plan_validated events"
+    entrypoints:
+      - src/cccc/ralph/cli.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/contracts/v1/event.py
+    required_verification_level: integration
+
+  - id: audit_retrospective
+    description: "ralph audit detects W_TASK_FLAPPING + H_COMPLETED_BUT_UNVERIFIED on ledger fixture"
+    entrypoints:
+      - src/cccc/ralph/cli.py
+      - src/cccc/ralph/stats.py
+    required_verification_level: integration
+
+  - id: scheduler_defer_observable
+    description: "Cross-workflow write pressure surfaces as scheduler lane event, not validator warning"
+    entrypoints:
+      - src/cccc/daemon/foreman/runtime_plan.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/contracts/v1/event.py
+    required_verification_level: integration
+
+forbidden_flows:
+  - id: silent_stale_plan_completion
+    description: "No completion write succeeds on stale plan without --force-stale-complete override"
+    required_verification_level: integration
+
+  - id: unbounded_prompt_growth
+    description: "_build_task_prompt must never exceed token budget silently — always emit omission_manifest"
+    required_verification_level: integration
+
+  - id: worker_prompt_omits_mandatory_minima
+    description: "Mandatory minima sections (8) must never be truncated, only degraded with explicit marker"
+    required_verification_level: integration
+
+  - id: severity_first_digest_inclusion
+    description: "Issue digest must not fall back to pure severity-first ordering — must honor action_owner + worker_relevance quota"
+    required_verification_level: unit
+
+  - id: char_based_truncation
+    description: "Budgeter must never truncate by char count — must use token estimate + section-level degradation"
+    required_verification_level: unit
+
+  - id: cross_workflow_warning_emission
+    description: "Must not emit W_CROSS_WORKFLOW_* validator code — cross-workflow pressure is scheduler lane event only"
+    required_verification_level: integration
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Finding refs — linking this plan back to findings.md lessons
+# ═══════════════════════════════════════════════════════════════════════════
+
+finding_refs:
+  - id: finding-1-compile-not-runnable
+    mitigation: "Every wave has integration-level verify task; W10-final-e2e drives real daemon + Codex worker"
+    enforced_by:
+      - "W1-verify"
+      - "W2-verify"
+      - "W3-verify"
+      - "W4-verify"
+      - "W5-verify"
+      - "W6-verify"
+      - "W7-verify"
+      - "W8-verify"
+      - "W9-verify"
+      - "W10-final-e2e"
+
+  - id: finding-2-file-slice-dead-code
+    mitigation: "Multi-feature prompt-projection tasks serialize on workflow_orchestrator.py; wave verify tasks own integration"
+    enforced_by:
+      - "W4-2-issue-digest"
+      - "W4-4-recommended-tests"
+      - "W4-forbidden-flows-inject"
+      - "W4-verify"
+
+  - id: finding-6-verify-before-feature
+    mitigation: "Wave 1 delivers error envelope + deterministic output FIRST; later waves depend on it"
+    enforced_by:
+      - "W1-7-error-envelope"
+      - "W1-verify"
+
+  - id: finding-9-one-path-first
+    mitigation: "Execution proceeds wave-by-wave; each wave self-contained; NO big-bang final integration"
+    enforced_by:
+      - "W1-verify"
+      - "W2-verify"
+      - "W3-verify"
+      - "W4-verify"
+
+  - id: finding-16-negative-invariants
+    mitigation: "forbidden_flows written for budget bypass, stale completion, severity-first regression, char truncation"
+    enforced_by:
+      - "W2-1-pre-transition-digest-guard"
+      - "W3-10-prompt-budgeter"
+      - "W4-2-issue-digest"
+      - "W10-cross-workflow-pressure"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Plan scope — enhancement touches these subtrees
+# ═══════════════════════════════════════════════════════════════════════════
+
+plan_scope:
+  - "src/cccc/ralph/"
+  - "src/cccc/daemon/foreman/"
+  - "src/cccc/cli/workflow_cmds.py"
+  - "src/cccc/contracts/v1/"
+  - "tests/"
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

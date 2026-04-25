@@ -1,0 +1,991 @@
+# Plan: RO-21~RO-31 + RA-1~RA-4 — 问题清单 v5 全量解决
+#
+# 来源：todo/问题清单-v5-ralph.md § 一 待实施改进 + § 一-B 蓝图 v0.3 新增
+# 工作流：findings.md § 〇 经验证的工作流程
+#
+# 设计原则：
+#   - #2  按功能切片拆分，避免按文件拆分产生死代码
+#   - #9  先跑通一条路径再扩展 — P1 > P2 > P5 严格分层
+#   - #11 verification 必须真正跑命令
+#   - #13 结构校验 + 代码审查互补
+#
+# 批次预期（由 ralph suggest 决定）：
+#   Batch 1: T1, T2, T3, T5   — 独立修复，无写冲突
+#   Batch 2: T4, T6            — 依赖 T2（统一路径逻辑）
+#   Batch 3: T7, T8, T9        — 依赖 T4/T5
+#   Batch 4: T10               — 依赖 T4, T5, T7（状态归一需前置修复完成）
+#   Batch 5: T11, T12          — 依赖 T10/T1
+#   Batch 6: T13               — 依赖 T8, T9
+#   Batch 7: T-int             — 全量集成
+
+schema_version: "1.0.0"
+
+required_issues:
+  - "RO-21"
+  - "RO-24"
+  - "RO-25"
+  - "RO-26"
+  - "RO-27"
+  - "RO-28"
+  - "RO-29"
+  - "RO-30"
+  - "RO-31"
+  - "RA-1"
+  - "RA-2"
+  - "RA-3"
+  - "RA-4"
+
+semantic_mode: "off"
+auto_infer: false
+
+critical_entrypoints:
+  - src/cccc/kernel/claimed_paths.py
+  - src/cccc/kernel/workflow_state_engine.py
+  - src/cccc/ralph/core.py
+  - src/cccc/ralph/models.py
+  - src/cccc/ralph/validator.py
+  - src/cccc/ralph/cli.py
+  - src/cccc/daemon/foreman/ralph_service.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - src/cccc/daemon/ralph_ipc_handler.py
+
+critical_flows:
+  - id: path_overlap_unified
+    description: >
+      claimed_paths conflict detection uses parent-child path overlap
+      consistently across kernel, ralph.core, ralph_service, and orchestrator
+    entrypoints:
+      - src/cccc/kernel/claimed_paths.py
+    required_verification_level: unit
+
+  - id: verification_skipped_blocked
+    description: >
+      Task with no verification commands → verify_completion returns skipped
+      → engine does NOT transition to COMPLETED → task stays BLOCKED/VERIFYING
+    entrypoints:
+      - src/cccc/kernel/workflow_state_engine.py
+      - src/cccc/daemon/foreman/ralph_service.py
+    required_verification_level: integration
+
+  - id: fallback_explicit_error
+    description: >
+      Missing group_id/project_root in _try_process_batch → returns error
+      (not skipped) → outer handler surfaces failure
+    entrypoints:
+      - src/cccc/daemon/ralph_ipc_handler.py
+    required_verification_level: unit
+
+  - id: cross_scope_detection
+    description: >
+      Verification check command references path in another task's
+      claimed_paths → validate reports W_VERIFICATION_CROSS_SCOPE
+    entrypoints:
+      - src/cccc/ralph/validator.py
+    required_verification_level: unit
+
+  - id: validate_auto_group
+    description: >
+      ralph validate without --group auto-detects group from project_root
+      → writes ledger event
+    entrypoints:
+      - src/cccc/ralph/cli.py
+    required_verification_level: unit
+
+  - id: beyond_scope_checklist
+    description: >
+      Beyond-scope checklist marks matching ValidationIssue with
+      beyond_scope=true for downstream Agent consumption
+    entrypoints:
+      - src/cccc/ralph/validator.py
+    required_verification_level: unit
+
+  - id: verification_mode_routing
+    description: >
+      Task with verification_mode=agent → verify gate routes to Agent path
+      (not core.verify); verification_mode=ralph → existing path unchanged
+    entrypoints:
+      - src/cccc/daemon/foreman/ralph_service.py
+    required_verification_level: integration
+
+forbidden_flows:
+  - id: FF_skipped_becomes_completed
+    description: >
+      verification outcome "skipped" must NOT automatically transition
+      task to COMPLETED state
+    test_created_by: [T4]
+    required_verification_level: unit
+
+  - id: FF_missing_params_ok
+    description: >
+      _try_process_batch with missing group_id/project_root must NOT
+      return status="skipped" (must return error)
+    test_created_by: [T5]
+    required_verification_level: unit
+
+  - id: FF_silent_fallback
+    description: >
+      Agent pool rejection must NOT silently auto-approve via group actor
+      fallback without explicit configuration
+    test_created_by: [T5]
+    required_verification_level: unit
+
+  - id: FF_parent_child_path_miss
+    description: >
+      detect_write_set_conflicts(["src"], ["src/a.py"]) must NOT return
+      empty (must detect parent-child overlap)
+    test_created_by: [T2]
+    required_verification_level: unit
+
+suppress_codes:
+  - "W_VERIFICATION_PYTEST_K_NO_MATCH"
+  - "W_UNCLAIMED_TEST_FOR_SOURCE"
+  - "W_TEST_COVERAGE_GAP"
+  - "W_PLAN_SCOPE_UNUSED"
+  - "E_CRITICAL_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED"
+  - "E_CRITICAL_FLOW_UNCOVERED"
+  - "W_FLOW_SEGMENT_UNOWNED"
+  - "W_CROSS_BOUNDARY_WITHOUT_GLUE"
+  - "W_COVERS_NOT_EXERCISED"
+  - "W_FLOW_OWNER_NO_VERIFICATION"
+  - "W_NO_EARLY_INTEGRATION_CHECKPOINT"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tasks
+# ═══════════════════════════════════════════════════════════════════════════
+
+tasks:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T1: RO-29 — Fix BatchResult duplicate fields (P2)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T1
+    title: "RO-29: Remove BatchResult duplicate fields, fix batch_boundary default"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RO-29"]
+    claimed_paths:
+      - src/cccc/ralph/models.py
+      - tests/ralph/test_batch_result_defaults.py
+    awareness_paths:
+      - src/cccc/ralph/core.py
+    goal_behavior: >
+      Remove duplicate field definitions (task_metadata, batch_sequence,
+      batch_boundary) in BatchResult class (models.py L380-385). Keep only
+      one definition per field with the design-intended defaults:
+      task_metadata: Dict[str, Dict[str, str]], batch_sequence: int = 0,
+      batch_boundary: bool = True (the first definition's value, matching
+      the "batch boundary marks the end of a batch" semantic).
+    acceptance_criteria: >
+      BatchResult.model_fields["batch_boundary"].default == True;
+      no duplicate field names in BatchResult class body;
+      unit test asserting correct defaults passes.
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_batch_result_defaults.py -xvs"
+      checks:
+        - name: default_values
+          command: >
+            python -c "from cccc.ralph.models import BatchResult;
+            b = BatchResult();
+            assert b.batch_boundary is True, f'Expected True, got {b.batch_boundary}';
+            assert b.batch_sequence == 0;
+            assert b.task_metadata == {};
+            print('OK: BatchResult defaults correct')"
+          required: true
+    provides:
+      - name: batch_result_clean_model
+        kind: artifact
+    failure_path: >
+      Batch boundary semantics remain ambiguous; suggest() may produce
+      unexpected batch splits.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T2: RO-28 — Unify claimed_paths overlap detection (P1)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T2
+    title: "RO-28: Consolidate path overlap logic into kernel.claimed_paths"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RO-28"]
+    claimed_paths:
+      - src/cccc/kernel/claimed_paths.py
+      - tests/test_claimed_paths_overlap.py
+    awareness_paths:
+      - src/cccc/ralph/core.py
+      - src/cccc/daemon/foreman/ralph_service.py
+    goal_behavior: >
+      Move _paths_overlap(), _normalize_path(), _normalize_write_set() from
+      ralph/core.py into kernel/claimed_paths.py as the single canonical
+      implementation. Update detect_write_set_conflicts() to use
+      _paths_overlap() for parent-child overlap detection (currently only
+      does exact set intersection). Export public API from claimed_paths
+      module. Update ralph/core.py and ralph_service.py to import from
+      kernel.claimed_paths instead of maintaining local copies.
+    acceptance_criteria: >
+      detect_write_set_conflicts([{"task_id":"a","paths":["src"]},
+      {"task_id":"b","paths":["src/a.py"]}]) returns a conflict;
+      ralph/core.py and ralph_service.py import from kernel.claimed_paths;
+      no duplicate _paths_overlap or _normalize_path implementations remain.
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_claimed_paths_overlap.py -xvs"
+      checks:
+        - name: parent_child_overlap
+          command: >
+            python -c "from cccc.kernel.claimed_paths import detect_write_set_conflicts;
+            r = detect_write_set_conflicts([
+              {'task_id': 'a', 'paths': ['src']},
+              {'task_id': 'b', 'paths': ['src/a.py']}
+            ]);
+            assert len(r) == 1, f'Expected 1 conflict, got {r}';
+            print('OK: parent-child overlap detected')"
+          required: true
+        - name: no_duplicate_impl
+          command: >
+            grep -rn "def _paths_overlap" src/cccc/ | wc -l | xargs test 1 -eq
+          required: true
+      covers:
+        paths:
+          - src/cccc/kernel/claimed_paths.py
+        flows:
+          - path_overlap_unified
+    provides:
+      - name: unified_path_overlap
+        kind: runtime_capability
+    failure_path: >
+      claimed_paths conflict detection remains inconsistent across
+      Ralph suggest, engine approve_batch, and cross-workflow pressure.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T3: RO-21 — ralph validate auto-detect group (P2, partial fix)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T3
+    title: "RO-21: Auto-detect group in ralph validate from project_root"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RO-21"]
+    claimed_paths:
+      - src/cccc/ralph/cli.py
+      - tests/ralph/test_validate_auto_group.py
+    awareness_paths:
+      - src/cccc/daemon/group/bootstrap_actor_ops.py
+      - src/cccc/kernel/ledger.py
+    goal_behavior: >
+      When ralph validate is invoked with --ledger but without --group,
+      auto-detect the group by searching for attached groups whose
+      project_root matches the resolved plan directory (or --project-root).
+      If exactly one group matches, use it. If zero or multiple match,
+      emit a clear diagnostic and require explicit --group.
+    acceptance_criteria: >
+      ralph validate plan.yaml --ledger writes workflow.plan_validated
+      event to the correct group's ledger without requiring --group,
+      when exactly one group is attached to the project_root.
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_validate_auto_group.py -xvs"
+      checks:
+        - name: auto_detect_works
+          command: "python -m pytest tests/ralph/test_validate_auto_group.py -k auto_detect -xvs"
+          required: true
+      covers:
+        flows:
+          - validate_auto_group
+    provides:
+      - name: validate_auto_group
+        kind: runtime_capability
+    failure_path: >
+      Foreman must manually pass --group for ledger events to appear;
+      "NO evidence" in E2E audit continues.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T4: RO-25 — verification skipped ≠ completed (P1)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T4
+    title: "RO-25: Block task completion when verification is skipped"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RO-25"]
+    claimed_paths:
+      - src/cccc/kernel/workflow_state_engine.py
+      - src/cccc/kernel/workflow_state_types.py
+      - tests/test_verification_skipped_blocked.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+    goal_behavior: >
+      Change record_verification_result() so that outcome="skipped" does NOT
+      transition the task to COMPLETED. Instead, skipped transitions to a new
+      VERIFICATION_BLOCKED status (or stays VERIFYING with a ledger event
+      KIND_VERIFICATION_SKIPPED_BLOCKED). The task can only proceed to
+      COMPLETED via: (a) adding real verification commands and re-running,
+      or (b) explicit Foreman override via a new force_complete_unverified()
+      method that writes a dedicated ledger event. Update _apply_verification()
+      replay to match: KIND_VERIFICATION_SKIPPED → FAILED (not COMPLETED).
+      Update orchestrator apply_task_event and on_verification_result to
+      handle the new behavior (skipped no longer in the success set).
+    acceptance_criteria: >
+      Task with no verification commands → verify_completion → skipped →
+      engine state is FAILED (not COMPLETED); ledger contains
+      KIND_VERIFICATION_SKIPPED with no subsequent COMPLETED transition;
+      orchestrator treats skipped as failure, not success.
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_verification_skipped_blocked.py -xvs"
+      checks:
+        - name: skipped_not_completed
+          command: >
+            python -m pytest tests/test_verification_skipped_blocked.py
+            -k "skipped_does_not_complete" -xvs
+          required: true
+        - name: force_override_works
+          command: >
+            python -m pytest tests/test_verification_skipped_blocked.py
+            -k "force_complete" -xvs
+          required: true
+      covers:
+        paths:
+          - src/cccc/kernel/workflow_state_engine.py
+        flows:
+          - verification_skipped_blocked
+    provides:
+      - name: verification_gate_integrity
+        kind: runtime_capability
+    failure_path: >
+      Tasks with no real verification can still silently enter completed
+      state, undermining the verify gate's core value.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T5: RO-27 — fallback/degradation returns error (P1)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T5
+    title: "RO-27: Make missing-params and pool-rejection return explicit errors"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RO-27"]
+    claimed_paths:
+      - src/cccc/daemon/ralph_ipc_handler.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - tests/test_fallback_error_paths.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/agent_pool.py
+    goal_behavior: >
+      (1) _try_process_batch(): when group_id or project_root is missing,
+      return {"status":"error","reason":"..."} instead of "skipped".
+      (2) _fallback_to_group_actors(): remove the automatic approval
+      fallback. Instead, when pool rejects and no explicit fallback_allowed
+      flag is set in the suggestion, return None (let rejection stand).
+      Add a fallback_allowed: bool field to ReadyBatchSuggestion that
+      must be explicitly True to enable group actor fallback. When
+      fallback IS used, write a ledger event documenting the decision.
+      (3) Ensure ralph_batch_suggest outer handler surfaces error status
+      from _try_process_batch instead of wrapping in ok response.
+    acceptance_criteria: >
+      _try_process_batch with no group_id returns status="error";
+      pool rejected batch without fallback_allowed stays rejected;
+      fallback_allowed=True with available group actors produces
+      approved result + ledger event with reason.
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_fallback_error_paths.py -xvs"
+      checks:
+        - name: missing_params_error
+          command: >
+            python -m pytest tests/test_fallback_error_paths.py
+            -k "missing_params" -xvs
+          required: true
+        - name: no_silent_fallback
+          command: >
+            python -m pytest tests/test_fallback_error_paths.py
+            -k "no_silent_fallback" -xvs
+          required: true
+      covers:
+        flows:
+          - fallback_explicit_error
+    provides:
+      - name: explicit_error_paths
+        kind: runtime_capability
+    failure_path: >
+      Configuration errors silently swallowed; pool rejections auto-approved
+      without audit trail.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T6: RO-24 — Verification cross-scope detection (P2)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T6
+    title: "RO-24: Detect verification commands referencing other tasks' paths"
+    role: leaf
+    type: backend
+    depends_on:
+      - T2
+    addresses: ["RO-24"]
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+      - tests/ralph/test_cross_scope_verification.py
+    awareness_paths:
+      - src/cccc/kernel/claimed_paths.py
+      - src/cccc/ralph/models.py
+    goal_behavior: >
+      Add validation rule W_VERIFICATION_CROSS_SCOPE: for each task's
+      verification.checks[].command, extract referenced paths (directory
+      and file arguments), and check if any referenced path falls within
+      another task's claimed_paths but NOT within the current task's
+      claimed_paths. Use the unified _paths_overlap() from
+      kernel.claimed_paths (provided by T2). Report as warning with
+      evidence showing which check, which path, and which other task
+      owns it.
+    acceptance_criteria: >
+      Plan where T1's check runs "pytest backend/tests/" but backend/tests/
+      is claimed by T2 → validator reports W_VERIFICATION_CROSS_SCOPE
+      warning for T1. Plan where T1's check only references own paths →
+      no warning.
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_cross_scope_verification.py -xvs"
+      checks:
+        - name: cross_scope_detected
+          command: >
+            python -m pytest tests/ralph/test_cross_scope_verification.py
+            -k "cross_scope_warning" -xvs
+          required: true
+        - name: same_scope_no_warning
+          command: >
+            python -m pytest tests/ralph/test_cross_scope_verification.py
+            -k "own_scope_no_warning" -xvs
+          required: true
+      covers:
+        flows:
+          - cross_scope_detection
+    consumes:
+      - name: unified_path_overlap
+        kind: runtime_capability
+        from: T2
+    provides:
+      - name: cross_scope_rule
+        kind: artifact
+    failure_path: >
+      Verification commands silently reference other tasks' paths,
+      causing spurious failures when tasks run in parallel.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T7: RO-30 — Clean stubs, align interfaces (P2)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T7
+    title: "RO-30: Remove stub interfaces, align RalphService API with reality"
+    role: leaf
+    type: backend
+    depends_on:
+      - T4
+    addresses: ["RO-30"]
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - tests/test_ralph_service_api.py
+    awareness_paths:
+      - src/cccc/ralph/core.py
+    goal_behavior: >
+      (1) Remove merge_worktree() (always returns False — unused).
+      (2) Remove analyze_import_graph() (returns empty list — unused).
+      (3) Remove detect_test_impact() (returns empty list — unused).
+      (4) Verify no callers reference these methods; if any do, remove
+      the calls too. (5) Add a docstring to RalphService clarifying its
+      three roles: CLI static validation, daemon-internal verify gate,
+      optional Agent review (RA-1 future). (6) Ensure tests don't accept
+      empty-list/False as success for removed methods.
+    acceptance_criteria: >
+      grep -rn "merge_worktree\|analyze_import_graph\|detect_test_impact"
+      src/cccc/ returns no hits; RalphService has clear role docstring;
+      existing tests still pass after removal.
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_ralph_service_api.py -xvs"
+      checks:
+        - name: stubs_removed
+          command: >
+            ! grep -rn "merge_worktree\|analyze_import_graph\|detect_test_impact"
+            src/cccc/daemon/foreman/ralph_service.py
+          required: true
+        - name: no_callers
+          command: >
+            ! grep -rn "merge_worktree\|analyze_import_graph\|detect_test_impact"
+            src/cccc/ --include="*.py" | grep -v "test_ralph_service_api"
+          required: true
+      covers:
+        paths:
+          - src/cccc/daemon/foreman/ralph_service.py
+    provides:
+      - name: clean_ralph_service_api
+        kind: artifact
+    failure_path: >
+      Stubs remain in code, documentation continues to claim
+      capabilities that don't exist.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T8: RA-2 — Beyond-scope checklist mechanism (P5)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T8
+    title: "RA-2: Implement beyond-scope checklist for Ralph Agent"
+    role: leaf
+    type: backend
+    depends_on: []
+    addresses: ["RA-2"]
+    claimed_paths:
+      - src/cccc/ralph/beyond_scope_checklist.yaml
+      - tests/ralph/test_beyond_scope_checklist.py
+    awareness_paths:
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/models.py
+    goal_behavior: >
+      (1) Create beyond_scope_checklist.yaml with initial entries from
+      问题清单-v5-ralph.md §二 已知局限: RV-15, RV-18, RV-19, RV-20,
+      RO-10n, RO-11n, RO-12n (those marked 🤖 可覆盖).
+      Each entry has: id, pattern (validation code or keyword to match),
+      description. (2) During validate, load the checklist and mark
+      matching ValidationIssue instances with beyond_scope=true
+      (field already exists on the model). (3) validate output in text
+      mode shows [beyond_scope] tag on marked issues. (4) Checklist is
+      static config, not modified during workflow execution.
+    acceptance_criteria: >
+      validate output includes beyond_scope=true on issues matching
+      checklist patterns; checklist loads without error; missing checklist
+      file degrades gracefully (no beyond_scope marking, no error).
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_beyond_scope_checklist.py -xvs"
+      checks:
+        - name: checklist_loads
+          command: >
+            python -c "import yaml; from pathlib import Path;
+            data = yaml.safe_load(Path('src/cccc/ralph/beyond_scope_checklist.yaml').read_text());
+            assert 'items' in data;
+            assert len(data['items']) >= 5;
+            print(f'OK: {len(data[\"items\"])} checklist items loaded')"
+          required: true
+      covers:
+        flows:
+          - beyond_scope_checklist
+    provides:
+      - name: beyond_scope_checklist
+        kind: artifact
+    failure_path: >
+      Ralph Agent (RA-1) has no structured input for what to review,
+      reducing its effectiveness.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T9: RA-3 — verification_mode routing (P5)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T9
+    title: "RA-3: Route verification by verification_mode (ralph vs agent)"
+    role: leaf
+    type: backend
+    depends_on:
+      - T4
+    addresses: ["RA-3"]
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/validator.py
+      - tests/ralph/test_verification_mode_routing.py
+    awareness_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/kernel/workflow_state_engine.py
+    goal_behavior: >
+      (1) Add validator rule: W_UNKNOWN_VERIFICATION_MODE if
+      verification_mode not in {"ralph", "agent"}.
+      (2) In RalphService.verify_completion(), check task_ref's
+      verification_mode. If "ralph", use existing core.verify() path.
+      If "agent", return a VerificationResult with overall_outcome=
+      "agent_pending" and summary indicating Agent review needed
+      (Agent implementation comes in RA-1/T13).
+      (3) verification_mode="ralph" is the default; existing behavior
+      unchanged for tasks that don't set it.
+    acceptance_criteria: >
+      Task with verification_mode="ralph" → existing verification path;
+      task with verification_mode="agent" → outcome "agent_pending";
+      task with verification_mode="invalid" → validator warns;
+      backward compatible: tasks without verification_mode → ralph path.
+    verification:
+      level: integration
+      command: "python -m pytest tests/ralph/test_verification_mode_routing.py -xvs"
+      checks:
+        - name: ralph_mode_unchanged
+          command: >
+            python -m pytest tests/ralph/test_verification_mode_routing.py
+            -k "ralph_mode" -xvs
+          required: true
+        - name: agent_mode_pending
+          command: >
+            python -m pytest tests/ralph/test_verification_mode_routing.py
+            -k "agent_mode" -xvs
+          required: true
+      covers:
+        flows:
+          - verification_mode_routing
+    consumes:
+      - name: verification_gate_integrity
+        kind: runtime_capability
+        from: T4
+    provides:
+      - name: verification_mode_routing
+        kind: runtime_capability
+    failure_path: >
+      No verification_mode routing means Agent verification path
+      cannot be implemented in RA-1.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T10: RO-26 — State source consolidation (P1)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T10
+    title: "RO-26: Consolidate state to WorkflowEngine as single truth source"
+    role: leaf
+    type: backend
+    depends_on:
+      - T4
+      - T5
+      - T7
+    addresses: ["RO-26"]
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/ralph_ipc_handler.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - tests/test_state_consolidation.py
+    awareness_paths:
+      - src/cccc/kernel/workflow_state_engine.py
+      - src/cccc/kernel/workflow_state_types.py
+    goal_behavior: >
+      (1) Remove _task_statuses dict from RalphService — all task lifecycle
+      state queries go through WorkflowEngine projection.
+      (2) Remove _task_refs dict from RalphService — task references come
+      from plan file or engine.
+      (3) Reduce _RALPH_STATE in ralph_ipc_handler.py to only hold
+      pending IPC messages not yet processed by engine, with TTL-based
+      cleanup (entries older than 5 minutes auto-removed).
+      (4) Remove duplicate state tracking in WorkflowOrchestrator._active_workflows
+      task status dicts — instead, query engine.get_task_state() for
+      current status. Keep _active_workflows only for batch tracking
+      and workflow-level metadata.
+      (5) Ensure workflow progress, task verify, task complete, and
+      sync-state all read from engine projection.
+    acceptance_criteria: >
+      _task_statuses removed from RalphService; _RALPH_STATE entries
+      have TTL cleanup; orchestrator task status queries go through
+      engine; E2E workflow test passes with consolidated state.
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_state_consolidation.py -xvs"
+      checks:
+        - name: no_task_statuses
+          command: >
+            ! grep -n "_task_statuses" src/cccc/daemon/foreman/ralph_service.py
+          required: true
+        - name: ralph_state_ttl
+          command: >
+            python -m pytest tests/test_state_consolidation.py
+            -k "ralph_state_ttl" -xvs
+          required: true
+      covers:
+        paths:
+          - src/cccc/daemon/foreman/workflow_orchestrator.py
+          - src/cccc/daemon/ralph_ipc_handler.py
+          - src/cccc/daemon/foreman/ralph_service.py
+    consumes:
+      - name: verification_gate_integrity
+        kind: runtime_capability
+        from: T4
+      - name: explicit_error_paths
+        kind: runtime_capability
+        from: T5
+      - name: clean_ralph_service_api
+        kind: artifact
+        from: T7
+    provides:
+      - name: unified_state_source
+        kind: runtime_capability
+    failure_path: >
+      CLI, UI, ledger, and Ralph continue reading different state
+      projections, causing inconsistent progress reporting.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T11: RO-31 — Module complexity reduction (P2)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T11
+    title: "RO-31: Split oversized orchestrator/validator into focused modules"
+    role: leaf
+    type: backend
+    depends_on:
+      - T10
+    addresses: ["RO-31"]
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/admission.py
+      - src/cccc/daemon/foreman/verification_gate.py
+      - src/cccc/daemon/foreman/prompt_builder.py
+      - src/cccc/ralph/validator.py
+      - src/cccc/ralph/validation_rules/__init__.py
+      - src/cccc/ralph/validation_rules/structural.py
+      - src/cccc/ralph/validation_rules/coverage.py
+      - src/cccc/ralph/validation_rules/contracts.py
+      - tests/test_module_split.py
+    awareness_paths:
+      - src/cccc/ralph/semantic_validator.py
+    goal_behavior: >
+      (1) Extract from workflow_orchestrator.py:
+        - admission.py: admission control logic (batch evaluation, single-writer)
+        - verification_gate.py: verify_task_completion flow
+        - prompt_builder.py: _build_task_prompt and PromptBudget
+      (2) Extract from validator.py:
+        - validation_rules/structural.py: graph, dependency, field checks
+        - validation_rules/coverage.py: flow, entrypoint, covers checks
+        - validation_rules/contracts.py: provider/consumer/contract checks
+        - validation_rules/__init__.py: rule registry
+      (3) orchestrator.py and validator.py become thin dispatchers.
+      (4) No behavioral change — pure refactor, existing tests must pass.
+    acceptance_criteria: >
+      workflow_orchestrator.py < 1500 lines; validator.py < 800 lines;
+      all functions < 80 lines; all existing Ralph/Workflow tests pass
+      without modification.
+    verification:
+      level: integration
+      command: "python -m pytest tests/ -x --timeout=120 -q"
+      checks:
+        - name: orchestrator_size
+          command: >
+            python -c "
+            lines = len(open('src/cccc/daemon/foreman/workflow_orchestrator.py').readlines());
+            assert lines < 1500, f'orchestrator too large: {lines} lines';
+            print(f'OK: orchestrator {lines} lines')"
+          required: true
+        - name: validator_size
+          command: >
+            python -c "
+            lines = len(open('src/cccc/ralph/validator.py').readlines());
+            assert lines < 800, f'validator too large: {lines} lines';
+            print(f'OK: validator {lines} lines')"
+          required: true
+        - name: all_tests_pass
+          command: "python -m pytest tests/ -x --timeout=120 -q"
+          required: true
+    consumes:
+      - name: unified_state_source
+        kind: runtime_capability
+        from: T10
+    provides:
+      - name: split_modules
+        kind: artifact
+    failure_path: >
+      Large files continue to make state transitions, error paths, and
+      validation rules hard to review.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T12: RA-4 — Two-phase split alignment (P5)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T12
+    title: "RA-4: Verify and align suggest() for two-phase task/module split"
+    role: leaf
+    type: backend
+    depends_on:
+      - T1
+    addresses: ["RA-4"]
+    claimed_paths:
+      - src/cccc/ralph/core.py
+      - tests/ralph/test_two_phase_split.py
+    awareness_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+    goal_behavior: >
+      (1) Verify that suggest() correctly produces task-level batches
+      where each batch respects dependency and write-set constraints.
+      (2) If BatchResult needs additional fields to support Foreman's
+      module-level sub-splitting (e.g., task functional description),
+      extend BatchResult with backward-compatible optional fields.
+      (3) Write tests demonstrating the two-phase model: suggest()
+      outputs task batches → Foreman can split each task into modules
+      → next suggest() computes the next batch.
+    acceptance_criteria: >
+      suggest() produces correct batches for a plan with 5+ tasks with
+      mixed dependencies; BatchResult carries enough metadata for Foreman
+      to do module splitting; test demonstrates batch→module→next-batch
+      progression.
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_two_phase_split.py -xvs"
+      checks:
+        - name: batch_correctness
+          command: >
+            python -m pytest tests/ralph/test_two_phase_split.py
+            -k "batch_respects_deps" -xvs
+          required: true
+      covers:
+        paths:
+          - src/cccc/ralph/core.py
+    consumes:
+      - name: batch_result_clean_model
+        kind: artifact
+        from: T1
+    provides:
+      - name: two_phase_ready
+        kind: runtime_capability
+    failure_path: >
+      suggest() output is insufficient for Foreman's module-level
+      splitting, requiring manual batch construction.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T13: RA-1 — Ralph Agent layer (P5)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T13
+    title: "RA-1: Implement Ralph Agent layer for semantic review"
+    role: leaf
+    type: backend
+    depends_on:
+      - T8
+      - T9
+    addresses: ["RA-1"]
+    claimed_paths:
+      - src/cccc/ralph/agent.py
+      - src/cccc/ralph/cli.py
+      - tests/ralph/test_ra1_agent.py
+    awareness_paths:
+      - src/cccc/ralph/beyond_scope_checklist.yaml
+      - src/cccc/ralph/validator.py
+      - src/cccc/daemon/foreman/ralph_service.py
+    goal_behavior: >
+      (1) Implement Ralph Agent module (ralph/agent.py) that:
+        - Accepts beyond_scope issues from validate output
+        - Invokes Gemini CLI Flash model for semantic review
+        - Returns structured agent suggestions (advisory only, no decisions)
+        - Results tagged as "agent suggestion, for reference only"
+      (2) Integrate into ralph validate: after structural validation,
+      pass beyond_scope issues to Agent for review.
+      (3) Add --no-agent CLI flag to ralph validate to disable Agent
+      and fall back to pure static validation.
+      (4) Agent operates per-workflow, can be started independently.
+      (5) Reuse existing persistent agent mechanism.
+    acceptance_criteria: >
+      ralph validate with Agent enabled processes beyond_scope items;
+      --no-agent produces same output as current static-only mode;
+      Agent results appear in validate output with advisory tag;
+      Agent can be started independently of workflow.
+    verification:
+      level: integration
+      command: "python -m pytest tests/ralph/test_ra1_agent.py -xvs"
+      checks:
+        - name: no_agent_fallback
+          command: >
+            python -m pytest tests/ralph/test_ra1_agent.py
+            -k "no_agent_static_only" -xvs
+          required: true
+        - name: agent_processes_beyond_scope
+          command: >
+            python -m pytest tests/ralph/test_ra1_agent.py
+            -k "agent_reviews_beyond_scope" -xvs
+          required: true
+    consumes:
+      - name: beyond_scope_checklist
+        kind: artifact
+        from: T8
+      - name: verification_mode_routing
+        kind: runtime_capability
+        from: T9
+    provides:
+      - name: ralph_agent_layer
+        kind: runtime_capability
+    failure_path: >
+      Known limitations (RV-15/18/19/20, RO-10n) remain without
+      any automated semantic review capability.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # T-int: Integration test across all changes
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: T-int
+    title: "Integration test: full Ralph pipeline with all improvements"
+    role: integration
+    type: backend
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T4
+      - T5
+      - T6
+      - T7
+      - T8
+      - T9
+      - T10
+      - T11
+      - T12
+      - T13
+    addresses: []
+    claimed_paths:
+      - tests/test_v5_full_integration.py
+    awareness_paths:
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/validator.py
+      - src/cccc/kernel/workflow_state_engine.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+    goal_behavior: >
+      End-to-end integration test covering:
+      (1) Plan with parent-child path overlap → detected by unified logic
+      (2) Plan with cross-scope verification → W_VERIFICATION_CROSS_SCOPE
+      (3) Task completion flow: skipped → FAILED, passed → COMPLETED
+      (4) Missing params → error not skipped
+      (5) BatchResult defaults are correct
+      (6) beyond_scope marking on known limitation codes
+      (7) verification_mode routing (ralph vs agent)
+      (8) Full suggest→verify→complete cycle
+    acceptance_criteria: >
+      Single test file exercises all 13 RO/RA improvements in a
+      cohesive scenario; all assertions pass; test runs in < 30s.
+    verification:
+      level: e2e
+      command: "python -m pytest tests/test_v5_full_integration.py -xvs --timeout=30"
+      checks:
+        - name: full_pipeline
+          command: "python -m pytest tests/test_v5_full_integration.py -xvs --timeout=30"
+          required: true
+      covers:
+        tasks: [T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13]
+        flows:
+          - path_overlap_unified
+          - verification_skipped_blocked
+          - fallback_explicit_error
+          - cross_scope_detection
+          - validate_auto_group
+          - beyond_scope_checklist
+          - verification_mode_routing
+
+state:
+  completed_task_ids:
+    - T-int
+    - T11
+    - T13
+    - T10
+    - T9
+    - T12
+    - T7
+    - T6
+    - T8
+    - T5
+    - T4
+    - T3
+    - T2
+    - T1
+  running_tasks: []
+  failed_task_ids: []

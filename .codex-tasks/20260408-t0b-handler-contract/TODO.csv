@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Create task artifacts and confirm T0b acceptance,DONE,T0b scope and verification commands are captured,test -f .codex-tasks/20260408-t0b-handler-contract/SPEC.md,2026-04-08T14:31:00+0800,0,计划与现有调用面已确认
+2,Implement IPC contract changes,DONE,ralph_ipc.py and ipc.py expose the new contract without schema breakage,python -c "from cccc.contracts.v1.ralph_ipc import RalphRegisterResponse; print('PASS')",2026-04-08T14:31:00+0800,0,已增加 validation model 常量 typed response，并保持 DaemonResponse schema 不变
+3,Add validation error tests and compat assertions,DONE,New and existing IPC tests cover defaults roundtrip and backward compatibility,python -m pytest tests/test_ralph_ipc_validation_errors.py -v --tb=short,2026-04-08T14:31:00+0800,0,新增 5 个 validation contract 测试并补充现有 IPC 默认值兼容断言
+4,Run requested verification commands,DONE,All plan verification commands pass,python -m pytest tests/test_ralph_ipc.py -v --tb=short,2026-04-08T14:31:00+0800,0,两条 python -c smoke checks 通过；新增测试 5 passed；既有 IPC 测试 46 passed

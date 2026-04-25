@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Create task record,DONE,"Task dir with SPEC/TODO/PROGRESS exists","test -f .codex-tasks/20260418-t20-failure-path/SPEC.md",2026-04-18,0,Initialized full single-task record
+2,Implement failure_path rule,DONE,"TaskSpec has failure_path and validator emits W_NO_FAILURE_PATH","rg -n \"failure_path|W_NO_FAILURE_PATH\" src/cccc/ralph/models.py src/cccc/ralph/validator.py",2026-04-18,0,Aligned rule logic with requested failure_path semantics
+3,Add regression tests and run pytest,DONE,"Specified pytest command passes","python -m pytest tests/test_ralph_verification.py -x -q",2026-04-18,0,11 passed in 0.42s
