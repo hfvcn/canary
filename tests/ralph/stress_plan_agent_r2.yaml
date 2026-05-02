@@ -1,0 +1,151 @@
+# Round 2 stress plan — tests agent with source code context available
+# Focus: subtle bugs, correct implementations, edge cases
+
+tasks:
+  # === SHOULD PASS: correct implementation exists ===
+  - id: T-pass-1
+    title: "Verify suggest() returns correct batch ordering"
+    role: leaf
+    goal_behavior: |
+      The suggest() function in src/cccc/ralph/core.py should return tasks
+      ordered by unlock_score (highest first). Tasks whose dependencies are
+      all completed should appear in the ready list.
+    acceptance_criteria: |
+      suggest() returns a BatchResult with ready tasks sorted by unlock_score.
+    claimed_paths:
+      - src/cccc/ralph/core.py
+    verification_mode: agent
+    verification:
+      level: unit
+      command: "python -c 'from cccc.ralph.core import suggest; print(suggest)'"
+      covers:
+        tasks: ["T-pass-1"]
+
+  # === SHOULD PASS: function actually exists and works ===
+  - id: T-pass-2
+    title: "Verify _run_check handles timeout"
+    role: leaf
+    goal_behavior: |
+      The _run_check() function in src/cccc/ralph/core.py should catch
+      subprocess.TimeoutExpired and return outcome="timeout" with duration_ms.
+    acceptance_criteria: |
+      _run_check returns {"outcome": "timeout", "duration_ms": <int>} on timeout.
+    claimed_paths:
+      - src/cccc/ralph/core.py
+    verification_mode: agent
+    verification:
+      level: unit
+      command: "python -c 'from cccc.ralph.core import _run_check; print(\"ok\")'"
+      covers:
+        tasks: ["T-pass-2"]
+
+  # === SUBTLE BUG: off-by-one in truncation ===
+  - id: T-subtle-1
+    title: "Fix _OUTPUT_TRUNCATE to keep last 2000 chars"
+    role: leaf
+    goal_behavior: |
+      Change _OUTPUT_TRUNCATE in src/cccc/ralph/core.py from 2000 to 4000
+      so that longer test output is preserved in verification results.
+    acceptance_criteria: |
+      _OUTPUT_TRUNCATE equals 4000 in core.py.
+    claimed_paths:
+      - src/cccc/ralph/core.py
+    verification_mode: agent
+    verification:
+      level: unit
+      command: "python -c 'from cccc.ralph.core import _OUTPUT_TRUNCATE; assert _OUTPUT_TRUNCATE == 4000'"
+      covers:
+        tasks: ["T-subtle-1"]
+
+  # === WRONG FILE CLAIM: task claims file A but describes work in file B ===
+  - id: T-wrong-file
+    title: "Add explain subcommand to Ralph CLI"
+    role: leaf
+    goal_behavior: |
+      Add a new 'explain' subcommand to the Ralph CLI in src/cccc/ralph/core.py
+      that prints documentation for a given validation rule code.
+    acceptance_criteria: |
+      Running 'ralph explain --code E_DUPLICATE_TASK_ID' prints the rule documentation.
+    claimed_paths:
+      - src/cccc/ralph/core.py
+    verification_mode: agent
+    verification:
+      level: unit
+      command: "python -c 'print(\"ok\")'"
+      covers:
+        tasks: ["T-wrong-file"]
+
+  # === CONTRADICTORY: goal says add, but acceptance says remove ===
+  - id: T-contradict
+    title: "Refactor verification timeout handling"
+    role: leaf
+    goal_behavior: |
+      Add a configurable timeout parameter to _run_check() in src/cccc/ralph/core.py
+      allowing callers to specify custom timeout values instead of using _VERIFY_TIMEOUT.
+    acceptance_criteria: |
+      _VERIFY_TIMEOUT constant is removed from core.py.
+      _run_check() no longer accepts a timeout parameter.
+    claimed_paths:
+      - src/cccc/ralph/core.py
+    verification_mode: agent
+    verification:
+      level: unit
+      command: "python -c 'print(\"ok\")'"
+      covers:
+        tasks: ["T-contradict"]
+
+  # === TESTS FAIL but code looks OK: verification output matters ===
+  - id: T-test-fail
+    title: "Verify Plan model import works"
+    role: leaf
+    goal_behavior: |
+      Ensure the Plan model can be imported from cccc.ralph.models.
+    acceptance_criteria: |
+      'from cccc.ralph.models import Plan' succeeds without errors.
+    claimed_paths:
+      - src/cccc/ralph/models.py
+    verification_mode: agent
+    verification:
+      level: unit
+      command: "python -c 'import nonexistent_module_that_will_fail'"
+      covers:
+        tasks: ["T-test-fail"]
+
+  # === LARGE FILE: test source truncation behavior ===
+  - id: T-large-file
+    title: "Audit validator.py for security issues"
+    role: leaf
+    goal_behavior: |
+      Review src/cccc/ralph/validator.py for any use of eval(), exec(),
+      or os.system() that could be a security vulnerability.
+    acceptance_criteria: |
+      No eval/exec/os.system calls exist in validator.py.
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+    verification_mode: agent
+    verification:
+      level: unit
+      command: "python -c 'print(\"security check ok\")'"
+      covers:
+        tasks: ["T-large-file"]
+
+  # === MULTI-FILE: cross-file consistency ===
+  - id: T-cross-file
+    title: "Verify agent.py and core.py use same GEMINI_PROVIDER constant"
+    role: leaf
+    goal_behavior: |
+      Both src/cccc/ralph/agent.py and src/cccc/ralph/core.py should reference
+      the GEMINI_PROVIDER constant from agent.py. core.py should import it
+      rather than defining its own copy.
+    acceptance_criteria: |
+      core.py imports GEMINI_PROVIDER from agent.py.
+      No duplicate definition of GEMINI_PROVIDER exists.
+    claimed_paths:
+      - src/cccc/ralph/agent.py
+      - src/cccc/ralph/core.py
+    verification_mode: agent
+    verification:
+      level: unit
+      command: "python -c 'from cccc.ralph.core import GEMINI_PROVIDER; print(GEMINI_PROVIDER)'"
+      covers:
+        tasks: ["T-cross-file"]

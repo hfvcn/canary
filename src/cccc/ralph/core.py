@@ -260,8 +260,8 @@ def _verify_with_agent(
         }
 
 
-_SOURCE_CONTEXT_MAX_BYTES = 30_000
-_SOURCE_FILE_MAX_BYTES = 8_000
+_SOURCE_CONTEXT_MAX_BYTES = 50_000
+_SOURCE_FILE_MAX_BYTES = 16_000
 
 
 def _read_claimed_paths(

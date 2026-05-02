@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 GEMINI_PROVIDER = "gemini-cli"
 STUB_PROVIDER = "stub"
 GEMINI_FLASH_MODEL = "flash"
-GEMINI_TIMEOUT_SECONDS = 60
+GEMINI_TIMEOUT_SECONDS = 120
 GEMINI_WARMUP_TIMEOUT_SECONDS = 30
 GEMINI_WARMUP_PROMPT = 'Return exactly this JSON: {"ok": true}'
 ALLOWED_CONFIDENCE = frozenset({"low", "medium", "high"})
@@ -234,15 +234,19 @@ class RalphAgent:
             "source_code, git_diff, and verification_output.\n"
             "2. If source_code shows a function/class referenced in "
             "goal_behavior does NOT exist, report it as failed.\n"
-            "3. If git_diff is empty or says 'files are unchanged', the task "
-            "likely did not make the changes it claims — report failed.\n"
+            "3. If git_diff is empty and the task goal is to CREATE or "
+            "MODIFY code (add, fix, change, implement, refactor, delete), "
+            "report failed — nothing was changed. However, if the goal is "
+            "to VERIFY, ENSURE, CHECK, AUDIT, or REVIEW existing code, "
+            "an empty diff is expected — judge based on source_code and "
+            "verification_output instead.\n"
             "4. If verification_output.status is 'passed' (all compile/test "
             "checks succeeded), do NOT fabricate failures. Only fail the "
             "task if you find a concrete gap between goal_behavior and the "
             "actual source_code.\n"
             "5. NEVER claim a function exists, is called, or works correctly "
-            "unless you can see it in source_code. If you cannot verify "
-            "something, say so explicitly — do not guess.\n"
+            "unless you can see it in source_code. If source_code is "
+            "truncated, state what you CAN verify and what you CANNOT.\n"
             "6. Do not use tools, shell commands, file reads, MCP, or "
             "workspace inspection.\n"
             "7. Return only JSON matching response_schema. No prose.\n\n"
