@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Record RO-33 in checklist,DONE,RO-33 exists in todo/问题清单-v5-ralph.md,rg -n "RO-33 Worker prompt findings" todo/问题清单-v5-ralph.md,2026-04-28T00:00:00+08:00,0,
+2,Wire assignment prompt context,DONE,start_assigned_agents prompt receives real issues recommended tests and forbidden flows,pytest tests/test_assignment_prompt_projection.py -q,2026-04-28T00:00:00+08:00,0,
+3,Add regression tests,DONE,tests cover assignment startup path rather than direct builder only,pytest tests/test_assignment_prompt_projection.py -q,2026-04-28T00:00:00+08:00,0,
+4,Run targeted validation,DONE,targeted prompt projection tests and ruff check pass,"pytest tests/test_assignment_prompt_projection.py -q; uvx ruff check modified files",2026-04-28T00:00:00+08:00,0,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -18,7 +18,9 @@ KIND_TASK_REPORTED_COMPLETED = "workflow.task_reported_completed"
 KIND_TASK_FAILED = "workflow.task_failed"
 KIND_VERIFICATION_PASSED = "workflow.verification_passed"
 KIND_VERIFICATION_SKIPPED = "workflow.verification_skipped"
+KIND_VERIFICATION_SKIPPED_BLOCKED = "workflow.verification_skipped_blocked"
 KIND_VERIFICATION_FAILED = "workflow.verification_failed"
+KIND_BATCH_FALLBACK_APPROVED = "workflow.batch_fallback_approved"
 KIND_RETRY_REQUESTED = "workflow.retry_requested"
 KIND_TASK_BLOCKED = "workflow.task_blocked"
 KIND_VERIFICATION_WARNING = "workflow.verification_warning"
@@ -60,6 +62,8 @@ class WorkflowMeta:
     workflow_id: str
     plan_path: str = ""
     plan_digest: str = ""
+    auto_dispatch: bool = False
+    assignment_map: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

@@ -62,8 +62,8 @@ class PromptBudget:
     """Token-budget-aware prompt assembler.
 
     Mandatory sections (Task ID, Title, Goal Behavior, Acceptance Criteria,
-    Verification Command, Do-Not-Ignore Issues, Recommended Tests, Forbidden
-    Actions) are never truncated.  If they exceed 40% of the budget the class
+    Ralph-mode Verification Command, Do-Not-Ignore Issues, Recommended Tests,
+    Forbidden Actions) are never truncated.  If they exceed 40% of the budget the class
     raises ``PromptMinimaOverflow`` (code ``E_PROMPT_MINIMA_OVERFLOW``).
 
     Remaining sections are included in priority order:
@@ -237,6 +237,12 @@ class PromptBudget:
 # Issue digest builder
 # ---------------------------------------------------------------------------
 
+def _field_value(item: Any, name: str, default: Any = "") -> Any:
+    if isinstance(item, dict):
+        return item.get(name, default)
+    return getattr(item, name, default)
+
+
 def build_issue_digest(issues: "List[Any]") -> str:
     """Build a compact issue digest for worker prompt injection.
 
@@ -246,7 +252,7 @@ def build_issue_digest(issues: "List[Any]") -> str:
     """
     filtered = [
         i for i in issues
-        if getattr(i, "action_owner", "unknown") in ("worker", "shared")
+        if _field_value(i, "action_owner", "unknown") in ("worker", "shared")
     ]
     if not filtered:
         return ""
@@ -255,7 +261,7 @@ def build_issue_digest(issues: "List[Any]") -> str:
     buckets: Dict[str, Any] = {}
     for relevance in ("blocking", "execution_risk", "verification_risk"):
         for issue in filtered:
-            if getattr(issue, "worker_relevance", "none") == relevance:
+            if _field_value(issue, "worker_relevance", "none") == relevance:
                 buckets[relevance] = issue
                 break
 
@@ -264,9 +270,9 @@ def build_issue_digest(issues: "List[Any]") -> str:
 
     lines: List[str] = []
     for relevance, issue in buckets.items():
-        code = str(getattr(issue, "code", ""))
-        msg = str(getattr(issue, "message", "")).strip()
-        evidence = getattr(issue, "evidence", {})
+        code = str(_field_value(issue, "code", ""))
+        msg = str(_field_value(issue, "message", "")).strip()
+        evidence = _field_value(issue, "evidence", {})
         evidence_brief = ""
         if isinstance(evidence, dict):
             for key in ("path", "summary", "detail", "message"):
@@ -298,6 +304,14 @@ def build_runtime_adapter_hint(runtime: str) -> str:
     return _RUNTIME_HINTS.get(str(runtime or "").strip().lower(), "")
 
 
+def _should_include_verification_command(task: Any) -> bool:
+    if str(getattr(task, "verification_mode", "ralph") or "ralph") == "agent":
+        return False
+    verification = getattr(task, "verification", None)
+    command = str(getattr(verification, "command", "") or "").strip()
+    return bool(command)
+
+
 # ---------------------------------------------------------------------------
 # Task prompt assembly
 # ---------------------------------------------------------------------------
@@ -316,7 +330,7 @@ def build_task_prompt(
 
     Wraps all content through :class:`PromptBudget` so the resulting text
     stays within the configured token budget.  Mandatory sections (task ID,
-    title, goal, acceptance criteria, verification command, forbidden
+    title, goal, acceptance criteria, Ralph-mode verification command, forbidden
     actions) are never truncated.  Lower-priority context is condensed or
     omitted when space is limited.
 
@@ -354,7 +368,7 @@ def build_task_prompt(
             text=f"Acceptance Criteria: {task.acceptance_criteria}",
             mandatory=True,
         ))
-    if task.verification and task.verification.command:
+    if _should_include_verification_command(task):
         sections.append(_PromptSection(
             name="verification_command",
             text=f"Verification Command: {task.verification.command}",
@@ -392,8 +406,8 @@ def build_task_prompt(
     ]
     if forbidden_flows:
         for flow in forbidden_flows:
-            flow_id = str(getattr(flow, "id", "")).strip()
-            flow_desc = str(getattr(flow, "description", "")).strip()
+            flow_id = str(_field_value(flow, "id", "")).strip()
+            flow_desc = str(_field_value(flow, "description", "")).strip()
             if flow_id:
                 forbidden_lines.append(f"[FORBIDDEN] {flow_id}: {flow_desc}")
     forbidden_text = "\n".join(forbidden_lines)
@@ -454,10 +468,10 @@ def build_task_prompt(
     ))
 
     report_section = (
-        f"Report back to Foreman with:\n"
-        f"- progress delta or blockers\n"
-        f"- changed files or evidence\n"
-        f"- anything still unverified"
+        "Report back to Foreman with:\n"
+        "- progress delta or blockers\n"
+        "- changed files or evidence\n"
+        "- anything still unverified"
     )
     sections.append(_PromptSection(
         name="condensed_semantic_focus",

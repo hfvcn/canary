@@ -10,7 +10,6 @@ Tests:
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, List
@@ -30,6 +29,7 @@ from cccc.kernel.workflow_state_types import (
     PreTransitionVetoed,
 )
 from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+from cccc.ralph.plan_io import compute_structural_plan_digest
 
 
 # ---------------------------------------------------------------------------
@@ -40,8 +40,8 @@ WORKFLOW_ID = "wf-wave2-test"
 BATCH_ID = "batch-wave2-test"
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _plan_digest(path: Path) -> str:
+    return compute_structural_plan_digest(path)
 
 
 def _write_plan(path: Path, payload: Dict[str, Any]) -> Path:
@@ -102,7 +102,7 @@ def _build_orchestrator(tmp_path: Path, plan_path: Path) -> WorkflowOrchestrator
         group_id="wave2-test-group",
     )
     # Register workflow metadata with the plan digest
-    digest = _sha256(plan_path)
+    digest = _plan_digest(plan_path)
     orch.engine.set_workflow_meta(
         WORKFLOW_ID,
         plan_path=str(plan_path),
@@ -161,7 +161,7 @@ def test_plan_digest_divergence_hard_blocks_completion(tmp_path: Path) -> None:
 
     # Mutate the plan on disk (add a task + suppress)
     _write_plan(plan_path, _edited_plan())
-    assert _sha256(plan_path) != orch.engine.get_workflow_meta(WORKFLOW_ID).plan_digest
+    assert _plan_digest(plan_path) != orch.engine.get_workflow_meta(WORKFLOW_ID).plan_digest
 
     # Attempt completion — should raise PreTransitionVetoed
     event = TaskEvent(

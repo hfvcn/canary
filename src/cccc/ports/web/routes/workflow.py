@@ -64,6 +64,8 @@ class BatchSuggestRequest(BaseModel):
     feishu_chat_id: Optional[str] = None
     auto_start_agents: bool = True
     assignments: Dict[str, str] = {}  # ARCH-1: task_id → actor_id
+    auto_dispatch: bool = False
+    assignment_map: Dict[str, str] = {}
 
 
 class ProcessPendingRequest(BaseModel):
@@ -164,6 +166,8 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
                 "feishu_chat_id": req.feishu_chat_id,
                 "auto_start_agents": req.auto_start_agents,
                 "assignments": req.assignments,
+                "auto_dispatch": req.auto_dispatch,
+                "assignment_map": req.assignment_map,
             },
         })
 

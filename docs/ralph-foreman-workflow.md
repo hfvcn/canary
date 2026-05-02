@@ -21,7 +21,7 @@
 │                                   │                                  │
 │               ┌───────────────────┼───────────────────┐              │
 │               │ ProgressReporter  │ Control Plane     │              │
-│               │ (飞书卡片)        │ (cccc_task/coord) │              │
+│               │ (飞书卡片)        │ (workflow/send)   │              │
 │               └───────────────────┴───────────────────┘              │
 └─────────────────────────────────────────────────────────────────────┘
                              │
@@ -33,9 +33,12 @@
 
 ### 1.1 Ralph — 观察层
 
-- 外部 Python 守护进程，监控 Git 提交和任务依赖图
+- Daemon 内部观察层服务（`RalphService`），分析任务依赖图，计算并行批次
 - 计算「哪些任务的前置依赖已满足，可以并行执行」
-- 通过 **Daemon IPC**（Unix socket + JSON line）将 `ReadyBatchSuggestion` 发送给 CCCC Daemon
+- Ralph 当前有三种形态：
+  - **CLI 静态验证**（`ralph validate`）— 计划结构校验
+  - **daemon 内 verify gate** — 任务完成时运行 verification checks
+  - **Agent 审查** — Gemini 驱动的对抗式语义审查
 - **只读分析层**，没有执行权限
 
 ### 1.2 Foreman — 控制层
@@ -44,14 +47,14 @@
 - 接收 Ralph 的 batch 建议 → 评估 Agent Pool → 分配任务 → 启动 Agent
 - 维护 Actor 生命周期的最终权威
 - 对外通过 ProgressReporter 推送飞书进度卡片
-- 对内通过 Control Plane（`cccc_task` / `cccc_coordination`）同步共享状态
+- 对内通过 Control Plane（`cccc workflow ...` / `cccc context get` / `cccc send`）同步共享状态
 
 ### 1.3 Worker Agent — 执行层
 
 - 由 Foreman 动态创建或复用的 AI Agent
 - 每个 Agent 绑定一个具体模型（Claude / Gemini / Codex 等）
-- 在独立的 UI tab 中运行，通过 MCP 工具与 Foreman 通信
-- 执行完成后通过 `cccc_message_send(to="@foreman", ...)` 汇报结果
+- 在独立的 UI tab 中运行，通过 CLI 可见通信与 Foreman 协作
+- 执行期间用 `cccc send --to @foreman --text "..."` 汇报进度或阻塞；完成时用 `cccc task complete <task_id> --changed-file <path> --evidence "..."` 提交结果
 
 ---
 
@@ -134,57 +137,56 @@ class ModelRegistry(BaseModel):
 ### 3.1 完整执行序列
 
 ```
-Ralph                   Daemon IPC              WorkflowOrchestrator        AgentPool           Web UI
-  │                        │                           │                       │                  │
-  │──ReadyBatchSuggestion─→│                           │                       │                  │
-  │                        │──handle_ralph_batch_suggest│                       │                  │
-  │                        │   ↓ auto_process=true     │                       │                  │
-  │                        │──process_batch_suggestion─→│                       │                  │
-  │                        │                           │──evaluate_for_task───→│                  │
-  │                        │                           │←─AgentEvaluation[]────│                  │
-  │                        │                           │──create_or_reuse_agent→│                  │
-  │                        │                           │←─TaskAssignment────────│                  │
-  │                        │                           │                       │                  │
-  │                        │                           │──sync_batch_to_control_plane              │
-  │                        │                           │  (cccc_task.create + coordination.note)   │
-  │                        │                           │                       │                  │
-  │                        │                           │──reporter.on_batch_started (飞书卡片)     │
-  │                        │                           │                       │                  │
-  │                        │                           │──_start_assigned_agents│                  │
-  │                        │                           │  ├─ _add_actor_via_daemon (actor_add)──→ │ 新 tab
-  │                        │                           │  └─ _send_message_fn (task prompt)──→    │
-  │                        │                           │                       │                  │
-  │                        │                           │            Worker 执行任务...             │
-  │                        │                           │                       │       poll 5s ──→│
-  │                        │                           │←─────────on_task_completed                │
-  │                        │                           │  ├─ reporter.on_task_completed (飞书)     │
-  │                        │                           │  ├─ record_model_usage                    │
-  │                        │                           │  ├─ release_agent                         │
-  │                        │                           │  └─ _check_batch_completion               │
-  │                        │                           │                       │                  │
-  │←─VerificationResult───│                           │                       │                  │
-  │                        │──on_verification_result──→│                       │                  │
-  │                        │                           │  (passed → batch_complete)                │
-  │                        │                           │  (failed → task_failed)                   │
-  │                        │                           │                       │                  │
-  │  (下一个 batch)         │                           │                       │                  │
-  │──ReadyBatchSuggestion─→│                           │  ... 循环 ...          │                  │
-  │                        │                           │                       │                  │
-  │                        │         complete_workflow  │ reporter.on_workflow_completed (飞书)     │
+RalphService             WorkflowOrchestrator          AgentPool             Web UI
+  │                              │                         │                   │
+  │──ReadyBatchSuggestion───────→│                         │                   │
+  │                              │ handle_ralph_batch_suggest                 │
+  │                              │ ↓ auto_process=true       │                   │
+  │                              │ process_batch_suggestion  │                   │
+  │                              │──evaluate_for_task───────→│                   │
+  │                              │←─AgentEvaluation[]────────│                   │
+  │                              │──create_or_reuse_agent───→│                   │
+  │                              │←─TaskAssignment───────────│                   │
+  │                              │                         │                   │
+  │                              │ sync_batch_to_control_plane                 │
+  │                              │ (`cccc workflow submit` + `cccc send`)      │
+  │                              │ reporter.on_batch_started (飞书卡片)        │
+  │                              │                         │                   │
+  │                              │ _start_assigned_agents    │                   │
+  │                              │ ├─ _add_actor_via_daemon (actor_add) ──────→│ 新 tab
+  │                              │ └─ _send_message_fn (task prompt) ─────────→│
+  │                              │                         │                   │
+  │                              │         Worker 执行任务...                  │
+  │                              │                         │        poll 5s ──→│
+  │                              │←─────────on_task_completed│                   │
+  │                              │ ├─ reporter.on_task_completed (飞书)        │
+  │                              │ ├─ record_model_usage                       │
+  │                              │ ├─ release_agent                            │
+  │                              │ └─ _check_batch_completion                  │
+  │                              │                         │                   │
+  │──VerificationResult────────→│                         │                   │
+  │                              │ on_verification_result                      │
+  │                              │ (passed → batch_complete)                   │
+  │                              │ (failed → task_failed)                      │
+  │                              │                         │                   │
+  │  (下一个 batch)              │                         │                   │
+  │──ReadyBatchSuggestion───────→│                         │ ... 循环 ...       │
+  │                              │                         │                   │
+  │                              │ complete_workflow        │ reporter.on_workflow_completed (飞书)
 ```
 
 ### 3.2 阶段详解
 
 #### Phase 1: 接收 Batch 建议
 
-Ralph 通过 IPC 发送 `ReadyBatchSuggestion`，包含：
+`RalphService` 在 Daemon 内生成 `ReadyBatchSuggestion`，包含：
 - `suggestion_id` — 建议唯一 ID
 - `workflow_id` — 工作流 ID
 - `tasks[]` — 准备执行的任务列表（TaskRef）
 - `rationale` — 为什么这些任务可以一起执行
 - `estimated_parallelism` — 预期并行度
 
-Daemon 的 `ralph_ipc_handler.py` 接收后：
+Daemon 内部处理该建议后：
 1. 存入 `_RALPH_STATE["pending_suggestions"]`
 2. 若 `auto_process=true`，直接调用 `_try_process_batch()` 进入下一阶段
 
@@ -261,10 +263,11 @@ TaskAssignment(
    - progress delta or blockers
    - changed files or evidence
    - anything still unverified
-   - Report via cccc_message_send(to="@foreman", text=...).
+   - Report progress/blockers via `cccc send --to @foreman --text "..."`.
+   - Report completion via `cccc task complete <task_id> --changed-file <path> --evidence "..."`.
    ```
 
-3. **同步到 Control Plane**：创建 `cccc_task` 记录 + `coordination.note`
+3. **同步到 Control Plane**：用 `cccc workflow ...` 更新任务状态，并通过 `cccc send --to @foreman --text "..."` 留下可见协同记录
 
 #### Phase 6: 任务执行与完成
 
@@ -280,7 +283,7 @@ Worker Agent 独立执行，完成后触发 `on_task_completed()`：
 
 #### Phase 7: 验证与批次完成
 
-Ralph 运行验证（build/test/lint），发送 `VerificationResult`：
+任务完成后，daemon 内 verify gate 运行 verification checks，并生成 `VerificationResult`：
 
 - `passed` → 标记 batch 完成，可以进入下一个 batch
 - `failed` → 标记相关任务失败，推送飞书告警
@@ -297,14 +300,14 @@ Batch 完成条件：当前 batch 内所有任务都不在 `pending`/`running` �
 
 ---
 
-## 4. Daemon IPC 操作接口
+## 4. Daemon 操作接口
 
-`ralph_ipc_handler.py` 注册的 Daemon 操作：
+`ralph_ipc_handler.py` 注册的 Daemon 操作仍复用 Unix socket + JSON line 基础设施；RalphService 本身运行在 Daemon 内部：
 
 | 操作名 | 功能 | 关键参数 |
 |--------|------|----------|
-| `ralph_batch_suggest` | Ralph 提交 batch 建议 | workflow_id, tasks[], auto_process |
-| `ralph_verification_result` | Ralph 报告验证结果 | workflow_id, overall_outcome, checks[] |
+| `ralph_batch_suggest` | 提交 batch 建议 | workflow_id, tasks[], auto_process |
+| `ralph_verification_result` | 提交验证结果 | workflow_id, overall_outcome, checks[] |
 | `ralph_restart_suggest` | Ralph 建议重启任务 | workflow_id, task_id, reason |
 | `ralph_batch_decision` | Foreman 决策 batch | suggestion_id, decision, approved/rejected |
 | `ralph_actor_status` | Actor 状态上报 | actor_id, status, progress_pct |
@@ -380,14 +383,14 @@ PENDING → RUNNING → COMPLETED
 **Foreman（管理者）**：
 - 负责用户对齐、计划制定、Agent 路由、模型选择、进度评判、对外更新
 - 不直接执行实现任务（除非用户明确指定 foreman-only）
-- 可用工具：`cccc_actor`, `cccc_runtime_list`, `cccc_model`
+- 可用 CLI：`cccc actor list`、`cccc runtime list`，并结合 actor 列表中的 runtime/model 信息做分配决策
 - 将 `done`、`idle`、沉默视为需要评估的信号，而非终结
 
 **Peer（执行者 / Worker）**：
 - 只执行 Foreman 分配的范围
 - 提交具体证据、变更文件、阻塞项
 - 不擅自重新规划工作流或创建新 Worker
-- 通过 `cccc_message_send(to="@foreman", ...)` 回报
+- 通过 `cccc send --to @foreman --text "..."` 回报进度或阻塞；完成时用 `cccc task complete <task_id> --changed-file <path> --evidence "..."` 提交
 
 ### 6.2 System Prompt 生成
 
@@ -412,7 +415,7 @@ Working Style:
 
 Platform Invariants:
 - No fabrication. Verify before claiming done.
-- Visible replies must go through MCP...
+- Visible replies must go through CLI delivery...
 
 Role Focus:
 - (Foreman 或 Peer 的角色规则)
@@ -430,20 +433,19 @@ Group Space:
 
 `prompt_files.py` 中的 `DEFAULT_PREAMBLE_BODY`：
 
-1. **Quick start** — 先调 `cccc_bootstrap`，获取 session/recovery/inbox/memory_recall_gate
+1. **Quick start** — 先跑 `cccc context get`，需要未读队列时再跑 `cccc inbox`
 2. **Ralph workflow** — Foreman 职责清单（对齐、规划、路由、进度、更新）
-3. **Execution checklist** — MCP 可见通信、共享状态同步、agent_state 维护
-4. **Gap routing** — 信息缺口 → bootstrap/context/project_info/web; 能力缺口 → capability_use
+3. **Execution checklist** — CLI 可见通信、共享状态同步、agent_state 维护
+4. **Gap routing** — 信息缺口 → `cccc context get` / `cccc inbox` / 本地仓库 / web；能力缺口 → `cccc --help` / runtime 文档
 5. **Memory boundary** — agent_state = 短期执行内存; memory files = 长期记忆
 
 ### 6.4 能力系统 (`kernel/capabilities.py`)
 
-**始终可见的核心工具**：
-- `cccc_help`, `cccc_bootstrap`, `cccc_project_info`
-- `cccc_capability_search`, `cccc_capability_state`
-- `cccc_inbox_*`, `cccc_message_*`, `cccc_file`, `cccc_presentation`
-- `cccc_context_get`, `cccc_coordination`, `cccc_task`
-- `cccc_agent_state`, `cccc_memory`
+**始终可见的核心 CLI**：
+- `cccc --help`, `cccc context get`, `cccc inbox`
+- `cccc workflow submit`, `cccc workflow status`, `cccc task complete`
+- `cccc send`, `cccc reply`
+- `cccc actor list`, `cccc runtime list`
 
 **按需启用的能力包**：
 
@@ -461,7 +463,7 @@ Group Space:
 
 为不同角色注入 Prompt Fragment：
 
-- **Common**：任务工具列表（cccc_task, cccc_coordination, cccc_actor, cccc_runtime_list, cccc_model）
+- **Common**：任务 CLI 列表（`cccc workflow submit/status`、`cccc context get`、`cccc send`、`cccc actor list`、`cccc runtime list`）
 - **Foreman**：编排职责、Worker 复用、模型选择策略
 - **Peer**：任务执行、证据提交、不擅自扩大范围
 
@@ -560,7 +562,7 @@ src/cccc/
 │   └── actors.py             # Actor 列表、角色推断
 ├── ports/
 │   ├── mcp/handlers/
-│   │   └── cccc_core.py      # MCP 核心工具（help, bootstrap, project_info, memory）
+│   │   └── cccc_core.py      # 系统入口（help/context/memory 等）
 │   ├── web/routes/
 │   │   └── groups.py         # HTTP API 路由
 │   └── im/templates/
@@ -587,7 +589,7 @@ web/src/
 
 ### 9.1 关注分离
 
-- **Ralph 只观察不执行**：分析 Git、计算依赖、建议 batch，但不碰 Actor 生命周期
+- **Ralph 只观察不执行**：分析任务依赖图、计算并行批次、建议 batch，但不碰 Actor 生命周期
 - **Foreman 只调度不实现**：评估 Agent、分配任务、追踪进度，但不写业务代码
 - **Worker 只执行不决策**：完成分配的任务范围，不擅自扩大或重新规划
 
@@ -605,4 +607,4 @@ Foreman 通过 `ModelRegistry` 了解各模型的 strengths/weaknesses，为不�
 
 ### 9.5 Control Plane 同步
 
-每个 batch 决策都会同步到 CCCC 的共享状态（`cccc_task` + `cccc_coordination`），确保所有 Actor 可以看到相同的任务全景。
+每个 batch 决策都会通过 `cccc workflow ...` 与 `cccc send` 同步到 CCCC 的共享状态，确保所有 Actor 可以看到相同的任务全景。

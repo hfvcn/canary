@@ -25,7 +25,14 @@ from ...contracts.v1.ralph_ipc import (
     VerificationCheckSpec,
     VerificationResult,
 )
-from ...ralph.agent import build_error_envelope
+from ...ralph.agent import (
+    AgentConfig,
+    GEMINI_PROVIDER,
+    GeminiResponseError,
+    RalphAgent,
+    build_error_envelope,
+)
+from ...ralph.plan_io import compute_structural_plan_digest, load_plan
 from ...kernel.claimed_paths import (
     GLOBAL_WRITE_CLAIM,
     conflicts_with_any as _conflicts_with_any_fn,
@@ -98,13 +105,58 @@ def _is_trivial_command(command: str) -> bool:
     return base in _TRIVIAL_VERIFY_COMMANDS
 
 
+def _agent_checks(raw_checks: Any) -> List[VerificationCheck]:
+    if not isinstance(raw_checks, list):
+        return []
+    checks: List[VerificationCheck] = []
+    for item in raw_checks:
+        if not isinstance(item, dict):
+            continue
+        checks.append(
+            VerificationCheck(
+                name=str(item.get("name") or "agent_simulation"),
+                outcome=str(item.get("outcome") or "failed"),
+                message=str(item.get("message") or ""),
+                details={"source": "ralph_agent"},
+            )
+        )
+    return checks
+
+
+def _agent_error_detail(exc: Exception) -> str:
+    if isinstance(exc, subprocess.CalledProcessError):
+        stderr = str(exc.stderr or "").strip()
+        return stderr or f"exit status {exc.returncode}"
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return f"timed out after {exc.timeout} seconds"
+    return str(exc) or type(exc).__name__
+
+
+def _dedupe_warnings(warnings: List[str]) -> List[str]:
+    return list(dict.fromkeys(warnings))
+
+
+def _task_covers_critical_flow(task_ref: TaskRef, critical_flows: List[Any]) -> bool:
+    claimed_paths = [
+        path for path in _normalize_write_set_fn(task_ref.claimed_paths)
+        if path != GLOBAL_WRITE_CLAIM
+    ]
+    if not claimed_paths or not critical_flows:
+        return False
+    for flow in critical_flows:
+        for entrypoint in getattr(flow, "entrypoints", []):
+            if any(_paths_overlap(claimed_path, entrypoint) for claimed_path in claimed_paths):
+                return True
+    return False
+
+
 class RalphService:
     """Observation layer service for workflow scheduling.
 
     Three roles:
     1. CLI static validation (``ralph validate``)
     2. Daemon-internal verify gate (``verify_completion``)
-    3. Future: optional Agent review (RA-1)
+    3. Agent verification for tasks declaring ``verification_mode=agent``
     """
 
     def __init__(
@@ -122,6 +174,7 @@ class RalphService:
         # engine delegation (see _get_task_status_from_engine).
         self._processed_keys: set[str] = set()
         self._semantic_gate_cache: Dict[tuple, str] = {}
+        self._workflow_plan_cache: Dict[str, tuple[int, Any]] = {}
 
     def get_changed_files(self, since_ref: str = "HEAD~1") -> List[str]:
         """Get list of files changed since a git ref."""
@@ -463,52 +516,207 @@ class RalphService:
         """Run task verification and return a structured verification result."""
         resolved_task = task_ref or self._find_task_ref(task_id)
         if resolved_task is None:
-            return VerificationResult(
-                verification_id=f"ver-{uuid.uuid4().hex[:READY_BATCH_ID_HEX_LEN]}",
-                workflow_id=workflow_id,
+            return self._verification_result(
                 task_id=task_id,
-                overall_outcome="failed",
-                checks=[],
-                warnings=[],
+                workflow_id=workflow_id,
+                outcome="failed",
                 summary=f"verification failed: task '{task_id}' not found",
             )
 
-        # RA-3: route by verification_mode
         mode = getattr(resolved_task, "verification_mode", "ralph") or "ralph"
+        critical_flows = self._load_workflow_critical_flows(workflow_id)
+        if mode == "ralph" and _task_covers_critical_flow(resolved_task, critical_flows):
+            _logger.info(
+                "verification mode upgrade: task_id=%s workflow_id=%s from=ralph to=challenge",
+                task_id,
+                workflow_id,
+            )
+            mode = "challenge"
         if mode == "agent":
-            return VerificationResult(
-                verification_id=f"ver-{uuid.uuid4().hex[:READY_BATCH_ID_HEX_LEN]}",
-                workflow_id=workflow_id,
+            return self._verify_completion_with_agent(
                 task_id=task_id,
-                overall_outcome="agent_pending",
-                checks=[],
-                warnings=[],
-                summary="Agent verification requested. Awaiting Ralph Agent review.",
+                changed_files=changed_files,
+                workflow_id=workflow_id,
+                task_ref=resolved_task,
+            )
+        if mode == "challenge":
+            return self._verify_completion_with_challenge(
+                task_id=task_id,
+                changed_files=changed_files,
+                workflow_id=workflow_id,
+                task_ref=resolved_task,
             )
 
-        warnings = self._build_scope_warnings(changed_files, resolved_task)
-        specs = self._resolve_verification_specs(resolved_task)
+        return self._verify_completion_with_worker(
+            task_id=task_id,
+            workflow_id=workflow_id,
+            changed_files=changed_files,
+            task_ref=resolved_task,
+        )
+
+    def _verify_completion_with_worker(
+        self,
+        *,
+        task_id: str,
+        workflow_id: str,
+        changed_files: List[str],
+        task_ref: TaskRef,
+    ) -> VerificationResult:
+        warnings = self._build_scope_warnings(changed_files, task_ref)
+        specs = self._resolve_verification_specs(task_ref)
         if not specs:
-            return VerificationResult(
-                verification_id=f"ver-{uuid.uuid4().hex[:READY_BATCH_ID_HEX_LEN]}",
-                workflow_id=workflow_id,
+            return self._verification_result(
                 task_id=task_id,
-                overall_outcome="skipped",
-                checks=[],
+                workflow_id=workflow_id,
+                outcome="skipped_blocked",
                 warnings=warnings,
-                summary="verification skipped: no command configured",
+                summary=(
+                    "verification skipped: no command configured; "
+                    "completion blocked"
+                ),
             )
 
         checks, overall_outcome = self._execute_verification_checks(specs)
-        summary = self._summarize_verification(checks, overall_outcome)
+        return self._verification_result(
+            task_id=task_id,
+            workflow_id=workflow_id,
+            outcome=overall_outcome,
+            checks=checks,
+            warnings=warnings,
+            summary=self._summarize_verification(checks, overall_outcome),
+        )
+
+    def _verify_completion_with_challenge(
+        self,
+        *,
+        task_id: str,
+        changed_files: List[str],
+        workflow_id: str,
+        task_ref: TaskRef,
+    ) -> VerificationResult:
+        worker_result = self._verify_completion_with_worker(
+            task_id=task_id,
+            changed_files=changed_files,
+            workflow_id=workflow_id,
+            task_ref=task_ref,
+        )
+        if worker_result.overall_outcome != "passed":
+            return worker_result
+
+        agent_result = self._verify_completion_with_agent(
+            task_id=task_id,
+            changed_files=changed_files,
+            workflow_id=workflow_id,
+            task_ref=task_ref,
+        )
+        return self._challenge_verification_result(worker_result, agent_result)
+
+    def _challenge_verification_result(
+        self,
+        worker_result: VerificationResult,
+        agent_result: VerificationResult,
+    ) -> VerificationResult:
+        challenge_outcome = str(agent_result.overall_outcome)
+        outcome = "passed" if challenge_outcome == "passed" else "failed"
+        summary = (
+            "worker verification passed; "
+            f"challenge verification {challenge_outcome}: {agent_result.summary}"
+        )
+        return VerificationResult(
+            verification_id=worker_result.verification_id,
+            workflow_id=worker_result.workflow_id,
+            task_id=worker_result.task_id,
+            overall_outcome=outcome,
+            checks=worker_result.checks + agent_result.checks,
+            warnings=_dedupe_warnings(worker_result.warnings + agent_result.warnings),
+            summary=summary,
+            challenge_outcome=challenge_outcome,
+        )
+
+    def _verification_result(
+        self,
+        *,
+        task_id: str,
+        workflow_id: str,
+        outcome: str,
+        checks: Optional[List[VerificationCheck]] = None,
+        warnings: Optional[List[str]] = None,
+        summary: str,
+    ) -> VerificationResult:
         return VerificationResult(
             verification_id=f"ver-{uuid.uuid4().hex[:READY_BATCH_ID_HEX_LEN]}",
             workflow_id=workflow_id,
             task_id=task_id,
-            overall_outcome=overall_outcome,
-            checks=checks,
-            warnings=warnings,
+            overall_outcome=outcome,
+            checks=checks or [],
+            warnings=warnings or [],
             summary=summary,
+        )
+
+    def _verify_completion_with_agent(
+        self,
+        *,
+        task_id: str,
+        changed_files: List[str],
+        workflow_id: str,
+        task_ref: TaskRef,
+    ) -> VerificationResult:
+        warnings = self._build_scope_warnings(changed_files, task_ref)
+        agent = RalphAgent(
+            workflow_id=workflow_id,
+            config=AgentConfig(provider=GEMINI_PROVIDER),
+        )
+        try:
+            payload = agent.verify_task_completion(
+                task_ref,
+                changed_files=changed_files,
+                project_root=self.project_root,
+            )
+        except (
+            OSError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            GeminiResponseError,
+            RuntimeError,
+        ) as exc:
+            return self._failed_agent_verification(task_id, workflow_id, warnings, exc)
+        return self._agent_verification_result(task_id, workflow_id, warnings, payload)
+
+    def _failed_agent_verification(
+        self,
+        task_id: str,
+        workflow_id: str,
+        warnings: List[str],
+        exc: Exception,
+    ) -> VerificationResult:
+        return VerificationResult(
+            verification_id=f"ver-{uuid.uuid4().hex[:READY_BATCH_ID_HEX_LEN]}",
+            workflow_id=workflow_id,
+            task_id=task_id,
+            overall_outcome="failed",
+            checks=[],
+            warnings=warnings,
+            summary=f"agent verification failed: {_agent_error_detail(exc)}",
+        )
+
+    def _agent_verification_result(
+        self,
+        task_id: str,
+        workflow_id: str,
+        warnings: List[str],
+        payload: Dict[str, Any],
+    ) -> VerificationResult:
+        outcome = str(payload.get("outcome") or "").strip()
+        if outcome not in {"passed", "failed"}:
+            outcome = "failed"
+        return VerificationResult(
+            verification_id=f"ver-{uuid.uuid4().hex[:READY_BATCH_ID_HEX_LEN]}",
+            workflow_id=workflow_id,
+            task_id=task_id,
+            overall_outcome=outcome,
+            checks=_agent_checks(payload.get("checks", [])),
+            warnings=warnings,
+            summary=str(payload.get("reason") or f"agent verification {outcome}"),
         )
 
     def _build_scope_warnings(
@@ -753,9 +961,8 @@ class RalphService:
         path = Path(plan_path)
         if not path.exists():
             return
-        try:
-            current_digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        except (OSError, ValueError):
+        current_digest = compute_structural_plan_digest(path)
+        if not current_digest:
             return
         if current_digest != registered_digest:
             _logger.warning(
@@ -764,6 +971,28 @@ class RalphService:
                 registered_digest[:12],
                 plan_path,
             )
+
+    def _load_workflow_critical_flows(self, workflow_id: str) -> List[Any]:
+        if self.workflow_engine is None:
+            return []
+        meta = self.workflow_engine.get_workflow_meta(workflow_id)
+        plan_path = str(getattr(meta, "plan_path", "") or "").strip()
+        if not plan_path:
+            return []
+        return list(getattr(self._load_cached_workflow_plan(plan_path), "critical_flows", []))
+
+    def _load_cached_workflow_plan(self, plan_path: str) -> Any:
+        path = Path(plan_path)
+        if not path.is_absolute():
+            path = self.project_root / path
+        cache_key = str(path.resolve())
+        mtime_ns = path.stat().st_mtime_ns
+        cached = self._workflow_plan_cache.get(cache_key)
+        if cached is not None and cached[0] == mtime_ns:
+            return cached[1]
+        plan = load_plan(path)
+        self._workflow_plan_cache[cache_key] = (mtime_ns, plan)
+        return plan
 
     def _get_metrics_mtime_ns(self) -> int:
         """Return mtime_ns of the metrics file, or 0 if missing/unreadable."""

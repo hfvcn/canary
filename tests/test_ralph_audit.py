@@ -3,7 +3,7 @@
 Verifies:
   (a) 4 verification failures -> W_TASK_FLAPPING emitted
   (b) 2 verification failures -> no W_TASK_FLAPPING emitted
-  (c) verification_skipped + task_reported_completed -> H_COMPLETED_BUT_UNVERIFIED
+  (c) skipped verification + task_reported_completed -> H_COMPLETED_BUT_UNVERIFIED
 """
 
 from __future__ import annotations
@@ -134,6 +134,16 @@ class TestCompletedButUnverified:
         assert "T1" in issue.task_ids
         assert issue.severity == "hint"
         assert "issue_instance_id" in issue.evidence
+
+    def test_skipped_blocked_then_completed(self):
+        """verification_skipped_blocked followed by task_reported_completed is still unverified."""
+        events = [
+            _make_event("workflow.verification_skipped_blocked", "T1", ts=_recent_ts(120)),
+            _make_event("workflow.task_reported_completed", "T1", ts=_recent_ts(60)),
+        ]
+        issues = audit_ledger(events, days=7)
+        unverified = [i for i in issues if i.code == AUDIT_H_COMPLETED_BUT_UNVERIFIED]
+        assert len(unverified) == 1
 
     def test_skipped_then_passed_then_completed_no_issue(self):
         """verification_skipped -> verification_passed -> completed = no issue."""

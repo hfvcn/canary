@@ -116,7 +116,7 @@ def test_verify_completion_executes_structured_checks(ralph_service, temp_projec
     assert result.checks[0].details["command"] == "true"
 
 
-def test_verify_completion_skips_when_no_checks(ralph_service):
+def test_verify_completion_blocks_when_no_checks(ralph_service):
     task_ref = TaskRef(id="T-skip", title="skip verification")
 
     result = ralph_service.verify_completion(
@@ -126,9 +126,9 @@ def test_verify_completion_skips_when_no_checks(ralph_service):
         task_ref=task_ref,
     )
 
-    assert result.overall_outcome == "skipped"
+    assert result.overall_outcome == "skipped_blocked"
     assert result.checks == []
-    assert result.summary == "verification skipped: no command configured"
+    assert result.summary == "verification skipped: no command configured; completion blocked"
 
 
 def test_metadata_survives_replay(engine):

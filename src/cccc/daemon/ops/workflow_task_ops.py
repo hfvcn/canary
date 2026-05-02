@@ -125,6 +125,7 @@ def complete_task(
     assignment_id="",
     actor_run_id="",
     override_stale_digest=False,
+    force_complete=False,
     attempt_id="",
 ):
     try:
@@ -144,7 +145,7 @@ def complete_task(
                 "actor_run_id": str(actor_run_id or "").strip(),
             },
         )
-        result = orchestrator.apply_task_event(event, override_stale_digest=bool(override_stale_digest))
+        result = orchestrator.apply_task_event(event, override_stale_digest=bool(override_stale_digest), force_complete=bool(force_complete))
         result["workflow_id"] = _normalize_text("workflow_id", workflow_id)
         return _wrap_event_result(result)
     except Exception as exc:
@@ -253,7 +254,7 @@ def verify_task(group_id, task_id, workflow_id, project_root, daemon_request_fn)
                 verification=verification,
             )
             notification_outcome = "passed"
-        elif verification.overall_outcome == "skipped":
+        elif verification.overall_outcome in {"skipped", "skipped_blocked"}:
             error_msg = (
                 "Verification skipped: no commands configured. "
                 "Add verification commands or use force_complete_unverified()."
@@ -264,7 +265,7 @@ def verify_task(group_id, task_id, workflow_id, project_root, daemon_request_fn)
                 agent_name=agent_id,
                 verification=verification,
             )
-            notification_outcome = "skipped"
+            notification_outcome = "skipped_blocked"
             notification_error = error_msg
         else:
             orchestrator.on_task_failed(

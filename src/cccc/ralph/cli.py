@@ -22,7 +22,9 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from .agent import (
+    AgentConfig,
     AgentSuggestion,
+    GEMINI_PROVIDER,
     build_error_envelope,
     create_agent,
     _is_debug_traceback_enabled,
@@ -47,37 +49,162 @@ _EXIT_INTERNAL_ERROR = 2       # Internal errors (load failures, crashes, etc.)
 logger = logging.getLogger(__name__)
 
 
+def _warning_exc_info(exc_info: object | None) -> object | None:
+    if exc_info is True:
+        return sys.exc_info()
+    if isinstance(exc_info, tuple):
+        return exc_info
+    return None
+
+
+def _can_emit_warning_safely(handler: logging.Handler) -> bool:
+    if handler.level > logging.WARNING:
+        return False
+    stream = getattr(handler, "stream", None)
+    if stream in (sys.stderr, sys.stdout):
+        return False
+    return not bool(getattr(stream, "closed", False))
+
+
+def _log_warning_safely(message: str, exc_info: object | None) -> None:
+    record = logger.makeRecord(
+        logger.name,
+        logging.WARNING,
+        __file__,
+        0,
+        message,
+        (),
+        _warning_exc_info(exc_info),
+        None,
+    )
+    current: logging.Logger | None = logger
+    while current is not None:
+        for handler in current.handlers:
+            if _can_emit_warning_safely(handler):
+                handler.handle(record)
+        if not current.propagate:
+            break
+        current = current.parent
+
+
+def _warn_visible(message: str, *args: object, exc_info: object | None = None) -> None:
+    rendered = message % args if args else message
+    print(rendered, file=sys.stderr)
+    _log_warning_safely(rendered, exc_info)
+
+
 def _auto_detect_group(project_root: Path) -> str | None:
     """Find the unique group whose project_root matches *project_root*."""
+    resolved = str(project_root.resolve())
     try:
         from ..paths import ensure_home
-        from ..kernel.group import load_group
 
         groups_dir = ensure_home() / "groups"
         if not groups_dir.is_dir():
-            return None
-        resolved = str(project_root.resolve())
-        matches: list[str] = []
-        for gp in groups_dir.iterdir():
-            if not gp.is_dir():
-                continue
-            g = load_group(gp.name)
-            if g is None:
-                continue
-            g_root = str(g.doc.get("project_root") or "").strip()
-            if g_root and str(Path(g_root).resolve()) == resolved:
-                matches.append(g.group_id)
-        if len(matches) == 1:
-            logger.info("Auto-detected group %s for project_root %s", matches[0], resolved)
-            return matches[0]
-        if len(matches) > 1:
-            logger.warning(
-                "Multiple groups match project_root %s: %s — pass --group explicitly",
-                resolved, matches,
+            _warn_visible(
+                "No validation event will be written: no groups configured for project_root %s",
+                resolved,
             )
-    except Exception:
-        logger.debug("Auto-detect group failed", exc_info=True)
+            return None
+        group_dirs = [gp for gp in groups_dir.iterdir() if gp.is_dir()]
+    except Exception as exc:
+        _warn_visible(
+            "No validation event will be written: group registry state unavailable for project_root %s: %s",
+            resolved,
+            exc,
+        )
+        return None
+
+    if not group_dirs:
+        _warn_visible(
+            "No validation event will be written: no groups configured for project_root %s",
+            resolved,
+        )
+        return None
+
+    matches = _matching_group_ids(group_dirs, resolved)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        _warn_visible(
+            "No validation event will be written: multiple groups match "
+            "project_root %s: %s; pass --group explicitly",
+            resolved,
+            matches,
+        )
+        return None
+
+    _warn_visible(
+        "No validation event will be written: no configured group project_root matches %s",
+        resolved,
+    )
     return None
+
+
+def _matching_group_ids(group_dirs: list[Path], resolved_project_root: str) -> list[str]:
+    matches: list[str] = []
+    for group_dir in group_dirs:
+        group_root = _load_group_project_root(group_dir.name)
+        if group_root is None:
+            continue
+        group_id, resolved_group_root = group_root
+        if resolved_group_root == resolved_project_root:
+            matches.append(group_id)
+    return matches
+
+
+def _load_group_project_root(group_id: str) -> tuple[str, str] | None:
+    try:
+        from ..kernel.group import load_group
+
+        group = load_group(group_id)
+    except Exception as exc:
+        _warn_visible(
+            "Auto-detect skipped group %s: group state unavailable: %s",
+            group_id,
+            exc,
+        )
+        return None
+
+    if group is None:
+        _warn_visible("Auto-detect skipped group %s: group state unavailable", group_id)
+        return None
+
+    raw_project_root = str(group.doc.get("project_root") or "").strip()
+    if not raw_project_root:
+        return None
+    try:
+        return group.group_id, str(Path(raw_project_root).resolve())
+    except Exception as exc:
+        _warn_visible(
+            "Auto-detect skipped group %s: invalid project_root %r: %s",
+            group_id,
+            raw_project_root,
+            exc,
+        )
+        return None
+
+
+def _resolve_group_ledger_path(group_id: str) -> Path | None:
+    try:
+        from ..kernel.group import load_group
+
+        group = load_group(group_id)
+    except Exception as exc:
+        _warn_visible(
+            "No validation event will be written: group state unavailable for %s: %s",
+            group_id,
+            exc,
+        )
+        return None
+
+    if group is None:
+        _warn_visible(
+            "No validation event will be written: group state unavailable for %s",
+            group_id,
+        )
+        return None
+    return group.ledger_path
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -274,71 +401,151 @@ def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
     show_semantic = not getattr(args, "no_semantic", False)
     no_agent = getattr(args, "no_agent", False)
 
-    # --- Agent review of beyond-scope issues ---
-    agent_suggestions: list[AgentSuggestion] = []
-    if not no_agent:
-        all_issues = list(report.errors) + list(report.warnings) + list(report.hints)
-        beyond_scope = [i for i in all_issues if i.beyond_scope]
-        if beyond_scope:
-            checklist_path = (
-                project_root / "src" / "cccc" / "ralph" / "beyond_scope_checklist.yaml"
-            )
-            # Also try relative to the plan file location
-            if not checklist_path.exists():
-                plan_dir = args.plan.resolve().parent if args.plan else project_root
-                checklist_path = plan_dir / "beyond_scope_checklist.yaml"
-            agent = create_agent(checklist_path)
-            agent_suggestions = agent.review_beyond_scope(beyond_scope)
+    try:
+        agent_suggestions = _review_beyond_scope_with_agent(
+            plan=plan,
+            report=report,
+            project_root=project_root,
+            plan_path=args.plan,
+            no_agent=no_agent,
+        )
+    except Exception as exc:
+        report.valid = False
+        report.errors.append(_agent_review_failure_issue(exc))
+        agent_suggestions = []
+    _print_validate_result(
+        report=report,
+        args=args,
+        project_root=project_root,
+        gate_name=gate_name,
+        show_semantic=show_semantic,
+        agent_suggestions=agent_suggestions,
+    )
 
-    if args.format == "json":
-        payload = report.model_dump()
-        payload["metadata"] = {"project_root": str(project_root)}
-        if gate_name:
-            payload["metadata"]["gate"] = gate_name
-        if agent_suggestions:
-            payload["agent_suggestions"] = [
-                {
-                    "issue_id": s.issue_id,
-                    "checklist_item_id": s.checklist_item_id,
-                    "suggestion": s.suggestion,
-                    "confidence": s.confidence,
-                    "advisory": s.advisory,
-                }
-                for s in agent_suggestions
-            ]
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
-    else:
-        print(f"Resolved project root: {project_root}", file=sys.stderr)
-        if gate_name:
-            print(_format_gate_mode_banner(gate_name, project_root))
-        _print_validation_text(report, show_semantic=show_semantic)
-        if agent_suggestions:
-            _print_agent_suggestions(agent_suggestions)
+    _write_validate_ledger_event_if_requested(
+        args=args,
+        report=report,
+        project_root=project_root,
+    )
 
+    return _EXIT_OK if report.valid else _EXIT_VALIDATION_FAILURE
+
+
+def _write_validate_ledger_event_if_requested(
+    *,
+    args: argparse.Namespace,
+    report: ValidationReport,
+    project_root: Path,
+) -> None:
     ledger_path = getattr(args, "ledger", None)
     group_id = getattr(args, "group", None)
     if not group_id and not ledger_path:
         group_id = _auto_detect_group(project_root)
     if not ledger_path and group_id:
-        try:
-            from ..kernel.group import load_group
+        ledger_path = _resolve_group_ledger_path(group_id)
+    if not ledger_path:
+        return
+    try:
+        _write_validation_event(
+            ledger_path=ledger_path,
+            plan_path=args.plan,
+            report=report,
+            group_id=group_id or "",
+        )
+    except Exception as exc:
+        _warn_visible("Failed to write validation event to ledger: %s", exc, exc_info=True)
 
-            g = load_group(group_id)
-            ledger_path = g.ledger_path
-        except Exception:
-            pass
-    if ledger_path:
-        try:
-            _write_validation_event(
-                ledger_path=ledger_path,
-                plan_path=args.plan,
-                report=report,
-                group_id=group_id or "",
-            )
-        except Exception:
-            logger.warning("Failed to write validation event to ledger", exc_info=True)
 
-    return _EXIT_OK if report.valid else _EXIT_VALIDATION_FAILURE
+def _review_beyond_scope_with_agent(
+    *,
+    plan: Plan,
+    report: ValidationReport,
+    project_root: Path,
+    plan_path: Path | None,
+    no_agent: bool,
+) -> list[AgentSuggestion]:
+    if no_agent:
+        return []
+    if report.errors:
+        return []
+    all_issues = list(report.errors) + list(report.warnings) + list(report.hints)
+    beyond_scope = [issue for issue in all_issues if issue.beyond_scope]
+    if not beyond_scope:
+        return []
+    agent = create_agent(
+        _agent_checklist_path(project_root=project_root, plan_path=plan_path),
+        plan=plan,
+        config=AgentConfig(provider=GEMINI_PROVIDER),
+    )
+    agent.warm_up()
+    return agent.review_beyond_scope(beyond_scope)
+
+
+def _agent_review_failure_issue(exc: Exception) -> ValidationIssue:
+    return ValidationIssue(
+        code="W_AGENT_REVIEW_SKIPPED",
+        severity="warning",
+        message=f"Ralph Agent review skipped: provider unavailable or returned invalid response ({exc})",
+        evidence={"error_type": type(exc).__name__},
+    )
+
+
+def _agent_checklist_path(*, project_root: Path, plan_path: Path | None) -> Path:
+    checklist_path = project_root / "src" / "cccc" / "ralph" / "beyond_scope_checklist.yaml"
+    if checklist_path.exists():
+        return checklist_path
+    plan_dir = plan_path.resolve().parent if plan_path else project_root
+    return plan_dir / "beyond_scope_checklist.yaml"
+
+
+def _print_validate_result(
+    *,
+    report: ValidationReport,
+    args: argparse.Namespace,
+    project_root: Path,
+    gate_name: str | None,
+    show_semantic: bool,
+    agent_suggestions: list[AgentSuggestion],
+) -> None:
+    if args.format == "json":
+        print(json.dumps(_validate_json_payload(
+            report=report,
+            project_root=project_root,
+            gate_name=gate_name,
+            agent_suggestions=agent_suggestions,
+        ), indent=2, ensure_ascii=False))
+        return
+    print(f"Resolved project root: {project_root}", file=sys.stderr)
+    if gate_name:
+        print(_format_gate_mode_banner(gate_name, project_root))
+    _print_validation_text(report, show_semantic=show_semantic)
+    if agent_suggestions:
+        _print_agent_suggestions(agent_suggestions)
+
+
+def _validate_json_payload(
+    *,
+    report: ValidationReport,
+    project_root: Path,
+    gate_name: str | None,
+    agent_suggestions: list[AgentSuggestion],
+) -> Dict[str, Any]:
+    payload = report.model_dump()
+    payload["metadata"] = {"project_root": str(project_root)}
+    if gate_name:
+        payload["metadata"]["gate"] = gate_name
+    if agent_suggestions:
+        payload["agent_suggestions"] = [
+            {
+                "issue_id": suggestion.issue_id,
+                "checklist_item_id": suggestion.checklist_item_id,
+                "suggestion": suggestion.suggestion,
+                "confidence": suggestion.confidence,
+                "advisory": suggestion.advisory,
+            }
+            for suggestion in agent_suggestions
+        ]
+    return payload
 
 
 def _apply_gate_mode(report: ValidationReport, gate_name: str, project_root: Path) -> ValidationReport:
@@ -631,6 +838,7 @@ AUDIT_H_COMPLETED_BUT_UNVERIFIED = "H_COMPLETED_BUT_UNVERIFIED"
 # Verification event kinds (stable strings from workflow_state_types)
 _KIND_VERIFICATION_FAILED = "workflow.verification_failed"
 _KIND_VERIFICATION_SKIPPED = "workflow.verification_skipped"
+_KIND_VERIFICATION_SKIPPED_BLOCKED = "workflow.verification_skipped_blocked"
 _KIND_VERIFICATION_PASSED = "workflow.verification_passed"
 _KIND_TASK_REPORTED_COMPLETED = "workflow.task_reported_completed"
 
@@ -688,8 +896,8 @@ def audit_ledger(
 
     Checks:
     - W_TASK_FLAPPING: >= 3 verification failures for the same task_id within window
-    - H_COMPLETED_BUT_UNVERIFIED: verification.skipped followed by task_reported_completed
-      with no verification.passed in between
+    - H_COMPLETED_BUT_UNVERIFIED: skipped verification followed by
+      task_reported_completed with no verification.passed in between
     """
     now = datetime.now(timezone.utc)
     cutoff = (now - timedelta(days=days)).isoformat()
@@ -734,9 +942,10 @@ def audit_ledger(
 
     # --- H_COMPLETED_BUT_UNVERIFIED ---
     # Track per-task: last verification outcome and completion events
-    # We look for: verification_skipped → task_reported_completed with no
-    # verification_passed between them.
+    # We look for skipped verification -> task_reported_completed with no
+    # verification_passed between them. Keep the legacy skipped kind for replay.
     task_last_verification: Dict[str, str] = {}  # task_id -> last verification kind
+    skipped_kinds = {_KIND_VERIFICATION_SKIPPED, _KIND_VERIFICATION_SKIPPED_BLOCKED}
     for event in window_events:
         kind = str(event.get("kind") or "")
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
@@ -744,11 +953,16 @@ def audit_ledger(
         if not task_id:
             continue
 
-        if kind in (_KIND_VERIFICATION_PASSED, _KIND_VERIFICATION_FAILED, _KIND_VERIFICATION_SKIPPED):
+        if kind in (
+            _KIND_VERIFICATION_PASSED,
+            _KIND_VERIFICATION_FAILED,
+            _KIND_VERIFICATION_SKIPPED,
+            _KIND_VERIFICATION_SKIPPED_BLOCKED,
+        ):
             task_last_verification[task_id] = kind
         elif kind == _KIND_TASK_REPORTED_COMPLETED:
             last_ver = task_last_verification.get(task_id)
-            if last_ver == _KIND_VERIFICATION_SKIPPED:
+            if last_ver in skipped_kinds:
                 eh = _event_hash(event)
                 instance_id = _make_audit_instance_id(
                     AUDIT_H_COMPLETED_BUT_UNVERIFIED, eh, task_id,

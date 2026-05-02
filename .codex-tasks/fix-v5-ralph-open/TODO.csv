@@ -1,0 +1,10 @@
+id,task,status,completed_at,notes
+1,Confirm remaining RO/RA gaps,DONE,2026-04-28T00:00:00+08:00,"RO-26/31/32 and RA-1/3 remain incomplete"
+2,Relocate RO-32 testing acceptance criteria outside .trellis,DONE,2026-04-28T00:00:00+08:00,"Using docs/standards/CCCC_TESTING_ACCEPTANCE_V1.md"
+3,Close RA-1/RA-3 Agent execution gaps,DONE,2026-04-28T00:00:00+08:00,"Gemini failures are explicit; daemon agent mode executes RalphAgent; persistent agent reuse remains documented as architecture split"
+4,Close RO-26 state source residuals,DONE,2026-04-28T00:00:00+08:00,"_RALPH_STATE now only stores pending suggestions/restarts"
+5,Address RO-31 complexity threshold,DONE,2026-04-28T00:00:00+08:00,"Explicit exception register added under docs/standards"
+6,Run focused verification,DONE,2026-04-28T00:00:00+08:00,"103 focused + 106 supplemental tests passed"
+7,Fix RO-21 validate auto-detect regression,DONE,2026-04-28T00:00:00+08:00,"Warning path writes current stderr and safe log handlers; RO-21 validate ledger/E2E tests pass"
+8,Tighten RO-31 complexity exception validation,DONE,2026-04-28T00:00:00+08:00,"Dynamic AST test now requires current RO-31 Ralph/Workflow complexity violations to be explicitly registered"
+9,Run final verification for RO-21 and RO-31,DONE,2026-04-28T00:00:00+08:00,"156 focused tests passed; full pytest -x reached 29% before 60s timeout with no failure"

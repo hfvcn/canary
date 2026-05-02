@@ -19,7 +19,9 @@ from ...kernel.workflow_state_types import (
 )
 from ...kernel.claimed_paths import (
     GLOBAL_WRITE_CLAIM,
+    any_overlap as _any_overlap,
     normalize_write_set as _normalize_write_set_fn,
+    paths_overlap as _paths_overlap,
 )
 from .agent_pool import TaskAssignment
 from .workflow import BatchEvaluationResult
@@ -72,7 +74,7 @@ def split_single_writer_tasks(
     deferred_tasks: List[TaskRef] = []
     for task in tasks:
         claimed_paths = set(extract_fn(task))
-        if claims_global_fn(claimed_paths) or claimed_paths & running_paths:
+        if claims_global_fn(claimed_paths) or _any_overlap(claimed_paths, running_paths):
             deferred_tasks.append(task)
             continue
         safe_tasks.append(task)
@@ -119,6 +121,62 @@ def record_deferred_tasks(
 # ---------------------------------------------------------------------------
 # Cross-workflow pressure
 # ---------------------------------------------------------------------------
+
+def _find_overlapping_external_owners(
+    task_paths: Set[str],
+    external_path_owners: Dict[str, List[TaskState]],
+) -> Dict[str, List[TaskState]]:
+    overlapping: Dict[str, List[TaskState]] = {}
+    for task_path in task_paths:
+        owners: List[TaskState] = []
+        for external_path, external_owners in external_path_owners.items():
+            if _paths_overlap(task_path, external_path):
+                owners.extend(external_owners)
+        if owners:
+            overlapping[task_path] = owners
+    return overlapping
+
+
+def _owner_overlaps_path(
+    task_path: str,
+    owner: TaskState,
+    external_path_owners: Dict[str, List[TaskState]],
+) -> bool:
+    owner_key = (owner.workflow_id, owner.task.id)
+    for external_path, owners in external_path_owners.items():
+        if not _paths_overlap(task_path, external_path):
+            continue
+        if any((candidate.workflow_id, candidate.task.id) == owner_key for candidate in owners):
+            return True
+    return False
+
+
+def _build_competing_refs(
+    task_paths: Set[str],
+    overlapping: Dict[str, List[TaskState]],
+    external_path_owners: Dict[str, List[TaskState]],
+    now: float,
+) -> List[Dict[str, Any]]:
+    seen_refs: set[str] = set()
+    refs: List[Dict[str, Any]] = []
+    for owners in overlapping.values():
+        for owner in owners:
+            ref_key = f"{owner.workflow_id}:{owner.task.id}"
+            if ref_key in seen_refs:
+                continue
+            seen_refs.add(ref_key)
+            ts_max = max(owner.started_at or 0.0, owner.last_heartbeat or 0.0)
+            heartbeat_age_ms = int((now - ts_max) * 1000) if ts_max > 0 else -1
+            refs.append({
+                "workflow_id": owner.workflow_id,
+                "task_id": owner.task.id,
+                "overlapping_paths": [
+                    path for path in sorted(task_paths)
+                    if _owner_overlaps_path(path, owner, external_path_owners)
+                ],
+                "heartbeat_age_ms": heartbeat_age_ms,
+            })
+    return refs
 
 def get_active_external_tasks(
     engine: Any,
@@ -187,36 +245,17 @@ def compute_cross_workflow_deferrals(
 
     for task in suggestion.tasks:
         task_paths = set(extract_fn(task))
-        overlapping: Dict[str, List[TaskState]] = {}
-        for p in task_paths:
-            if p in external_path_owners:
-                overlapping[p] = external_path_owners[p]
+        overlapping = _find_overlapping_external_owners(task_paths, external_path_owners)
         if not overlapping:
             safe_tasks.append(task)
             continue
         deferred_tasks.append(task)
-        # Build competing_refs
-        seen_refs: set[str] = set()
-        refs: List[Dict[str, Any]] = []
-        for path, owners in overlapping.items():
-            for owner in owners:
-                ref_key = f"{owner.workflow_id}:{owner.task.id}"
-                if ref_key in seen_refs:
-                    continue
-                seen_refs.add(ref_key)
-                ts_max = max(owner.started_at or 0.0, owner.last_heartbeat or 0.0)
-                heartbeat_age_ms = int((now - ts_max) * 1000) if ts_max > 0 else -1
-                refs.append({
-                    "workflow_id": owner.workflow_id,
-                    "task_id": owner.task.id,
-                    "overlapping_paths": [
-                        p2 for p2 in task_paths if p2 in external_path_owners
-                        and any(o.workflow_id == owner.workflow_id and o.task.id == owner.task.id
-                                for o in external_path_owners[p2])
-                    ],
-                    "heartbeat_age_ms": heartbeat_age_ms,
-                })
-        deferred_competing[task.id] = refs
+        deferred_competing[task.id] = _build_competing_refs(
+            task_paths,
+            overlapping,
+            external_path_owners,
+            now,
+        )
 
     return safe_tasks, deferred_tasks, deferred_competing
 

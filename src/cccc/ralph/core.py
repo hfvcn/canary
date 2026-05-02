@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
+from .agent import AgentConfig, GEMINI_PROVIDER, GeminiResponseError, RalphAgent
 from .models import (
     BatchResult,
     BlockedTask,
@@ -154,6 +155,12 @@ def suggest(plan: Plan) -> BatchResult:
 
     n = len(ready)
     ready_set = set(ready)
+    task_descriptions = {}
+    for tid in ready:
+        task = task_map.get(tid)
+        if task and task.goal_behavior:
+            task_descriptions[tid] = task.goal_behavior
+
     return BatchResult(
         ready=ready,
         blocked=blocked,
@@ -169,6 +176,7 @@ def suggest(plan: Plan) -> BatchResult:
             for tid in ready
             if tid in task_map and task_map[tid].title
         },
+        task_descriptions=task_descriptions,
     )
 
 
@@ -183,15 +191,10 @@ def verify(
     project_root: Path,
 ) -> Dict[str, Any]:
     """Run verification checks for a completed task. Returns structured result."""
-    del changed_files
-
     if task.verification_mode == "agent":
-        return {
-            "task_id": task.id,
-            "outcome": "agent_pending",
-            "reason": "awaiting external agent verification",
-            "checks": [],
-        }
+        return _verify_with_agent(task, changed_files, project_root=project_root)
+
+    del changed_files
 
     specs, reason = _resolve_verification_specs(task)
     if reason is not None:
@@ -221,6 +224,127 @@ def verify(
         "outcome": outcome,
         "checks": checks,
     }
+
+
+def _verify_with_agent(
+    task: TaskSpec,
+    changed_files: List[str],
+    *,
+    project_root: Path,
+) -> Dict[str, Any]:
+    source_context = _read_claimed_paths(task.claimed_paths, project_root)
+    git_diff = _git_diff_for_files(changed_files, project_root)
+    verification_output = _run_verification_pre_check(task, project_root)
+
+    agent = RalphAgent(config=AgentConfig(provider=GEMINI_PROVIDER))
+    try:
+        return agent.verify_task_completion(
+            task,
+            changed_files=changed_files,
+            project_root=project_root,
+            source_context=source_context,
+            git_diff=git_diff,
+            verification_output=verification_output,
+        )
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        GeminiResponseError,
+    ) as exc:
+        return {
+            "task_id": task.id,
+            "outcome": "error",
+            "reason": f"Ralph Agent verification failed: {_agent_error_detail(exc)}",
+            "checks": [],
+        }
+
+
+_SOURCE_CONTEXT_MAX_BYTES = 30_000
+_SOURCE_FILE_MAX_BYTES = 8_000
+
+
+def _read_claimed_paths(
+    claimed_paths: List[str],
+    project_root: Path,
+) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    total = 0
+    for rel_path in claimed_paths:
+        if total >= _SOURCE_CONTEXT_MAX_BYTES:
+            break
+        full = project_root / rel_path
+        if not full.is_file():
+            result[rel_path] = "<file not found>"
+            continue
+        try:
+            text = full.read_text(encoding="utf-8", errors="replace")
+            if len(text) > _SOURCE_FILE_MAX_BYTES:
+                text = text[:_SOURCE_FILE_MAX_BYTES] + f"\n... (truncated at {_SOURCE_FILE_MAX_BYTES} bytes)"
+            result[rel_path] = text
+            total += len(text)
+        except Exception:
+            result[rel_path] = "<read error>"
+    return result
+
+
+def _git_diff_for_files(
+    changed_files: List[str],
+    project_root: Path,
+) -> str:
+    if not changed_files:
+        return "<no changed files — nothing was modified>"
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "HEAD", "--", *changed_files],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        diff = (proc.stdout or "").strip()
+        if not diff:
+            return "<empty diff — files are unchanged from HEAD>"
+        if len(diff) > _SOURCE_CONTEXT_MAX_BYTES:
+            diff = diff[:_SOURCE_CONTEXT_MAX_BYTES] + "\n... (truncated)"
+        return diff
+    except Exception:
+        return "<git diff unavailable>"
+
+
+_PRECHECK_TIMEOUT = 30
+
+
+def _run_verification_pre_check(
+    task: TaskSpec,
+    project_root: Path,
+) -> Dict[str, Any]:
+    specs, reason = _resolve_verification_specs(task)
+    if reason is not None:
+        return {"status": "skipped", "reason": reason}
+    results: List[Dict[str, Any]] = []
+    for spec in specs:
+        check = _run_check(
+            name=spec["name"],
+            command=spec["command"],
+            project_root=project_root,
+            expected_exit_code=spec["expected_exit_code"],
+        )
+        results.append(check)
+    all_passed = all(c["outcome"] == "passed" for c in results)
+    return {
+        "status": "passed" if all_passed else "failed",
+        "checks": results,
+    }
+
+
+def _agent_error_detail(exc: Exception) -> str:
+    if isinstance(exc, subprocess.CalledProcessError):
+        stderr = str(exc.stderr or "").strip()
+        return stderr or f"exit status {exc.returncode}"
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return f"timed out after {exc.timeout} seconds"
+    return str(exc) or type(exc).__name__
 
 
 def _resolve_verification_specs(task: TaskSpec) -> tuple[List[Dict[str, Any]], str | None]:

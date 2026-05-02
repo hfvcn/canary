@@ -1112,4 +1112,172 @@ RO 改进在 v13 中的验证效果：
   3. 状态源合并测试没有构造 engine 空但 shadow state 污染的负向场景。
   4. RA-3 测试曾把 `agent_pending` 可 complete 的错误行为固化为预期。
 - **改进方向**：建立测试等级与验收准入：`runtime-contract`、`unit-contract`、`schema-smoke`、`api-surface`。P1/P2 修复必须至少有一个 `runtime-contract` 测试，从 CLI/IPC op/daemon public entrypoint 进入，断言 public response、`WorkflowEngine`/ledger 权威状态和实际副作用。
-- **验收标准**：每个 P1/P2 修复必须提供修复前失败、修复后通过的真实入口测试；mock 不得替代被验证核心调用链；涉及“不再 fallback/不再 completed/不再 sync”的需求必须有负向测试；浅层 smoke 测试不得单独作为完成依据。
+- **验收标准**：每个 P1/P2 修复必须提供修复前失败、修复后通过的真实入口测试；mock 不得替代被验证核心调用链；涉及”不再 fallback/不再 completed/不再 sync”的需求必须有负向测试；浅层 smoke 测试不得单独作为完成依据。
+
+---
+
+## 2026-05-01 E2E v15 实测归档
+
+### v15 E2E 评分
+
+| 维度 | v15 | 审查者 |
+|------|-----|--------|
+| 结果 | 3/5 | Codex（1 CRITICAL: title=null 崩溃搜索主流程） |
+| 过程 | 5/5 | Codex + 内置 Agent 一致（10/10） |
+| 体验 | 4/5 | Foreman 自评 |
+| 综合 | 4.0/5 | 历史最高 |
+
+### RF-2026-04-25-1 IPC verification 回写 — ✅ v15 验证通过
+> v15 E2E 中 5/5 任务的 `workflow.verification_passed` 事件含真实 `checks[]`（name + outcome=passed + stdout 捕获 + duration_ms），engine state 从 running → completed 正确转换。此项从”待完整回归”升级为”已验证”。
+
+### RO-35 Gemini CLI trust directory 导致 Ralph Agent 失败 — ✅ 已修复
+> **来源**：2026-05-01 E2E v15
+> - **现象**：`ralph validate` 在非信任目录（如 `/tmp/`）运行时 Gemini CLI 返回 exit code 55（”not running in a trusted directory”）
+> - **根因**：Gemini CLI v0.40+ 要求运行目录被显式信任；Ralph Agent 的 `_gemini_command()` 未带 `--skip-trust`
+> - **修复**：在 `src/cccc/ralph/agent.py::_gemini_command()` 中加 `--skip-trust` 标志
+> - **验证**：v15 第二轮 `ralph validate` 包含 Gemini Agent review，`workflow.plan_validated` valid=true
+
+### RO-41 E_AGENT_REVIEW_FAILED 阻塞 validate 当 Agent 不可用 — ✅ 已修复
+> **来源**：2026-05-02 v16 plan validate 实践
+> - **现象**：`ralph validate plans/fix-v5-open-issues.yaml` → Gemini CLI 超时或返回无效 suggestion → `E_AGENT_REVIEW_FAILED` error → 规划 AI 被迫添加 `suppress_codes: [E_AGENT_REVIEW_FAILED]`
+> - **根因**：Agent 不可用/返回异常时 validate 阶段报 error 阻塞验证流程。suppress 后降低了验证可信度 — 无法区分"Agent 发现真实问题"和"Agent 自身故障"
+> - **修复**：`src/cccc/ralph/cli.py::_agent_review_failure_issue()` — `E_AGENT_REVIEW_FAILED` (error) → `W_AGENT_REVIEW_SKIPPED` (warning)。Agent 不可用时结构性验证不被阻塞，Agent 审查结果以 warning 形式呈现
+> - **触发实例**：v16 plan validate 因 Gemini CLI 30s 超时触发 error，必须 suppress 才能继续工作流
+
+### v15 验证的已有修复生效确认
+
+| 修复 | v15 验证证据 |
+|------|-------------|
+| FIX-1 (metadata 传递) | 5 个 task_registered 含完整 claimed_paths + verification.checks + contracts |
+| FIX-2 (auto-dispatch) | 5/5 任务由 service:workflow_orchestrator 自动下发，100% 自动化 |
+| FIX-3 (DAG gating) | 每个任务在依赖 verification_passed 后 14-39s 内启动 |
+| FIX-5 (verification 语义) | 5/5 verification_passed 含真实 checks、stdout、exit code，无 skipped |
+
+### v15 新发现问题
+
+| 编号 | 严重度 | 状态 | 说明 |
+|------|--------|------|------|
+| RO-34 | Medium | 未解决 | actor restart 后 inbox 消息不重投递，Foreman idle 8 分钟 |
+| RO-35 | Medium | ✅ 已修复 | Gemini CLI trust directory，`--skip-trust` 修复 |
+| RO-36 | Medium | 未解决 | Foreman 批次手工 submit 摩擦，5 任务 = 5 次手工 submit |
+
+### v15 代码验证确认已解决的条目（11 项）
+
+以下条目在 2026-05-01 通过代码逐项验证确认已实现，从主文档移入 full。
+
+| 编号 | 验证结果 | 代码证据 |
+|------|----------|---------|
+| RO-24 | ✅ RESOLVED | `validation_rules/coverage.py:293-364` 实现 `_check_verification_cross_scope()`，发出 `W_VERIFICATION_CROSS_SCOPE` warning；有专项测试 `test_cross_scope_verification.py` |
+| RO-25 | ✅ RESOLVED | `verification_gate.py:173-185` 将 skipped 路由到 `on_task_failed_fn()`；`workflow_state_engine.py:594,679` 映射 `KIND_VERIFICATION_SKIPPED_BLOCKED` → FAILED；测试 `test_ralph_verification_skipped_block.py:125-137` |
+| RO-26 | ✅ RESOLVED | `ralph_service.py:153` 注释 `"RO-26: _task_statuses removed"`；仅保留 `_task_refs`(cache) 和 `_processed_keys`(dedup)；engine 为唯一写入源 |
+| RO-27 | ✅ RESOLVED | `ralph_ipc_handler.py:287-288` 缺 group_id/project_root 返回 error；`assignment_batches.py:143-147` fallback 需显式 `fallback_allowed` 标志 |
+| RO-28 | ✅ RESOLVED | `kernel/claimed_paths.py:31-87` 统一 `normalize_write_set()` + `paths_overlap()`；`ralph/core.py:26-31` 和 `validation_rules/coverage.py:11` 均从 kernel 导入 |
+| RO-29 | ✅ RESOLVED | `models.py:374-383` BatchResult 无重复字段；`test_batch_result_defaults.py:21-25` 防回归测试 |
+| RO-32 | ✅ RESOLVED | `docs/standards/CCCC_TESTING_ACCEPTANCE_V1.md` 定义 P1/P2 runtime-contract 准入标准 |
+| RO-33 | ✅ RESOLVED | `assignment_startup.py:112-118` 现在传 `issues`/`recommended_tests`/`forbidden_flows` 给 `_build_task_prompt()` |
+| RA-1 | ✅ RESOLVED | `agent.py:30,45,135,182` 真实 Gemini CLI 调用；`cli.py:249-252` `--no-agent` 标志 |
+| RA-2 | ✅ RESOLVED | `ralph/beyond_scope_checklist.yaml` 存在；`models.py:406` `ValidationIssue.beyond_scope: bool = False` |
+| RA-3 | ✅ RESOLVED | `models.py:118` `verification_mode: Literal["ralph","agent"]`；`core.py:187-188` + `ralph_service.py:506-513` agent 模式路由 |
+
+## 2026-05-02 E2E v16 实测归档
+
+### v16 E2E 评分
+
+| 维度 | v16 | 审查者 |
+|------|-----|--------|
+| 结果 | 3/5 | Codex（1 CRITICAL: javascript: URL XSS，4 WARN） |
+| 过程 | 3/5 | Codex（8/10 正面，自动化 14.3%，29 monitor_violation） |
+| 体验 | 3/5 | Foreman 自评 |
+| 综合 | 3.0/5 | PTY worker 可靠性 + digest 同步退步 |
+
+### RO-34 Actor restart 后 inbox 消息不重投递 — ✅ v16 验证通过
+> **来源**：2026-05-01 E2E v15（发现），2026-05-02 v16（验证解决）
+> - **原现象**：v15 Foreman restart 后 idle 8 分钟，inbox 消息不重投递
+> - **修复**：`actor_lifecycle_ops.py:34-42` `_reset_inbox_cursor_on_actor_restart()` 在 restart 时删除 cursor
+> - **v16 验证**：2 次 `actor.restart`（backend-worker 07:47:25, frontend-worker 07:47:26），frontend-worker restart 后恢复工作（T4 heartbeat 09:39:38），无需手动发送提醒消息
+
+### RA-4 两阶段拆分对齐 — ✅ v16 验证通过
+> **来源**：2026-04-04 工作流蓝图 v0.3
+> - **要求**：suggest() 输出 Task 批次，正确反映依赖和写冲突
+> - **v16 验证**：4 个 batch 严格按依赖+写冲突调度：[T1]→[T2(backend/)+T4(frontend/)]→[T3(backend/tests/)+T5(frontend/)]→[T6(frontend/)+T7(tests/)]。T2+T4 并行（不同 claimed_paths），不等彼此完成。suggest 算法在 Task 级拆分 + Module 级并行模型中工作正常
+
+### v16 验证的已有修复生效确认
+
+| 修复 | v16 验证证据 |
+|------|-------------|
+| FIX-1 (metadata 传递) | 7 个 task_registered 含完整 claimed_paths + verification.checks(1-3个) + provides/consumes + depends_on |
+| FIX-2 (auto-dispatch) | T1→[T2,T4] 1s 自动推进；T5→[T6,T7] 2s 自动推进；首次 submit 后无需手工 submit |
+| FIX-3 (DAG gating) | 4 batch 严格按依赖顺序，不等整批完成，单任务完成即解锁下游 |
+| FIX-4 (stall detection) | 29 个 monitor_violation 正确检测 T2/T4/T6 的 stall（300s 阈值） |
+| FIX-5 (verification 语义) | 7/7 verification_passed 含真实 checks(15个 total)、outcome=passed，无 skipped |
+
+### v16 新发现问题
+
+| 编号 | 严重度 | 状态 | 说明 |
+|------|--------|------|------|
+| RO-38 | P0 | 未解决 | plan_digest_divergence 死锁：`ralph complete` 改 plan.yaml → engine digest 过期 → task complete 被 veto（5 次） |
+| RO-39 | P1 | 未解决 | manual completion 不触发 auto-advance：Foreman 手动 complete T2 后 T3 未自动推进 |
+| RO-40 | P1 | 未解决 | PTY Worker completion protocol 缺失：1/7 自主完成率，6 个 completer_mismatch |
+
+### v16 退步分析
+
+| 指标 | v15 | v16 | 退步原因 |
+|------|-----|-----|----------|
+| 过程 | 5/5 | 3/5 | PTY worker 1/7 自主率（v15 100%）；29 monitor_violation |
+| 体验 | 4/5 | 3/5 | plan_digest_divergence 新问题；双状态机冲突 |
+| 结果 | 3/5 | 3/5 | 持平：v15 title=null → v16 javascript: XSS（类型不同） |
+
+---
+
+## v17-v19 已解决条目（2026-05-02/03 三轮 E2E 验证）
+
+### RO-37 Verification gate 对 Worker 自测盲区无对抗能力 — ✅ v17-v19 E2E 验证通过
+> **来源**：2026-05-01 E2E v15 Codex 审查；v16 再次印证
+> **代码修复**：三层架构全部实现：
+>   1. Ralph validate 层：`W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION` warning（coverage.py:679-701）
+>   2. Engine 默认层：auto-upgrade verification_mode 到 challenge（ralph_service.py:526-534）
+>   3. Agent 审查层：challenge 模式先执行 worker verification 再 Agent 对抗（ralph_service.py:589-612）
+> **E2E 验证**：v17/v18/v19 三轮均确认 challenge mode 自动升级并执行。T1-T4 全部走 challenge 路径。
+> **残留**：challenge agent（Gemini）产生假阳性（见 RO-42），但机制本身已正确运行。
+
+### RO-38 plan_digest_divergence 死锁 — ✅ v18+v19 E2E 验证通过
+> **来源**：2026-05-02 E2E v16 实战
+> **代码修复**：structural digest 排除 state 字段（plan_io.py:74-87 `_strip_plan_state()`），测试覆盖（test_digest_state_exempt.py）
+> **E2E 验证**：v17/v18/v19 连续 3 轮 0 次 plan_digest_divergence 事件
+
+### RO-39 manual completion 不触发 auto-advance — ✅ v19 E2E 验证通过
+> **来源**：2026-05-02 E2E v16 实战
+> **代码修复**：`_resuggest_ready_tasks()` 无条件调用（assignment_completion.py:36），测试覆盖（test_manual_complete_resuggest.py）
+> **E2E 验证**：v17/v18 被 RO-41 cwd bug 掩盖；v19 通过 --force 在引擎内完成后下游批次自动出现（Codex 日志分析确认）
+
+### RO-40 PTY Worker completion protocol 缺失 — ✅ 2026-05-02 Codex 审查确认已实现
+> **来源**：2026-05-02 E2E v16 实战
+> **解决**：agent_pool.py:530-534 已有完整 COMPLETION PROTOCOL section，prompt_builder.py:295 有 runtime hint
+
+### RO-41 verify gate cwd bug — ✅ v18+v19 E2E 验证通过
+> **来源**：2026-05-02 E2E v17 实战
+> **代码修复**：CLI 端 plan_path resolve 为绝对路径（workflow_cmds.py:139），daemon 端 _store_workflow_meta resolve（assignment_batches.py:288），_load_cached_workflow_plan fallback 到 project_root（ralph_service.py:986）
+> **E2E 验证**：v17 T1 全部 FileNotFoundError；v18+v19 T1 verification_passed，verify gate 正常运行
+
+### RO-43 auto-dispatch 不抗故障 — ✅ v19 E2E 验证通过
+> **来源**：2026-05-02 E2E v17 实战
+> **代码修复**：retry_task() 末尾调用 _resuggest_ready_tasks()（workflow_orchestrator.py:1292）
+> **E2E 验证**：v18 retry 后任务重新 started（7 次 vs 5 个任务）；v19 自动化率 88.9%（8/9 批次自动）
+
+### RO-44 challenge 失败后无 foreman override 机制 — ✅ v19 E2E 验证通过
+> **来源**：2026-05-03 E2E v18 实战
+> **代码修复**：`--force` flag 线程传递 CLI→daemon→orchestrator→verification_gate，hook_ctx.force_complete 跳过 verify gate（verification_gate.py:138-148）
+> **E2E 验证**：v19 4/4 任务成功使用 `cccc task complete --force` 绕过 challenge 假阳性，下游自动推进
+
+### RO-36 Foreman 批次手工 submit 摩擦 — ✅ v19 E2E 验证通过
+> **来源**：2026-05-01 E2E v15 Foreman 体验反馈
+> **解决**：`--auto-dispatch --assignment-map` + DAG gating + RO-39 修复 + RO-44 --force 联合作用
+> **E2E 验证**：v19 自动化率 88.9%（8/9 批次自动），Foreman 只需一次 `cccc workflow submit`
+
+### v17-v19 版本趋势
+
+| 版本 | 日期 | 结果 | 过程 | 体验 | 综合 | 自动化率 | 关键修复 |
+|------|------|------|------|------|------|----------|----------|
+| v17 | 2026-05-02 | 2/5 | 2/5 | 3/5 | 2.3/5 | 20% | challenge mode 首次运行；verify gate cwd P0 bug |
+| v18 | 2026-05-03 | 3/5 | 2/5 | 3/5 | 2.7/5 | 60% | +RO-41 cwd fix |
+| v19 | 2026-05-03 | 3/5 | 3/5 | 3/5 | 3.0/5 | 88.9% | +RO-44 --force; depends_on 首次通过 |

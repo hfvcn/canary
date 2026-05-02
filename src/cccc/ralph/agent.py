@@ -11,10 +11,12 @@ Used by the CLI, daemon IPC, and orchestrator surfaces.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import hashlib
 import json
+import logging
 import os
+import subprocess
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -23,12 +25,32 @@ import yaml
 
 from .models import Plan, ValidationIssue
 
+log = logging.getLogger(__name__)
+
+GEMINI_PROVIDER = "gemini-cli"
+STUB_PROVIDER = "stub"
+GEMINI_FLASH_MODEL = "flash"
+GEMINI_TIMEOUT_SECONDS = 60
+GEMINI_WARMUP_TIMEOUT_SECONDS = 30
+GEMINI_WARMUP_PROMPT = 'Return exactly this JSON: {"ok": true}'
+ALLOWED_CONFIDENCE = frozenset({"low", "medium", "high"})
+ADVISORY_NOTICE = "Agent suggestions are advisory only and have no decision authority."
+
 
 @dataclass(frozen=True)
 class AgentConfig:
     provider: str = "stub"
     enabled: bool = True
     api_key_env: str = ""
+    command: tuple[str, ...] = ("gemini",)
+    model: str = GEMINI_FLASH_MODEL
+    timeout_seconds: int = GEMINI_TIMEOUT_SECONDS
+    warmup_enabled: bool = True
+    warmup_timeout_seconds: int = GEMINI_WARMUP_TIMEOUT_SECONDS
+
+
+class GeminiResponseError(RuntimeError):
+    """Gemini CLI returned output that cannot be converted to suggestions."""
 
 
 @dataclass(frozen=True)
@@ -52,11 +74,10 @@ class AgentSuggestion:
 
 
 class RalphAgent:
-    """Lightweight advisory agent wrapper used by Ralph integration tests.
+    """Advisory agent wrapper for beyond-scope Ralph validation findings.
 
-    The agent reviews beyond-scope issues identified during static validation
-    and produces structured advisory suggestions.  It does NOT call any LLM —
-    it is a placeholder that generates formatted review requests.
+    Gemini CLI is the production provider. The stub provider is only used when
+    explicitly configured by tests or a caller that asks for static suggestions.
     """
 
     def __init__(
@@ -73,6 +94,8 @@ class RalphAgent:
         self.beyond_scope_items = beyond_scope_items or []
         self.config = config or AgentConfig()
         self.available = self._is_available()
+        self._warmed_up = False
+        self._resume_warmed_session = False
         self._checklist: List[Dict[str, Any]] = []
         if checklist_path is not None:
             self._checklist = _load_checklist(checklist_path)
@@ -80,7 +103,7 @@ class RalphAgent:
     def _is_available(self) -> bool:
         if not self.config.enabled:
             return False
-        if self.config.provider == "stub":
+        if self.config.provider in {STUB_PROVIDER, GEMINI_PROVIDER}:
             return True
         if not self.config.api_key_env:
             return False
@@ -97,11 +120,32 @@ class RalphAgent:
             findings.append(AgentFinding(issue_ref=f"{issue.code}[{task_suffix}]"))
         return findings
 
+    def warm_up(self) -> None:
+        """Run a minimal provider call so the first real review is not cold."""
+        if self._warmed_up or not self.available:
+            return
+        if not self.config.warmup_enabled:
+            return
+        if self.config.provider == STUB_PROVIDER:
+            self._warmed_up = True
+            return
+        if self.config.provider != GEMINI_PROVIDER:
+            raise RuntimeError(f"Unsupported Ralph Agent provider: {self.config.provider}")
+        subprocess.run(
+            self._gemini_command(GEMINI_WARMUP_PROMPT, resume_warmed_session=False),
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=self.config.warmup_timeout_seconds,
+        )
+        self._warmed_up = True
+        self._resume_warmed_session = True
+
     def review_beyond_scope(self, issues: list[ValidationIssue]) -> list[AgentSuggestion]:
         """Review beyond-scope issues and return advisory suggestions.
 
-        For each beyond-scope issue, matches it against checklist items and
-        produces a placeholder suggestion.  No LLM is called.
+        Gemini CLI Flash is used for semantic suggestions. Provider failures are
+        raised to the caller so validation cannot silently degrade.
         """
         if not self.available:
             return []
@@ -110,37 +154,251 @@ class RalphAgent:
         if not beyond:
             return []
 
+        if self.config.provider == GEMINI_PROVIDER:
+            return self._review_with_gemini(beyond)
+        if self.config.provider == STUB_PROVIDER:
+            return self._stub_suggestions(beyond)
+
+        raise RuntimeError(f"Unsupported Ralph Agent provider: {self.config.provider}")
+
+    def verify_task_completion(
+        self,
+        task: Any,
+        *,
+        changed_files: list[str],
+        project_root: Path,
+        source_context: Dict[str, str] | None = None,
+        git_diff: str = "",
+        verification_output: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Run Ralph Agent verification for Foreman-preset simulation cases."""
+        if not self.available:
+            raise RuntimeError("Ralph Agent verification is disabled")
+        if self.config.provider != GEMINI_PROVIDER:
+            raise RuntimeError("Ralph Agent verification requires Gemini provider")
+        prompt = self._build_verification_prompt(
+            task=task,
+            changed_files=changed_files,
+            project_root=project_root,
+            source_context=source_context,
+            git_diff=git_diff,
+            verification_output=verification_output,
+        )
+        result = subprocess.run(
+            self._gemini_command(prompt),
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=self.config.timeout_seconds,
+        )
+        return _parse_agent_verification_payload(result.stdout, str(task.id))
+
+    def _build_verification_prompt(
+        self,
+        *,
+        task: Any,
+        changed_files: list[str],
+        project_root: Path,
+        source_context: Dict[str, str] | None = None,
+        git_diff: str = "",
+        verification_output: Dict[str, Any] | None = None,
+    ) -> str:
+        payload: Dict[str, Any] = {
+            "workflow_id": self.workflow_id,
+            "project_root": str(project_root),
+            "changed_files": list(changed_files),
+            "task": self._agent_verification_task_context(task),
+            "response_schema": {
+                "passed": "boolean",
+                "summary": "short explanation",
+                "checks": [
+                    {
+                        "name": "simulation case name",
+                        "outcome": "passed|failed",
+                        "message": "why this case passed or failed",
+                    }
+                ],
+            },
+        }
+        if source_context:
+            payload["source_code"] = source_context
+        if git_diff:
+            payload["git_diff"] = git_diff
+        if verification_output:
+            payload["verification_output"] = verification_output
+        context = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        return (
+            "Run Ralph Agent verification for a completed task.\n\n"
+            "## Rules\n"
+            "1. Base your analysis ONLY on the evidence provided below: "
+            "source_code, git_diff, and verification_output.\n"
+            "2. If source_code shows a function/class referenced in "
+            "goal_behavior does NOT exist, report it as failed.\n"
+            "3. If git_diff is empty or says 'files are unchanged', the task "
+            "likely did not make the changes it claims — report failed.\n"
+            "4. If verification_output.status is 'passed' (all compile/test "
+            "checks succeeded), do NOT fabricate failures. Only fail the "
+            "task if you find a concrete gap between goal_behavior and the "
+            "actual source_code.\n"
+            "5. NEVER claim a function exists, is called, or works correctly "
+            "unless you can see it in source_code. If you cannot verify "
+            "something, say so explicitly — do not guess.\n"
+            "6. Do not use tools, shell commands, file reads, MCP, or "
+            "workspace inspection.\n"
+            "7. Return only JSON matching response_schema. No prose.\n\n"
+            f"{context}"
+        )
+
+    def _agent_verification_task_context(self, task: Any) -> Dict[str, Any]:
+        verification = task.verification.model_dump() if task.verification else None
+        return {
+            "id": task.id,
+            "title": task.title,
+            "role": task.role,
+            "type": task.type,
+            "goal_behavior": task.goal_behavior,
+            "acceptance_criteria": task.acceptance_criteria,
+            "claimed_paths": list(task.claimed_paths),
+            "verification_mode": task.verification_mode,
+            "foreman_preset_simulation_cases": verification,
+        }
+
+    def _review_with_gemini(self, issues: list[ValidationIssue]) -> list[AgentSuggestion]:
+        prompt = self._build_gemini_prompt(issues)
+        result = subprocess.run(
+            self._gemini_command(prompt),
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=self.config.timeout_seconds,
+        )
+        return self._parse_gemini_output(result.stdout, issues)
+
+    def _gemini_command(
+        self,
+        prompt: str,
+        *,
+        resume_warmed_session: bool = True,
+    ) -> list[str]:
+        command = [
+            *self.config.command,
+            "--model",
+            self.config.model,
+            "--output-format",
+            "json",
+            "--skip-trust",
+        ]
+        if resume_warmed_session and self._resume_warmed_session:
+            command.extend(["--resume", "latest"])
+        command.extend(["--prompt", prompt])
+        return command
+
+    def _build_gemini_prompt(self, issues: list[ValidationIssue]) -> str:
+        payload = {
+            "workflow_id": self.workflow_id,
+            "advisory_notice": ADVISORY_NOTICE,
+            "plan_context": self._plan_context(issues),
+            "issues": [self._issue_context(issue) for issue in issues],
+            "response_schema": {
+                "suggestions": [{
+                    "issue_id": "ValidationIssue.issue_instance_id or code",
+                    "checklist_item_id": "matching beyond_scope_checklist item id",
+                    "suggestion": "short advisory suggestion",
+                    "confidence": "low|medium|high",
+                }],
+            },
+        }
+        context = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        return (
+            "Review Ralph beyond-scope validation issues.\n"
+            f"{ADVISORY_NOTICE}\n"
+            "Do not use tools, shell commands, file reads, MCP, or workspace inspection.\n"
+            "Use only the JSON payload below.\n"
+            "Return only JSON matching response_schema. Do not include prose.\n\n"
+            f"{context}"
+        )
+
+    def _plan_context(self, issues: list[ValidationIssue]) -> Dict[str, Any]:
+        if self.plan is None:
+            return {"available": False, "reason": "plan not provided"}
+        task_ids = {tid for issue in issues for tid in issue.task_ids}
+        tasks = [task for task in self.plan.tasks if not task_ids or task.id in task_ids]
+        return {
+            "available": True,
+            "schema_version": self.plan.schema_version,
+            "task_count": len(self.plan.tasks),
+            "relevant_tasks": [self._task_context(task) for task in tasks],
+        }
+
+    def _task_context(self, task: Any) -> Dict[str, Any]:
+        verification = task.verification.model_dump() if task.verification else None
+        return {
+            "id": task.id,
+            "title": task.title,
+            "role": task.role,
+            "type": task.type,
+            "depends_on": list(task.depends_on),
+            "claimed_paths": list(task.claimed_paths),
+            "goal_behavior": task.goal_behavior,
+            "acceptance_criteria": task.acceptance_criteria,
+            "verification_mode": task.verification_mode,
+            "verification": verification,
+        }
+
+    def _issue_context(self, issue: ValidationIssue) -> Dict[str, Any]:
+        matched_item = self._match_checklist(issue)
+        return {
+            "issue_id": issue.issue_instance_id or issue.code,
+            "code": issue.code,
+            "severity": issue.severity,
+            "message": issue.message,
+            "task_ids": list(issue.task_ids),
+            "evidence": dict(issue.evidence),
+            "checklist_item": matched_item or {"id": "unknown"},
+        }
+
+    def _parse_gemini_output(
+        self,
+        stdout: str,
+        issues: list[ValidationIssue],
+    ) -> list[AgentSuggestion]:
+        payload = _parse_gemini_payload(stdout)
+        raw_suggestions = payload.get("suggestions")
+        if not isinstance(raw_suggestions, list):
+            raise GeminiResponseError("Gemini response missing suggestions list")
+        valid_issue_ids = {issue.issue_instance_id or issue.code for issue in issues}
         suggestions: list[AgentSuggestion] = []
-        for issue in beyond:
-            matched_item = self._match_checklist(issue)
-            item_id = matched_item.get("id", "unknown") if matched_item else "unknown"
-            description = (
-                matched_item.get("description", issue.message)
-                if matched_item
-                else issue.message
-            )
-            suggestions.append(AgentSuggestion(
-                issue_id=issue.issue_instance_id or issue.code,
-                checklist_item_id=item_id,
-                suggestion=f"Requires manual review: {description}",
-                confidence="low",
-                advisory=True,
-            ))
+        for item in raw_suggestions:
+            suggestions.append(_suggestion_from_payload(item, valid_issue_ids))
+        if not suggestions:
+            raise GeminiResponseError("Gemini response returned no suggestions")
         return suggestions
 
+    def _stub_suggestions(self, issues: list[ValidationIssue]) -> list[AgentSuggestion]:
+        return [_stub_suggestion(issue, self._match_checklist(issue)) for issue in issues]
+
     def _match_checklist(self, issue: ValidationIssue) -> Dict[str, Any] | None:
-        """Find the best matching checklist item for an issue."""
+        """Find the best matching checklist item for an issue.
+
+        Priority: field_content > code_prefix > manual.
+        field_content is checked first because it matches on the specific
+        issue message, making it more targeted than a broad code prefix.
+        """
+        field_match: Dict[str, Any] | None = None
+        prefix_match: Dict[str, Any] | None = None
         for item in self._checklist:
             match_type = item.get("match_type", "")
             pattern = item.get("pattern", "")
-            if match_type == "code_prefix" and issue.code.startswith(pattern.rstrip("*")):
-                return item
             if match_type == "field_content" and pattern in issue.message:
-                return item
-            if match_type == "manual":
-                # manual items match everything as a fallback
-                continue
-        # Fall back to the first manual item if no specific match
+                if field_match is None:
+                    field_match = item
+            elif match_type == "code_prefix" and issue.code.startswith(pattern.rstrip("*")):
+                if prefix_match is None:
+                    prefix_match = item
+        if field_match is not None:
+            return field_match
+        if prefix_match is not None:
+            return prefix_match
         for item in self._checklist:
             if item.get("match_type") == "manual":
                 return item
@@ -159,13 +417,169 @@ def _load_checklist(checklist_path: Path) -> List[Dict[str, Any]]:
         return []
 
 
-def create_agent(checklist_path: Path) -> RalphAgent:
+def _stub_suggestion(
+    issue: ValidationIssue,
+    matched_item: Dict[str, Any] | None,
+) -> AgentSuggestion:
+    item_id = matched_item.get("id", "unknown") if matched_item else "unknown"
+    description = matched_item.get("description", issue.message) if matched_item else issue.message
+    return AgentSuggestion(
+        issue_id=issue.issue_instance_id or issue.code,
+        checklist_item_id=item_id,
+        suggestion=f"Requires manual review: {description}",
+        confidence="low",
+        advisory=True,
+    )
+
+
+def _parse_gemini_payload(stdout: str) -> Dict[str, Any]:
+    response_text = _extract_gemini_response(stdout)
+    try:
+        payload = json.loads(_strip_json_fence(response_text))
+    except json.JSONDecodeError as exc:
+        raise GeminiResponseError("Gemini response was not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise GeminiResponseError("Gemini response JSON must be an object")
+    return payload
+
+
+def _extract_gemini_response(stdout: str) -> str:
+    raw = str(stdout or "").strip()
+    if not raw:
+        raise GeminiResponseError("Gemini CLI produced empty output")
+    try:
+        outer = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if isinstance(outer, dict) and isinstance(outer.get("response"), str):
+        return outer["response"]
+    if isinstance(outer, dict) and any(
+        key in outer for key in ("suggestions", "passed", "outcome")
+    ):
+        return raw
+    raise GeminiResponseError("Gemini CLI JSON output missing response")
+
+
+def _strip_json_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    body = lines[1:] if lines else []
+    if body and body[-1].strip() == "```":
+        body = body[:-1]
+    return "\n".join(body).strip()
+
+
+def _suggestion_from_payload(
+    item: object,
+    valid_issue_ids: set[str],
+) -> AgentSuggestion:
+    if not isinstance(item, dict):
+        raise GeminiResponseError("Gemini suggestion must be an object")
+    issue_id = str(item.get("issue_id", "")).strip()
+    suggestion = str(item.get("suggestion", "")).strip()
+    if issue_id not in valid_issue_ids or not suggestion:
+        raise GeminiResponseError("Gemini suggestion had invalid issue_id or text")
+    confidence = str(item.get("confidence", "low")).strip().lower()
+    if confidence not in ALLOWED_CONFIDENCE:
+        raise GeminiResponseError("Gemini suggestion had invalid confidence")
+    return AgentSuggestion(
+        issue_id=issue_id,
+        checklist_item_id=str(item.get("checklist_item_id", "unknown")).strip() or "unknown",
+        suggestion=suggestion,
+        confidence=confidence,
+        advisory=True,
+    )
+
+
+def _parse_agent_verification_payload(stdout: str, task_id: str) -> Dict[str, Any]:
+    payload = _parse_gemini_payload(stdout)
+    outcome = _agent_verification_outcome(payload)
+    summary = str(payload.get("summary", "")).strip()
+    if not summary:
+        raise GeminiResponseError("Ralph Agent verification missing summary")
+    checks = _agent_verification_checks(payload.get("checks", []))
+    outcome = _consistency_check(outcome, checks, summary)
+    return {
+        "task_id": task_id,
+        "outcome": outcome,
+        "reason": summary,
+        "checks": checks,
+    }
+
+
+def _consistency_check(
+    outcome: str,
+    checks: list[Dict[str, Any]],
+    summary: str,
+) -> str:
+    """Override outcome when it contradicts the individual checks."""
+    if outcome != "passed" or not checks:
+        return outcome
+    failed_count = sum(1 for c in checks if c["outcome"] == "failed")
+    if failed_count > 0 and failed_count >= len(checks) // 2:
+        log.warning(
+            "Agent claimed passed but %d/%d checks failed — overriding to failed",
+            failed_count,
+            len(checks),
+        )
+        return "failed"
+    return outcome
+
+
+def _agent_verification_outcome(payload: Dict[str, Any]) -> str:
+    if "passed" in payload:
+        passed = payload["passed"]
+        if not isinstance(passed, bool):
+            raise GeminiResponseError("Ralph Agent verification passed must be boolean")
+        return "passed" if passed else "failed"
+    outcome = str(payload.get("outcome", "")).strip().lower()
+    if outcome not in {"passed", "failed"}:
+        raise GeminiResponseError("Ralph Agent verification outcome must be passed or failed")
+    return outcome
+
+
+def _agent_verification_checks(raw_checks: object) -> list[Dict[str, Any]]:
+    if not isinstance(raw_checks, list):
+        raise GeminiResponseError("Ralph Agent verification checks must be a list")
+    checks: list[Dict[str, Any]] = []
+    for item in raw_checks:
+        checks.append(_agent_verification_check(item))
+    return checks
+
+
+def _agent_verification_check(item: object) -> Dict[str, Any]:
+    if not isinstance(item, dict):
+        raise GeminiResponseError("Ralph Agent verification check must be an object")
+    outcome = str(item.get("outcome", "")).strip().lower()
+    if outcome not in {"passed", "failed"}:
+        raise GeminiResponseError("Ralph Agent verification check outcome invalid")
+    return {
+        "name": str(item.get("name", "")).strip() or "agent_simulation",
+        "outcome": outcome,
+        "message": str(item.get("message", "")).strip(),
+    }
+
+
+def create_agent(
+    checklist_path: Path,
+    *,
+    workflow_id: str = "",
+    plan: Plan | None = None,
+    config: AgentConfig | None = None,
+) -> RalphAgent:
     """Factory: create a RalphAgent backed by a beyond-scope checklist.
 
     If *checklist_path* does not exist the agent is still usable — it will
     produce generic suggestions without checklist metadata.
     """
-    return RalphAgent(checklist_path=checklist_path)
+    return RalphAgent(
+        workflow_id=workflow_id,
+        plan=plan,
+        checklist_path=checklist_path,
+        config=config,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -734,6 +1148,7 @@ RULE_VERSION_REGISTRY: Dict[str, int] = {
     "E_NO_CROSS_TASK_VERIFICATION": 1,
     "W_WEAK_VERIFICATION_ONLY": 1,
     "W_VERIFICATION_DUPLICATE_COMMAND": 1,
+    "E_VERIFICATION_SHALLOW_CRITICAL": 1,
     "E_CONSUMER_WITHOUT_PROVIDER": 1,
     "E_CONSUMER_FROM_UNKNOWN": 1,
     "W_CONTRACT_SCHEMA_MISMATCH": 1,

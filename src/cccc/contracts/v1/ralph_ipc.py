@@ -44,6 +44,7 @@ VerificationOutcome = Literal[
     "passed",         # All checks passed
     "failed",         # One or more checks failed
     "skipped",        # Verification was skipped
+    "skipped_blocked",  # Verification was skipped and completion is blocked
     "timeout",        # Verification timed out
     "agent_pending",  # Awaiting external agent verification (RA-3)
 ]
@@ -120,6 +121,11 @@ class ReadyBatchSuggestion(BaseModel):
     # ARCH-1: Foreman-explicit task→actor assignments (empty = agent pool decides)
     assignments: Dict[str, str] = Field(default_factory=dict)
     fallback_allowed: bool = False
+    # Worker prompt projection metadata. Values are serialized to keep this IPC
+    # layer independent from Ralph implementation classes.
+    prompt_issues: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
+    recommended_tests: Dict[str, List[str]] = Field(default_factory=dict)
+    forbidden_flows: List[Dict[str, Any]] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -150,6 +156,7 @@ class VerificationResult(BaseModel):
     checks: List[VerificationCheck] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
     summary: str = ""
+    challenge_outcome: str = ""
     created_at: str = Field(default_factory=utc_now_iso)
 
     model_config = ConfigDict(extra="forbid")
@@ -333,10 +340,9 @@ def parse_ralph_message(data: Dict[str, Any]) -> RalphIPCMessage:
 # Shared validation event serializer — W8d-ledger-schema-parity
 # ---------------------------------------------------------------------------
 
-from .event import (
+from .event import (  # noqa: E402
     KIND_PLAN_VALIDATED,
     KIND_PLAN_VALIDATION_FAILED,
-    KIND_SCHEMA_STATS,
     PlanValidatedData,
     PlanValidationFailedData,
     SchemaStatsData,

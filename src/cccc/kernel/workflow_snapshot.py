@@ -115,11 +115,14 @@ class WorkflowSnapshot:
             "pending_hook_alerts": [dict(item) for item in self._engine._pending_alerts],
         }
 
-    def _serialize_workflow_meta(self) -> list[Dict[str, str]]:
+    def _serialize_workflow_meta(self) -> list[Dict[str, Any]]:
         return [
             {
                 "workflow_id": meta.workflow_id,
                 "plan_path": meta.plan_path,
+                "plan_digest": meta.plan_digest,
+                "auto_dispatch": meta.auto_dispatch,
+                "assignment_map": dict(meta.assignment_map),
             }
             for _, meta in sorted(self._engine._workflow_meta.items())
         ]
@@ -161,6 +164,13 @@ class WorkflowSnapshot:
             restored[workflow_id] = WorkflowMeta(
                 workflow_id=workflow_id,
                 plan_path=str(item.get("plan_path") or "").strip(),
+                plan_digest=str(item.get("plan_digest") or "").strip(),
+                auto_dispatch=bool(item.get("auto_dispatch", False)),
+                assignment_map={
+                    str(task_id or "").strip(): str(agent_id or "").strip()
+                    for task_id, agent_id in dict(item.get("assignment_map") or {}).items()
+                    if str(task_id or "").strip() and str(agent_id or "").strip()
+                },
             )
         return restored
 

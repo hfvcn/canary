@@ -170,7 +170,7 @@ def _check_field_completeness(plan: Plan) -> List[ValidationIssue]:
             ))
 
         # RA-3: unknown verification_mode
-        _valid_modes = {"ralph", "agent"}
+        _valid_modes = {"ralph", "agent", "challenge"}
         if hasattr(t, "verification_mode") and t.verification_mode not in _valid_modes:
             issues.append(ValidationIssue(
                 code="W_UNKNOWN_VERIFICATION_MODE",

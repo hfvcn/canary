@@ -353,11 +353,13 @@ def test_validate_ledger_error_not_silent(tmp_path: Path, caplog: pytest.LogCapt
         patch("cccc.kernel.ledger.append_event", side_effect=RuntimeError("boom")),
         caplog.at_level("WARNING", logger="cccc.ralph.cli"),
     ):
-        rc, _, _ = _capture_ralph_main(["validate", str(plan_path), "--ledger", str(ledger_path)])
+        rc, _, stderr = _capture_ralph_main(["validate", str(plan_path), "--ledger", str(ledger_path)])
 
     assert rc == 0
     assert "Failed to write validation event to ledger" in caplog.text
     assert "RuntimeError: boom" in caplog.text
+    assert "Failed to write validation event to ledger: boom" in stderr
+    assert "Traceback" not in stderr
 
 
 def test_verify_completion_exit_code_is_enforced(group, temp_project_dir: Path) -> None:

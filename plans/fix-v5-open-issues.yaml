@@ -1,0 +1,433 @@
+# Plan: RO-37 + RO-30 + RO-34 + RO-36 + RA-4 — 问题清单 v5 剩余全量解决
+#
+# 来源：todo/问题清单-v5-ralph.md 所有未解决改进项
+# 工作流：findings.md § 〇 经验证的工作流程
+#
+# 设计原则：
+#   - #2  按功能切片拆分，不按文件拆
+#   - #9  先跑通一条路径再扩展 — P1 > P2 > P5
+#   - #11 verification 必须真正跑命令
+#   - #13 结构校验 + 代码审查互补
+#
+# 批次预期（由 ralph suggest 决定）：
+#   Batch 1: T2, T3, T4, T5       — 独立修复，无写冲突
+#   Batch 2: T1                     — 并行安全（与 Batch 1 无写冲突）
+#   注：T1 和 T6 都改 models.py → T6 依赖 T1
+#   Batch 3: T6                     — 依赖 T1（models.py 写冲突）
+#   Batch 4: T-int                  — 全量集成验证，依赖 T1-T6
+
+schema_version: "1.0.0"
+
+required_issues:
+  - "RO-37"
+  - "RO-30"
+  - "RO-34"
+  - "RO-36"
+  - "RA-4"
+
+semantic_mode: "off"
+auto_infer: false
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+
+critical_entrypoints:
+  - src/cccc/daemon/foreman/verification_gate.py
+  - src/cccc/daemon/foreman/ralph_service.py
+  - src/cccc/ralph/agent.py
+  - src/cccc/ralph/validation_rules/coverage.py
+  - src/cccc/kernel/inbox.py
+  - src/cccc/daemon/actors/actor_lifecycle_ops.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - docs/ralph-foreman-workflow.md
+
+critical_flows:
+  - id: adversarial_challenge_gate
+    description: >
+      Worker 自测通过后，verify gate 对 critical_flow 任务触发 Agent 对抗式审查。
+      Agent 基于 goal_behavior + acceptance_criteria 生成边缘测试。
+      如果 Agent 审查失败，整体 verification outcome 为 failed。
+    entrypoints:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/daemon/foreman/verification_gate.py
+      - src/cccc/ralph/agent.py
+    required_verification_level: integration
+
+  - id: shallow_checks_critical_block
+    description: >
+      W_VERIFICATION_SHALLOW_CHECKS 对覆盖 critical_flow 的任务升级为 error，
+      阻止只有 compile/import 检查的任务通过 critical flow 验证。
+    entrypoints:
+      - src/cccc/ralph/validation_rules/coverage.py
+    required_verification_level: unit
+
+  - id: inbox_restart_redelivery
+    description: >
+      Actor restart 后 inbox cursor 被重置，pending 消息自动重新投递给新进程，
+      无需手动发送提醒消息。
+    entrypoints:
+      - src/cccc/daemon/actors/actor_lifecycle_ops.py
+      - src/cccc/kernel/inbox.py
+    required_verification_level: integration
+
+  - id: auto_dispatch_subsequent_batches
+    description: >
+      Foreman 首次 submit 声明全量 assignment 后，引擎在依赖满足时自动调度
+      后续批次，无需手工 cccc workflow submit。
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/ops/workflow_task_ops.py
+    required_verification_level: integration
+
+forbidden_flows:
+  - id: no_silent_challenge_skip
+    description: >
+      当 challenge_enabled=True 且 Agent 不可用时，不能静默 pass — 必须
+      返回 failed 或 skipped_blocked，由 Foreman 决策。
+    test_created_by:
+      - T1
+    required_verification_level: unit
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []
+
+# ================================================================
+# T1: Adversarial challenge phase in verify_completion (RO-37 core)
+# ================================================================
+
+tasks:
+  - id: T1
+    title: "Adversarial challenge phase in verification gate"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-37"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/agent.py
+      - src/cccc/ralph/models.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - tests/ralph/test_adversarial_gate.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/verification_gate.py
+    goal_behavior: >
+      verify_completion() 增加对抗式审查第二阶段：当 Worker 自测通过后，
+      如果 TaskSpec.verification_mode == "challenge"（新增枚举值），
+      先执行 Worker 自身的 verification checks，通过后再调用 RalphAgent
+      基于 goal_behavior + acceptance_criteria 生成边缘测试并执行。
+      Agent 审查失败 → overall_outcome=failed。
+      Agent 不可用 → overall_outcome=failed（禁止静默 pass）。
+      TaskSpec.verification_mode Literal 扩展为 "ralph" | "agent" | "challenge"。
+    acceptance_criteria: |
+      - TaskSpec.verification_mode 新增 "challenge" 枚举值（models.py）
+      - ralph_service.verify_completion() 对 mode="challenge" 先跑 Worker checks，pass 后触发 Agent 对抗审查
+      - 新增 VerificationResult.challenge_outcome 字段记录对抗结果（ralph_ipc.py）
+      - Agent 审查 failed → 整体 outcome 为 failed，reason 包含 Agent 发现
+      - Agent 不可用（gemini 未安装）→ 返回 failed，不静默 pass
+      - 单元测试覆盖 passed/failed/agent_unavailable 三种场景
+    verification_mode: ralph
+    verification:
+      level: unit
+      checks:
+        - name: adversarial_gate_tests
+          command: python -m pytest tests/ralph/test_adversarial_gate.py -v
+          expected_exit_code: 0
+        - name: existing_verification_tests
+          command: python -m pytest tests/ralph/test_verification_mode_routing.py tests/ralph/test_ra3_verification_mode.py -v
+          expected_exit_code: 0
+      covers:
+        flows:
+          - adversarial_challenge_gate
+          - no_silent_challenge_skip
+    provides:
+      - name: adversarial_challenge_api
+        schema: "verify_completion(task_id, changed_files, ...) -> VerificationResult with challenge_outcome"
+    failure_path: >
+      如果 Agent 调用过于复杂，退化为在 verify_completion 中检测
+      W_VERIFICATION_SHALLOW_CHECKS 条件并直接拒绝（不依赖 Agent）。
+
+  # ================================================================
+  # T2: W_VERIFICATION_SHALLOW_CHECKS 升级为 error (RO-37 validation)
+  # ================================================================
+
+  - id: T2
+    title: "Shallow checks upgrade to error for critical_flow tasks"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-37"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/ralph/validation_rules/coverage.py
+      - tests/ralph/test_shallow_checks_critical.py
+    awareness_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/validator.py
+    goal_behavior: >
+      _check_verification_shallow_checks() 增加逻辑：如果 task 的
+      verification.covers.flows 包含 critical_flow，则 severity 从
+      warning 升级为 error（code 改为 E_VERIFICATION_SHALLOW_CRITICAL）。
+      普通任务仍为 warning。
+    acceptance_criteria: |
+      - 覆盖 critical_flow 的任务仅有 shallow checks → error 且阻止验证
+      - 不覆盖 critical_flow 的任务仅有 shallow checks → 保持 warning
+      - E_VERIFICATION_SHALLOW_CRITICAL 加入 RULE_VERSION_REGISTRY
+      - 单元测试覆盖升级和保持两种场景
+    verification_mode: ralph
+    verification:
+      level: unit
+      checks:
+        - name: shallow_critical_tests
+          command: python -m pytest tests/ralph/test_shallow_checks_critical.py -v
+          expected_exit_code: 0
+        - name: existing_coverage_tests
+          command: python -m pytest tests/ralph/test_ralph_standalone.py -k "shallow" -v
+          expected_exit_code: 0
+      covers:
+        flows:
+          - shallow_checks_critical_block
+
+  # ================================================================
+  # T3: Documentation alignment (RO-30)
+  # ================================================================
+
+  - id: T3
+    title: "Ralph documentation alignment with daemon-internal reality"
+    role: leaf
+    type: general
+    addresses:
+      - "RO-30"
+    depends_on: []
+    claimed_paths:
+      - docs/ralph-foreman-workflow.md
+    awareness_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+    goal_behavior: >
+      更新 docs/ralph-foreman-workflow.md §1.1：
+      - 删除 "外部 Python 守护进程，监控 Git 提交和任务依赖图" 描述
+      - 改为 daemon-internal observation layer（与 ralph_service.py L1-4 一致）
+      - 明确 Ralph 三种形态（CLI 静态验证、daemon 内 verify gate、Agent 审查）
+      - 移除或标注任何引用不存在接口的描述
+    acceptance_criteria: |
+      - §1.1 描述与 ralph_service.py 实际实现一致
+      - 不包含 "外部 daemon" / "Git watcher" 等已过时描述
+      - 三种形态（CLI / daemon gate / Agent）边界清晰
+      - merge_worktree / analyze_import_graph / detect_test_impact 不出现在主能力清单
+    verification_mode: ralph
+    verification:
+      level: compile
+      checks:
+        - name: no_external_daemon_refs
+          command: "! grep -i 'external.*daemon\\|外部.*守护进程\\|Git.*watcher\\|监控.*Git.*提交' docs/ralph-foreman-workflow.md"
+          expected_exit_code: 0
+        - name: three_forms_present
+          command: grep -c 'CLI\|daemon.*gate\|Agent.*审查' docs/ralph-foreman-workflow.md | grep -v '^0$'
+          expected_exit_code: 0
+
+  # ================================================================
+  # T4: Inbox cursor reset on actor restart (RO-34)
+  # ================================================================
+
+  - id: T4
+    title: "Reset inbox cursor on actor restart for message redelivery"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-34"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/daemon/actors/actor_lifecycle_ops.py
+      - src/cccc/kernel/inbox.py
+      - tests/test_inbox_restart_redelivery.py
+    awareness_paths:
+      - src/cccc/daemon/messaging/delivery.py
+      - src/cccc/daemon/server.py
+    goal_behavior: >
+      handle_actor_start() 在 run_id 递增后（L57），调用
+      inbox.delete_cursor(group, actor_id) 重置该 actor 的读取游标。
+      这样 restart 后新进程的 unread_messages() 会返回 restart 前
+      已投递但未被新进程消费的消息，实现自动重投递。
+    acceptance_criteria: |
+      - handle_actor_start() 成功后 inbox cursor 被删除
+      - restart 后 unread_messages() 返回 restart 前的 pending 消息
+      - cursor 删除失败时 handle_actor_start() 记录 warning 日志并继续（不静默吞错）
+      - 单元测试模拟 restart → 验证 cursor reset → 验证消息可重读
+    verification_mode: ralph
+    verification:
+      level: integration
+      checks:
+        - name: restart_redelivery_tests
+          command: python -m pytest tests/test_inbox_restart_redelivery.py -v
+          expected_exit_code: 0
+        - name: existing_inbox_tests
+          command: python -m pytest tests/ -k "inbox" -v --no-header 2>&1 | tail -5
+          expected_exit_code: 0
+      covers:
+        flows:
+          - inbox_restart_redelivery
+
+  # ================================================================
+  # T5: Auto-dispatch subsequent batches (RO-36)
+  # ================================================================
+
+  - id: T5
+    title: "Auto-dispatch subsequent batches after initial submit"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-36"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/ops/workflow_task_ops.py
+      - src/cccc/kernel/workflow_state_engine.py
+      - src/cccc/kernel/workflow_state_types.py
+      - tests/e2e/test_auto_dispatch.py
+    awareness_paths:
+      - src/cccc/ralph/core.py
+      - src/cccc/daemon/foreman/ralph_service.py
+    goal_behavior: >
+      workflow submit 新增 auto_dispatch 模式：首次 submit 时声明所有
+      任务的 worker assignment（assignment_map: {task_id: agent_id}）。
+      on_task_completed 触发 resuggest 后，如果 auto_dispatch=True 且
+      assignment_map 包含新 ready 任务的 assignment，引擎自动提交并
+      下发，无需手工 submit。
+    acceptance_criteria: |
+      - _active_workflows dict 中的 workflow entry 新增 auto_dispatch: bool 和 assignment_map: Dict[str, str]
+      - 首次 workflow submit --auto-dispatch --assignment-map '{...}' 设置模式
+      - on_task_completed → resuggest → ready tasks 自动按 assignment_map 分发
+      - 没有 assignment_map 条目的 ready task 不自动分发（等手工 submit）
+      - daemon 重启后 auto_dispatch/assignment_map 从快照恢复（持久化到 workflow meta）
+      - E2E 测试：5 个线性任务，首次 submit 后自动推进到完成
+    verification_mode: ralph
+    verification:
+      level: integration
+      checks:
+        - name: auto_dispatch_tests
+          command: python -m pytest tests/e2e/test_auto_dispatch.py -v
+          expected_exit_code: 0
+        - name: existing_workflow_tests
+          command: python -m pytest tests/e2e/test_workflow_e2e.py -v
+          expected_exit_code: 0
+      covers:
+        flows:
+          - auto_dispatch_subsequent_batches
+    provides:
+      - name: auto_dispatch_api
+        schema: "workflow_submit(plan, auto_dispatch=True, assignment_map={}) -> auto-advance on completion"
+
+  # ================================================================
+  # T6: Two-phase split E2E verification (RA-4)
+  # ================================================================
+
+  - id: T6
+    title: "Two-phase split alignment — suggest() E2E verification"
+    role: leaf
+    type: backend
+    addresses:
+      - "RA-4"
+    depends_on:
+      - T1
+    claimed_paths:
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/models.py
+      - tests/ralph/test_ra4_two_phase_e2e.py
+    awareness_paths:
+      - src/cccc/ralph/cli.py
+      - src/cccc/kernel/claimed_paths.py
+    goal_behavior: >
+      验证 suggest() 在两阶段拆分模型（Task 级拆分 + Module 级并行）下
+      正确工作。BatchResult 新增 task_descriptions: Dict[str, str] 字段
+      携带每个 ready task 的 goal_behavior 供 Foreman 第二阶段 Module 拆分使用。
+      现有 _unlock_score / _write_sets_conflict / _dependency_block_reasons
+      无需修改，只需验证在新流程中行为正确。
+    acceptance_criteria: |
+      - BatchResult.task_descriptions 包含 ready tasks 的 goal_behavior
+      - suggest() 在 Task 级依赖 + 写冲突检测下输出正确批次
+      - E2E 测试用例：5 个 Task，T1/T2 并行 → T3 依赖 T1 → T4/T5 依赖 T3
+      - 每个 BatchResult 包含 task_descriptions 供 Foreman 拆分
+      - 现有 test_two_phase_split.py 和 test_ra4_two_phase.py 仍通过
+    verification_mode: ralph
+    verification:
+      level: unit
+      checks:
+        - name: ra4_e2e_tests
+          command: python -m pytest tests/ralph/test_ra4_two_phase_e2e.py -v
+          expected_exit_code: 0
+        - name: existing_ra4_tests
+          command: python -m pytest tests/ralph/test_two_phase_split.py tests/ralph/test_ra4_two_phase.py -v
+          expected_exit_code: 0
+
+  # ================================================================
+  # T-int: Integration — full E2E
+  # ================================================================
+
+  - id: T-int
+    title: "Integration: adversarial gate + auto-dispatch + restart redelivery E2E"
+    role: integration
+    type: backend
+    addresses:
+      - "RO-37"
+      - "RO-34"
+      - "RO-36"
+      - "RA-4"
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T4
+      - T5
+      - T6
+    claimed_paths:
+      - tests/e2e/test_v5_open_issues_integration.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/verification_gate.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/kernel/inbox.py
+      - src/cccc/daemon/actors/actor_lifecycle_ops.py
+    goal_behavior: >
+      集成测试验证所有改进协同工作：
+      1. 对抗式审查在 verify gate 正确触发并拦截弱验证
+      2. W_VERIFICATION_SHALLOW_CRITICAL 阻止 critical_flow 弱验证任务
+      3. Actor restart 后 inbox 消息重投递
+      4. Auto-dispatch 后续批次无需手工 submit
+      5. BatchResult.task_descriptions 正确传递
+    acceptance_criteria: |
+      - 集成测试覆盖 adversarial gate 拦截 CRITICAL bug 场景
+      - 集成测试覆盖 restart 后消息重投递场景
+      - 集成测试覆盖 auto-dispatch 多批次自动推进场景
+      - 所有既有测试不回归
+    verification_mode: ralph
+    verification:
+      level: integration
+      checks:
+        - name: integration_tests
+          command: python -m pytest tests/e2e/test_v5_open_issues_integration.py -v
+          expected_exit_code: 0
+        - name: full_regression
+          command: python -m pytest tests/ -x --timeout=120 -q
+          expected_exit_code: 0
+      covers:
+        flows:
+          - adversarial_challenge_gate
+          - shallow_checks_critical_block
+          - inbox_restart_redelivery
+          - auto_dispatch_subsequent_batches
+          - no_silent_challenge_skip
+        tasks:
+          - T1
+          - T2
+          - T4
+          - T5
+          - T6
+    consumes:
+      - name: adversarial_challenge_api
+        from: T1
+      - name: auto_dispatch_api
+        from: T5

@@ -14,7 +14,6 @@ Covers:
 
 from __future__ import annotations
 
-import hashlib
 import json
 import tempfile
 from pathlib import Path
@@ -35,6 +34,7 @@ from cccc.kernel.workflow_state_types import (
     PreTransitionVetoed,
     WorkflowMeta,
 )
+from cccc.ralph.plan_io import compute_structural_plan_digest
 from cccc.ralph.validator import check_plan_digest_freshness
 
 
@@ -69,9 +69,12 @@ def _register_running_task(
 
 
 def _write_plan(plan_path: Path, content: str = "tasks: []") -> str:
-    """Write a plan file and return its sha256 digest."""
-    plan_path.write_text(content, encoding="utf-8")
-    return hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    """Write a plan file and return its structural digest."""
+    rendered = content
+    if ":" not in content and not content.lstrip().startswith("{"):
+        rendered = f"tasks:\n  - id: T1\n    title: {content!r}\n"
+    plan_path.write_text(rendered, encoding="utf-8")
+    return compute_structural_plan_digest(plan_path)
 
 
 @pytest.fixture

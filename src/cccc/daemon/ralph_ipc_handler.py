@@ -28,21 +28,20 @@ from ..contracts.v1.ralph_ipc import (
     ReadyBatchSuggestion,
     RestartSuggestion,
     VerificationResult,
-    parse_ralph_message,
 )
-from ..util.time import parse_utc_iso, utc_now_iso
+from ..util.time import parse_utc_iso
 
 logger = logging.getLogger("cccc.daemon.ralph_ipc")
 RALPH_STATE_TTL_SECONDS = 300
+RALPH_STATE_BUCKETS = ("pending_suggestions", "pending_restarts")
 
-# In-memory store for Ralph IPC state (can be extended to persistent storage)
+# Transient IPC state. Only pre-engine messages live here; authoritative
+# workflow decisions and verification results are written through the engine.
 _RALPH_STATE: Dict[str, Any] = {
     "pending_suggestions": {},  # suggestion_id -> ReadyBatchSuggestion
     "pending_restarts": {},     # suggestion_id -> RestartSuggestion
-    "decisions": {},            # decision_id -> BatchDecision
-    "verifications": {},        # verification_id -> VerificationResult
-    "actor_statuses": {},       # actor_id -> ActorStatus
 }
+_ACTOR_STATUS_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def _cleanup_stale_ralph_state(ttl_seconds: int = 300) -> int:
@@ -54,7 +53,7 @@ def _cleanup_stale_ralph_state(ttl_seconds: int = 300) -> int:
     """
     now = time.time()
     removed = 0
-    for bucket in ("pending_suggestions", "pending_restarts", "decisions", "verifications", "actor_statuses"):
+    for bucket in RALPH_STATE_BUCKETS:
         store = _RALPH_STATE.get(bucket)
         if not isinstance(store, dict):
             continue
@@ -159,6 +158,16 @@ def _resolve_group_project_root(group_id: str, *candidates: Any) -> str:
     return _project_root_from_group_doc(group.doc)
 
 
+def _normalize_assignment_map(value: Any) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(task_id or "").strip(): str(agent_id or "").strip()
+        for task_id, agent_id in value.items()
+        if str(task_id or "").strip() and str(agent_id or "").strip()
+    }
+
+
 def handle_ralph_batch_suggest(args: Dict[str, Any], *, daemon_request_fn: Any = None) -> DaemonResponse:
     """
     Handle ralph_batch_suggest operation.
@@ -189,8 +198,11 @@ def handle_ralph_batch_suggest(args: Dict[str, Any], *, daemon_request_fn: Any =
         tasks=tasks,  # Pass raw dicts — Pydantic validates via TaskRef(extra="ignore")
         rationale=str(args.get("rationale", "")),
         estimated_parallelism=int(args.get("estimated_parallelism", len(tasks))),
-        assignments=dict(args.get("assignments") or {}),
+        assignments=dict(args.get("assignments") or _normalize_assignment_map(args.get("assignment_map"))),
         fallback_allowed=bool(args.get("fallback_allowed", False)),
+        prompt_issues=dict(args.get("prompt_issues") or {}),
+        recommended_tests=dict(args.get("recommended_tests") or {}),
+        forbidden_flows=list(args.get("forbidden_flows") or []),
     )
 
     _RALPH_STATE["pending_suggestions"][suggestion_id] = suggestion.model_dump()
@@ -209,6 +221,8 @@ def handle_ralph_batch_suggest(args: Dict[str, Any], *, daemon_request_fn: Any =
             if process_result.get("status") == "error":
                 return _error("processing_error", process_result.get("reason") or process_result.get("error", "batch processing failed"))
             result["processing"] = process_result
+            if process_result.get("decision") in ("approved", "rejected"):
+                _RALPH_STATE["pending_suggestions"].pop(suggestion_id, None)
 
     return _success(result)
 
@@ -251,9 +265,12 @@ def handle_ralph_register_and_suggest(
             suggestion_id=args.get("suggestion_id"),
             rationale=str(args.get("rationale", "")),
             estimated_parallelism=int(args.get("estimated_parallelism", len(tasks))),
+            auto_dispatch=bool(args.get("auto_dispatch", False)),
+            assignment_map=_normalize_assignment_map(args.get("assignment_map")),
             auto_start_agents=bool(args.get("auto_start_agents", True)),
             assignments=dict(args.get("assignments") or {}),
             fallback_allowed=bool(args.get("fallback_allowed", False)),
+            plan_path=str(args.get("plan_path") or "").strip(),
         )
         return _success(
             {
@@ -299,6 +316,17 @@ def _try_process_batch(
         # Update daemon_request_fn on cached orchestrator (may have been created without it)
         if daemon_request_fn and not orchestrator._daemon_request_fn:
             orchestrator._daemon_request_fn = daemon_request_fn
+        orchestrator._ensure_active_workflow(
+            suggestion.workflow_id,
+            auto_dispatch=bool(args.get("auto_dispatch", False)),
+            assignment_map=_normalize_assignment_map(args.get("assignment_map")),
+            auto_start_agents=bool(args.get("auto_start_agents", True)),
+        )
+        orchestrator.engine.set_workflow_meta(
+            suggestion.workflow_id,
+            auto_dispatch=bool(args.get("auto_dispatch", False)),
+            assignment_map=_normalize_assignment_map(args.get("assignment_map")),
+        )
 
         result = orchestrator.process_batch_suggestion(
             suggestion,
@@ -403,7 +431,7 @@ def handle_ralph_verification_result(args: Dict[str, Any], *, daemon_request_fn:
     Args:
         workflow_id: Workflow identifier
         task_id: Optional task that triggered verification
-        overall_outcome: passed/failed/skipped/timeout
+        overall_outcome: passed/failed/skipped/skipped_blocked/timeout
         checks: List of individual check results
         summary: Human-readable summary
         group_id: Optional group ID for forwarding to an active orchestrator
@@ -413,7 +441,7 @@ def handle_ralph_verification_result(args: Dict[str, Any], *, daemon_request_fn:
         return err
 
     outcome = str(args["overall_outcome"])
-    if outcome not in ("passed", "failed", "skipped", "timeout", "agent_pending"):
+    if outcome not in ("passed", "failed", "skipped", "skipped_blocked", "timeout", "agent_pending"):
         return _error("invalid_outcome", f"Invalid verification outcome: {outcome}")
 
     verification_id = str(args.get("verification_id") or uuid4())
@@ -435,7 +463,6 @@ def handle_ralph_verification_result(args: Dict[str, Any], *, daemon_request_fn:
         summary=str(args.get("summary", "")),
     )
 
-    _RALPH_STATE["verifications"][verification_id] = verification.model_dump()
     logger.info(f"Ralph verification result: {verification_id} - {outcome}")
     _try_forward_verification(verification, args, daemon_request_fn=daemon_request_fn)
 
@@ -498,6 +525,8 @@ def handle_ralph_restart_suggest(args: Dict[str, Any], *, daemon_request_fn: Any
             if process_result.get("status") == "error":
                 return _error("processing_error", process_result.get("reason") or process_result.get("error", "restart processing failed"))
             result["processing"] = process_result
+            if process_result.get("decision") in ("approved", "rejected"):
+                _RALPH_STATE["pending_restarts"].pop(suggestion_id, None)
 
     return _success(result)
 
@@ -540,8 +569,6 @@ def handle_ralph_batch_decision(args: Dict[str, Any]) -> DaemonResponse:
         rejected_tasks=list(args.get("rejected_tasks", [])),
         reason=str(args.get("reason", "")),
     )
-
-    _RALPH_STATE["decisions"][decision_id] = decision.model_dump()
 
     # Remove from pending if approved or rejected
     if decision_type in ("approved", "rejected"):
@@ -601,7 +628,7 @@ def handle_ralph_actor_status(args: Dict[str, Any]) -> DaemonResponse:
         progress_pct=progress,
     )
 
-    _RALPH_STATE["actor_statuses"][actor_status.actor_id] = actor_status.model_dump()
+    _ACTOR_STATUS_CACHE[actor_status.actor_id] = actor_status.model_dump()
     logger.debug(f"Actor status update: {actor_status.actor_id} - {status_type}")
 
     return _success({
@@ -615,11 +642,11 @@ def handle_ralph_get_pending(args: Dict[str, Any]) -> DaemonResponse:
     """
     Handle ralph_get_pending operation.
 
-    Get pending suggestions and verifications for a workflow.
+    Get pre-engine pending suggestions and restarts for a workflow.
 
     Args:
         workflow_id: Workflow identifier
-        include_decisions: Whether to include past decisions
+        include_decisions: Rejected; decisions are ledger/engine data.
     """
     workflow_id = str(args.get("workflow_id", ""))
 
@@ -639,11 +666,10 @@ def handle_ralph_get_pending(args: Dict[str, Any]) -> DaemonResponse:
     }
 
     if args.get("include_decisions"):
-        decisions = [
-            d for d in _RALPH_STATE["decisions"].values()
-            if not workflow_id or d.get("workflow_id") == workflow_id
-        ]
-        result["decisions"] = decisions
+        return _error(
+            "decisions_not_in_ipc_state",
+            "Batch decisions are not stored in transient Ralph IPC state",
+        )
 
     return _success(result)
 
@@ -661,7 +687,7 @@ def handle_ralph_get_actors(args: Dict[str, Any]) -> DaemonResponse:
     workflow_id = args.get("workflow_id")
     actor_type = args.get("actor_type")
 
-    actors = list(_RALPH_STATE["actor_statuses"].values())
+    actors = list(_ACTOR_STATUS_CACHE.values())
 
     if workflow_id:
         actors = [a for a in actors if a.get("workflow_id") == workflow_id]
@@ -686,7 +712,7 @@ def handle_ralph_clear_workflow(args: Dict[str, Any]) -> DaemonResponse:
         return err
 
     workflow_id = str(args["workflow_id"])
-    cleared = {"suggestions": 0, "restarts": 0, "decisions": 0, "verifications": 0, "actors": 0}
+    cleared = {"suggestions": 0, "restarts": 0, "actors": 0}
 
     # Clear pending suggestions
     to_remove = [k for k, v in _RALPH_STATE["pending_suggestions"].items() if v.get("workflow_id") == workflow_id]
@@ -700,22 +726,10 @@ def handle_ralph_clear_workflow(args: Dict[str, Any]) -> DaemonResponse:
         _RALPH_STATE["pending_restarts"].pop(k, None)
         cleared["restarts"] += 1
 
-    # Clear decisions
-    to_remove = [k for k, v in _RALPH_STATE["decisions"].items() if v.get("workflow_id") == workflow_id]
-    for k in to_remove:
-        _RALPH_STATE["decisions"].pop(k, None)
-        cleared["decisions"] += 1
-
-    # Clear verifications
-    to_remove = [k for k, v in _RALPH_STATE["verifications"].items() if v.get("workflow_id") == workflow_id]
-    for k in to_remove:
-        _RALPH_STATE["verifications"].pop(k, None)
-        cleared["verifications"] += 1
-
     # Clear actor statuses
-    to_remove = [k for k, v in _RALPH_STATE["actor_statuses"].items() if v.get("workflow_id") == workflow_id]
+    to_remove = [k for k, v in _ACTOR_STATUS_CACHE.items() if v.get("workflow_id") == workflow_id]
     for k in to_remove:
-        _RALPH_STATE["actor_statuses"].pop(k, None)
+        _ACTOR_STATUS_CACHE.pop(k, None)
         cleared["actors"] += 1
 
     logger.info(f"Cleared Ralph state for workflow {workflow_id}: {cleared}")
@@ -763,6 +777,9 @@ def handle_ralph_process_pending(args: Dict[str, Any], *, daemon_request_fn: Any
         estimated_parallelism=suggestion_data.get("estimated_parallelism", 1),
         assignments=dict(suggestion_data.get("assignments") or {}),
         fallback_allowed=bool(suggestion_data.get("fallback_allowed", False)),
+        prompt_issues=dict(suggestion_data.get("prompt_issues") or {}),
+        recommended_tests=dict(suggestion_data.get("recommended_tests") or {}),
+        forbidden_flows=list(suggestion_data.get("forbidden_flows") or []),
     )
 
     try:
@@ -789,9 +806,6 @@ def handle_ralph_process_pending(args: Dict[str, Any], *, daemon_request_fn: Any
 
         # Generate batch decision
         decision = orchestrator.get_batch_decision(result)
-
-        # Store decision
-        _RALPH_STATE["decisions"][decision.decision_id] = decision.model_dump()
 
         # Remove from pending if approved or rejected
         if result.decision in ("approved", "rejected"):
@@ -909,7 +923,6 @@ def handle_ralph_task_heartbeat(args: Dict[str, Any]) -> DaemonResponse:
     """Handle ralph_task_heartbeat — worker progress push."""
     group_id = str(args.get("group_id") or "").strip()
     task_id = str(args.get("task_id") or "").strip()
-    workflow_id = str(args.get("workflow_id") or "").strip()
     progress = args.get("progress")
     message = str(args.get("message") or "").strip()
     project_root = _resolve_group_project_root(group_id, args.get("project_root"))
@@ -946,6 +959,8 @@ def handle_ralph_task_event(args: Dict[str, Any]) -> DaemonResponse:
     actor_run_id = str(payload.get("actor_run_id") or args.get("actor_run_id") or "").strip()
 
     if event_type == "completed":
+        override_stale_digest = bool(args.get("override_stale_digest", False))
+        force_complete = bool(args.get("force_complete", False))
         return _from_workflow_task_op(
             complete_task(
                 group_id=group_id,
@@ -958,6 +973,8 @@ def handle_ralph_task_event(args: Dict[str, Any]) -> DaemonResponse:
                 daemon_request_fn=None,
                 assignment_id=assignment_id,
                 actor_run_id=actor_run_id,
+                override_stale_digest=override_stale_digest,
+                force_complete=force_complete,
             )
         )
     if event_type == "failed":

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from argparse import Namespace
+import json
 from pathlib import Path
+import subprocess
+from typing import Any
 
 import pytest
 
@@ -37,6 +40,16 @@ def _complete_args(plan_path: Path, *, task: str = "T1", verify_flag: bool = Tru
     )
 
 
+def _agent_completed(passed: bool) -> subprocess.CompletedProcess[str]:
+    payload = {
+        "passed": passed,
+        "summary": "agent simulation result",
+        "checks": [{"name": "foreman_case", "outcome": "passed" if passed else "failed"}],
+    }
+    stdout = json.dumps({"response": json.dumps(payload)})
+    return subprocess.CompletedProcess(args=["gemini"], returncode=0, stdout=stdout, stderr="")
+
+
 def test_ralph_mode_default(tmp_path: Path) -> None:
     plan_path = tmp_path / "plan.yaml"
     plan_path.write_text(
@@ -60,24 +73,26 @@ def test_ralph_mode_default(tmp_path: Path) -> None:
     assert result["outcome"] == "passed"
 
 
-def test_agent_mode_returns_agent_pending(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    task = _task("T1", verification_mode="agent", command="definitely-not-a-real-command")
+def test_agent_mode_routes_to_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    task = _task("T1", verification_mode="agent", command="true")
 
-    def _fail_if_called(*args, **kwargs):  # noqa: ANN002, ANN003
-        raise AssertionError("verification subprocess must not run in agent mode")
+    monkeypatch.setattr(
+        "cccc.ralph.agent.subprocess.run",
+        lambda command, **kwargs: _agent_completed(True),
+    )
 
-    monkeypatch.setattr("cccc.ralph.core.subprocess.run", _fail_if_called)
     result = verify(task, changed_files=[], project_root=tmp_path)
 
-    assert result == {
-        "task_id": "T1",
-        "outcome": "agent_pending",
-        "reason": "awaiting external agent verification",
-        "checks": [],
-    }
+    assert result["task_id"] == "T1"
+    assert result["outcome"] == "passed"
+    assert result["outcome"] != "agent_pending"
 
 
-def test_agent_pending_does_not_complete(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_agent_failure_does_not_complete(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     plan_path = tmp_path / "plan.yaml"
     plan_path.write_text(
         "tasks:\n"
@@ -93,13 +108,17 @@ def test_agent_pending_does_not_complete(tmp_path: Path, capsys: pytest.CaptureF
         "          - T1\n",
         encoding="utf-8",
     )
+    monkeypatch.setattr(
+        "cccc.ralph.agent.subprocess.run",
+        lambda command, **kwargs: _agent_completed(False),
+    )
 
     exit_code = _cmd_complete(load_plan(plan_path), _complete_args(plan_path))
 
     output = capsys.readouterr()
     saved_plan = load_plan(plan_path)
     assert exit_code == 1
-    assert "verification pending" in output.err
+    assert "verification failed" in output.err
     assert saved_plan.state.completed_task_ids == []
 
 

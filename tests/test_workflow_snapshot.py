@@ -61,7 +61,7 @@ def test_snapshot_round_trip_preserves_workflow_meta(group, tmp_path: Path) -> N
     WorkflowSnapshot(restored_engine).restore_snapshot(snapshot_path)
 
     assert snapshot_doc["state"]["workflow_meta"] == [
-        {"workflow_id": "wf-1", "plan_path": str(plan_path.resolve())}
+        {"workflow_id": "wf-1", "plan_path": str(plan_path.resolve()), "plan_digest": "", "auto_dispatch": False, "assignment_map": {}}
     ]
     meta = restored_engine.get_workflow_meta("wf-1")
     assert meta is not None

@@ -6,7 +6,6 @@ The validator reads the Plan and produces a ValidationReport without side effect
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from pathlib import Path
@@ -31,6 +30,7 @@ from .models import (
     classify_issue_metadata,
     stamp_issue_ids,
 )
+from .plan_io import compute_structural_plan_digest
 from .workspace_index import WorkspaceIndex
 from .rules_advisory import check_goal_hardcoded_awareness, check_inline_assertions
 
@@ -58,6 +58,7 @@ from .validation_rules import (
     _check_critical_coverage,
     _check_flow_segment_ownership,
     _check_critical_flow_levels,
+    _check_critical_flow_worker_only_verification,
     _check_issue_coverage,
     _check_forbidden_flows,
     _check_finding_refs,
@@ -218,6 +219,7 @@ def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
     issues.extend(_check_critical_coverage(plan))
     issues.extend(_check_flow_segment_ownership(plan))
     issues.extend(_check_critical_flow_levels(plan))
+    issues.extend(_check_critical_flow_worker_only_verification(plan))
     issues.extend(_check_forbidden_flows(plan))
     issues.extend(_check_suppress_flows(plan))
     issues.extend(_check_finding_refs(plan))
@@ -613,9 +615,8 @@ def check_plan_digest_freshness(
     """
     if not registered_digest:
         return None
-    try:
-        current_digest = hashlib.sha256(plan_path.read_bytes()).hexdigest()
-    except (OSError, ValueError):
+    current_digest = compute_structural_plan_digest(plan_path)
+    if not current_digest:
         return None
     if current_digest == registered_digest:
         return None

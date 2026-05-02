@@ -120,6 +120,7 @@ def _check_verification_no_checks(plan: Plan) -> List[ValidationIssue]:
 
 def _check_verification_shallow_checks(plan: Plan) -> List[ValidationIssue]:
     issues: List[ValidationIssue] = []
+    critical_flow_ids = {flow.id for flow in plan.critical_flows}
     for task in plan.tasks:
         verification = task.verification
         if verification is None or not verification.checks:
@@ -132,9 +133,18 @@ def _check_verification_shallow_checks(plan: Plan) -> List[ValidationIssue]:
         risk_keywords = _acceptance_risk_keywords(task.acceptance_criteria)
         if risk_keywords:
             evidence["acceptance_risk_keywords"] = risk_keywords
+        covered_critical_flows = sorted(set(verification.covers.flows) & critical_flow_ids)
+        if covered_critical_flows:
+            evidence["critical_flows"] = covered_critical_flows
+        code = (
+            "E_VERIFICATION_SHALLOW_CRITICAL"
+            if covered_critical_flows
+            else "W_VERIFICATION_SHALLOW_CHECKS"
+        )
+        severity = "error" if covered_critical_flows else "warning"
         issues.append(ValidationIssue(
-            code="W_VERIFICATION_SHALLOW_CHECKS",
-            severity="warning",
+            code=code,
+            severity=severity,
             message=(
                 f"task '{task.id}' verification checks are all shallow "
                 "(compile/import/help) — consider adding at least one behavioral test check"
@@ -569,6 +579,14 @@ def _claimed_flow_entrypoints(task: TaskSpec, entrypoints: List[str]) -> List[st
     return result
 
 
+def _task_covers_critical_flow(task: TaskSpec, critical_flows: List[Any]) -> List[str]:
+    covered_flow_ids: List[str] = []
+    for flow in critical_flows:
+        if _claimed_flow_entrypoints(task, list(flow.entrypoints)):
+            covered_flow_ids.append(flow.id)
+    return covered_flow_ids
+
+
 def _check_flow_segment_ownership(plan: Plan) -> List[ValidationIssue]:
     issues: List[ValidationIssue] = []
 
@@ -655,6 +673,31 @@ def _check_critical_flow_levels(plan: Plan) -> List[ValidationIssue]:
                 },
             ))
 
+    return issues
+
+
+def _check_critical_flow_worker_only_verification(plan: Plan) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    for task in plan.tasks:
+        if task.verification_mode in ("agent", "challenge"):
+            continue
+        covered_flow_ids = _task_covers_critical_flow(task, plan.critical_flows)
+        if not covered_flow_ids:
+            continue
+        issues.append(ValidationIssue(
+            code="W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION",
+            severity="warning",
+            message=(
+                f"task '{task.id}' claims critical flow entrypoints but uses "
+                f"verification_mode='{task.verification_mode}' instead of agent/challenge"
+            ),
+            task_ids=[task.id],
+            evidence={
+                "task_id": task.id,
+                "verification_mode": task.verification_mode,
+                "critical_flows": covered_flow_ids,
+            },
+        ))
     return issues
 
 

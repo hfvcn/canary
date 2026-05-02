@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import shlex
@@ -15,6 +14,7 @@ from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
 from cccc.kernel.workflow_state_types import KIND_PLAN_DIGEST_DIVERGENCE, KIND_TASK_DEFERRED
 from cccc.ralph.cli import main as ralph_main
 from cccc.ralph.models import ForbiddenFlow
+from cccc.ralph.plan_io import compute_structural_plan_digest
 
 
 def _python_exit_command(code: int) -> str:
@@ -30,7 +30,7 @@ def _capture_cli(argv: list[str]) -> tuple[int, str, str]:
 
 
 def _write_plan(plan_path: Path, *, with_unknown_flow: bool) -> Path:
-    covers = {"tasks": ["T1"]}
+    covers = {"tasks": ["T1"], "paths": ["tests/test_app.py"]}
     if with_unknown_flow:
         covers["flows"] = ["ghost-flow"]
     payload = {
@@ -44,6 +44,11 @@ def _write_plan(plan_path: Path, *, with_unknown_flow: bool) -> Path:
             "verification": {
                 "level": "unit",
                 "command": "pytest tests/test_app.py -q",
+                "checks": [{
+                    "name": "unit",
+                    "command": "pytest tests/test_app.py -q",
+                    "required": True,
+                }],
                 "covers": covers,
             },
         }],
@@ -137,7 +142,7 @@ def test_ralph_enhancement_surface_e2e(tmp_path: Path) -> None:
     orch.engine.set_workflow_meta(
         workflow_id,
         plan_path=str(plan_path.resolve()),
-        plan_digest=hashlib.sha256(plan_path.read_bytes()).hexdigest(),
+        plan_digest=compute_structural_plan_digest(plan_path),
     )
     _advance_task_to_running(orch, workflow_id, task_ref, agent_id="worker-main")
 

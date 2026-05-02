@@ -565,6 +565,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_workflow_submit.add_argument("--group", default="", help="Target group_id (default: active group)")
     p_workflow_submit.add_argument("--assignments", default="", help='Foreman explicit assignments JSON: {"task_id":"actor_id",...}')
+    p_workflow_submit.add_argument("--auto-dispatch", action="store_true", help="Auto-dispatch later ready tasks using --assignment-map")
+    p_workflow_submit.add_argument("--assignment-map", default="", help='Task auto-dispatch map JSON: {"task_id":"actor_id",...}')
     p_workflow_submit.set_defaults(func=cmd_workflow_submit)
 
     p_workflow_status = workflow_sub.add_parser("status", help="Show workflow progress snapshot")
@@ -607,6 +609,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_task_complete.add_argument("--assignment-id", default="", help="Optional assignment id")
     p_task_complete.add_argument("--actor-run-id", default="", help="Optional actor run id")
     p_task_complete.add_argument("--idempotency-key", default="", help="Optional idempotency key")
+    p_task_complete.add_argument("--force", action="store_true", help="Force completion, bypassing verification gate (foreman override)")
     p_task_complete.add_argument("--group", default="", help="Target group_id (default: active group)")
     p_task_complete.set_defaults(func=cmd_task_complete)
 

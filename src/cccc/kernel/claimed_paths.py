@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import posixpath
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List
 
 
 GLOBAL_WRITE_CLAIM = "/"
@@ -60,9 +60,15 @@ def paths_overlap(left: str, right: str) -> bool:
     return left.startswith(f"{right}/") or right.startswith(f"{left}/")
 
 
+def any_overlap(paths_a: Iterable[str], paths_b: Iterable[str]) -> bool:
+    """Return True if any path in *paths_a* overlaps any path in *paths_b*."""
+    right_paths = tuple(paths_b)
+    return any(paths_overlap(a, b) for a in paths_a for b in right_paths)
+
+
 def write_sets_conflict(left: List[str], right: List[str]) -> bool:
     """Return True if any path in *left* overlaps any path in *right*."""
-    return any(paths_overlap(a, b) for a in left for b in right)
+    return any_overlap(left, right)
 
 
 def conflicts_with_any(
@@ -79,6 +85,7 @@ def conflicts_with_any(
 _normalize_path = normalize_path
 _normalize_write_set = normalize_write_set
 _paths_overlap = paths_overlap
+_any_overlap = any_overlap
 _write_sets_conflict = write_sets_conflict
 _conflicts_with_any = conflicts_with_any
 

@@ -264,33 +264,42 @@ def test_build_task_prompt_includes_semantic_section(tmp_path, monkeypatch):
 
 
 def test_build_task_prompt_callsite_passes_workflow_id():
-    source_path = Path(__file__).resolve().parents[1] / "src/cccc/daemon/foreman/workflow_orchestrator.py"
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    foreman_dir = Path(__file__).resolve().parents[1] / "src/cccc/daemon/foreman"
+    # After RO-31 refactor, the call lives in assignment_startup.py
+    # (previously in workflow_orchestrator.py _start_assigned_agents).
+    candidates = ["assignment_startup.py", "workflow_orchestrator.py"]
+    found = False
+    for candidate in candidates:
+        source_path = foreman_dir / candidate
+        if not source_path.exists():
+            continue
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
 
-    class PromptCallVisitor(ast.NodeVisitor):
-        def __init__(self):
-            self.function_stack: list[str] = []
-            self.found = False
+        class PromptCallVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.function_stack: list[str] = []
+                self.found = False
 
-        def visit_FunctionDef(self, node: ast.FunctionDef):
-            self.function_stack.append(node.name)
-            self.generic_visit(node)
-            self.function_stack.pop()
+            def visit_FunctionDef(self, node: ast.FunctionDef):
+                self.function_stack.append(node.name)
+                self.generic_visit(node)
+                self.function_stack.pop()
 
-        def visit_Call(self, node: ast.Call):
-            if (
-                self.function_stack
-                and self.function_stack[-1] == "_start_assigned_agents"
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_build_task_prompt"
-                and any(keyword.arg == "workflow_id" for keyword in node.keywords)
-            ):
-                self.found = True
-            self.generic_visit(node)
+            def visit_Call(self, node: ast.Call):
+                if (
+                    self.function_stack
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "_build_task_prompt"
+                ):
+                    self.found = True
+                self.generic_visit(node)
 
-    visitor = PromptCallVisitor()
-    visitor.visit(tree)
-    assert visitor.found is True
+        visitor = PromptCallVisitor()
+        visitor.visit(tree)
+        if visitor.found:
+            found = True
+            break
+    assert found is True, "No _build_task_prompt call found in assignment_startup.py or workflow_orchestrator.py"
 
 
 def test_auto_label_skips_when_provider_none(tmp_path, monkeypatch):

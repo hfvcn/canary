@@ -1,0 +1,379 @@
+# Plan: RO-38 + RO-39 + RO-37 + RO-30 — 问题清单 v5 待实施修复（Codex 审查修订版）
+#
+# 来源：todo/问题清单-v5-ralph.md 所有未解决改进项
+# 工作流：findings.md § 〇 经验证的工作流程
+# Codex 审查：2026-05-02，6 项反馈均已纳入
+#
+# Codex 审查修正：
+#   - T1: digest 注册在 assignment_batches.py:289 而非 set_workflow_meta，
+#     validator.py:606 check_plan_digest_freshness 也是字节 digest，全部需修改
+#   - T2: _resuggest_ready_tasks 已无条件调用，RO-39 可能是 RO-38 的症状
+#     → 改为验证+回归覆盖（如果 RO-38 修复后 RO-39 自动解决则标记完成）
+#   - T3: COMPLETION PROTOCOL 已在 agent_pool.py:530 实现 → 移除该任务
+#   - T4: verify_completion() 无 critical_flows 访问路径 → 需通过 plan 文件或
+#     engine meta 传递 critical_flows 信息
+#   - T5: 文档已无 external daemon/Git watcher，真正问题是 cccc_message_send
+#     引用仍存在；验证命令恒为成功需修正
+#   - RO-40: 已在 agent_pool.py:530 实现，标记完成
+#
+# 设计原则：
+#   - #2  按功能切片拆分，不按文件拆
+#   - #9  先跑通一条路径再扩展 — P0 > P1 > P2
+#   - #11 verification 必须真正跑命令
+#   - #13 结构校验 + 代码审查互补
+#
+# 批次预期：
+#   Batch 1: T1, T3, T4  — 独立修复
+#   Batch 2: T2           — 依赖 T1（digest 修复后才能验证 auto-advance）
+#   Batch 3: T-int        — 全量集成验证
+
+schema_version: "1.0.0"
+
+required_issues:
+  - "RO-38"
+  - "RO-39"
+  - "RO-37"
+  - "RO-30"
+  - "RO-36"
+
+semantic_mode: "off"
+auto_infer: false
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_AGENT_REVIEW_FAILED
+  - W_UNCLAIMED_TEST_FOR_SOURCE
+  - W_TEST_COVERAGE_GAP
+  - W_VERIFICATION_TARGET_MISSING
+  - W_VERIFICATION_NO_CHECKS
+  - W_VERIFICATION_COMPLEX_SHELL_SKIPPED
+  - W_CROSS_BOUNDARY_WITHOUT_GLUE
+  - W_NO_FAILURE_PATH
+  - W_PLAN_SCOPE_UNUSED
+  - W_VERIFICATION_BEHAVIOR_MISMATCH
+
+critical_entrypoints:
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - src/cccc/daemon/foreman/assignment_batches.py
+  - src/cccc/daemon/foreman/ralph_service.py
+  - src/cccc/ralph/validator.py
+  - src/cccc/daemon/ops/workflow_task_ops.py
+  - docs/ralph-foreman-workflow.md
+
+critical_flows:
+  - id: structural_digest_all_paths
+    description: >
+      plan digest 计算在三处同步使用 structural digest：
+      1. assignment_batches.py _store_workflow_meta 注册时
+      2. workflow_orchestrator.py freshness hook 检查时
+      3. validator.py check_plan_digest_freshness CLI 检查时
+      三处都排除 state 节，只对 task 定义变更触发 divergence。
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/assignment_batches.py
+      - src/cccc/ralph/validator.py
+    required_verification_level: integration
+
+  - id: manual_complete_auto_advance
+    description: >
+      Foreman 手动 cccc task complete → digest 不再 veto →
+      verification gate 正常完成 → on_task_completed → _resuggest_ready_tasks
+      → downstream task 自动推进。
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/ops/workflow_task_ops.py
+    required_verification_level: integration
+
+  - id: critical_flow_challenge_upgrade
+    description: >
+      覆盖 critical_flow 的任务在 verify_completion 时自动升级
+      verification_mode 到 challenge（worker + agent 双重验证）。
+    entrypoints:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/validation_rules/coverage.py
+    required_verification_level: unit
+
+forbidden_flows:
+  - id: no_state_digest_veto
+    description: >
+      ralph complete 修改 plan.yaml state 节后，cccc task complete
+      不得触发 plan_digest_divergence veto。
+    test_created_by:
+      - T1
+    required_verification_level: integration
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []
+
+# ================================================================
+# T1: Structural digest — 排除 state 节 (RO-38, P0)
+# ================================================================
+
+tasks:
+  - id: T1
+    title: "Structural digest excludes plan state section across all 3 paths"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-38"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/assignment_batches.py
+      - src/cccc/ralph/validator.py
+      - tests/test_digest_state_exempt.py
+    awareness_paths:
+      - src/cccc/ralph/plan_io.py
+      - src/cccc/kernel/workflow_state_engine.py
+    goal_behavior: >
+      修改 digest 计算使其排除 state 节，在所有三个使用点保持一致：
+
+      1. 新增 _compute_structural_digest(path) 静态方法（在 workflow_orchestrator.py）：
+         读取 plan 文件 → YAML/JSON 解析 → 移除 "state" 键 → 序列化为
+         canonical JSON → sha256。同时处理 YAML 和 JSON 格式。
+
+      2. assignment_batches.py _store_workflow_meta (line 289)：
+         将 self._owner._compute_file_digest(Path(plan_path)) 替换为
+         self._owner._compute_structural_digest(Path(plan_path))。
+
+      3. workflow_orchestrator.py _create_plan_digest_freshness_hook (line 284)：
+         将 _compute_file_digest(plan_path) 替换为
+         _compute_structural_digest(plan_path)。
+
+      4. workflow_orchestrator.py _post_hoc_plan_digest_check (line 347)：
+         将 _compute_file_digest(plan_path) 替换为
+         _compute_structural_digest(plan_path)。
+
+      5. validator.py check_plan_digest_freshness (line 606)：
+         将 hashlib.sha256(plan_path.read_bytes()).hexdigest() 替换为
+         调用共享的 structural digest 函数。需将函数放在可被 validator
+         import 的位置（如 ralph/plan_io.py 或独立模块）。
+
+      注意：_compute_file_digest 保留不变（其他用途可能依赖它），
+      新增 _compute_structural_digest 专用于 plan digest。
+    acceptance_criteria: >
+      1. 注册 workflow（plan_digest 基于 structural content）。
+      2. 调用 save_plan_state() 添加 completed_task_id 到 state 节。
+      3. freshness hook 检查 → 不触发 plan_digest_divergence（digest 相同）。
+      4. 修改 plan.yaml 中的 task 定义（如改 title）→ 触发 divergence。
+      5. validator check_plan_digest_freshness 同样行为。
+      6. 对 YAML 和 JSON 格式的 plan 文件都正确工作。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_digest_state_exempt.py -xvs"
+      covers:
+        tasks: [T1]
+        flows: [structural_digest_all_paths]
+    provides:
+      - name: structural_digest_fn
+        kind: function
+    consumes: []
+
+  # ================================================================
+  # T2: 验证 manual completion auto-advance (RO-39 + RO-36)
+  # ================================================================
+
+  - id: T2
+    title: "Verify manual completion auto-advance works after digest fix"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-39"
+      - "RO-36"
+    depends_on:
+      - T1
+    claimed_paths:
+      - tests/test_manual_complete_resuggest.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/assignment_completion.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/ops/workflow_task_ops.py
+    goal_behavior: >
+      Codex 审查确认 _resuggest_ready_tasks() 已在 on_task_completed_inner
+      中无条件调用（assignment_completion.py:36），且 _workflow_dispatch_settings
+      已回退到 engine.get_workflow_meta()。RO-39 的 v16 现象很可能是 RO-38
+      digest divergence veto 导致 complete 被拒绝，从而 resuggest 无法触发。
+
+      本任务验证 RO-38 修复后 manual completion auto-advance 是否自动恢复：
+      1. 创建回归测试覆盖完整 CLI 路径：cccc task complete（走 workflow_task_ops
+         → apply_task_event → verification gate → on_task_completed → resuggest）。
+      2. 测试场景：Foreman（非 assigned agent）手动完成 upstream task 后，
+         downstream task 通过 auto_dispatch 自动推进到 ASSIGNED。
+      3. 如果 RO-38 修复后测试通过，RO-39 标记为已解决（症状而非独立 bug）。
+      4. 如果测试仍失败，排查 _active_workflows 丢失或 completer_mismatch
+         阻断等独立根因。
+    acceptance_criteria: >
+      1. 注册 workflow（auto_dispatch=True, assignment_map={...}）。
+      2. plan 文件存在且 state 节会被修改（模拟 ralph complete）。
+      3. 手动完成 T-upstream（非 assigned agent）→ 不触发 digest veto。
+      4. T-downstream 自动进入 ASSIGNED 或 RUNNING 状态。
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_manual_complete_resuggest.py -xvs"
+      covers:
+        tasks: [T2]
+        flows: [manual_complete_auto_advance]
+    provides:
+      - name: manual_advance_verified
+        kind: behavior
+    consumes:
+      - name: structural_digest_fn
+        from_task: T1
+
+  # ================================================================
+  # T3: Critical flow 任务默认升级 verification_mode (RO-37, P1)
+  # ================================================================
+
+  - id: T3
+    title: "Critical flow tasks auto-upgrade to challenge verification"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-37"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/validation_rules/coverage.py
+      - tests/test_critical_flow_challenge_upgrade.py
+    awareness_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - src/cccc/ralph/plan_io.py
+    goal_behavior: >
+      两层改进，共享一个 predicate 函数判断 task 是否关联 critical_flow：
+
+      1. 共享 predicate：新增 _task_covers_critical_flow(task_ref, critical_flows)
+         函数，判断 task 的 claimed_paths 与任一 critical_flow 的 entrypoints
+         有交集。放在 ralph_service.py 或独立工具模块。
+
+      2. Ralph validate 层（coverage.py）：对覆盖 critical_flow 的任务
+         如果 verification_mode 不是 agent 或 challenge，发出
+         W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION warning。
+         critical_flows 信息直接来自 Plan 对象（validate 入口已有）。
+
+      3. Runtime 层（ralph_service.py verify_completion）：如果
+         task_ref 关联 critical_flow 且 verification_mode == "ralph"，
+         自动升级到 "challenge"。critical_flows 数据来源：
+         通过 workflow_engine.get_workflow_meta() 获取 plan_path →
+         加载 plan 文件 → 提取 critical_flows。或者在注册时将
+         critical_flows 存入 WorkflowMeta。
+
+      4. 确保非 critical_flow 任务不受影响。
+    acceptance_criteria: >
+      1. ralph validate 对 critical_flow 关联 + verification_mode=ralph 的任务
+         输出 W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION。
+      2. verify_completion() 对 critical_flow 关联任务自动使用 challenge 模式。
+      3. 非 critical_flow 任务不被升级。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_critical_flow_challenge_upgrade.py -xvs"
+      covers:
+        tasks: [T3]
+        flows: [critical_flow_challenge_upgrade]
+    provides:
+      - name: challenge_auto_upgrade
+        kind: behavior
+    consumes: []
+
+  # ================================================================
+  # T4: 文档对齐 — cccc_message_send → CLI (RO-30, P2)
+  # ================================================================
+
+  - id: T4
+    title: "Update docs: replace cccc_message_send with CLI commands"
+    role: leaf
+    type: general
+    addresses:
+      - "RO-30"
+    depends_on: []
+    claimed_paths:
+      - docs/ralph-foreman-workflow.md
+    awareness_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/cli.py
+    goal_behavior: >
+      Codex 审查确认：docs/ralph-foreman-workflow.md 已无 external daemon /
+      Git watcher / merge_worktree 等旧术语，但仍有 3 处使用 cccc_message_send：
+      - line 57: 执行完成后通过 cccc_message_send(to="@foreman", ...) 汇报结果
+      - line 266: Report via cccc_message_send(to="@foreman", text=...).
+      - line 392: 通过 cccc_message_send(to="@foreman", ...) 回报
+
+      全部替换为 CLI 等价命令：
+      - cccc send --to @foreman --text "..."（进度/阻塞汇报）
+      - cccc task complete <task_id> --changed-file <path> --evidence "..."（完成）
+
+      同时审查文档中是否有其他过时的 MCP 工具引用（如 cccc_task, context.sync 等），
+      一并替换为 CLI 命令。
+    acceptance_criteria: >
+      1. docs/ralph-foreman-workflow.md 不再包含 cccc_message_send。
+      2. 所有 Worker 汇报/完成指引改为 CLI 命令。
+      3. 无其他 MCP 工具名称残留。
+    verification:
+      level: unit
+      command: "python -c \"import sys; t=open('docs/ralph-foreman-workflow.md').read(); sys.exit(1 if 'cccc_message_send' in t else 0)\""
+      covers:
+        tasks: [T4]
+        flows: []
+    provides: []
+    consumes: []
+
+  # ================================================================
+  # T-int: 全量集成验证
+  # ================================================================
+
+  - id: T-int
+    title: "Integration validation: digest + auto-advance + challenge upgrade"
+    role: integration
+    type: backend
+    addresses:
+      - "RO-38"
+      - "RO-39"
+      - "RO-37"
+      - "RO-30"
+      - "RO-36"
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T4
+    claimed_paths:
+      - tests/test_v5_integration_remaining.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/daemon/ops/workflow_task_ops.py
+      - tests/test_ralph_plan_digest_guard.py
+      - tests/e2e/test_auto_dispatch.py
+    goal_behavior: >
+      编写集成测试验证所有修复的端到端协同：
+      1. digest_state_exempt: 注册 workflow → save_plan_state 修改 state →
+         structural digest 不变 → freshness hook 不 veto。
+      2. manual_complete_auto_advance: 注册 workflow(auto_dispatch=True) →
+         手动完成 upstream → downstream 自动 ASSIGNED。
+      3. critical_flow_challenge: 注册 critical_flow 关联任务 →
+         verify_completion 自动使用 challenge 模式。
+      4. 全量 pytest 回归：现有测试不被破坏。
+    acceptance_criteria: >
+      1. 新集成测试全部通过。
+      2. 全量 python -m pytest 无新增失败。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/test_v5_integration_remaining.py -xvs"
+      covers:
+        tasks: [T1, T2, T3, T4, T-int]
+        flows:
+          - structural_digest_all_paths
+          - manual_complete_auto_advance
+          - critical_flow_challenge_upgrade
+    provides: []
+    consumes:
+      - name: structural_digest_fn
+        from_task: T1
+      - name: manual_advance_verified
+        from_task: T2
+      - name: challenge_auto_upgrade
+        from_task: T3

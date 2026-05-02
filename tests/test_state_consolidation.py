@@ -76,6 +76,11 @@ class TestNoTaskStatusesInRalphService:
 class TestRalphStateTTL:
     """RO-26: entries with _created_at older than TTL are cleaned up."""
 
+    def test_ralph_state_only_contains_pre_engine_pending_buckets(self) -> None:
+        from cccc.daemon.ralph_ipc_handler import _RALPH_STATE
+
+        assert set(_RALPH_STATE) == {"pending_suggestions", "pending_restarts"}
+
     def test_stale_entries_removed(self) -> None:
         from cccc.daemon.ralph_ipc_handler import (
             _RALPH_STATE,
@@ -111,14 +116,14 @@ class TestRalphStateTTL:
 
         original = {k: dict(v) for k, v in _RALPH_STATE.items()}
         try:
-            _RALPH_STATE["verifications"]["legacy-1"] = {
+            _RALPH_STATE["pending_restarts"]["legacy-1"] = {
                 "workflow_id": "wf-legacy",
                 # no _created_at
             }
 
             removed = _cleanup_stale_ralph_state(ttl_seconds=300)
             assert removed == 0
-            assert "legacy-1" in _RALPH_STATE["verifications"]
+            assert "legacy-1" in _RALPH_STATE["pending_restarts"]
         finally:
             for k in _RALPH_STATE:
                 _RALPH_STATE[k] = original.get(k, {})
@@ -131,7 +136,7 @@ class TestRalphStateTTL:
 
         original = {k: dict(v) for k, v in _RALPH_STATE.items()}
         try:
-            _RALPH_STATE["decisions"]["medium-1"] = {
+            _RALPH_STATE["pending_restarts"]["medium-1"] = {
                 "_created_at": time.time() - 120,  # 2 min ago
                 "workflow_id": "wf-medium",
             }
@@ -139,12 +144,12 @@ class TestRalphStateTTL:
             # 5 min TTL -> should NOT remove
             removed_5m = _cleanup_stale_ralph_state(ttl_seconds=300)
             assert removed_5m == 0
-            assert "medium-1" in _RALPH_STATE["decisions"]
+            assert "medium-1" in _RALPH_STATE["pending_restarts"]
 
             # 1 min TTL -> should remove
             removed_1m = _cleanup_stale_ralph_state(ttl_seconds=60)
             assert removed_1m == 1
-            assert "medium-1" not in _RALPH_STATE["decisions"]
+            assert "medium-1" not in _RALPH_STATE["pending_restarts"]
         finally:
             for k in _RALPH_STATE:
                 _RALPH_STATE[k] = original.get(k, {})

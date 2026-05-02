@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
@@ -61,6 +62,29 @@ def _parse_raw_bytes(source: bytes, source_path: Path) -> Dict[str, Any]:
         except Exception:
             data = json.loads(text)
     return data or {}
+
+
+def _strip_plan_state(data: Any) -> Any:
+    """Return a copy of the top-level plan payload without runtime state."""
+    if not isinstance(data, dict):
+        return data
+    return {key: value for key, value in data.items() if key != "state"}
+
+
+def compute_structural_plan_digest(path: Path) -> str:
+    """Compute a canonical sha256 digest for a plan excluding top-level state."""
+    try:
+        data = _parse_raw_data(path)
+        structural = _strip_plan_state(data)
+        canonical = json.dumps(
+            structural,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, yaml.YAMLError):
+        return ""
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)

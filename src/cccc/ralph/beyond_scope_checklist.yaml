@@ -29,11 +29,11 @@ items:
     match_type: code_prefix  # Agent reviews verification commands for runtime coverage
 
   - id: RO-11n
-    pattern: "claimed_paths"
+    pattern: "side effect"
     description: "计划中'删除函数'的副作用链无法静态检测"
     match_type: field_content
 
   - id: RO-12n
-    pattern: "claimed_paths"
+    pattern: "entry"
     description: "同一文件多入口只覆盖部分时 Ralph 不报警"
     match_type: field_content

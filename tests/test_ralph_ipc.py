@@ -844,10 +844,13 @@ class TestRalphIPCHandler(unittest.TestCase):
         self.assertEqual(len(resp.result["pending_suggestions"]), 1)
 
     def test_ralph_get_actors(self) -> None:
-        from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op, _RALPH_STATE
+        from cccc.daemon.ralph_ipc_handler import (
+            _ACTOR_STATUS_CACHE,
+            try_handle_ralph_op,
+        )
 
         # Clear state first
-        _RALPH_STATE["actor_statuses"].clear()
+        _ACTOR_STATUS_CACHE.clear()
 
         # Create actor statuses
         try_handle_ralph_op("ralph_actor_status", {
@@ -875,7 +878,11 @@ class TestRalphIPCHandler(unittest.TestCase):
         self.assertEqual(resp.result["actors"][0]["actor_type"], "ralph")
 
     def test_ralph_clear_workflow(self) -> None:
-        from cccc.daemon.ralph_ipc_handler import try_handle_ralph_op, _RALPH_STATE
+        from cccc.daemon.ralph_ipc_handler import (
+            _ACTOR_STATUS_CACHE,
+            _RALPH_STATE,
+            try_handle_ralph_op,
+        )
 
         # Clear state and create data
         for key in _RALPH_STATE:
@@ -893,7 +900,7 @@ class TestRalphIPCHandler(unittest.TestCase):
 
         # Verify data exists
         self.assertEqual(len(_RALPH_STATE["pending_suggestions"]), 1)
-        self.assertEqual(len(_RALPH_STATE["actor_statuses"]), 1)
+        self.assertEqual(len(_ACTOR_STATUS_CACHE), 1)
 
         # Clear workflow
         resp = try_handle_ralph_op("ralph_clear_workflow", {"workflow_id": "wf-1"})
@@ -902,7 +909,7 @@ class TestRalphIPCHandler(unittest.TestCase):
 
         # Verify data cleared
         self.assertEqual(len(_RALPH_STATE["pending_suggestions"]), 0)
-        self.assertEqual(len(_RALPH_STATE["actor_statuses"]), 0)
+        self.assertEqual(len(_ACTOR_STATUS_CACHE), 0)
 
     def test_ralph_batch_suggest_preserves_metadata_fields(self) -> None:
         """WF-1: Verify that goal_behavior, acceptance_criteria, verification

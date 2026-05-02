@@ -135,22 +135,33 @@ def process_completed_event(
         attempt_id=attempt_id,
     )
 
-    try:
-        verification = ralph_service.verify_completion(
-            task_id,
-            list(changed_files),
-            workflow_id=state.workflow_id,
-            task_ref=state.task,
-        )
-    except Exception as e:
+    if hook_ctx.get("force_complete"):
+        logger.warning("force_complete: skipping verification gate for task %s", task_id)
         verification = VerificationResult(
-            verification_id=f"ver-error-{task_id}",
+            verification_id=f"ver-forced-{task_id}",
             workflow_id=state.workflow_id,
             task_id=task_id,
-            overall_outcome="failed",
+            overall_outcome="passed",
             checks=[],
-            summary=f"verification_error: {e}",
+            summary="verification skipped: foreman force-complete override",
         )
+    else:
+        try:
+            verification = ralph_service.verify_completion(
+                task_id,
+                list(changed_files),
+                workflow_id=state.workflow_id,
+                task_ref=state.task,
+            )
+        except Exception as e:
+            verification = VerificationResult(
+                verification_id=f"ver-error-{task_id}",
+                workflow_id=state.workflow_id,
+                task_id=task_id,
+                overall_outcome="failed",
+                checks=[],
+                summary=f"verification_error: {e}",
+            )
 
     engine.record_verification_result(task_id, verification, hook_ctx=hook_ctx)
     result["verification_outcome"] = verification.overall_outcome
@@ -170,7 +181,7 @@ def process_completed_event(
         )
         notification_outcome = "passed"
         context_error = ""
-    elif verification.overall_outcome == "skipped":
+    elif verification.overall_outcome in {"skipped", "skipped_blocked"}:
         error_msg = (
             "Verification skipped: no commands configured. "
             "Add verification commands or use force_complete_unverified()."
@@ -181,7 +192,7 @@ def process_completed_event(
             agent_name=agent_id,
             verification=verification,
         )
-        notification_outcome = "skipped"
+        notification_outcome = "skipped_blocked"
         context_error = error_msg
     else:
         on_task_failed_fn(

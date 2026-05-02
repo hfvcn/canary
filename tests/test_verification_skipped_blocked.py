@@ -2,8 +2,8 @@
 
 When no verification commands are configured, the outcome is "skipped".
 This must result in FAILED status (not COMPLETED), because an unverified task
-should not be considered complete.  The ledger event KIND_VERIFICATION_SKIPPED
-is still written for the audit trail.
+should not be considered complete. The ledger event
+KIND_VERIFICATION_SKIPPED_BLOCKED is written for the audit trail.
 """
 from __future__ import annotations
 
@@ -130,10 +130,10 @@ def test_failed_stays_failed(group) -> None:
 
 
 def test_skipped_ledger_event(group) -> None:
-    """skipped writes KIND_VERIFICATION_SKIPPED to ledger (audit trail preserved)."""
+    """skipped writes KIND_VERIFICATION_SKIPPED_BLOCKED to ledger."""
     from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationResult
     from cccc.kernel.workflow_state import WorkflowEngine
-    from cccc.kernel.workflow_state_types import KIND_VERIFICATION_SKIPPED
+    from cccc.kernel.workflow_state_types import KIND_VERIFICATION_SKIPPED_BLOCKED
 
     engine = WorkflowEngine(group)
     wf = "wf-ledger-skip"
@@ -143,7 +143,7 @@ def test_skipped_ledger_event(group) -> None:
     engine.report_worker_started("T1", "a1")
     engine.report_worker_completion("T1", {"idempotency_key": "idem-ledger-1"})
 
-    before = _count_kind(group.ledger_path, kind=KIND_VERIFICATION_SKIPPED)
+    before = _count_kind(group.ledger_path, kind=KIND_VERIFICATION_SKIPPED_BLOCKED)
 
     vr = VerificationResult(
         verification_id="ver-ledger-1",
@@ -155,14 +155,14 @@ def test_skipped_ledger_event(group) -> None:
     )
     engine.record_verification_result("T1", vr)
 
-    after = _count_kind(group.ledger_path, kind=KIND_VERIFICATION_SKIPPED)
+    after = _count_kind(group.ledger_path, kind=KIND_VERIFICATION_SKIPPED_BLOCKED)
     assert after == before + 1, (
-        f"Expected KIND_VERIFICATION_SKIPPED event in ledger; before={before}, after={after}"
+        f"Expected KIND_VERIFICATION_SKIPPED_BLOCKED event; before={before}, after={after}"
     )
 
 
 def test_skipped_replay_restores_failed(group) -> None:
-    """Ledger replay of KIND_VERIFICATION_SKIPPED must restore task to FAILED."""
+    """Ledger replay of skipped verification must restore task to FAILED."""
     from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationResult
     from cccc.kernel.group import load_group
     from cccc.kernel.workflow_state import WorkflowEngine, WorkflowTaskStatus

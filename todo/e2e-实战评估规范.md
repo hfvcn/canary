@@ -457,3 +457,8 @@ cat ${PROJECT_DIR}/WORKFLOW_EVALUATION.md
 | v5 | 2026-04-19 | 2/5 | 1/5 | 4/5 | 2.3/5 | group 复用 task ID 冲突（环境问题） |
 | v13 | 2026-04-19 | 4/5 | 4/5 | 3.5/5 | 3.8/5 | +RO全量修复 +干净group +W_VERIFICATION_SHALLOW_CHECKS |
 | v14 | 2026-04-22 | 2/5 | 3/5 | 3.8/5 | 3.0/5 | +pool复用 +completion protocol +批次自动推进 +heartbeat指引; 前端CRITICAL bug拉低结果分 |
+| v15 | 2026-05-01 | 3/5 | 5/5 | 4/5 | 4.0/5 | +Gemini fix +verification真实执行 +100% auto-dispatch; Codex 发现 title=null CRITICAL; 历史最高 |
+| v16 | 2026-05-02 | 3/5 | 3/5 | 3/5 | 3.0/5 | +inbox重投递 +stall detection; PTY worker 1/7自主率; plan_digest_divergence新问题; javascript: XSS |
+| v17 | 2026-05-02 | 2/5 | 2/5 | 3/5 | 2.3/5 | +challenge mode首次运行 +structural digest; verify gate cwd P0 bug; challenge假阳性; Worker 100%可靠 |
+| v18 | 2026-05-03 | 3/5 | 2/5 | 3/5 | 2.7/5 | +RO-41 cwd fix +RO-43 retry resuggest; 0 CRITICAL; auto-dispatch 3/5; challenge假阳性仍是瓶颈 |
+| v19 | 2026-05-03 | 3/5 | 3/5 | 3/5 | 3.0/5 | +RO-44 --force override; 自动化率88.9%历史新高; depends_on首次通过; challenge假阳性唯一瓶颈 |

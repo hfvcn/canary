@@ -1,6 +1,7 @@
 """Integration test for all v5-ralph-phase5 new rules."""
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -265,7 +266,7 @@ def test_ra2_beyond_scope_marking(tmp_path):
 # ── RA-3: verification_mode agent_pending ────────────────────────────
 
 
-def test_ra3_verification_mode(tmp_path):
+def test_ra3_verification_mode(tmp_path, monkeypatch):
     tasks = [
         {
             "id": "T1",
@@ -281,8 +282,24 @@ def test_ra3_verification_mode(tmp_path):
     ]
     plan = _make_plan(tmp_path, tasks)
     task = plan.tasks[0]
+    payload = {
+        "passed": True,
+        "summary": "agent simulation passed",
+        "checks": [{"name": "foreman_case", "outcome": "passed"}],
+    }
+    stdout = json.dumps({"response": json.dumps(payload)})
+    monkeypatch.setattr(
+        "cccc.ralph.agent.subprocess.run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=stdout,
+            stderr="",
+        ),
+    )
+
     result = verify(task, changed_files=[], project_root=tmp_path)
-    assert result["outcome"] == "agent_pending"
+    assert result["outcome"] == "passed"
 
 
 # ── CLI smoke test ──────────────────────────────────────────────────

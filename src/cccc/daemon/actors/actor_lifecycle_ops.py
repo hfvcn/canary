@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
 
 from ...contracts.v1 import DaemonError, DaemonResponse
 from ...kernel.actors import list_actors, update_actor
 from ...kernel.group import load_group
+from ...kernel.inbox import delete_cursor
 from ...kernel.ledger import append_event
 from ...kernel.permissions import require_actor_permission
 from ...runners import headless as headless_runner
 from ...runners import pty as pty_runner
 from ...util.conv import coerce_bool
 from .actor_profile_runtime import ActorProfileAccessDeniedError, resolve_linked_actor_before_start
+
+LOGGER = logging.getLogger("cccc.daemon.actors")
 
 
 def _error(code: str, message: str, *, details: Optional[Dict[str, Any]] = None) -> DaemonResponse:
@@ -25,6 +29,17 @@ def _find_actor(group: Any, actor_id: str) -> Optional[Dict[str, Any]]:
         if isinstance(item, dict) and str(item.get("id") or "").strip() == actor_id:
             return item
     return None
+
+
+def _reset_inbox_cursor_on_actor_restart(group: Any, actor_id: str) -> None:
+    try:
+        delete_cursor(group, actor_id)
+    except Exception:
+        LOGGER.warning(
+            "Failed to reset inbox cursor for actor %s on restart",
+            actor_id,
+            exc_info=True,
+        )
 
 
 def handle_actor_start(
@@ -55,6 +70,7 @@ def handle_actor_start(
         actor = _find_actor(group, actor_id)
         current_run_id = actor.get("run_id", 0) if isinstance(actor, dict) else getattr(actor, "run_id", 0)
         actor = update_actor(group, actor_id, {"enabled": True, "admin_hold": "none", "run_id": current_run_id + 1, "desired_state": "running", "runtime_state": "starting"})
+        _reset_inbox_cursor_on_actor_restart(group, actor_id)
         actor = resolve_linked_actor_before_start(
             group,
             actor_id,
@@ -221,6 +237,7 @@ def handle_actor_restart(
         actor = _find_actor(group, actor_id)
         current_run_id = actor.get("run_id", 0) if isinstance(actor, dict) else getattr(actor, "run_id", 0)
         actor = update_actor(group, actor_id, {"enabled": True, "admin_hold": "none", "run_id": current_run_id + 1, "desired_state": "running", "runtime_state": "starting"})
+        _reset_inbox_cursor_on_actor_restart(group, actor_id)
         actor = resolve_linked_actor_before_start(
             group,
             actor_id,

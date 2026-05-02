@@ -1,0 +1,126 @@
+# Stress test plan — deliberately contains problems that
+# the Agent should catch if "🤖 Agent 可覆盖" claims are real.
+#
+# Problems planted:
+# RL-1: T1 describes an already-existing feature (field_validator exists in models.py)
+# RL-2: T2 references wrong function name (says validate_input, actual is validate_with_project)
+# RV-18: T3 references nonexistent function delete_orphan_nodes() in goal_behavior
+# RO-11n: T4 deletes a function used by many other modules
+# RO-12n: T5 only covers one of multiple entry points in a file
+
+tasks:
+  - id: T1-already-done
+    title: "Add field_validator for Plan schema_version"
+    role: leaf
+    goal_behavior: |
+      Add a Pydantic field_validator to the Plan model in src/cccc/ralph/models.py
+      that validates schema_version is not None when provided.
+      This is a new feature that does not yet exist.
+    acceptance_criteria: |
+      Plan model rejects invalid schema_version values.
+      Unit tests pass.
+    claimed_paths:
+      - src/cccc/ralph/models.py
+    verification_mode: agent
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -x"
+      covers:
+        tasks: ["T1-already-done"]
+
+  - id: T2-wrong-ref
+    title: "Fix validate_input function in validator.py"
+    role: leaf
+    goal_behavior: |
+      Modify the validate_input() function in src/cccc/ralph/validator.py
+      to handle the case where plan.tasks is an empty list.
+      The function is at approximately line 50 of validator.py.
+    acceptance_criteria: |
+      validate_input() returns an error when plan has zero tasks.
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+    verification_mode: agent
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -x"
+      covers:
+        tasks: ["T2-wrong-ref"]
+
+  - id: T3-phantom-func
+    title: "Implement delete_orphan_nodes cleanup"
+    role: leaf
+    goal_behavior: |
+      Call the existing delete_orphan_nodes() function from src/cccc/ralph/core.py
+      to clean up orphaned dependency graph nodes after validation.
+      delete_orphan_nodes() should be invoked at the end of suggest().
+    acceptance_criteria: |
+      Orphan nodes are removed. delete_orphan_nodes() is called once per suggest().
+    claimed_paths:
+      - src/cccc/ralph/core.py
+    depends_on: []
+    verification_mode: agent
+    verification:
+      level: unit
+      command: "pytest tests/ralph/test_ralph_standalone.py -q -x"
+      covers:
+        tasks: ["T3-phantom-func"]
+
+  - id: T4-delete-side-effects
+    title: "Delete legacy _run_check helper"
+    role: leaf
+    goal_behavior: |
+      Remove the _run_check() function from src/cccc/ralph/core.py.
+      This function is no longer needed since we moved to agent-based verification.
+      Simply delete the function and all references to it within core.py.
+    acceptance_criteria: |
+      _run_check is removed from core.py. No references remain in that file.
+    claimed_paths:
+      - src/cccc/ralph/core.py
+    depends_on: []
+    verification_mode: agent
+    verification:
+      level: unit
+      command: "python -c 'import cccc.ralph.core'"
+      covers:
+        tasks: ["T4-delete-side-effects"]
+
+  - id: T5-partial-entry
+    title: "Add rate limiting to validate endpoint"
+    role: leaf
+    goal_behavior: |
+      Add rate limiting to the validate() function in src/cccc/ralph/validator.py.
+      Limit to 100 calls per minute per client.
+    acceptance_criteria: |
+      validate() is rate-limited. Other functions in validator.py are not affected.
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+    depends_on: []
+    verification_mode: agent
+    verification:
+      level: unit
+      command: "true"
+      covers:
+        tasks: ["T5-partial-entry"]
+
+  - id: T-int
+    title: "Integration — verify all changes work together"
+    role: integration
+    goal_behavior: |
+      Run full integration test suite to verify T1-T5 don't break existing functionality.
+    acceptance_criteria: |
+      All existing tests pass. No regressions.
+    claimed_paths:
+      - tests/ralph/
+    depends_on: ["T1-already-done", "T2-wrong-ref", "T3-phantom-func", "T4-delete-side-effects", "T5-partial-entry"]
+    verification:
+      level: integration
+      command: "pytest tests/ralph/ -q --timeout=30"
+      covers:
+        tasks: ["T1-already-done", "T2-wrong-ref", "T3-phantom-func", "T4-delete-side-effects", "T5-partial-entry", "T-int"]
+        flows: ["validate_then_verify"]
+
+critical_flows:
+  - id: validate_then_verify
+    description: "Plan validate -> task verify -> completion"
+    entrypoints: ["src/cccc/ralph/validator.py", "src/cccc/ralph/core.py"]
+    required_verification_level: integration

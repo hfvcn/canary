@@ -1,7 +1,9 @@
 """Tests for RA-3 verification_mode routing in ralph_service + validator."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import subprocess
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
 
@@ -58,6 +60,20 @@ def _make_ralph_service(tmp_path: Path) -> RalphService:
     return RalphService(project_root=tmp_path, group_id="test-group")
 
 
+def _agent_completed(passed: bool = True) -> subprocess.CompletedProcess[str]:
+    payload = {
+        "passed": passed,
+        "summary": "agent simulation result",
+        "checks": [{"name": "foreman_case", "outcome": "passed" if passed else "failed"}],
+    }
+    return subprocess.CompletedProcess(
+        args=["gemini"],
+        returncode=0,
+        stdout=json.dumps({"response": json.dumps(payload)}),
+        stderr="",
+    )
+
+
 # ---------------------------------------------------------------------------
 # ralph_service.verify_completion routing tests
 # ---------------------------------------------------------------------------
@@ -75,15 +91,23 @@ class TestVerifyCompletionRouting:
         # ralph mode should actually run checks (or skip if no command runs)
         assert result.overall_outcome != "agent_pending"
 
-    def test_agent_mode_returns_pending(self, tmp_path: Path) -> None:
+    def test_agent_mode_runs_agent(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "cccc.ralph.agent.subprocess.run",
+            lambda command, **kwargs: _agent_completed(True),
+        )
         svc = _make_ralph_service(tmp_path)
         task = _task_ref("T1", verification_mode="agent")
         result = svc.verify_completion(
             "T1", [], workflow_id="wf-1", task_ref=task,
         )
         assert isinstance(result, VerificationResult)
-        assert result.overall_outcome == "agent_pending"
-        assert "Agent verification requested" in result.summary
+        assert result.overall_outcome == "passed"
+        assert result.summary == "agent simulation result"
         assert result.task_id == "T1"
         assert result.workflow_id == "wf-1"
 
@@ -98,8 +122,16 @@ class TestVerifyCompletionRouting:
         )
         assert result.overall_outcome != "agent_pending"
 
-    def test_agent_mode_does_not_run_checks(self, tmp_path: Path) -> None:
+    def test_agent_mode_does_not_run_checks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Agent mode must not call _execute_verification_checks."""
+        monkeypatch.setattr(
+            "cccc.ralph.agent.subprocess.run",
+            lambda command, **kwargs: _agent_completed(True),
+        )
         svc = _make_ralph_service(tmp_path)
         task = _task_ref("T1", verification_mode="agent")
 
@@ -108,19 +140,27 @@ class TestVerifyCompletionRouting:
                 "T1", [], workflow_id="wf-1", task_ref=task,
             )
         mock_exec.assert_not_called()
-        assert result.overall_outcome == "agent_pending"
+        assert result.overall_outcome == "passed"
 
-    def test_agent_mode_does_not_build_scope_warnings(self, tmp_path: Path) -> None:
-        """Agent mode returns before scope warning construction."""
+    def test_agent_mode_keeps_scope_warnings(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Agent mode still reports worker changes outside claimed_paths."""
+        monkeypatch.setattr(
+            "cccc.ralph.agent.subprocess.run",
+            lambda command, **kwargs: _agent_completed(True),
+        )
         svc = _make_ralph_service(tmp_path)
         task = _task_ref("T1", verification_mode="agent")
 
-        with patch.object(svc, "_build_scope_warnings") as mock_scope:
-            result = svc.verify_completion(
-                "T1", ["some/file.py"], workflow_id="wf-1", task_ref=task,
-            )
-        mock_scope.assert_not_called()
-        assert result.overall_outcome == "agent_pending"
+        result = svc.verify_completion(
+            "T1", ["some/file.py"], workflow_id="wf-1", task_ref=task,
+        )
+
+        assert result.overall_outcome == "passed"
+        assert result.warnings
 
 
 # ---------------------------------------------------------------------------

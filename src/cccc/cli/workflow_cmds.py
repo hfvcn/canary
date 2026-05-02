@@ -96,6 +96,25 @@ def _load_tasks_from_plan(plan_path: str) -> list[dict[str, Any]]:
         tasks.append(ref.model_dump())
     return tasks
 
+
+def _parse_task_agent_map(raw: str, option_name: str) -> tuple[dict[str, str], dict[str, Any] | None]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}, None
+    try:
+        parsed = json.loads(text)
+    except Exception as exc:
+        return {}, {"code": f"invalid_{option_name}", "message": f"Invalid --{option_name} JSON: {exc}"}
+    if not isinstance(parsed, dict):
+        return {}, {"code": f"invalid_{option_name}", "message": f"--{option_name} must be a JSON object"}
+    normalized = {
+        str(task_id or "").strip(): str(agent_id or "").strip()
+        for task_id, agent_id in parsed.items()
+        if str(task_id or "").strip() and str(agent_id or "").strip()
+    }
+    return normalized, None
+
+
 def cmd_workflow_submit(args: argparse.Namespace) -> int:
     if not _ensure_daemon_or_exit():
         return 1
@@ -117,6 +136,7 @@ def cmd_workflow_submit(args: argparse.Namespace) -> int:
         return 2
 
     if plan_path:
+        plan_path = str(Path(plan_path).resolve())
         try:
             tasks = _load_tasks_from_plan(plan_path)
         except Exception as e:
@@ -144,17 +164,16 @@ def cmd_workflow_submit(args: argparse.Namespace) -> int:
     if not project_root:
         _print_json({"ok": False, "error": {"code": "missing_project_root", "message": "Group has no attached scope/project_root"}})
         return 2
-    # ARCH-1: Parse optional Foreman assignments
-    assignments_raw = str(getattr(args, "assignments", "") or "").strip()
-    assignments: dict[str, str] = {}
-    if assignments_raw:
-        try:
-            assignments = json.loads(assignments_raw)
-        except Exception as e:
-            _print_json({"ok": False, "error": {"code": "invalid_assignments", "message": f"Invalid --assignments JSON: {e}"}})
-            return 2
+    assignments, assignments_error = _parse_task_agent_map(getattr(args, "assignments", ""), "assignments")
+    if assignments_error:
+        _print_json({"ok": False, "error": assignments_error})
+        return 2
+    assignment_map, assignment_map_error = _parse_task_agent_map(getattr(args, "assignment_map", ""), "assignment_map")
+    if assignment_map_error:
+        _print_json({"ok": False, "error": assignment_map_error})
+        return 2
     op = "ralph_register_and_suggest" if plan_path else "ralph_batch_suggest"
-    payload = _build_task_request(op, workflow_id=workflow_id, tasks=tasks, rationale=str(getattr(args, "rationale", "") or "").strip(), estimated_parallelism=int(getattr(args, "parallelism", 1) or 1), auto_process=bool(getattr(args, "auto_process", True)), group_id=group_id, project_root=project_root, auto_start_agents=bool(getattr(args, "auto_start_agents", True)), assignments=assignments)
+    payload = _build_task_request(op, workflow_id=workflow_id, tasks=tasks, rationale=str(getattr(args, "rationale", "") or "").strip(), estimated_parallelism=int(getattr(args, "parallelism", 1) or 1), auto_process=bool(getattr(args, "auto_process", True)), group_id=group_id, project_root=project_root, auto_start_agents=bool(getattr(args, "auto_start_agents", True)), assignments=assignments, auto_dispatch=bool(getattr(args, "auto_dispatch", False)), assignment_map=assignment_map, plan_path=plan_path)
     resp = call_daemon(payload)
     _print_json(resp)
     return 0 if resp.get("ok") else 1
@@ -264,6 +283,7 @@ def cmd_task_complete(args: argparse.Namespace) -> int:
     evidence = _parse_json_object_arg(getattr(args, "evidence", "") or "", field="--evidence") if hasattr(args, "evidence") else {}
     workflow_id = _resolve_task_workflow_id(group_id, project_root, task_id, str(getattr(args, "workflow_id", "") or "").strip())
     force_stale_complete = bool(getattr(args, "force_stale_complete", False))
+    force_complete = bool(getattr(args, "force", False))
     resp = call_daemon(
         _build_task_event_request(
             group_id=group_id,
@@ -285,7 +305,8 @@ def cmd_task_complete(args: argparse.Namespace) -> int:
                 "agent_id": agent_id,
                 "changed_files": changed_files,
                 "evidence": evidence,
-                "override_stale_digest": force_stale_complete,
+                "override_stale_digest": force_stale_complete or force_complete,
+                "force_complete": force_complete,
             },
         )
     )

@@ -115,7 +115,7 @@ class TaskSpec(BaseModel):
 
     goal_behavior: str = ""
     acceptance_criteria: str = ""
-    verification_mode: Literal["ralph", "agent"] = "ralph"
+    verification_mode: Literal["ralph", "agent", "challenge"] = "ralph"
 
     verification: Optional[Verification] = None
 
@@ -381,6 +381,7 @@ class BatchResult(BaseModel):
     batch_sequence: int = 0
     batch_boundary: bool = True
     task_summaries: Dict[str, str] = Field(default_factory=dict)
+    task_descriptions: Dict[str, str] = Field(default_factory=dict)
 
 
 IssueSeverity = Literal["error", "warning", "hint"]
