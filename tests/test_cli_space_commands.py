@@ -69,8 +69,14 @@ class TestCliSpaceCommands(unittest.TestCase):
         self.assertEqual(req.get("args", {}).get("lane"), "work")
         self.assertEqual(req.get("args", {}).get("remote_space_id"), "nb_123")
 
-    def test_space_ingest_invalid_payload_rejected_before_daemon_call(self) -> None:
+    def test_space_ingest_invalid_payload_coerced_to_summary_before_daemon_call(self) -> None:
         from cccc import cli
+
+        calls = []
+
+        def _fake_call_daemon(req):
+            calls.append(req)
+            return {"ok": True, "result": {"job": {"state": "queued"}}}
 
         args = Namespace(
             group="g_test",
@@ -81,14 +87,19 @@ class TestCliSpaceCommands(unittest.TestCase):
             payload="{bad json",
             idempotency_key="",
         )
-        with patch.object(cli, "call_daemon") as mock_call, \
+        with patch.object(cli, "_ensure_daemon_running", return_value=True), \
+             patch.object(cli, "call_daemon", side_effect=_fake_call_daemon), \
              patch.object(cli, "_print_json") as mock_print:
             code = cli.cmd_space_ingest(args)
 
-        self.assertEqual(code, 2)
-        mock_call.assert_not_called()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 1)
+        req = calls[0]
+        self.assertEqual(req.get("op"), "group_space_ingest")
+        self.assertEqual(req.get("args", {}).get("group_id"), "g_test")
+        self.assertEqual(req.get("args", {}).get("payload"), {"summary": "{bad json"})
         printed = mock_print.call_args[0][0] if mock_print.call_args else {}
-        self.assertEqual(str((printed.get("error") or {}).get("code") or ""), "invalid_payload")
+        self.assertEqual(printed.get("ok"), True)
 
     def test_space_jobs_cancel_routes_to_group_space_jobs(self) -> None:
         from cccc import cli

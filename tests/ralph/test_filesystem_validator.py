@@ -39,7 +39,7 @@ def test_validate_filesystem_skips_missing_verification(tmp_path):
 
 
 def test_complex_shell_skipped(tmp_path):
-    issues = _validate(tmp_path, "pytest tests/test_demo.py && echo done")
+    issues = _validate(tmp_path, "pytest tests/test_demo.py | grep PASS")
 
     assert [issue.code for issue in issues] == ["W_VERIFICATION_COMPLEX_SHELL_SKIPPED"]
     assert issues[0].severity == "hint"

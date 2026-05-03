@@ -57,7 +57,11 @@ def clear_issue_file_map_cache() -> None:
 
 
 _TRIVIAL_COMMANDS = {"true", ":", "echo", "printf"}
-_SHELL_OPERATORS = {"&&", "||", ";", "|", ">", ">>", "<", "2>", "2>>", "&"}
+_SPLITTABLE_SHELL_OPERATORS = ("&&", ";")
+_UNSPLITTABLE_SHELL_OPERATORS = ("2>>", "2>", "||", ">>", "|", ">", "<", "&")
+_ALL_SHELL_OPERATORS = _SPLITTABLE_SHELL_OPERATORS + _UNSPLITTABLE_SHELL_OPERATORS
+_INDIRECT_IMPORT_FOLD_SAMPLE_COUNT = 5
+_INDIRECT_IMPORT_FOLD_THRESHOLD = 10
 _PYTEST_FLAGS_WITH_VALUE = {
     "-c",
     "-k",
@@ -117,6 +121,66 @@ def validate_filesystem(
     issues.extend(_check_registration_invariants(plan, project_root, workspace))
     issues.extend(_check_unclaimed_tests_for_source(plan, project_root, workspace))
     return issues
+
+
+def _iter_shell_operators(cmd: str) -> Iterable[Tuple[int, str]]:
+    in_single = False
+    in_double = False
+    escaped = False
+    index = 0
+    while index < len(cmd):
+        char = cmd[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and not in_single:
+            escaped = True
+            index += 1
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            index += 1
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            index += 1
+            continue
+        if in_single or in_double:
+            index += 1
+            continue
+        operator = next(
+            (candidate for candidate in _ALL_SHELL_OPERATORS if cmd.startswith(candidate, index)),
+            None,
+        )
+        if operator is None:
+            index += 1
+            continue
+        yield index, operator
+        index += len(operator)
+
+
+def _split_shell_command(cmd: str) -> Optional[List[str]]:
+    parts: List[str] = []
+    start = 0
+    found_split = False
+    for index, operator in _iter_shell_operators(cmd):
+        if operator not in _SPLITTABLE_SHELL_OPERATORS:
+            continue
+        parts.append(cmd[start:index].strip())
+        start = index + len(operator)
+        found_split = True
+    if not found_split:
+        return None
+    parts.append(cmd[start:].strip())
+    return parts
+
+
+def _has_unsplittable_shell_operator(cmd: str) -> bool:
+    return any(
+        operator in _UNSPLITTABLE_SHELL_OPERATORS
+        for _, operator in _iter_shell_operators(cmd)
+    )
 
 
 def _check_test_coverage_gaps(
@@ -184,15 +248,7 @@ def _check_test_coverage_gaps(
             message=f"task '{task_id}' source '{source_path}' has {count} related test(s) not covered by any verification",
             evidence={"source_path": source_path, "uncovered_tests": test_paths},
         ))
-    for (task_id, source_path), test_paths in indirect_gaps.items():
-        count = len(test_paths)
-        issues.append(_issue(
-            code="W_INDIRECT_TEST_IMPORT",
-            severity="hint",
-            task_id=task_id,
-            message=f"task '{task_id}' source '{source_path}' has {count} related test(s) not covered by any verification",
-            evidence={"source_path": source_path, "uncovered_tests": test_paths},
-        ))
+    issues.extend(_build_indirect_gap_issues(indirect_gaps))
 
     issues.extend(dynamic_hints)
     return issues
@@ -391,6 +447,61 @@ def _coverage_gap_issue(
     )
 
 
+def _build_indirect_gap_issues(
+    indirect_gaps: dict[tuple[str, str], list[str]],
+) -> list[ValidationIssue]:
+    grouped_by_task: dict[str, list[tuple[str, list[str]]]] = {}
+    for (task_id, source_path), test_paths in indirect_gaps.items():
+        grouped_by_task.setdefault(task_id, []).append((source_path, test_paths))
+
+    issues: list[ValidationIssue] = []
+    for task_id, entries in grouped_by_task.items():
+        sorted_entries = sorted(entries, key=lambda item: item[0])
+        if len(sorted_entries) < _INDIRECT_IMPORT_FOLD_THRESHOLD:
+            issues.extend(
+                _indirect_gap_issue(task_id, source_path, test_paths)
+                for source_path, test_paths in sorted_entries
+            )
+            continue
+        issues.append(_folded_indirect_gap_issue(task_id, sorted_entries))
+    return issues
+
+
+def _indirect_gap_issue(
+    task_id: str,
+    source_path: str,
+    test_paths: list[str],
+) -> ValidationIssue:
+    count = len(test_paths)
+    return _issue(
+        code="W_INDIRECT_TEST_IMPORT",
+        severity="hint",
+        task_id=task_id,
+        message=f"task '{task_id}' source '{source_path}' has {count} related test(s) not covered by any verification",
+        evidence={"source_path": source_path, "uncovered_tests": test_paths},
+    )
+
+
+def _folded_indirect_gap_issue(
+    task_id: str,
+    entries: list[tuple[str, list[str]]],
+) -> ValidationIssue:
+    samples = [
+        {"source_path": source_path, "uncovered_tests": test_paths}
+        for source_path, test_paths in entries[:_INDIRECT_IMPORT_FOLD_SAMPLE_COUNT]
+    ]
+    return _issue(
+        code="W_INDIRECT_TEST_IMPORT",
+        severity="hint",
+        task_id=task_id,
+        message=(
+            f"task '{task_id}' has {len(entries)} indirect test import hint(s) "
+            f"not covered by any verification; showing first {len(samples)} sample(s)"
+        ),
+        evidence={"total_hints": len(entries), "samples": samples},
+    )
+
+
 def _classify_test_import(
     test_path: str,
     source_path: str,
@@ -465,7 +576,24 @@ def _check_verification_command(
     # RV-24: upstream_projected defaults to projected for backwards compat
     up_proj = upstream_projected if upstream_projected is not None else projected
 
-    if any(operator in cmd for operator in _SHELL_OPERATORS):
+    split_commands = _split_shell_command(cmd)
+    if split_commands is not None:
+        issues: List[ValidationIssue] = []
+        for sub_command in split_commands:
+            issues.extend(
+                _check_verification_command(
+                    sub_command,
+                    task_id,
+                    projected,
+                    workspace,
+                    claimed_paths,
+                    all_plan_claimed,
+                    upstream_projected=up_proj,
+                )
+            )
+        return issues
+
+    if _has_unsplittable_shell_operator(cmd):
         return [_issue(
             code="W_VERIFICATION_COMPLEX_SHELL_SKIPPED",
             severity="hint",

@@ -14,7 +14,7 @@
 | **Foreman prompt** | 引导使用 workflow submit | ✅ v4 实战验证：零手工 cccc send，自动下发 [Foreman Assignment] |
 | **Worker prompt** | 引导使用 task complete | ✅ v4 实战验证：4/4 任务通过 cccc task complete 完成 |
 | **MCP → CLI 迁移** | MCP 工具从 AI 上下文中移除 | ✅ 已完成，CLI 为唯一主路径 |
-| **Verify gate** | task complete → verifying → done/failed | ✅ v4 验证：checks 非空，outcome=passed |
+| **Verify gate** | task complete → verifying → completed/failed | ✅ v4 验证：checks 非空，outcome=passed |
 | **Foreman 主导 worker 决策** | Foreman 判断并创建 worker，引擎不自动兜底 | ❌ 代码仍有自动分配和静默 fallback，待修正（见 ARCH 系列问题）|
 | **Engine 为状态唯一权威** | assignment + 状态全进 engine，无影子状态 | ❌ _active_workflows 影子状态仍存在（见 ARCH-4）|
 
@@ -102,6 +102,11 @@ Ralph 已从 daemon 中抽取为独立 CLI 工具，可脱离 CCCC 使用。
 
 **Foreman 的质检搭档**：Foreman 自由规划 → Ralph 立即校验并反馈不足 → Foreman 据此修正。循环越紧密，对 Foreman 精确度的依赖越低。
 
+Ralph 当前有三种形态：
+- **CLI 静态验证**（`ralph validate`）— 计划结构校验
+- **daemon 内 verify gate** — 任务完成时运行 verification checks
+- **Agent 审查** — 基于 Agent 的对抗式语义审查
+
 ### 2.2 CLI 命令
 
 ```bash
@@ -151,7 +156,7 @@ critical_flows:
     required_verification_level: integration
 
 forbidden_flows:
-  - id: message_send_cannot_complete
+  - id: progress_update_cannot_complete
     description: "旧路径不能改变状态"
     required_verification_level: e2e
 
@@ -225,7 +230,7 @@ pending → assigned → running → verifying → completed
 | running → verifying | **未发生**（Worker 不走 task complete） | Worker 调 `cccc task complete` |
 | verifying → completed | **未发生** | Ralph verify_completion() 通过 |
 | verifying → failed | **未发生** | Ralph verify_completion() 失败 |
-| running → done | **Foreman 通过 context.sync task.move** | 不应存在（绕过 verify gate） |
+| running → done | **Foreman 通过旧状态变更接口直接改状态** | 不应存在（绕过 verify gate） |
 
 ---
 
@@ -292,7 +297,7 @@ Title: {title}
 
 Execute this task only.
 Report completion via: cccc task complete {task_id} --changed-file <path> --evidence "..."
-Use cccc_message_send for progress updates or blockers only.
+Use cccc send --to @foreman --text "..." for progress updates or blockers only.
 ```
 
 ### 5.3 Prompt 稳定性问题（E2E 验证发现）
@@ -300,7 +305,7 @@ Use cccc_message_send for progress updates or blockers only.
 | 条件 | Foreman 行为 | Worker 行为 |
 |------|-------------|-------------|
 | 新 session，无历史 | ✅ 使用 workflow submit | 未测到 |
-| 有历史上下文 | ❌ 回退到 cccc_task + message_send | ❌ 使用 message_send + task.move |
+| 有历史上下文 | ❌ 回退到旧 MCP 状态工具 + 进度消息接口 | ❌ 使用 `cccc send` 后再走绕过 verify gate 的旧状态路径 |
 
 **结论：AI 使用旧路径是因为 MCP 工具仍然暴露在上下文中，不是 prompt 引导失败。完成 MCP → CLI 迁移后需重新验证。**
 
@@ -358,7 +363,7 @@ E2E 应该是"确认已验收的模块能组合"，而不是"第一次发现问�
 
 | 步骤 | 描述 | 对应问题清单 v3 |
 |------|------|----------------|
-| MCP 工具移除 | 从 AI 可见上下文中移除 cccc_task 等用于状态变更的 MCP 工具 | M-1 |
+| MCP 工具移除 | 从 AI 可见上下文中移除旧状态变更 MCP 工具 | M-1 |
 | CLI 唯一化 | CLI 成为 AI 唯一可用的操作接口 | M-1 |
 | Prompt 收敛 | Prompt 只引导 CLI 用法，不再提及 MCP 备选 | R-1 |
 | Ralph 校验 | Ralph 检查 AI 是否正确使用了 CLI | 新 |
@@ -590,5 +595,5 @@ tests/
 └── e2e/
     ├── test_smoke_workflow.py     # 基础 smoke 测试
     ├── test_workflow_e2e.py       # 正向 E2E（verify pass + fail）
-    └── test_workflow_anti_bypass.py  # 反向 E2E（message_send 不能完成任务）
+    └── test_workflow_anti_bypass.py  # 反向 E2E（进度消息不能完成任务）
 ```

@@ -17,6 +17,7 @@ FUNCTION_SIGNATURES = {
         "assignment_id",
         "actor_run_id",
         "override_stale_digest",
+        "force_complete",
         "attempt_id",
     ],
     "fail_task": [

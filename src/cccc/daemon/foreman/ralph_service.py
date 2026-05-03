@@ -53,6 +53,8 @@ _SHELL_OPERATOR_TOKENS = {"&&", "||", "|", ";"}
 _TRIVIAL_VERIFY_COMMANDS = {"true", ":", "echo", "printf"}
 WORKER_SCOPE_WARNING_CODE = "W_WORKER_EXCEEDED_SCOPE"
 MAX_SCOPE_WARNING_FILES = 5
+SOURCE_CONTEXT_MAX_BYTES = 50_000
+SOURCE_FILE_MAX_BYTES = 16_000
 
 
 def _has_shell_operators(command: str) -> bool:
@@ -603,11 +605,13 @@ class RalphService:
         if worker_result.overall_outcome != "passed":
             return worker_result
 
+        verification_output = self._verification_output_from_result(worker_result)
         agent_result = self._verify_completion_with_agent(
             task_id=task_id,
             changed_files=changed_files,
             workflow_id=workflow_id,
             task_ref=task_ref,
+            verification_output=verification_output,
         )
         return self._challenge_verification_result(worker_result, agent_result)
 
@@ -660,8 +664,16 @@ class RalphService:
         changed_files: List[str],
         workflow_id: str,
         task_ref: TaskRef,
+        verification_output: Optional[Dict[str, Any]] = None,
     ) -> VerificationResult:
         warnings = self._build_scope_warnings(changed_files, task_ref)
+        source_context = self._read_claimed_paths(task_ref)
+        git_diff = self._git_diff_for_files(changed_files)
+        agent_verification_output = (
+            verification_output
+            if verification_output is not None
+            else self._run_verification_pre_check(task_ref)
+        )
         agent = RalphAgent(
             workflow_id=workflow_id,
             config=AgentConfig(provider=GEMINI_PROVIDER),
@@ -671,6 +683,9 @@ class RalphService:
                 task_ref,
                 changed_files=changed_files,
                 project_root=self.project_root,
+                source_context=source_context,
+                git_diff=git_diff,
+                verification_output=agent_verification_output,
             )
         except (
             OSError,
@@ -768,6 +783,106 @@ class RalphService:
                 )
             ]
         return []
+
+    def _read_claimed_paths(self, task_ref: TaskRef) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        total = 0
+        for rel_path in task_ref.claimed_paths:
+            if total >= SOURCE_CONTEXT_MAX_BYTES:
+                break
+            full_path = self.project_root / rel_path
+            if not full_path.is_file():
+                result[rel_path] = "<file not found>"
+                continue
+            try:
+                text = full_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                result[rel_path] = "<read error>"
+                continue
+            if len(text) > SOURCE_FILE_MAX_BYTES:
+                text = (
+                    text[:SOURCE_FILE_MAX_BYTES]
+                    + f"\n... (truncated at {SOURCE_FILE_MAX_BYTES} bytes)"
+                )
+            remaining = SOURCE_CONTEXT_MAX_BYTES - total
+            if len(text) > remaining:
+                text = text[:remaining] + "\n... (truncated)"
+            result[rel_path] = text
+            total += len(text)
+        return result
+
+    def _git_diff_for_files(self, changed_files: List[str]) -> str:
+        if not changed_files:
+            return "<no changed files — nothing was modified>"
+        try:
+            proc = subprocess.run(
+                ["git", "diff", "HEAD", "--", *changed_files],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return "<git diff unavailable>"
+        diff = (proc.stdout or "").strip()
+        if not diff:
+            return "<empty diff — files are unchanged from HEAD>"
+        if len(diff) > SOURCE_CONTEXT_MAX_BYTES:
+            return diff[:SOURCE_CONTEXT_MAX_BYTES] + "\n... (truncated)"
+        return diff
+
+    def _run_verification_pre_check(self, task_ref: TaskRef) -> Dict[str, Any]:
+        specs = self._resolve_verification_specs(task_ref)
+        checks = [
+            self._run_verification_check(
+                name=spec.name,
+                command=command,
+                expected_exit_code=spec.expected_exit_code,
+            )
+            for spec, command in specs
+        ]
+        return {
+            "status": "passed" if checks and all(
+                check.outcome == "passed" for check in checks
+            ) else "failed",
+            "checks": [
+                self._verification_check_payload(check, command)
+                for (spec, command), check in zip(specs, checks)
+            ],
+        }
+
+    def _verification_output_from_result(
+        self,
+        verification_result: VerificationResult,
+    ) -> Dict[str, Any]:
+        return {
+            "status": (
+                "passed"
+                if verification_result.overall_outcome == "passed"
+                else "failed"
+            ),
+            "checks": [
+                self._verification_check_payload(
+                    check,
+                    str(check.details.get("command", "")),
+                )
+                for check in verification_result.checks
+            ],
+        }
+
+    def _verification_check_payload(
+        self,
+        check: VerificationCheck,
+        command: str,
+    ) -> Dict[str, Any]:
+        return {
+            "name": check.name,
+            "command": command,
+            "outcome": check.outcome,
+            "message": check.message,
+            "duration_ms": check.duration_ms,
+            "details": dict(check.details),
+        }
 
     def _execute_verification_checks(
         self,

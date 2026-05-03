@@ -1,0 +1,386 @@
+# Plan: RO-42 + RO-30 + RL-3 + RL-5 — 问题清单 v5 最终未解决项
+#
+# 来源：todo/问题清单-v5-ralph.md 所有未解决改进项（2026-05-03 快照）
+# 工作流：findings.md § 〇 经验证的工作流程
+#
+# 待实施项：
+#   RO-42 (P0): daemon 路径 challenge verification 缺失证据注入 → 假阳性
+#   RO-30 (P2): todo/ralph-foreman-workflow.md 仍有 cccc_message_send 引用
+#   RL-3:  shell 操作符验证命令被跳过无语义回退
+#   RL-5:  W_INDIRECT_TEST_IMPORT 对高 import 文件警告爆炸
+#
+# 设计原则：
+#   #2  按功能切片拆分，不按文件拆
+#   #9  先跑通一条路径再扩展 — P0 > P1 > P2
+#   #11 verification 必须真正跑命令
+#   #13 结构校验 + 代码审查互补
+#
+# 关键发现（探索阶段）：
+#   - RO-42: CLI 路径 (core.py:235-248) 已正确注入三类证据
+#     (source_context, git_diff, verification_output)；
+#     daemon 路径 (ralph_service.py:656-683) 完全未注入，且 challenge
+#     模式 (ralph_service.py:589) 的 worker 结果也未传递给 agent。
+#   - RO-30: 三个 stub 方法已移除；仅 todo/ralph-foreman-workflow.md:295
+#     残留一处 cccc_message_send。
+#   - RL-3: filesystem_validator.py:468 对含 shell 操作符的命令直接 return，
+#     无 fallback，substring 匹配会误触发。
+#   - RL-5: filesystem_validator.py:187-195 每个 (task_id, source_path)
+#     生成一条 hint，无折叠。
+#
+# Codex 审查反馈（2026-05-03，verdict: needs-attention）：
+#   M1: T1 challenge 路径需给 _verify_completion_with_agent() 增加
+#       verification_output 可选参数，challenge 复用 worker_result 时
+#       必须转为 CLI 格式 {"status":"passed","checks":[...]}
+#   M2: T2 拆分必须做引号外顶层扫描，python -c "...;..." 不能被切碎
+#   M3: T-int 的 && 命令在 T2 后会被拆分检查，改为分开两条 command
+#   S1: T2/T3 都 claim filesystem_validator.py，Ralph 已自动串行化
+#   S2: T4 验证命令改用 encoding="utf-8" 显式指定编码
+#   N1: TaskRef 已有 claimed_paths + verification.checks，无需改 IPC 契约
+#   N2: 折叠阈值 10 与问题清单一致，模块常量足够
+#
+# ��次预期：
+#   Batch 1: T1, T4 — 独立并行
+#   Batch 1 (serialized): T2, T3 — Ralph 自动串行（共享 filesystem_validator.py）
+#   Batch 2: T-int — 集成验证，依赖全部 leaf
+
+schema_version: "1.0.0"
+
+required_issues:
+  - "RO-42"
+  - "RO-30"
+  - "RL-3"
+  - "RL-5"
+
+semantic_mode: "off"
+auto_infer: false
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_AGENT_REVIEW_FAILED
+  - W_UNCLAIMED_TEST_FOR_SOURCE
+  - W_TEST_COVERAGE_GAP
+  - W_VERIFICATION_TARGET_MISSING
+  - W_VERIFICATION_NO_CHECKS
+  - W_VERIFICATION_COMPLEX_SHELL_SKIPPED
+  - W_CROSS_BOUNDARY_WITHOUT_GLUE
+  - W_NO_FAILURE_PATH
+  - W_PLAN_SCOPE_UNUSED
+  - W_VERIFICATION_BEHAVIOR_MISMATCH
+
+critical_entrypoints:
+  - src/cccc/daemon/foreman/ralph_service.py
+  - src/cccc/ralph/core.py
+  - src/cccc/ralph/filesystem_validator.py
+
+critical_flows:
+  - id: daemon_evidence_injection
+    description: >
+      daemon 路径的 challenge verification 必须与 CLI 路径一致，
+      在调用 agent 前注入 source_context + git_diff + verification_output
+      三类证据。challenge 模式下 worker 结果也须传递给 agent。
+    entrypoints:
+      - src/cccc/daemon/foreman/ralph_service.py
+    required_verification_level: integration
+
+  - id: shell_operator_subcommand_check
+    description: >
+      含 shell 操作符（&&, ;）的验证命令被拆分为子命令后逐个检查，
+      而非直接跳过。保持对管道/重定向操作符的跳过不变。
+    entrypoints:
+      - src/cccc/ralph/filesystem_validator.py
+    required_verification_level: unit
+
+forbidden_flows:
+  - id: no_evidence_free_agent_call
+    description: >
+      daemon 路径的 _verify_completion_with_agent() 禁止在无
+      source_context/verification_output 的情况下调用 agent。
+    test_created_by:
+      - T1
+    required_verification_level: integration
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []
+
+# ================================================================
+# T1: daemon 路径 agent 证据注入 (RO-42, P0)
+# ================================================================
+
+tasks:
+  - id: T1
+    title: "Inject evidence into daemon-path agent verification"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-42"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - tests/ralph/test_ralph_service_evidence.py
+    awareness_paths:
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/agent.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+    goal_behavior: >
+      参照 CLI 路径 core.py:229-248 的实现模式，在 ralph_service.py 的
+      daemon 验证路径中补齐证据注入。
+
+      Codex 审查确认：TaskRef（contracts/v1/ralph_ipc.py）已有
+      claimed_paths 和 verification.checks 字段，无需改 IPC 契约。
+
+      1. 在 ralph_service.py 中新增三个私有方法（复用 core.py 的逻辑，
+         适配 self.project_root 和 TaskRef 类型）：
+         - _read_claimed_paths(task_ref) → Dict[str, str]
+           读取 task_ref.claimed_paths 中每个文件内容，
+           单文件上限 16KB，总量上限 50KB。
+         - _git_diff_for_files(changed_files) → str
+           运行 git diff HEAD -- <changed_files>，上限 50KB。
+         - _run_verification_pre_check(task_ref) → Dict[str, Any]
+           执行 task_ref.verification.checks 命令，返回结构化结果，
+           格式必须与 CLI 路径一致：{"status": "passed"|"failed", "checks": [...]}。
+           这是 agent prompt 依赖的格式（agent.py:243 检查 verification_output.status）。
+
+      2. 修改 _verify_completion_with_agent() (line 656)：
+         增加可选参数 verification_output: Optional[Dict[str, Any]] = None。
+         如果调用方未传入 verification_output，则自行调用 _run_verification_pre_check()。
+         始终调用 _read_claimed_paths() 和 _git_diff_for_files()。
+         将三类证据传入 agent.verify_task_completion() 的
+         source_context, git_diff, verification_output 参数。
+
+      3. 修改 _verify_completion_with_challenge() (line 589)：
+         worker 验证通过后，将 worker_result 转换为 CLI 格式的
+         verification_output：{"status": "passed", "checks": [
+           {"command": c.command, "outcome": c.outcome, ...} for c in worker_result.checks
+         ]}。将此 verification_output 传给 _verify_completion_with_agent()
+         的新参数，避免 agent 重复执行 checks。
+    acceptance_criteria: >
+      1. daemon 路径 agent 验证收到非空 source_context（至少包含
+         claimed_paths 中存在的文件内容）。
+      2. daemon 路径 agent 验证收到非空 git_diff（changed_files 非空时）。
+      3. daemon 路径 agent 验证收到 verification_output（包含 checks 执行结果）。
+      4. challenge 模式下 agent 收到 worker 已执行的 verification 结果。
+      5. 现有 ralph_service 相关测试不被破坏。
+    verification:
+      level: integration
+      command: "python -m pytest tests/ralph/test_ralph_service_evidence.py -xvs"
+      covers:
+        tasks: [T1]
+        flows: [daemon_evidence_injection]
+    provides:
+      - name: daemon_evidence_injection
+        kind: behavior
+    consumes: []
+
+  # ================================================================
+  # T2: shell 操作符验证命令子命令拆分 (RL-3)
+  # ================================================================
+
+  - id: T2
+    title: "Split shell-operator verification commands into sub-commands"
+    role: leaf
+    type: backend
+    addresses:
+      - "RL-3"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/ralph/filesystem_validator.py
+      - tests/ralph/test_shell_operator_split.py
+    awareness_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/validator.py
+    goal_behavior: >
+      修改 filesystem_validator.py _check_verification_command() (line 468)：
+
+      1. 新增 _split_shell_command(cmd) → Optional[List[str]] 函数：
+         做引号外顶层扫描（跟踪 ' 和 " 的开/闭状态），
+         仅在引号外匹配 && 和 ; 进行拆分。
+         返回子命令列表，如果没有可拆分操作符则返回 None。
+
+         关键：python -c "import sys; print(1)" 中的 ; 在双引号内，
+         不得被拆分。同样 'foo && bar' 中的 && 在单引号内不拆。
+
+      2. 区分"可拆分操作符"和"不可拆分操作符"：
+         - 可拆分（顶层引号外）：&& 和 ;
+         - 不可拆分：||, |, >, >>, <, 2>, 2>>, &（单个）
+         对不可拆分操作符保持当前的跳过行为（hint）。
+
+      3. 修改 _check_verification_command() 入口：
+         先调用 _split_shell_command()。如果返回子命令列表，
+         对每个子命令递归调用 _check_verification_command()，
+         收集合并 issues。如果任何子命令含不可拆分操作符，
+         该子命令仍然跳过。
+
+      4. 操作符检测改为引号外顶层扫描（复用 _split_shell_command
+         的解析状态），不再用 substring 匹配，消除误触发。
+
+      5. 保持 hint severity 不变。
+    acceptance_criteria: >
+      1. "pytest a.py && pytest b.py" 被拆为两个子命令分别检查。
+      2. "pytest a.py; grep foo bar" 被拆为两个子命令分别检查。
+      3. "pytest a.py | grep PASS" 仍然产生 W_VERIFICATION_COMPLEX_SHELL_SKIPPED。
+      4. "pytest a.py || true" 仍然产生 W_VERIFICATION_COMPLEX_SHELL_SKIPPED。
+      5. "pytest tests/test_foo.py::test_bar_and_stuff" 不再误触发。
+      6. 'python -c "import sys; print(1)"' 中引号内的 ; 不触发拆分。
+      7. "python -c 'foo && bar'" 中引号内的 && 不触发拆分。
+      8. 子命令的 issues 正确归属原 task_id。
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_shell_operator_split.py -xvs"
+      covers:
+        tasks: [T2]
+        flows: [shell_operator_subcommand_check]
+    provides:
+      - name: shell_split_check
+        kind: behavior
+    consumes: []
+
+  # ================================================================
+  # T3: W_INDIRECT_TEST_IMPORT 折叠 (RL-5)
+  # ================================================================
+
+  - id: T3
+    title: "Fold excessive W_INDIRECT_TEST_IMPORT into summary hint"
+    role: leaf
+    type: backend
+    addresses:
+      - "RL-5"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/ralph/filesystem_validator.py
+      - tests/ralph/test_indirect_import_fold.py
+    awareness_paths:
+      - src/cccc/ralph/models.py
+    goal_behavior: >
+      修改 filesystem_validator.py _check_test_coverage_gaps() (line 187)：
+
+      1. 在生成 W_INDIRECT_TEST_IMPORT issues 后，对同一 task_id 下
+         的 indirect_gaps 进行折叠：
+         - 如果某个 task_id 的 indirect_gaps 条目 ≥ 10，
+           将所有条目合并为一条摘要 hint：
+           "task 'T1' has N indirect test imports across M source files (folded)"
+         - evidence 中保留前 5 条的详情 + 总数。
+         - 如果 < 10 条，保持当前逐条输出。
+
+      2. 折叠阈值设为常量 _INDIRECT_IMPORT_FOLD_THRESHOLD = 10。
+
+      3. 保持 severity="hint" 不变。
+    acceptance_criteria: >
+      1. 某 task 有 15 条 W_INDIRECT_TEST_IMPORT → 输出 1 条摘要。
+      2. 某 task 有 5 条 → 仍输出 5 条独立 hint。
+      3. 摘要的 evidence 包含总数和前 5 条详情。
+      4. 不影响 W_TEST_COVERAGE_GAP（直接 gap）的输出。
+    verification:
+      level: unit
+      command: "python -m pytest tests/ralph/test_indirect_import_fold.py -xvs"
+      covers:
+        tasks: [T3]
+        flows: []
+    provides:
+      - name: indirect_import_fold
+        kind: behavior
+    consumes: []
+
+  # ================================================================
+  # T4: 文档对齐 — cccc_message_send → CLI (RO-30)
+  # ================================================================
+
+  - id: T4
+    title: "Replace remaining cccc_message_send in workflow docs"
+    role: leaf
+    type: general
+    addresses:
+      - "RO-30"
+    depends_on: []
+    claimed_paths:
+      - todo/ralph-foreman-workflow.md
+    awareness_paths:
+      - docs/ralph-foreman-workflow.md
+      - src/cccc/ralph/cli.py
+    goal_behavior: >
+      todo/ralph-foreman-workflow.md:295 仍有一处 cccc_message_send 引用。
+      docs/ralph-foreman-workflow.md 已清理干净。
+
+      1. 将 todo/ralph-foreman-workflow.md 中所有 cccc_message_send
+         替换为 CLI 等价命令：
+         - 进度汇报：cccc send --to @foreman --text "..."
+         - 完成：cccc task complete <task_id> --changed-file <path>
+
+      2. 同时扫描 todo/ralph-foreman-workflow.md 是否有其他过时的
+         MCP 工具引用（cccc_task, context.sync 等），一并替换。
+
+      3. 确保 RalphService 文档描述与当前代码一致：
+         三种形态（CLI validate / daemon verify gate / Agent review）。
+    acceptance_criteria: >
+      1. todo/ralph-foreman-workflow.md 不再包含 cccc_message_send。
+      2. 无其他 MCP 工具名称残留（cccc_task, context.sync）。
+      3. 文档描述的 Ralph 能力与代码实际一致。
+    verification:
+      level: unit
+      command: "python -c \"import sys; from pathlib import Path; t=Path('todo/ralph-foreman-workflow.md').read_text(encoding='utf-8'); bad=['cccc_message_send','cccc_task','context.sync']; found=[w for w in bad if w in t]; sys.exit(1) if found else sys.exit(0)\""
+      covers:
+        tasks: [T4]
+        flows: []
+    provides: []
+    consumes: []
+
+  # ================================================================
+  # T-int: 全量集成验证
+  # ================================================================
+
+  - id: T-int
+    title: "Integration validation: all fixes + full regression"
+    role: integration
+    type: backend
+    addresses:
+      - "RO-42"
+      - "RO-30"
+      - "RL-3"
+      - "RL-5"
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T4
+    claimed_paths:
+      - tests/ralph/test_v5_final_integration.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/filesystem_validator.py
+      - tests/ralph/test_agent_stress.py
+    goal_behavior: >
+      编写集成测试验证所有修复的协同：
+
+      1. evidence_injection: 构造含 verification.checks 的 TaskRef →
+         通过 ralph_service.verify_completion(mode=challenge) →
+         验证 agent 收到 source_context + git_diff + verification_output。
+
+      2. shell_split: 构造含 "pytest a.py && pytest b.py" 验证命令的
+         plan → ralph validate → 验证两个子命令分别被检查。
+
+      3. indirect_fold: 构造含 12 条 indirect test import 的场景 →
+         ralph validate → 验证输出折叠为 1 条摘要。
+
+      4. 全量 pytest 回归：现有测试不被破坏。
+    acceptance_criteria: >
+      1. 新集成测试全部通过。
+      2. python -m pytest 全量回归无新增失败。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/ralph/test_v5_final_integration.py -xvs"
+      covers:
+        tasks: [T1, T2, T3, T4, T-int]
+        flows:
+          - daemon_evidence_injection
+          - shell_operator_subcommand_check
+    provides: []
+    consumes:
+      - name: daemon_evidence_injection
+        from_task: T1
+      - name: shell_split_check
+        from_task: T2
+      - name: indirect_import_fold
+        from_task: T3

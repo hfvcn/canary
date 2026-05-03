@@ -203,6 +203,8 @@ def test_ipc_handler_delegates_to_canonical() -> None:
         daemon_request_fn=None,
         assignment_id="",
         actor_run_id="",
+        override_stale_digest=False,
+        force_complete=False,
     )
 
 
@@ -314,5 +316,6 @@ def test_cli_complete_builds_canonical_task_event_request() -> None:
             "changed_files": [CLAIMED_PATH],
             "evidence": {"summary": "done"},
             "override_stale_digest": False,
+            "force_complete": False,
         },
     }
