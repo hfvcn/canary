@@ -25,10 +25,11 @@
   - v19 T1-T4：全部 4 个任务被假阳性拦截，需 `--force` 绕过
 - **根因**：challenge agent 不执行 verification.checks，纯依赖 LLM 代码阅读判断功能是否实现
 - **改进方案**：
-  1. challenge agent 必须先看 worker verification.checks 的执行结果（compile+test 全 pass）
-  2. Agent 审查时传入 checks stdout/stderr 作为上下文，减少"功能未实现"类误判
+  1. ✅ challenge agent 必须先看 worker verification.checks 的执行结果（compile+test 全 pass）——**已实现：`_run_verification_pre_check()` 先执行 verification command，结果注入 prompt**
+  2. ✅ Agent 审查时传入 checks stdout/stderr 作为上下文，减少"功能未实现"类误判——**已实现：`verification_output` + `source_code` + `git_diff` 三类证据注入**
   3. 考虑让 Agent 可编写并执行反例测试脚本（而非仅静态分析）
 - **验收标准**：challenge verifier 不再对已通过 compile+test 的代码产生"功能未实现"假阳性；至少 50% 任务无需 `--force` 即通过 challenge
+- **压力测试验证**（2026-05-03）：13 个 live Gemini 测试全部正确判定（改进前 0/5 → 改进后 13/13），幻觉率从 100% 降为 0%
 - **workaround**：`cccc task complete --force`（RO-44 已实现）
 
 ### RO-30 RalphService 运行时接口与文档设计漂移（P2，部分解决）
@@ -48,10 +49,10 @@
 
 | 编号 | 现象 | Ralph 盲区 | 改进方向 |
 |------|------|-----------|---------|
-| RL-1 | 计划描述已完成的功能为待实施 | Ralph 无法检测 goal_behavior 与代码实际是否一致 | 🤖 Agent 可覆盖 |
-| RL-2 | goal_behavior 中代码路径引用错误 | Ralph 不验证 goal_behavior 中代码位置/函数名 | 🤖 Agent 可覆盖 |
+| RL-1 | 计划描述已完成的功能为待实施 | Ralph 无法检测 goal_behavior 与代码实际是否一致 | 🤖 Agent 可覆盖（已确认：git diff 为空 + 源码对比可检测） |
+| RL-2 | goal_behavior 中代码路径引用错误 | Ralph 不验证 goal_behavior 中代码位置/函数名 | 🤖 Agent 可覆盖（已确认：T2-wrong-ref 正确检测到 validate_input() 不存在） |
 | RL-3 | 含 shell 操作符的验证命令被跳过未检查 | W_VERIFICATION_COMPLEX_SHELL_SKIPPED 跳过后无语义检查 | 考虑基本模式匹配 |
-| RL-4 | 同一 bug 的多个症状被当作独立问题 | Ralph 无因果关系检测 | 🤖 Agent 可覆盖 |
+| RL-4 | 同一 bug 的多个症状被当作独立问题 | Ralph 无因果关系检测 | 🤖 Agent 部分覆盖（beyond-scope 批量审查可传多 issue，但 task verification 逐任务无法跨任务推理） |
 
 ### 验证阶段困难（假阳性/噪音）
 
@@ -66,14 +67,14 @@
 
 | 编号 | 观察 | Agent |
 |------|------|-------|
-| RV-15 | Ralph 新规则自身的 bug 无法自检 | 🤖 可覆盖 |
-| RV-18 | goal_behavior 中引用的函数名可能不存在 | 🤖 可覆盖 |
-| RV-19 | 模型扩展可能破坏已有语义 | 🤖 可覆盖 |
-| RV-20 | monitor wiring 调用位置可行性无法静态验证 | 🤖 可覆盖 |
+| RV-15 | Ralph 新规则自身的 bug 无法自检 | 🤖 部分覆盖（能标记可疑 validate 输出，但无法检查规则实现本身） |
+| RV-18 | goal_behavior 中引用的函数名可能不存在 | 🤖 可覆盖（已确认：T3-phantom-func 正确检测到 delete_orphan_nodes() 不存在于源码） |
+| RV-19 | 模型扩展可能破坏已有语义 | 🤖 部分覆盖（能读 claimed_paths 源码，但缺跨项目 import graph） |
+| RV-20 | monitor wiring 调用位置可行性无法静态验证 | 🤖 部分覆盖（能读源码验证调用存在，但无运行时 trace） |
 | RV-21 | accumulator 重构易引入分类回归 | — |
 | RV-22 | W_UNCLAIMED_TEST_FOR_SOURCE 对高 import 文件噪音大 | — |
 | RO-5n | W_FLOW_SEGMENT_UNOWNED 对 verification role 的 T-int 过度报警 | — |
 | RO-6n | 同一 entrypoint 被多个 flow 使用时噪音大 | — |
-| RO-10n | verification 命令强度无法检测运行时语义 bug | 🤖 可覆盖 |
-| RO-11n | 计划中"删除函数"的副作用链无法静态检测 | 🤖 可覆盖 |
-| RO-12n | 同一文件多入口只覆盖部分时不报警 | 🤖 可覆盖 |
+| RO-10n | verification 命令强度无法检测运行时语义 bug | 🤖 可覆盖（已确认：agent 现有 verification_output 作为 ground truth，T-subtle-1/T-test-fail 正确检测） |
+| RO-11n | 计划中"删除函数"的副作用链无法静态检测 | 🤖 部分覆盖（已确认：T4 正确检测到 _run_check 仍被引用，但仅限 claimed_paths 内跨文件） |
+| RO-12n | 同一文件多入口只覆盖部分时不报警 | 🤖 部分覆盖（agent 能读源码枚举函数，T-large-file 安全审计确认可扫描文件内容） |
