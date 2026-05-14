@@ -1,0 +1,75 @@
+workflow_id: fix-v5-ro67-compact
+title: "RO-67: ralph validate --compact mode for reduced noise"
+description: |
+  Add --compact flag to ralph validate that shows only errors + exact-confidence
+  warnings, suppressing opaque/best_effort warnings and all hints.
+  Addresses Foreman feedback: "Signal-to-noise ratio needs improvement for small projects"
+  (6-task plan produced 15 warnings + 32 hints).
+addresses:
+  - RO-67
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_NO_CROSS_TASK_VERIFICATION
+  - W_PLAN_SCOPE_UNUSED
+
+tasks:
+  - id: T1
+    title: "Add --compact flag and filtering to CLI validate"
+    goal_behavior: |
+      1. Add --compact argument to validate subparser (store_true, default False)
+      2. Pass compact flag through _cmd_validate → _print_validate_result
+      3. In _print_validation_text(), when compact=True:
+         - Show all errors
+         - Show only warnings with confidence=="exact"
+         - Hide all hints
+         - Skip Semantic Findings section
+      4. In _validate_json_payload(), when compact=True:
+         - Apply same filtering to JSON output
+      5. Summary banner reflects filtered counts
+    acceptance_criteria: "--compact flag accepted by argparse; compact mode shows errors + exact-confidence warnings only; non-compact mode unchanged; JSON format respects --compact"
+    claimed_paths:
+      - src/cccc/ralph/cli.py
+    verification:
+      level: unit
+      checks:
+        - name: compact-flag-parse
+          command: "python -c \"from cccc.ralph.cli import main; main(['validate', '--help'])\" 2>&1 | grep -q compact"
+        - name: existing-tests-pass
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -x -q"
+      covers:
+        paths:
+          - tests/ralph/test_ralph_standalone.py
+    provides:
+      - name: compact_validate_cli
+        kind: cli_flag
+    depends_on: []
+
+  - id: T2
+    title: "Unit tests for --compact mode"
+    goal_behavior: |
+      Create tests/test_compact_validate.py with tests:
+      1. test_compact_hides_hints: build report with hints, assert compact text has no hint lines
+      2. test_compact_filters_low_confidence_warnings: warnings with confidence=opaque hidden
+      3. test_compact_shows_errors: errors always shown
+      4. test_compact_shows_exact_warnings: warnings with confidence=exact shown
+      5. test_compact_json_filtered: JSON output also filtered
+      6. test_default_mode_unchanged: without --compact all issues present
+    acceptance_criteria: "6 tests covering compact filtering logic; all tests pass"
+    claimed_paths:
+      - tests/test_compact_validate.py
+    verification:
+      level: unit
+      checks:
+        - name: compact-tests-pass
+          command: "python -m pytest tests/test_compact_validate.py -x -q"
+      covers:
+        paths:
+          - tests/test_compact_validate.py
+    consumes:
+      - name: compact_validate_cli
+        from: T1
+    depends_on:
+      - T1

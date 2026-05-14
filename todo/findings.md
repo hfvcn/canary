@@ -26,7 +26,7 @@
 
 > 来源：Phase 2 修复实践 (2026-03-31)，10 个任务全部通过，54 pytest 通过
 
-**计划生成 → Ralph 验证 → Codex 审查 → 并行执行 → 实测**
+**计划生成 → Ralph 验证 → Codex 审查 → 并行执行 → 能力指南生成 → 实测（新会话）**
 
 | 阶段 | 做什么 | 工具 | 产出 |
 |------|--------|------|------|
@@ -35,7 +35,8 @@
 | **Codex 审查** | 将 plan.yaml + 关键代码上下文通过collaborate with codex发给 Codex并要求浏览todo/adversarial-review-web-v2.md(审查用到的提示词)，审查任务本身合理性, 任务边界、安全性、依赖完整性、验证命令有效性 | Codex (codex_bridge.py) | 采纳审查建议修正计划 |
 | **Ralph 不足记录** | 收集 Ralph 在本轮实践中暴露的所有不足（两类来源，见下方），写入问题清单作为 Ralph 后续改进项，附带触发该问题的具体实例 | Claude + 问题清单 | Ralph 改进项 + 实例 |
 | **并行执行** | 按 `ralph suggest` 输出的 ready 批次并行分发给 Codex(必须是codex而不是自带的agent)，每个任务独立执行，完成后更新 state 并 re-suggest | Codex 并行 × N | 代码变更 + 测试 |
-| **实测** | 启动真实 daemon，创建 group，跑完整 workflow 流程 | cccc CLI + daemon | 确认端到端可用 |
+| **能力指南生成** | 探索**当前源码**，生成 `foreman-capability-guide.md`。必须覆盖：CLI 所有 flag（特别是本轮新增的）、verification 模式和 shell 执行语义、DAG gating 行为、stall detection 阈值和覆盖范围、plan schema 字段、auto-dispatch + assignment_map 机制。**不可复用旧版**——每轮代码都在变，旧版会导致 Foreman 不知道新特性或误用已改变的行为，无法准确归因问题来源 | Claude 代码探索 agent | `docs/foreman-capability-guide.md` |
+| **实测** | **新建会话**，启动真实 daemon（确保用最新代码重启），创建干净 group，跑完整 workflow 流程，按 `e2e-实战评估规范.md` 六阶段执行。审查使用 collaborating-with-codex | cccc CLI + daemon + Codex | 确认端到端可用 |
 
 **关键约束**：
 - 计划必须经过 Ralph validate（结构性保障）**和** Codex 审查（语义保障）才能执行
@@ -412,3 +413,4 @@ MCP 关闭后，claude 一启动就被 preamble 引导去找 MCP 工具，找不
 ### Ralph 的盲区
 
 Ralph 当前是计划校验器 + 任务调度器，不是运行时 agent 行为监控器。它在执行前检查计划质量、执行后验证任务结果，但执行中不观察 agent 做了什么。v4 文档描述了"Ralph 校验 AI 是否正确使用了 CLI"的目标，但尚未实现。这意味着即使 Ralph 在运行，它也无法发现"agent 卡在 MCP 冷启动流程上"这个问题。
+

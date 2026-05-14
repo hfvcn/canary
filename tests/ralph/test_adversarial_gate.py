@@ -9,7 +9,10 @@ from typing import Any
 import pytest
 
 from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationSpec
-from cccc.daemon.foreman.ralph_service import RalphService
+from cccc.daemon.foreman.ralph_service import (
+    CHALLENGE_DEGRADED_WARNING_CODE,
+    RalphService,
+)
 
 
 def _task_ref() -> TaskRef:
@@ -124,6 +127,7 @@ def test_challenge_mode_agent_unavailable(
         task_ref=_task_ref(),
     )
 
-    assert result.overall_outcome == "failed"
-    assert result.challenge_outcome == "failed"
-    assert "agent verification failed" in result.summary
+    assert result.overall_outcome == "passed"
+    assert result.challenge_outcome == ""
+    assert result.warnings
+    assert result.warnings[0].startswith(f"{CHALLENGE_DEGRADED_WARNING_CODE}:")

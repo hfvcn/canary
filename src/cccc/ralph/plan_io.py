@@ -64,11 +64,41 @@ def _parse_raw_bytes(source: bytes, source_path: Path) -> Dict[str, Any]:
     return data or {}
 
 
+_TASK_OPERATIONAL_KEYS = frozenset({
+    "verification",
+    "verification_mode",
+    "goal_behavior",
+    "acceptance_criteria",
+    "title",
+})
+
+
+def _strip_task_operational(task: Any) -> Any:
+    """Return a task dict without operational fields that don't affect plan structure."""
+    if not isinstance(task, dict):
+        return task
+    return {k: v for k, v in task.items() if k not in _TASK_OPERATIONAL_KEYS}
+
+
 def _strip_plan_state(data: Any) -> Any:
-    """Return a copy of the top-level plan payload without runtime state."""
+    """Return a copy of the plan payload without runtime state and operational fields.
+
+    Structural fields (task id, depends_on, claimed_paths, provides/consumes,
+    addresses) are preserved.  Operational fields (verification commands,
+    goal_behavior, acceptance_criteria, title) are excluded so that changing
+    them does not trigger digest divergence.
+    """
     if not isinstance(data, dict):
         return data
-    return {key: value for key, value in data.items() if key != "state"}
+    result = {}
+    for key, value in data.items():
+        if key == "state":
+            continue
+        if key == "tasks" and isinstance(value, list):
+            result[key] = [_strip_task_operational(t) for t in value]
+        else:
+            result[key] = value
+    return result
 
 
 def compute_structural_plan_digest(path: Path) -> str:
@@ -156,14 +186,16 @@ def _check_strict_extra_fields(data: Dict[str, Any]) -> list[str]:
 
     for key in data:
         if key not in plan_fields:
-            errors.append(f"{key}: Extra inputs are not permitted. {plan_guidance}")
+            suggestion = _suggest_field_by_name(key, "Plan")
+            errors.append(f"{key}: Extra inputs are not permitted.{suggestion} {plan_guidance}")
 
     for idx, task_data in enumerate(data.get("tasks", []) or []):
         if not isinstance(task_data, dict):
             continue
         for key in task_data:
             if key not in task_fields:
-                errors.append(f"tasks.{idx}.{key}: Extra inputs are not permitted. {task_guidance}")
+                suggestion = _suggest_field_by_name(key, "TaskSpec")
+                errors.append(f"tasks.{idx}.{key}: Extra inputs are not permitted.{suggestion} {task_guidance}")
 
     return errors
 
@@ -267,10 +299,82 @@ def _flow_type_issue(field_path: str, field: str, model_cls: type) -> PlanLoadIs
     return PlanLoadIssue("<plan>", field_path, f"{field_path} expects {expected}")
 
 
+_FIELD_ALIASES: Dict[str, Dict[str, str]] = {
+    "CriticalFlow": {
+        "name": "id",
+        "segments": "entrypoints",
+        "entry": "entrypoints",
+        "paths": "entrypoints",
+        "level": "required_verification_level",
+        "verification_level": "required_verification_level",
+        "desc": "description",
+        "tests": "test_created_by",
+        "created_by": "test_created_by",
+    },
+    "ForbiddenFlow": {
+        "name": "id",
+        "desc": "description",
+        "level": "required_verification_level",
+        "verification_level": "required_verification_level",
+        "tests": "test_created_by",
+        "created_by": "test_created_by",
+    },
+    "TaskSpec": {
+        "name": "id",
+        "deps": "depends_on",
+        "dependencies": "depends_on",
+        "files": "claimed_paths",
+        "write_set": "claimed_paths",
+        "goal": "goal_behavior",
+        "criteria": "acceptance_criteria",
+        "verify": "verification",
+        "verify_command": "verification",
+        "type_": "type",
+    },
+    "Plan": {
+        "version": "schema_version",
+        "flows": "critical_flows",
+        "forbidden": "forbidden_flows",
+        "issues": "required_issues",
+    },
+}
+
+_MODEL_YAML_EXAMPLES: Dict[str, str] = {
+    "CriticalFlow": (
+        'Example:\n'
+        '  - id: "user-login-flow"\n'
+        '    description: "End-to-end user login"\n'
+        '    entrypoints: ["src/auth/login.py"]\n'
+        '    required_verification_level: "integration"'
+    ),
+    "ForbiddenFlow": (
+        'Example:\n'
+        '  - id: "no-direct-db-write"\n'
+        '    description: "Must use ORM, not raw SQL"\n'
+        '    required_verification_level: "unit"'
+    ),
+}
+
+
+def _suggest_field_by_name(key: str, model_name: str) -> str:
+    """Suggest a correct field name given a model name string."""
+    aliases = _FIELD_ALIASES.get(model_name, {})
+    if key in aliases:
+        return f' Did you mean "{aliases[key]}"?'
+    return ""
+
+
+def _suggest_field(key: str, model_cls: type) -> str:
+    return _suggest_field_by_name(key, model_cls.__name__)
+
+
 def _extra_field_issue(prefix: str, key: str, model_cls: type) -> PlanLoadIssue:
     field_path = f"{prefix}.{key}"
     guidance = _format_allowed_fields(model_cls.__name__, model_cls.model_fields.keys(), sort_fields=False)
-    return PlanLoadIssue("<plan>", field_path, f"{field_path} Extra inputs are not permitted. {guidance}")
+    suggestion = _suggest_field(key, model_cls)
+    example = _MODEL_YAML_EXAMPLES.get(model_cls.__name__, "")
+    msg = f"{field_path} Extra inputs are not permitted.{suggestion} {guidance}"
+    return PlanLoadIssue("<plan>", field_path, msg, suggested_format=example)
 
 
 def _check_task_nested_shapes(data: Dict[str, Any]) -> list[PlanLoadIssue]:
@@ -333,10 +437,29 @@ def _semantic_target_issue(task_id: str, field_path: str) -> PlanLoadIssue:
 def _issues_from_validation_error(exc: ValidationError) -> list[PlanLoadIssue]:
     issues: list[PlanLoadIssue] = []
     for error in exc.errors():
-        field_path = ".".join(str(part) for part in error.get("loc", ()))
+        loc = error.get("loc", ())
+        field_path = ".".join(str(part) for part in loc)
         message = str(error.get("msg") or "invalid value")
-        issues.append(PlanLoadIssue("<plan>", field_path, f"{field_path} {message}"))
+        err_type = str(error.get("type") or "")
+        hint = ""
+        if err_type == "missing":
+            hint = f" (required field — check spelling and indentation)"
+        elif "extra" in err_type and loc:
+            model_name = _infer_model_from_loc(loc)
+            hint = _suggest_field_by_name(str(loc[-1]), model_name)
+        issues.append(PlanLoadIssue("<plan>", field_path, f"{field_path} {message}{hint}"))
     return issues
+
+
+def _infer_model_from_loc(loc: tuple) -> str:
+    loc_str = ".".join(str(p) for p in loc)
+    if "critical_flows" in loc_str:
+        return "CriticalFlow"
+    if "forbidden_flows" in loc_str:
+        return "ForbiddenFlow"
+    if "tasks" in loc_str:
+        return "TaskSpec"
+    return "Plan"
 
 
 class SchemaUnknownFieldError(Exception):

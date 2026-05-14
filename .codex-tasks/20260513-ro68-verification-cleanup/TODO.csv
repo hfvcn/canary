@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read plan and current verification implementation,DONE,T3 boundary and target schemas understood,test -f plans/fix-v5-v27-remaining.yaml,2026-05-13,0,T3 challenge degradation preserved; cleanup injection point is worker entry before resolve specs
+2,Update verification schemas and propagation,DONE,cleanup_patterns accepted and copied into TaskRef,python -m pytest tests/test_ralph_ipc.py -q,2026-05-13,0,47 passed
+3,Implement cleanup before worker verification resolution,DONE,cleanup only affects claimed_paths and logs removals,python -m pytest tests/test_verification_cleanup.py -v,2026-05-13,0,5 passed
+4,Add and run focused cleanup tests,DONE,required cleanup scenarios pass,python -m pytest tests/test_verification_cleanup.py -v,2026-05-13,0,5 passed

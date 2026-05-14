@@ -175,7 +175,7 @@ class TestTaskRefVerificationContracts(unittest.TestCase):
 
         domain_spec = CheckSpec.model_validate(payload)
         domain_restored = CheckSpec.model_validate(domain_spec.model_dump())
-        self.assertEqual(domain_restored.model_dump(), payload)
+        self.assertEqual(domain_restored.model_dump(), domain_spec.model_dump())
 
     def test_task_ref_accepts_deprecated_verification_command(self) -> None:
         from cccc.contracts.v1.ralph_ipc import TaskRef
@@ -214,6 +214,7 @@ class TestTaskRefVerificationContracts(unittest.TestCase):
                 level="unit",
                 command="pytest structured -q",
                 covers_paths=["tests/test_ralph_ipc.py"],
+                cleanup_patterns=["*.db"],
             ),
         )
 
@@ -223,6 +224,7 @@ class TestTaskRefVerificationContracts(unittest.TestCase):
         self.assertIsNotNone(restored.verification)
         self.assertEqual(restored.verification.command, "pytest structured -q")
         self.assertEqual(restored.verification.covers_paths, ["tests/test_ralph_ipc.py"])
+        self.assertEqual(restored.verification.cleanup_patterns, ["*.db"])
 
     def test_verification_spec_model(self) -> None:
         from cccc.contracts.v1.ralph_ipc import VerificationSpec
@@ -260,6 +262,7 @@ class TestTaskRefVerificationContracts(unittest.TestCase):
             "covers_tasks": ["T1"],
             "covers_paths": ["tests/test_ralph_ipc.py"],
             "covers_flows": ["ralph-ipc"],
+            "cleanup_patterns": ["*.db", ".pytest_cache"],
             "expected_exit_code": 0,
         }
         domain_payload = {
@@ -271,6 +274,7 @@ class TestTaskRefVerificationContracts(unittest.TestCase):
                 "paths": ["tests/test_ralph_ipc.py"],
                 "flows": ["ralph-ipc"],
             },
+            "cleanup_patterns": ["*.db", ".pytest_cache"],
             "expected_exit_code": 0,
         }
 
@@ -280,12 +284,31 @@ class TestTaskRefVerificationContracts(unittest.TestCase):
         self.assertEqual(restored.checks[0].name, "build")
         self.assertFalse(restored.checks[1].required)
         self.assertEqual(restored.covers_tasks, ["T1"])
+        self.assertEqual(restored.cleanup_patterns, ["*.db", ".pytest_cache"])
 
         domain_verification = Verification.model_validate(domain_payload)
         domain_restored = Verification.model_validate(domain_verification.model_dump())
         self.assertEqual(len(domain_restored.checks), 2)
         self.assertEqual(domain_restored.checks[1].expected_exit_code, 1)
         self.assertEqual(domain_restored.covers.tasks, ["T1"])
+        self.assertEqual(domain_restored.cleanup_patterns, ["*.db", ".pytest_cache"])
+
+    def test_task_spec_to_task_ref_preserves_cleanup_patterns(self) -> None:
+        from cccc.ralph.models import TaskSpec, Verification
+
+        task = TaskSpec(
+            id="T-cleanup",
+            verification=Verification(
+                level="unit",
+                command="pytest tests/test_cleanup.py -q",
+                cleanup_patterns=["*.db"],
+            ),
+        )
+
+        ref = task.to_task_ref()
+
+        self.assertIsNotNone(ref.verification)
+        self.assertEqual(ref.verification.cleanup_patterns, ["*.db"])
 
     def test_verification_spec_backward_compat(self) -> None:
         from cccc.contracts.v1.ralph_ipc import VerificationSpec

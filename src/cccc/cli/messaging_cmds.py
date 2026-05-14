@@ -41,6 +41,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     priority = normalize_priority(getattr(args, "priority", "normal"))
     reply_required = normalize_reply_required(getattr(args, "reply_required", False))
     sender = resolve_sender_actor(group.doc, getattr(args, "by", "user"))
+    task_id = str(getattr(args, "task", "") or "").strip()
 
     if not _ensure_daemon_running():
         _print_json({"ok": False, "error": {"code": "daemon_unavailable", "message": "ccccd unavailable"}})
@@ -54,6 +55,7 @@ def cmd_send(args: argparse.Namespace) -> int:
             by=sender,
             path=str(args.path or ""),
             to=to_tokens,
+            task_id=task_id,
             priority=priority,
             reply_required=reply_required,
         )

@@ -6,9 +6,13 @@ Not an external process; runs inside the daemon.
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import logging
+import os
+import re
 import shlex
+import shutil
 import subprocess
 import time
 import uuid
@@ -36,6 +40,7 @@ from ...ralph.plan_io import compute_structural_plan_digest, load_plan
 from ...kernel.claimed_paths import (
     GLOBAL_WRITE_CLAIM,
     conflicts_with_any as _conflicts_with_any_fn,
+    normalize_path as _normalize_path_fn,
     normalize_write_set as _normalize_write_set_fn,
     paths_overlap as _paths_overlap,
     write_sets_conflict as _write_sets_conflict_fn,
@@ -48,24 +53,70 @@ STUCK_LOOP_LOOKBACK = 6
 STUCK_LOOP_MIN_REPEATS = 3
 WORKTREE_ROOT_DIRNAME = ".ralph-worktrees"
 VERIFICATION_COMMAND_TIMEOUT_SECONDS = 60
+DEFAULT_VERIFICATION_CLEANUP_PATTERNS = [
+    "*.db",
+    "__pycache__",
+    "*.pyc",
+    ".pytest_cache",
+]
 SUSPICIOUS_DURATION_THRESHOLD_MS = 50
 _SHELL_OPERATOR_TOKENS = {"&&", "||", "|", ";"}
 _TRIVIAL_VERIFY_COMMANDS = {"true", ":", "echo", "printf"}
 WORKER_SCOPE_WARNING_CODE = "W_WORKER_EXCEEDED_SCOPE"
+CHALLENGE_DEGRADED_WARNING_CODE = "W_CHALLENGE_DEGRADED"
+CHALLENGE_DEGRADED_WARNING = (
+    f"{CHALLENGE_DEGRADED_WARNING_CODE}: verification passed by default due to "
+    "Gemini unavailability"
+)
+AGENT_VERIFICATION_FAILED_PREFIX = "agent verification failed:"
+AGENT_REVIEW_SKIPPED_WARNING_CODE = "W_AGENT_REVIEW_SKIPPED"
 MAX_SCOPE_WARNING_FILES = 5
 SOURCE_CONTEXT_MAX_BYTES = 50_000
 SOURCE_FILE_MAX_BYTES = 16_000
+_SOURCE_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx"}
+AGENT_VERIFICATION_EXCEPTIONS = (
+    OSError,
+    subprocess.CalledProcessError,
+    subprocess.TimeoutExpired,
+    GeminiResponseError,
+    RuntimeError,
+)
+
+
+def _source_files_in_directory(directory: Path) -> List[Path]:
+    return [
+        path
+        for path in sorted(directory.rglob("*"), key=lambda item: str(item))
+        if path.is_file() and path.suffix in _SOURCE_EXTENSIONS
+    ]
+
+
+def _trim_source_text(text: str, total: int) -> str:
+    if len(text) > SOURCE_FILE_MAX_BYTES:
+        text = (
+            text[:SOURCE_FILE_MAX_BYTES]
+            + f"\n... (truncated at {SOURCE_FILE_MAX_BYTES} bytes)"
+        )
+    remaining = SOURCE_CONTEXT_MAX_BYTES - total
+    if len(text) > remaining:
+        text = text[:remaining] + "\n... (truncated)"
+    return text
+
+
+_ENV_VAR_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=\S")
 
 
 def _has_shell_operators(command: str) -> bool:
-    """Check if command contains bare (unquoted) shell operators.
+    """Check if command contains bare (unquoted) shell operators or env-var assignments.
 
     Scans the raw command string character-by-character, tracking
-    single/double quote state.  Only detects operators (&&, ||, |, ;)
-    that appear outside of quoted regions.  Handles both spaced
-    ('a && b') and unspaced ('a&&b') forms correctly, and does NOT
-    false-positive on quoted data like 'echo "a && b"'.
+    single/double quote state.  Detects operators (&&, ||, |, ;)
+    that appear outside of quoted regions, and leading ``VAR=value``
+    environment-variable assignments (shell syntax not supported by
+    exec-style subprocess invocation).
     """
+    if _ENV_VAR_PREFIX_RE.match(command):
+        return True
     in_single = False
     in_double = False
     i = 0
@@ -134,8 +185,85 @@ def _agent_error_detail(exc: Exception) -> str:
     return str(exc) or type(exc).__name__
 
 
+def _agent_dependency_error_detail(result: VerificationResult) -> Optional[str]:
+    if result.overall_outcome != "failed":
+        return None
+    if not result.summary.startswith(AGENT_VERIFICATION_FAILED_PREFIX):
+        return None
+    return result.summary[len(AGENT_VERIFICATION_FAILED_PREFIX):].strip()
+
+
+def _challenge_degraded_warning(error_detail: str) -> str:
+    return (
+        f"{CHALLENGE_DEGRADED_WARNING_CODE}: agent verification unavailable "
+        f"({error_detail}), falling back to worker-only"
+    )
+
+
+def _mock_command_timeout_result(
+    command: str,
+    timeout: int,
+    duration_ms: int,
+    exc: subprocess.TimeoutExpired,
+) -> Dict[str, Any]:
+    return {
+        "command": command,
+        "outcome": "timeout",
+        "returncode": None,
+        "stdout": str(exc.stdout or ""),
+        "stderr": str(exc.stderr or ""),
+        "duration_ms": duration_ms,
+        "timeout": timeout,
+    }
+
+
+def _mock_command_start_failure(
+    command: str,
+    duration_ms: int,
+    exc: OSError,
+) -> Dict[str, Any]:
+    return {
+        "command": command,
+        "outcome": "failed",
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+        "duration_ms": duration_ms,
+        "error": str(exc),
+    }
+
+
+def _mock_test_details(
+    mock_test: Any,
+    setup_result: Optional[Dict[str, Any]],
+    verify_result: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "source": "mock_tests",
+        "mock_test_name": str(getattr(mock_test, "name", "") or ""),
+        "description": str(getattr(mock_test, "description", "") or ""),
+        "input": dict(getattr(mock_test, "input", {}) or {}),
+        "expected_output": dict(getattr(mock_test, "expected_output", {}) or {}),
+        "setup_command": str(getattr(mock_test, "setup_command", "") or ""),
+        "verify_command": str(getattr(mock_test, "verify_command", "") or ""),
+        "command": str(getattr(mock_test, "verify_command", "") or ""),
+        "setup": setup_result,
+        "verify": verify_result,
+    }
+
+
 def _dedupe_warnings(warnings: List[str]) -> List[str]:
     return list(dict.fromkeys(warnings))
+
+
+def _agent_verification_warnings(
+    warnings: List[str],
+    payload: Dict[str, Any],
+) -> List[str]:
+    merged = list(warnings)
+    if bool(payload.get("degraded")):
+        merged.append(CHALLENGE_DEGRADED_WARNING)
+    return _dedupe_warnings(merged)
 
 
 def _task_covers_critical_flow(task_ref: TaskRef, critical_flows: List[Any]) -> bool:
@@ -564,6 +692,7 @@ class RalphService:
         changed_files: List[str],
         task_ref: TaskRef,
     ) -> VerificationResult:
+        self._cleanup_artifacts(task_ref)
         warnings = self._build_scope_warnings(changed_files, task_ref)
         specs = self._resolve_verification_specs(task_ref)
         if not specs:
@@ -587,6 +716,83 @@ class RalphService:
             warnings=warnings,
             summary=self._summarize_verification(checks, overall_outcome),
         )
+
+    def _cleanup_artifacts(self, task_ref: TaskRef) -> None:
+        patterns = self._cleanup_patterns(task_ref)
+        for scope in self._cleanup_scopes(task_ref):
+            for pattern in patterns:
+                self._cleanup_artifacts_matching(task_ref.id, scope, pattern)
+
+    def _cleanup_patterns(self, task_ref: TaskRef) -> List[str]:
+        verification = getattr(task_ref, "verification", None)
+        patterns = getattr(verification, "cleanup_patterns", None)
+        if patterns is None:
+            return list(DEFAULT_VERIFICATION_CLEANUP_PATTERNS)
+        return [self._validate_cleanup_pattern(pattern) for pattern in patterns]
+
+    def _validate_cleanup_pattern(self, pattern: str) -> str:
+        if not pattern:
+            raise ValueError("verification cleanup_patterns must not include empty patterns")
+        candidate = Path(pattern)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError("verification cleanup_patterns must stay within claimed_paths")
+        return pattern
+
+    def _cleanup_scopes(self, task_ref: TaskRef) -> List[Path]:
+        scopes: List[Path] = []
+        project_root = self.project_root.resolve()
+        for rel_path in task_ref.claimed_paths:
+            scope = self.project_root / rel_path
+            if not scope.is_dir():
+                continue
+            if not self._is_cleanup_path_within(scope, project_root):
+                _logger.warning(
+                    "verification cleanup skipped path outside project: task_id=%s path=%s",
+                    task_ref.id,
+                    rel_path,
+                )
+                continue
+            scopes.append(scope)
+        return scopes
+
+    def _cleanup_artifacts_matching(
+        self,
+        task_id: str,
+        scope: Path,
+        pattern: str,
+    ) -> None:
+        scope_root = scope.resolve()
+        search_pattern = str(scope / "**" / pattern)
+        for match in glob.glob(search_pattern, recursive=True):
+            artifact = Path(match)
+            if self._is_cleanup_path_within(artifact, scope_root):
+                self._remove_cleanup_artifact(task_id, artifact)
+
+    def _is_cleanup_path_within(self, path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root)
+        except ValueError:
+            return False
+        return True
+
+    def _remove_cleanup_artifact(self, task_id: str, artifact: Path) -> None:
+        if not artifact.exists() and not artifact.is_symlink():
+            return
+        if artifact.is_dir() and not artifact.is_symlink():
+            shutil.rmtree(artifact)
+        else:
+            os.remove(artifact)
+        _logger.info(
+            "verification cleanup removed artifact: task_id=%s path=%s",
+            task_id,
+            self._cleanup_log_path(artifact),
+        )
+
+    def _cleanup_log_path(self, artifact: Path) -> str:
+        try:
+            return artifact.relative_to(self.project_root).as_posix()
+        except ValueError:
+            return str(artifact)
 
     def _verify_completion_with_challenge(
         self,
@@ -613,6 +819,13 @@ class RalphService:
             task_ref=task_ref,
             verification_output=verification_output,
         )
+        dependency_error = _agent_dependency_error_detail(agent_result)
+        if dependency_error is not None:
+            warnings = _dedupe_warnings(
+                worker_result.warnings
+                + [_challenge_degraded_warning(dependency_error)]
+            )
+            return worker_result.model_copy(update={"warnings": warnings})
         return self._challenge_verification_result(worker_result, agent_result)
 
     def _challenge_verification_result(
@@ -667,6 +880,49 @@ class RalphService:
         verification_output: Optional[Dict[str, Any]] = None,
     ) -> VerificationResult:
         warnings = self._build_scope_warnings(changed_files, task_ref)
+        mock_tests = self._verification_mock_tests(task_ref)
+        if mock_tests:
+            checks, outcome = self._execute_mock_tests(mock_tests)
+            if outcome != "passed":
+                return self._mock_tests_failed_result(
+                    task_id=task_id,
+                    workflow_id=workflow_id,
+                    warnings=warnings,
+                    checks=checks,
+                    total=len(mock_tests),
+                )
+            return self._verify_agent_after_mock_tests(
+                task_id=task_id,
+                changed_files=changed_files,
+                workflow_id=workflow_id,
+                task_ref=task_ref,
+                verification_output=verification_output,
+                warnings=warnings,
+                mock_checks=checks,
+            )
+
+        try:
+            return self._run_agent_completion_verification(
+                task_id=task_id,
+                changed_files=changed_files,
+                workflow_id=workflow_id,
+                task_ref=task_ref,
+                verification_output=verification_output,
+                warnings=warnings,
+            )
+        except AGENT_VERIFICATION_EXCEPTIONS as exc:
+            return self._failed_agent_verification(task_id, workflow_id, warnings, exc)
+
+    def _run_agent_completion_verification(
+        self,
+        *,
+        task_id: str,
+        changed_files: List[str],
+        workflow_id: str,
+        task_ref: TaskRef,
+        verification_output: Optional[Dict[str, Any]],
+        warnings: List[str],
+    ) -> VerificationResult:
         source_context = self._read_claimed_paths(task_ref)
         git_diff = self._git_diff_for_files(changed_files)
         agent_verification_output = (
@@ -678,24 +934,215 @@ class RalphService:
             workflow_id=workflow_id,
             config=AgentConfig(provider=GEMINI_PROVIDER),
         )
-        try:
-            payload = agent.verify_task_completion(
-                task_ref,
-                changed_files=changed_files,
-                project_root=self.project_root,
-                source_context=source_context,
-                git_diff=git_diff,
-                verification_output=agent_verification_output,
-            )
-        except (
-            OSError,
-            subprocess.CalledProcessError,
-            subprocess.TimeoutExpired,
-            GeminiResponseError,
-            RuntimeError,
-        ) as exc:
-            return self._failed_agent_verification(task_id, workflow_id, warnings, exc)
+        payload = agent.verify_task_completion(
+            task_ref,
+            changed_files=changed_files,
+            project_root=self.project_root,
+            source_context=source_context,
+            git_diff=git_diff,
+            verification_output=agent_verification_output,
+        )
         return self._agent_verification_result(task_id, workflow_id, warnings, payload)
+
+    def _verify_agent_after_mock_tests(
+        self,
+        *,
+        task_id: str,
+        changed_files: List[str],
+        workflow_id: str,
+        task_ref: TaskRef,
+        verification_output: Optional[Dict[str, Any]],
+        warnings: List[str],
+        mock_checks: List[VerificationCheck],
+    ) -> VerificationResult:
+        agent_input = verification_output or self._mock_tests_verification_output(mock_checks)
+        try:
+            agent_result = self._run_agent_completion_verification(
+                task_id=task_id,
+                changed_files=changed_files,
+                workflow_id=workflow_id,
+                task_ref=task_ref,
+                verification_output=agent_input,
+                warnings=warnings,
+            )
+        except AGENT_VERIFICATION_EXCEPTIONS as exc:
+            return self._mock_tests_passed_without_agent(
+                task_id=task_id,
+                workflow_id=workflow_id,
+                warnings=warnings,
+                checks=mock_checks,
+                exc=exc,
+            )
+        return agent_result.model_copy(update={
+            "checks": mock_checks + agent_result.checks,
+            "warnings": _dedupe_warnings(warnings + agent_result.warnings),
+        })
+
+    def _verification_mock_tests(self, task_ref: TaskRef) -> List[Any]:
+        verification = getattr(task_ref, "verification", None)
+        return list(getattr(verification, "mock_tests", None) or [])
+
+    def _execute_mock_tests(
+        self,
+        mock_tests: List[Any],
+    ) -> tuple[List[VerificationCheck], str]:
+        checks = [
+            self._run_mock_test(index=index, mock_test=mock_test)
+            for index, mock_test in enumerate(mock_tests, start=1)
+        ]
+        outcome = "passed" if all(check.outcome == "passed" for check in checks) else "failed"
+        return checks, outcome
+
+    def _run_mock_test(self, *, index: int, mock_test: Any) -> VerificationCheck:
+        timeout = VERIFICATION_COMMAND_TIMEOUT_SECONDS
+        setup_command = str(getattr(mock_test, "setup_command", "") or "").strip()
+        verify_command = str(getattr(mock_test, "verify_command", "") or "").strip()
+        started_at = time.perf_counter()
+        if not verify_command:
+            return self._mock_test_check(
+                index=index,
+                mock_test=mock_test,
+                outcome="failed",
+                message="mock test verify_command is required",
+                duration_ms=0,
+                setup_result=None,
+                verify_result=None,
+            )
+        setup_result = self._run_mock_test_command(setup_command, timeout) if setup_command else None
+        if setup_result is not None and setup_result["outcome"] != "passed":
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
+            return self._mock_test_check(
+                index=index,
+                mock_test=mock_test,
+                outcome=str(setup_result["outcome"]),
+                message="mock test setup did not pass",
+                duration_ms=duration_ms,
+                setup_result=setup_result,
+                verify_result=None,
+            )
+        verify_result = self._run_mock_test_command(verify_command, timeout)
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        message = "mock test passed" if verify_result["outcome"] == "passed" else "mock test did not pass"
+        return self._mock_test_check(
+            index=index,
+            mock_test=mock_test,
+            outcome=str(verify_result["outcome"]),
+            message=message,
+            duration_ms=duration_ms,
+            setup_result=setup_result,
+            verify_result=verify_result,
+        )
+
+    def _run_mock_test_command(self, command: str, timeout: int) -> Dict[str, Any]:
+        started_at = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
+            return _mock_command_timeout_result(command, timeout, duration_ms, exc)
+        except OSError as exc:
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
+            return _mock_command_start_failure(command, duration_ms, exc)
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        outcome = "passed" if proc.returncode == 0 else "failed"
+        return {
+            "command": command,
+            "outcome": outcome,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "duration_ms": duration_ms,
+        }
+
+    def _mock_test_check(
+        self,
+        *,
+        index: int,
+        mock_test: Any,
+        outcome: str,
+        message: str,
+        duration_ms: int,
+        setup_result: Optional[Dict[str, Any]],
+        verify_result: Optional[Dict[str, Any]],
+    ) -> VerificationCheck:
+        details = _mock_test_details(mock_test, setup_result, verify_result)
+        return VerificationCheck(
+            name=f"mock_test_{index}",
+            outcome=outcome,
+            message=message,
+            duration_ms=duration_ms,
+            details=details,
+        )
+
+    def _mock_tests_failed_result(
+        self,
+        *,
+        task_id: str,
+        workflow_id: str,
+        warnings: List[str],
+        checks: List[VerificationCheck],
+        total: int,
+    ) -> VerificationResult:
+        return self._verification_result(
+            task_id=task_id,
+            workflow_id=workflow_id,
+            outcome="failed",
+            checks=checks,
+            warnings=warnings,
+            summary=self._mock_tests_failure_summary(checks, total),
+        )
+
+    def _mock_tests_passed_without_agent(
+        self,
+        *,
+        task_id: str,
+        workflow_id: str,
+        warnings: List[str],
+        checks: List[VerificationCheck],
+        exc: Exception,
+    ) -> VerificationResult:
+        skipped = (
+            f"{AGENT_REVIEW_SKIPPED_WARNING_CODE}: agent verification unavailable "
+            f"after mock tests passed ({type(exc).__name__})"
+        )
+        return self._verification_result(
+            task_id=task_id,
+            workflow_id=workflow_id,
+            outcome="passed",
+            checks=checks,
+            warnings=_dedupe_warnings(warnings + [skipped]),
+            summary=f"verification passed: {len(checks)} mock tests passed",
+        )
+
+    def _mock_tests_verification_output(
+        self,
+        checks: List[VerificationCheck],
+    ) -> Dict[str, Any]:
+        return {
+            "status": "passed",
+            "checks": [
+                self._verification_check_payload(
+                    check,
+                    str(check.details.get("verify_command", "")),
+                )
+                for check in checks
+            ],
+        }
+
+    def _mock_tests_failure_summary(
+        self,
+        checks: List[VerificationCheck],
+        total: int,
+    ) -> str:
+        failed = sum(1 for check in checks if check.outcome != "passed")
+        return f"verification failed: {failed} of {total} mock tests did not pass"
 
     def _failed_agent_verification(
         self,
@@ -730,7 +1177,7 @@ class RalphService:
             task_id=task_id,
             overall_outcome=outcome,
             checks=_agent_checks(payload.get("checks", [])),
-            warnings=warnings,
+            warnings=_agent_verification_warnings(warnings, payload),
             summary=str(payload.get("reason") or f"agent verification {outcome}"),
         )
 
@@ -739,10 +1186,14 @@ class RalphService:
         changed_files: List[str],
         task_ref: TaskRef,
     ) -> List[str]:
-        claimed = getattr(task_ref, "claimed_paths", []) or []
+        claimed = [
+            _normalize_path_fn(path)
+            for path in (getattr(task_ref, "claimed_paths", []) or [])
+        ]
+        normalized_changed_files = [_normalize_path_fn(path) for path in changed_files]
         exceeded = [
             path
-            for path in changed_files
+            for path in normalized_changed_files
             if not any(_paths_overlap(path, claimed_path) for claimed_path in claimed)
         ]
         if not exceeded:
@@ -791,6 +1242,27 @@ class RalphService:
             if total >= SOURCE_CONTEXT_MAX_BYTES:
                 break
             full_path = self.project_root / rel_path
+            if full_path.is_dir():
+                source_files = _source_files_in_directory(full_path)
+                if not source_files:
+                    result[rel_path] = "<file not found>"
+                    continue
+                for source_file in source_files:
+                    if total >= SOURCE_CONTEXT_MAX_BYTES:
+                        break
+                    rel_source = source_file.relative_to(self.project_root).as_posix()
+                    try:
+                        text = source_file.read_text(
+                            encoding="utf-8",
+                            errors="replace",
+                        )
+                    except Exception:
+                        result[rel_source] = "<read error>"
+                        continue
+                    text = _trim_source_text(text, total)
+                    result[rel_source] = text
+                    total += len(text)
+                continue
             if not full_path.is_file():
                 result[rel_path] = "<file not found>"
                 continue
@@ -799,14 +1271,7 @@ class RalphService:
             except Exception:
                 result[rel_path] = "<read error>"
                 continue
-            if len(text) > SOURCE_FILE_MAX_BYTES:
-                text = (
-                    text[:SOURCE_FILE_MAX_BYTES]
-                    + f"\n... (truncated at {SOURCE_FILE_MAX_BYTES} bytes)"
-                )
-            remaining = SOURCE_CONTEXT_MAX_BYTES - total
-            if len(text) > remaining:
-                text = text[:remaining] + "\n... (truncated)"
+            text = _trim_source_text(text, total)
             result[rel_path] = text
             total += len(text)
         return result
@@ -826,6 +1291,18 @@ class RalphService:
             return "<git diff unavailable>"
         diff = (proc.stdout or "").strip()
         if not diff:
+            try:
+                head_proc = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=str(self.project_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                return "<git diff unavailable>"
+            if head_proc.returncode != 0:
+                return "<empty diff — project has no prior commits, files are newly created>"
             return "<empty diff — files are unchanged from HEAD>"
         if len(diff) > SOURCE_CONTEXT_MAX_BYTES:
             return diff[:SOURCE_CONTEXT_MAX_BYTES] + "\n... (truncated)"
@@ -833,14 +1310,16 @@ class RalphService:
 
     def _run_verification_pre_check(self, task_ref: TaskRef) -> Dict[str, Any]:
         specs = self._resolve_verification_specs(task_ref)
-        checks = [
-            self._run_verification_check(
-                name=spec.name,
-                command=command,
-                expected_exit_code=spec.expected_exit_code,
-            )
-            for spec, command in specs
-        ]
+        checks = []
+        for spec, command in specs:
+            kwargs: Dict[str, Any] = {
+                "name": spec.name,
+                "command": command,
+                "expected_exit_code": spec.expected_exit_code,
+            }
+            if spec.timeout is not None:
+                kwargs["timeout"] = spec.timeout
+            checks.append(self._run_verification_check(**kwargs))
         return {
             "status": "passed" if checks and all(
                 check.outcome == "passed" for check in checks
@@ -890,11 +1369,14 @@ class RalphService:
     ) -> tuple[List[VerificationCheck], str]:
         checks: List[VerificationCheck] = []
         for spec, command in specs:
-            check = self._run_verification_check(
-                name=spec.name,
-                command=command,
-                expected_exit_code=spec.expected_exit_code,
-            )
+            kwargs: Dict[str, Any] = {
+                "name": spec.name,
+                "command": command,
+                "expected_exit_code": spec.expected_exit_code,
+            }
+            if spec.timeout is not None:
+                kwargs["timeout"] = spec.timeout
+            check = self._run_verification_check(**kwargs)
             checks.append(check)
             if check.outcome != "passed" and spec.required:
                 return checks, check.outcome
@@ -922,18 +1404,23 @@ class RalphService:
         name: str = "verification",
         command: str,
         expected_exit_code: int = 0,
+        timeout: Optional[int] = None,
     ) -> VerificationCheck:
         """Execute a verification command and return the normalized check result."""
+        actual_timeout = timeout or VERIFICATION_COMMAND_TIMEOUT_SECONDS
         use_shell = _has_shell_operators(command)
         started_at = time.perf_counter()
         try:
             if use_shell:
+                shell_command = command
+                if "pipefail" not in command:
+                    shell_command = f"set -o pipefail; {command}"
                 proc = subprocess.run(
-                    ["bash", "-c", command],
+                    ["bash", "-c", shell_command],
                     cwd=str(self.project_root),
                     capture_output=True,
                     text=True,
-                    timeout=VERIFICATION_COMMAND_TIMEOUT_SECONDS,
+                    timeout=actual_timeout,
                 )
             else:
                 proc = subprocess.run(
@@ -941,14 +1428,14 @@ class RalphService:
                     cwd=str(self.project_root),
                     capture_output=True,
                     text=True,
-                    timeout=VERIFICATION_COMMAND_TIMEOUT_SECONDS,
+                    timeout=actual_timeout,
                 )
         except subprocess.TimeoutExpired:
             duration_ms = int((time.perf_counter() - started_at) * 1000)
             return VerificationCheck(
                 name=name,
                 outcome="timeout",
-                message=f"{name} timed out after {VERIFICATION_COMMAND_TIMEOUT_SECONDS}s",
+                message=f"{name} timed out after {actual_timeout}s",
                 duration_ms=duration_ms,
                 details={"command": command, "expected_exit_code": expected_exit_code},
             )
@@ -1190,3 +1677,33 @@ class RalphService:
 
     def _write_sets_conflict(self, left: List[str], right: List[str]) -> bool:
         return _write_sets_conflict_fn(left, right)
+
+    def verify_batch_e2e(
+        self,
+        command: str,
+        timeout: int = 300,
+    ) -> Dict[str, Any]:
+        """BP-5: Run batch-level E2E command and return structured result."""
+        import subprocess
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(self.project_root) if self.project_root else None,
+            )
+            return {
+                "success": result.returncode == 0,
+                "exit_code": result.returncode,
+                "stdout": result.stdout[-2000:] if result.stdout else "",
+                "stderr": result.stderr[-2000:] if result.stderr else "",
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "success": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"batch_e2e_command timed out after {timeout}s",
+            }

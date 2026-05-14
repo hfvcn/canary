@@ -36,6 +36,7 @@ class AssignmentCompletionMixin:
         self._owner._resuggest_ready_tasks(wf_id)
         self._notify_task_completed(task_id, agent_id, duration_seconds, changed_files, verification)
         self._run_completion_monitors(wf_id, task_id, agent_id, changed_files)
+        self._owner._check_workflow_completion_after_terminal(task_id)
         return success
 
     def _find_workflow_for_task(self, task_id: str) -> Optional[str]:

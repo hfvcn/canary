@@ -814,7 +814,7 @@ class TestAgentErrorHandling:
         assert "segfault" in result["reason"]
 
     def test_gemini_invalid_json(self) -> None:
-        """Agent handles invalid JSON from Gemini."""
+        """Agent handles invalid JSON from Gemini with graceful degradation."""
         task = _task("T1", verification_mode="agent")
 
         with patch(
@@ -826,10 +826,11 @@ class TestAgentErrorHandling:
         ):
             result = verify(task, changed_files=[], project_root=Path("/fake"))
 
-        assert result["outcome"] == "error"
+        assert result["outcome"] == "failed"
+        assert result.get("degraded") is True
 
     def test_gemini_missing_summary(self) -> None:
-        """Agent handles response missing required 'summary' field."""
+        """Agent handles response missing required 'summary' field with degradation."""
         task = _task("T1", verification_mode="agent")
 
         payload = {"passed": True, "checks": []}  # missing summary
@@ -843,8 +844,8 @@ class TestAgentErrorHandling:
         ):
             result = verify(task, changed_files=[], project_root=Path("/fake"))
 
-        assert result["outcome"] == "error"
-        assert "missing summary" in result["reason"].lower()
+        assert result["outcome"] == "failed"
+        assert result.get("degraded") is True
 
 
 # ===========================================================================

@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current Ralph schema and validation flow,DONE,Relevant models and structural validator call path identified,rg/sed context review,2026-05-13T21:29:13+08:00,0,
+2,Implement mock_tests schema and model propagation,DONE,Contract and Ralph model expose mock_tests and to_task_ref passes it,python -m pytest tests/test_mock_tests_schema.py -v,2026-05-13T21:29:13+08:00,0,
+3,Implement coverage validation rule and export/call it,DONE,Missing mock test name/verify command errors and ralph mode hint are emitted,python -m pytest tests/test_mock_tests_schema.py -v,2026-05-13T21:29:13+08:00,0,
+4,Add focused tests,DONE,Tests cover YAML parsing plus validation rules,python -m pytest tests/test_mock_tests_schema.py -v,2026-05-13T21:29:13+08:00,0,
+5,Run verification,DONE,Requested pytest command passes,python -m pytest tests/test_mock_tests_schema.py -v,2026-05-13T21:29:13+08:00,0,

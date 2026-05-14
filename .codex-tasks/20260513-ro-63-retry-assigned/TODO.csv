@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read implementation and test patterns,DONE,Relevant engine/test APIs identified,test -f src/cccc/kernel/workflow_state_engine.py,2026-05-13,0,
+2,Update retry precondition,DONE,ASSIGNED is an accepted retry status,python -m pytest tests/test_retry_assigned.py -v,2026-05-13,0,
+3,Add retry assigned tests,DONE,Specified success/rejection/ledger cases covered,python -m pytest tests/test_retry_assigned.py -v,2026-05-13,0,
+4,Run focused verification,DONE,Focused pytest command passes,python -m pytest tests/test_retry_assigned.py -v,2026-05-13,0,

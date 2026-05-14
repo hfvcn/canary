@@ -1,0 +1,438 @@
+# Plan: v31 — all remaining issues + blueprint advancement
+# Source: todo/问题清单-v5-ralph.md (RO-77/78/79) + 蓝图偏移 (BP-2/4/5)
+# Date: 2026-05-14
+# Scope: RO-77, RO-78, RO-79, BP-5, BP-4, BP-2
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - W_UNCLAIMED_TEST_FOR_SOURCE
+  - W_COVERS_PATHS_UNVERIFIED
+  - W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION
+  - W_FLOW_OWNER_NO_VERIFICATION
+  - W_COVERS_NOT_EXERCISED
+
+tasks:
+  # ── T1: RO-77 — workflow terminal state ledger events ──────────────
+  - id: T1
+    title: "RO-77: Emit workflow.completed / workflow.failed ledger events on terminal state"
+    role: leaf
+    claimed_paths:
+      - src/cccc/kernel/workflow_state_types.py
+      - src/cccc/kernel/workflow_state_engine.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+    depends_on: []
+    addresses: ["RO-77"]
+    goal_behavior: >
+      When all tasks in a workflow reach terminal state (completed/failed/archived)
+      and the orchestrator auto-completes, emit a ledger event so the completion
+      is auditable. Three changes: (1) Add KIND_WORKFLOW_COMPLETED and
+      KIND_WORKFLOW_FAILED constants to workflow_state_types.py. (2) Add a public
+      emit_workflow_terminal() method to WorkflowEngine that calls _append() with
+      kind=workflow.completed or workflow.failed and data containing workflow_id,
+      completed_count, failed_count, total, summary. (3) In workflow_orchestrator.py
+      complete_workflow(), call self.engine.emit_workflow_terminal() before calling
+      reporter.on_workflow_completed(). The event kind should be workflow.completed
+      if all tasks are completed, workflow.failed if any task failed/archived.
+    acceptance_criteria: >
+      1. KIND_WORKFLOW_COMPLETED = "workflow.completed" exists in workflow_state_types.py.
+      2. KIND_WORKFLOW_FAILED = "workflow.failed" exists in workflow_state_types.py.
+      3. WorkflowEngine.emit_workflow_terminal() emits ledger event with correct kind.
+      4. complete_workflow() calls emit_workflow_terminal() before reporter.
+      5. Ledger contains workflow.completed event after all-tasks-terminal.
+      6. Ledger contains workflow.failed event if any task is failed/archived.
+    verification:
+      level: unit
+      checks:
+        - name: test_ro77_ledger_events
+          command: "pytest tests/test_workflow_snapshot.py tests/test_state_consolidation.py -q -k 'terminal or complete'"
+          required: true
+      covers:
+        tasks: ["T1"]
+        paths:
+          - src/cccc/kernel/workflow_state_types.py
+          - src/cccc/kernel/workflow_state_engine.py
+          - src/cccc/daemon/foreman/workflow_orchestrator.py
+        flows: ["workflow_terminal_ledger", "terminal_without_ledger"]
+    provides:
+      - name: workflow_terminal_event
+        kind: runtime_capability
+        schema_hint: "WorkflowEngine.emit_workflow_terminal(workflow_id, task_counts, summary)"
+
+  # ── T2: RO-79 — verify_command Python syntax check in validate ─────
+  - id: T2
+    title: "RO-79: Enable check_verification_command_syntax in ralph validate"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/validator.py
+    depends_on: []
+    addresses: ["RO-79"]
+    goal_behavior: >
+      The function check_verification_command_syntax() already exists in
+      rules_advisory.py and performs ast.parse() on python -c payloads. It is
+      exported but NOT called in _collect_structural_issues(). Fix: (1) Add
+      check_verification_command_syntax to the import on line 35 of validator.py
+      (alongside check_inline_assertions). (2) Add issues.extend(
+      check_verification_command_syntax(plan)) in _collect_structural_issues(),
+      right after the check_inline_assertions call on line 211.
+    acceptance_criteria: >
+      1. check_verification_command_syntax is imported in validator.py.
+      2. check_verification_command_syntax(plan) is called in _collect_structural_issues.
+      3. A plan with verify_command containing invalid Python syntax triggers
+         W_VERIFICATION_COMMAND_INVALID_SYNTAX warning.
+      4. Valid Python verify_commands produce no new warnings.
+      5. Existing tests still pass (no regressions).
+    verification:
+      level: unit
+      checks:
+        - name: test_ro79_syntax_check
+          command: "pytest tests/ralph/test_ralph_standalone.py -q -k 'syntax or verification_command'"
+          required: true
+      covers:
+        tasks: ["T2"]
+        paths: ["src/cccc/ralph/validator.py"]
+
+  # ── T3: RO-78 — fix retry workflow_id mismatch ────────────────────
+  - id: T3
+    title: "RO-78: Resolve existing workflow_id in register_and_suggest_inner"
+    role: leaf
+    claimed_paths:
+      - src/cccc/daemon/foreman/assignment_batches.py
+    depends_on: []
+    addresses: ["RO-78"]
+    goal_behavior: >
+      register_and_suggest_inner() currently passes the caller-provided workflow_id
+      directly to engine.register_task(), causing ValueError("workflow_id mismatch")
+      when retrying tasks that already exist under a different workflow_id. Fix:
+      after ensure_tasks_are_new() and before _ensure_active_workflow(), call
+      resolve_workflow_id_for_tasks(task_refs, workflow_id, self._owner.engine.get_task)
+      to get the canonical workflow_id. Use the resolved id for all subsequent
+      calls (_ensure_active_workflow, _store_workflow_meta, register_task,
+      suggest_ready_batch). Import resolve_workflow_id_for_tasks from
+      .workflow_id_resolution (already used in process_batch_suggestion).
+    acceptance_criteria: >
+      1. Retrying a failed task with a new workflow_id resolves to the existing one.
+      2. Truly new tasks use the provided workflow_id unchanged.
+      3. Log message emitted when workflow_id is resolved to existing one.
+      4. MixedWorkflowIdsError raised if tasks belong to different workflows.
+      5. Existing register_and_suggest tests still pass.
+    verification:
+      level: unit
+      checks:
+        - name: test_ro78_retry_resolve
+          command: "pytest tests/test_ralph_ipc.py -q -k 'register_and_suggest or resubmit or workflow_id'"
+          required: true
+      covers:
+        tasks: ["T3"]
+        paths: ["src/cccc/daemon/foreman/assignment_batches.py"]
+        flows: ["retry_workflow_id_resolution", "retry_mismatch_crash"]
+
+  # ── T4: BP-5 schema — batch_e2e_command field in plan ──────────────
+  - id: T4
+    title: "BP-5 schema: Add batch_e2e_command to plan and batch completion gate"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/validation_rules/coverage.py
+    depends_on: []
+    addresses: ["BP-5"]
+    goal_behavior: >
+      Extend Plan model to support batch-level E2E verification. (1) Add
+      batch_e2e_command: Optional[str] field to Plan (top-level, not per-task).
+      This is a shell command that runs after each batch completes to verify
+      cross-task integration. (2) Add batch_e2e_timeout: int = 300 field.
+      (3) Add validation rule W_BATCH_E2E_NO_COMMAND: warning when plan has
+      >1 batch boundary (multiple DAG layers) but no batch_e2e_command — hints
+      that cross-task integration won't be verified between batches.
+    acceptance_criteria: >
+      1. Plan model accepts batch_e2e_command and batch_e2e_timeout fields.
+      2. Plans without batch_e2e_command continue to work (backward compatible).
+      3. W_BATCH_E2E_NO_COMMAND emitted for multi-batch plans without the field.
+      4. Single-batch plans do not trigger the warning.
+      5. batch_e2e_command accepts arbitrary shell commands.
+    verification:
+      level: unit
+      checks:
+        - name: test_bp5_schema
+          command: "pytest tests/ralph/test_ralph_standalone.py -q -k 'batch_e2e'"
+          required: true
+      covers:
+        tasks: ["T4"]
+        paths:
+          - src/cccc/ralph/models.py
+          - src/cccc/ralph/validation_rules/coverage.py
+    provides:
+      - name: batch_e2e_schema
+        kind: data_model
+        schema_hint: "Plan.batch_e2e_command: Optional[str], Plan.batch_e2e_timeout: int"
+
+  # ── T5: BP-5 gate — execute batch E2E after batch completion ───────
+  - id: T5
+    title: "BP-5 gate: Execute batch_e2e_command after batch completion"
+    role: integration
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+    depends_on: ["T1", "T4"]
+    addresses: ["BP-5"]
+    goal_behavior: >
+      After all tasks in a batch complete and pass individual verification,
+      run the plan's batch_e2e_command if present. (1) Add verify_batch_e2e()
+      method to RalphService that executes batch_e2e_command in a subprocess
+      with timeout. Returns success/failure + stdout/stderr. (2) In
+      workflow_orchestrator._check_batch_completion(), after detecting batch
+      completion, call verify_batch_e2e() if plan has batch_e2e_command.
+      (3) If batch E2E fails, emit a workflow.batch_e2e_failed ledger event
+      and log the failure. Do NOT block next batch dispatch — this is
+      informational in v31 (gating in future version). (4) If batch E2E
+      passes, emit workflow.batch_e2e_passed event and proceed to _resuggest.
+    acceptance_criteria: >
+      1. verify_batch_e2e() runs the command and returns structured result.
+      2. Batch completion triggers E2E check when batch_e2e_command is set.
+      3. E2E failure emits ledger event with stdout/stderr.
+      4. E2E success emits ledger event.
+      5. Missing batch_e2e_command means no E2E check (backward compatible).
+      6. Command timeout respected (kills subprocess after batch_e2e_timeout).
+    verification:
+      level: integration
+      checks:
+        - name: test_bp5_gate
+          command: "pytest tests/test_workflow_e2e_closure.py -q -k 'batch_e2e'"
+          required: true
+      covers:
+        tasks: ["T4", "T5"]
+        paths:
+          - src/cccc/daemon/foreman/ralph_service.py
+          - src/cccc/daemon/foreman/workflow_orchestrator.py
+        flows: ["batch_e2e_verification"]
+    consumes:
+      - name: workflow_terminal_event
+        from: T1
+      - name: batch_e2e_schema
+        from: T4
+
+  # ── T6: BP-4 — cross-task contract validation at batch boundary ────
+  - id: T6
+    title: "BP-4: Cross-task expected_output → expected_input contract validation"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/validation_rules/contracts.py
+      - src/cccc/ralph/validator.py
+    depends_on: ["T2"]
+    addresses: ["BP-4"]
+    goal_behavior: >
+      Add static validation rule that checks cross-task I/O contract alignment.
+      When task B depends_on task A, and both have expected_output (A) and
+      expected_input (B), validate that A's output keys are a superset of B's
+      input keys. (1) Add _check_cross_task_io_contracts() to contracts.py.
+      For each (A→B) dependency edge where both tasks have non-empty
+      expected_output/expected_input, check key overlap. Emit
+      W_CROSS_TASK_IO_MISMATCH warning if B expects keys not in A's output.
+      (2) Call it from _collect_structural_issues in validator.py.
+    acceptance_criteria: >
+      1. W_CROSS_TASK_IO_MISMATCH emitted when task B expects keys not produced by A.
+      2. No warning when expected_input/output are empty (backward compatible).
+      3. No warning when all expected keys are present.
+      4. Warning message includes the missing keys and task IDs.
+      5. Works with multi-dependency chains (B depends on A and C).
+    verification:
+      level: unit
+      checks:
+        - name: test_bp4_contract_validation
+          command: "pytest tests/ralph/test_ralph_standalone.py -q -k 'cross_task_io'"
+          required: true
+      covers:
+        tasks: ["T6"]
+        paths:
+          - src/cccc/ralph/validation_rules/contracts.py
+          - src/cccc/ralph/validator.py
+    provides:
+      - name: cross_task_io_validation
+        kind: runtime_capability
+        schema_hint: "_check_cross_task_io_contracts(plan) emits W_CROSS_TASK_IO_MISMATCH"
+
+  # ── T7: BP-4 — runtime contract check after task completion ────────
+  - id: T7
+    title: "BP-4: Runtime cross-task contract check after task verification passes"
+    role: integration
+    claimed_paths:
+      - src/cccc/daemon/foreman/verification_gate.py
+      - src/cccc/daemon/foreman/ralph_service.py
+    depends_on: ["T5", "T6"]
+    addresses: ["BP-4"]
+    goal_behavior: >
+      After a task passes verification, check whether its actual changed files
+      and outputs satisfy the expected_output contract for downstream tasks.
+      (1) Add check_output_contract() to RalphService that compares task's
+      verification result (changed_files, exit codes) against expected_output.
+      Returns list of contract violations. (2) In verification_gate
+      process_completed_event(), after verification passes, call
+      check_output_contract(). If violations found, emit
+      workflow.contract_violation ledger event (warning, not blocking).
+      (3) Add KIND_CONTRACT_VIOLATION to workflow_state_types.py.
+    acceptance_criteria: >
+      1. check_output_contract() returns empty list when contracts are satisfied.
+      2. Contract violations emitted as ledger events.
+      3. Violations do not block task completion (warning only in v31).
+      4. Missing expected_output means no contract check.
+      5. Changed files checked against expected_output.paths if present.
+    verification:
+      level: integration
+      checks:
+        - name: test_bp4_runtime_contract
+          command: "pytest tests/test_workflow_e2e_closure.py -q -k 'contract_violation'"
+          required: true
+      covers:
+        tasks: ["T6", "T7"]
+        paths:
+          - src/cccc/daemon/foreman/verification_gate.py
+          - src/cccc/daemon/foreman/ralph_service.py
+        flows: ["runtime_contract_check"]
+    consumes:
+      - name: cross_task_io_validation
+        from: T6
+
+  # ── T8: BP-2 — module decomposition schema + prompt guidance ───────
+  - id: T8
+    title: "BP-2: Add module decomposition fields to plan schema + prompt builder"
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/daemon/foreman/prompt_builder.py
+    depends_on: ["T4"]
+    addresses: ["BP-2"]
+    goal_behavior: >
+      Extend TaskSpec to support optional module decomposition. (1) Add ModuleSpec
+      model with fields: id (str), description (str), input_spec (Dict),
+      output_spec (Dict), internal_depends_on (List[str]). (2) Add
+      modules: Optional[List[ModuleSpec]] = None field to TaskSpec. When present,
+      it tells Foreman to decompose the task into these modules for the worker.
+      (3) In prompt_builder.py, when task.modules is non-empty, render a
+      "Module Decomposition" section listing each module with its I/O spec.
+      This is advisory — workers see the module structure as guidance, not
+      as strict enforcement. (4) Add validation: module ids must be unique
+      within a task, internal_depends_on must reference valid module ids.
+    acceptance_criteria: >
+      1. ModuleSpec model validates correctly.
+      2. TaskSpec accepts optional modules field.
+      3. Prompt builder renders module section when modules present.
+      4. Module section not rendered when modules is None/empty.
+      5. Duplicate module ids within a task trigger validation error.
+      6. Invalid internal_depends_on triggers validation error.
+    verification:
+      level: unit
+      checks:
+        - name: test_bp2_schema
+          command: "pytest tests/ralph/test_ralph_standalone.py -q -k 'module'"
+          required: true
+      covers:
+        tasks: ["T8"]
+        paths:
+          - src/cccc/ralph/models.py
+          - src/cccc/daemon/foreman/prompt_builder.py
+
+  # ── T-int: Integration test for all v31 features ───────────────────
+  - id: T-int
+    title: "Integration test: all v31 features end-to-end"
+    role: verification
+    claimed_paths:
+      - tests/test_v31_integration.py
+    depends_on: ["T1", "T2", "T3", "T5", "T7", "T8"]
+    addresses: ["RO-77", "RO-78", "RO-79", "BP-5", "BP-4", "BP-2"]
+    goal_behavior: >
+      Integration test covering all v31 features: (1) RO-77: create workflow,
+      complete all tasks, verify ledger contains workflow.completed event.
+      (2) RO-79: validate a plan with broken python -c verify_command, assert
+      W_VERIFICATION_COMMAND_INVALID_SYNTAX. (3) RO-78: register tasks under
+      workflow A, resubmit with workflow B, verify resolved to A. (4) BP-5:
+      plan with batch_e2e_command, verify batch completion triggers E2E.
+      (5) BP-4: plan with cross-task expected_input/output mismatch, verify
+      W_CROSS_TASK_IO_MISMATCH. (6) BP-2: plan with module decomposition,
+      verify prompt contains module section.
+    acceptance_criteria: >
+      1. All integration test scenarios pass.
+      2. No regressions in existing test suite.
+      3. Full pytest run: 0 failures.
+    verification:
+      level: integration
+      checks:
+        - name: test_v31_integration
+          command: "pytest tests/test_v31_integration.py -q"
+          required: true
+        - name: test_full_suite
+          command: "pytest --tb=short -q 2>&1 | tail -5"
+          required: true
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T-int"]
+        flows:
+          - workflow_terminal_ledger
+          - retry_workflow_id_resolution
+          - batch_e2e_verification
+          - runtime_contract_check
+
+# ── Critical flows ─────────────────────────────────────────────────────
+critical_flows:
+  - id: workflow_terminal_ledger
+    description: >
+      All tasks reach terminal → orchestrator auto-completes → ledger contains
+      workflow.completed or workflow.failed event with task counts.
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/kernel/workflow_state_engine.py
+    required_verification_level: unit
+
+  - id: batch_e2e_verification
+    description: >
+      Batch completes → batch_e2e_command executes → result emitted as ledger event
+      → next batch proceeds regardless (informational in v31).
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/ralph_service.py
+    required_verification_level: integration
+
+  - id: runtime_contract_check
+    description: >
+      Task verification passes → check_output_contract() validates changed files
+      against expected_output → contract violations emitted as warnings.
+    entrypoints:
+      - src/cccc/daemon/foreman/verification_gate.py
+      - src/cccc/daemon/foreman/ralph_service.py
+    required_verification_level: integration
+
+  - id: retry_workflow_id_resolution
+    description: >
+      Retry submit with different workflow_id → resolve_workflow_id_for_tasks
+      returns existing id → registration succeeds without mismatch error.
+    entrypoints:
+      - src/cccc/daemon/foreman/assignment_batches.py
+    required_verification_level: unit
+
+# ── Forbidden flows ────────────────────────────────────────────────────
+forbidden_flows:
+  - id: terminal_without_ledger
+    description: >
+      Workflow must NOT transition to terminal state without emitting a ledger
+      event. The RO-77 gap where only reporter was called is the forbidden pattern.
+    required_verification_level: unit
+
+  - id: retry_mismatch_crash
+    description: >
+      Retry submit must NOT raise ValueError workflow_id mismatch when resubmitting
+      tasks that already exist under a different workflow_id.
+    required_verification_level: unit
+
+# ── Required issues ────────────────────────────────────────────────────
+required_issues:
+  - "RO-77"
+  - "RO-78"
+  - "RO-79"
+  - "BP-5"
+  - "BP-4"
+  - "BP-2"
+
+# ── State ──────────────────────────────────────────────────────────────
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

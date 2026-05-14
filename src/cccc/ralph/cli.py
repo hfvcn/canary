@@ -31,7 +31,7 @@ from .agent import (
     RULE_DOCS,
 )
 from .core import suggest, verify
-from .models import Plan, ValidationIssue, ValidationReport
+from .models import Plan, ValidationIssue, ValidationReport, compute_issue_instance_id
 from .plan_io import load_plan, save_plan_state
 from .report_diff import (
     diff_validation_reports,
@@ -252,6 +252,18 @@ def main(argv: List[str] | None = None) -> int:
         help="Skip agent review of beyond-scope issues (pure static mode)",
     )
     p_val.add_argument(
+        "--compact",
+        action="store_true",
+        default=False,
+        help="Show only errors and high-confidence warnings (suppress hints and low-confidence warnings)",
+    )
+    p_val.add_argument(
+        "--show-schema",
+        action="store_true",
+        default=False,
+        help="Print the plan schema (all model fields with types and defaults) and exit",
+    )
+    p_val.add_argument(
         "--ledger",
         type=Path,
         default=None,
@@ -323,6 +335,11 @@ def main(argv: List[str] | None = None) -> int:
             _emit_error_envelope("sync-state", exc)
             return _EXIT_INTERNAL_ERROR
 
+    # ``validate --show-schema`` prints the plan schema and exits
+    if args.command == "validate" and getattr(args, "show_schema", False):
+        _cmd_show_schema()
+        return 0
+
     # ``validate --diff`` does not require a plan file
     if args.command == "validate" and getattr(args, "diff", None):
         try:
@@ -380,6 +397,60 @@ def main(argv: List[str] | None = None) -> int:
 # Commands
 # ---------------------------------------------------------------------------
 
+def _cmd_show_schema() -> None:
+    """Print the full plan schema with field names, types, and defaults."""
+    from .models import (
+        CriticalFlow, ForbiddenFlow, Plan, TaskSpec, Verification,
+        CheckSpec, Contract, SemanticBlock, SemanticTarget,
+        VerificationCovers, RegistrationInvariant, FindingRef,
+    )
+
+    def _format_model(name: str, model_cls: type) -> str:
+        from pydantic.fields import PydanticUndefined
+        lines = [f"\n# {name}"]
+        for field_name, field_info in model_cls.model_fields.items():
+            annotation = field_info.annotation
+            type_str = getattr(annotation, "__name__", str(annotation))
+            default = field_info.default
+            if default is PydanticUndefined and field_info.default_factory is not None:
+                default = field_info.default_factory()
+            elif default is PydanticUndefined:
+                default = "(required)"
+            lines.append(f"  {field_name}: {type_str}  # default: {default!r}")
+        return "\n".join(lines)
+
+    sections = [
+        "# Ralph Plan Schema Reference",
+        _format_model("Plan (top level)", Plan),
+        _format_model("TaskSpec (tasks[])", TaskSpec),
+        _format_model("Verification (tasks[].verification)", Verification),
+        _format_model("CheckSpec (tasks[].verification.checks[])", CheckSpec),
+        _format_model("VerificationCovers (tasks[].verification.covers)", VerificationCovers),
+        _format_model("Contract (tasks[].provides[] / consumes[])", Contract),
+        _format_model("SemanticBlock (tasks[].semantic)", SemanticBlock),
+        _format_model("SemanticTarget (tasks[].semantic.targets[])", SemanticTarget),
+        _format_model("CriticalFlow (critical_flows[])", CriticalFlow),
+        _format_model("ForbiddenFlow (forbidden_flows[])", ForbiddenFlow),
+        _format_model("FindingRef (finding_refs[])", FindingRef),
+        _format_model("RegistrationInvariant (registration_invariants[])", RegistrationInvariant),
+        "\n# Example CriticalFlow:",
+        '  - id: "user-login"',
+        '    description: "End-to-end login flow"',
+        '    entrypoints: ["src/auth/login.py"]',
+        '    required_verification_level: "integration"',
+        "\n# Example TaskSpec:",
+        '  - id: "T1"',
+        '    title: "Fix login handler"',
+        '    role: "leaf"',
+        '    depends_on: []',
+        '    claimed_paths: ["src/auth/login.py"]',
+        '    verification:',
+        '      level: "unit"',
+        '      command: "pytest tests/test_login.py -x"',
+    ]
+    print("\n".join(sections))
+
+
 def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
     project_root = _resolve_project_root(
         explicit_project_root=args.project_root,
@@ -410,9 +481,14 @@ def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
             no_agent=no_agent,
         )
     except Exception as exc:
-        report.valid = False
-        report.errors.append(_agent_review_failure_issue(exc))
+        issue = _agent_review_failure_issue(exc)
+        issue.issue_instance_id = compute_issue_instance_id(issue)
+        if issue.code in plan.suppress_codes:
+            report.hints.append(issue)
+        else:
+            report.warnings.append(issue)
         agent_suggestions = []
+    compact = getattr(args, "compact", False)
     _print_validate_result(
         report=report,
         args=args,
@@ -420,6 +496,7 @@ def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
         gate_name=gate_name,
         show_semantic=show_semantic,
         agent_suggestions=agent_suggestions,
+        compact=compact,
     )
 
     _write_validate_ledger_event_if_requested(
@@ -498,6 +575,17 @@ def _agent_checklist_path(*, project_root: Path, plan_path: Path | None) -> Path
     return plan_dir / "beyond_scope_checklist.yaml"
 
 
+def _compact_filter_issues(
+    issues: list[ValidationIssue],
+    severity: str,
+) -> list[ValidationIssue]:
+    if severity == "error":
+        return list(issues)
+    if severity == "warning":
+        return [i for i in issues if i.confidence == "exact"]
+    return []
+
+
 def _print_validate_result(
     *,
     report: ValidationReport,
@@ -506,6 +594,7 @@ def _print_validate_result(
     gate_name: str | None,
     show_semantic: bool,
     agent_suggestions: list[AgentSuggestion],
+    compact: bool = False,
 ) -> None:
     if args.format == "json":
         print(json.dumps(_validate_json_payload(
@@ -513,14 +602,22 @@ def _print_validate_result(
             project_root=project_root,
             gate_name=gate_name,
             agent_suggestions=agent_suggestions,
+            compact=compact,
         ), indent=2, ensure_ascii=False))
         return
     print(f"Resolved project root: {project_root}", file=sys.stderr)
     if gate_name:
         print(_format_gate_mode_banner(gate_name, project_root))
-    _print_validation_text(report, show_semantic=show_semantic)
+    _print_validation_text(report, show_semantic=show_semantic, compact=compact)
     if agent_suggestions:
-        _print_agent_suggestions(agent_suggestions)
+        if compact:
+            visible_ids = {i.issue_instance_id for i in report.errors}
+            visible_ids |= {i.issue_instance_id for i in report.warnings if i.confidence == "exact"}
+            filtered = [s for s in agent_suggestions if s.issue_id in visible_ids]
+            if filtered:
+                _print_agent_suggestions(filtered)
+        else:
+            _print_agent_suggestions(agent_suggestions)
 
 
 def _validate_json_payload(
@@ -529,9 +626,19 @@ def _validate_json_payload(
     project_root: Path,
     gate_name: str | None,
     agent_suggestions: list[AgentSuggestion],
+    compact: bool = False,
 ) -> Dict[str, Any]:
-    payload = report.model_dump()
-    payload["metadata"] = {"project_root": str(project_root)}
+    if compact:
+        filtered_errors = _compact_filter_issues(report.errors, "error")
+        filtered_warnings = _compact_filter_issues(report.warnings, "warning")
+        payload = report.model_dump()
+        payload["errors"] = [i.model_dump() for i in filtered_errors]
+        payload["warnings"] = [i.model_dump() for i in filtered_warnings]
+        payload["hints"] = []
+        payload["metadata"] = {"project_root": str(project_root), "compact": True}
+    else:
+        payload = report.model_dump()
+        payload["metadata"] = {"project_root": str(project_root)}
     if gate_name:
         payload["metadata"]["gate"] = gate_name
     if agent_suggestions:
@@ -1067,8 +1174,33 @@ def _print_validation_text(
     report: ValidationReport,
     *,
     show_semantic: bool = True,
+    compact: bool = False,
 ) -> None:
-    # Summary banner — always first non-blank line
+    if compact:
+        errors = _compact_filter_issues(report.errors, "error")
+        warnings = _compact_filter_issues(report.warnings, "warning")
+        total = len(errors) + len(warnings)
+
+        print(_format_compact_banner(report, len(errors), len(warnings)))
+
+        if total == 0:
+            print("Plan is valid. No actionable issues in compact view.")
+            return
+
+        print()
+        if errors:
+            print(f"Errors ({len(errors)}):")
+            for issue in errors:
+                _print_issue(issue)
+        if warnings:
+            print(f"\nWarnings ({len(warnings)}, exact-confidence only):")
+            for issue in warnings:
+                _print_issue(issue)
+
+        print(f"\ncompact: {len(errors)} error(s), {len(warnings)} warning(s) shown"
+              f" (full: {len(report.errors)} errors, {len(report.warnings)} warnings, {len(report.hints)} hints)")
+        return
+
     print(_format_summary_banner(report))
 
     total = len(report.errors) + len(report.warnings) + len(report.hints)
@@ -1094,12 +1226,28 @@ def _print_validation_text(
         for issue in report.hints:
             _print_issue(issue)
 
-    # Semantic Findings section (default-on, suppressed by --no-semantic)
     if show_semantic:
         _print_semantic_findings(report)
 
     status = "INVALID" if not report.valid else "valid (with warnings)"
     print(f"\n{status}: {len(report.errors)} error(s), {len(report.warnings)} warning(s), {len(report.hints)} hint(s)")
+
+
+def _format_compact_banner(
+    report: ValidationReport,
+    filtered_errors: int,
+    filtered_warnings: int,
+) -> str:
+    if filtered_errors > 0:
+        status = "FAILED"
+    elif filtered_warnings > 0:
+        status = "PASSED_WITH_WARNINGS"
+    else:
+        status = "PASSED"
+    return (
+        f"Validation (compact): {status} "
+        f"(errors={filtered_errors} warnings={filtered_warnings})"
+    )
 
 
 def _print_semantic_findings(report: ValidationReport) -> None:

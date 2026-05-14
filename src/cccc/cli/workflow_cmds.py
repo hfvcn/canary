@@ -210,6 +210,7 @@ def cmd_workflow_retry(args: argparse.Namespace) -> int:
         return 1
     group_id, project_root = _task_request_context(args)
     task_id = str(getattr(args, "task_id", "") or "").strip()
+    assign_agent_id = str(getattr(args, "assign", "") or "").strip()
     if not group_id:
         _print_json({"ok": False, "error": {"code": "missing_group_id", "message": "Missing --group or active group"}})
         return 2
@@ -217,7 +218,16 @@ def cmd_workflow_retry(args: argparse.Namespace) -> int:
         _print_json({"ok": False, "error": {"code": "missing_task_id", "message": "Missing task_id"}})
         return 2
     workflow_id = _resolve_task_workflow_id(group_id, project_root, task_id)
-    resp = call_daemon(_build_task_request("ralph_task_retry", group_id=group_id, project_root=project_root, task_id=task_id, workflow_id=workflow_id))
+    resp = call_daemon(
+        _build_task_request(
+            "ralph_task_retry",
+            group_id=group_id,
+            project_root=project_root,
+            task_id=task_id,
+            workflow_id=workflow_id,
+            assign_agent_id=assign_agent_id,
+        )
+    )
     _print_json(resp)
     return 0 if resp.get("ok") else 1
 def cmd_workflow_fail(args: argparse.Namespace) -> int:

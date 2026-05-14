@@ -61,6 +61,7 @@ from .workflow_monitor import (
     check_file_overstepping,
     check_path_deviation,
     check_completer_mismatch,
+    check_progress_stall,
     check_silent_agent,
     check_unauthorized_subagent,
     MonitorAlert,
@@ -76,13 +77,16 @@ TASK_STATUS_PENDING = "pending"
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_COMPLETED = "completed"
 TASK_STATUS_FAILED = "failed"
+_TERMINAL_STATUSES = {"completed", "archived"}
 TASK_STATUS_DEFERRED = _WTS.DEFERRED.value
 SINGLE_WRITER_REASON = "single_writer_active"
 EXTERNAL_PRESSURE_REASON = "external_workflow_pressure"
 CROSS_WORKFLOW_ACTIVE_WINDOW_SECONDS = 300
+CODEX_STALL_THRESHOLD_SECONDS = 1800
 ORCHESTRATOR_SERVICE_ACTOR = "service:workflow_orchestrator"
 COMPLETER_MISMATCH_BLOCKED_REASON = "completer_mismatch_blocked"
 AUTO_DISPATCH_BATCH_SUFFIX = "-auto"
+MANUAL_ASSIGN_BATCH_PREFIX = "manual-send"
 
 from .verification_gate import (  # noqa: E402
     auto_start_assigned_task_for_completion as _vg_auto_start,
@@ -385,6 +389,7 @@ class WorkflowOrchestrator:
         auto_process: Optional[bool] = None,
         auto_start_agents: Optional[bool] = None,
         auto_dispatch: Optional[bool] = None,
+        stall_auto_reassign: Optional[bool] = None,
         assignment_map: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         workflow = self._active_workflows.get(workflow_id)
@@ -397,6 +402,8 @@ class WorkflowOrchestrator:
                 workflow["auto_start_agents"] = auto_start_agents
             if auto_dispatch is not None:
                 workflow["auto_dispatch"] = auto_dispatch
+            if stall_auto_reassign is not None:
+                workflow["stall_auto_reassign"] = stall_auto_reassign
             if assignment_map is not None:
                 workflow["assignment_map"] = self._normalize_assignment_map(assignment_map)
             return workflow
@@ -409,6 +416,7 @@ class WorkflowOrchestrator:
             "auto_process": bool(auto_process) if auto_process is not None else False,
             "auto_start_agents": bool(auto_start_agents) if auto_start_agents is not None else True,
             "auto_dispatch": bool(auto_dispatch) if auto_dispatch is not None else False,
+            "stall_auto_reassign": bool(stall_auto_reassign) if stall_auto_reassign is not None else False,
             "assignment_map": self._normalize_assignment_map(assignment_map),
         }
         self._active_workflows[workflow_id] = workflow
@@ -450,6 +458,9 @@ class WorkflowOrchestrator:
         tracked.setdefault("model_id", "")
         tracked.setdefault("progress_pct", None)
         tracked.setdefault("last_heartbeat", None)
+        tracked.setdefault("progress_heartbeat_count", 0)
+        tracked.setdefault("progress_stall_since", None)
+        tracked.setdefault("progress_stall_pct", None)
         if status is not None:
             tracked["status"] = status
         else:
@@ -778,10 +789,18 @@ class WorkflowOrchestrator:
                 auto_start_agents=workflow_data.get("auto_start_agents", True),
             )
         if skipped_ids:
-            self._notify_foreman_task_update(
-                task_id=suggestion.suggestion_id,
-                new_status="tasks_ready",
-                summary=f"{len(skipped_ids)} downstream tasks need manual assignment: {skipped_ids}.",
+            skipped_suggestion = suggestion.model_copy(
+                update={
+                    "suggestion_id": f"{suggestion.suggestion_id}_auto_fallback",
+                    "tasks": [task for task in suggestion.tasks if task.id in skipped_ids],
+                    "assignments": {},
+                    "estimated_parallelism": len(skipped_ids),
+                }
+            )
+            self._log(f"[DAG gating] auto_dispatch fallback: dispatching unmapped tasks {skipped_ids}")
+            self.process_batch_suggestion(
+                skipped_suggestion,
+                auto_start_agents=workflow_data.get("auto_start_agents", True),
             )
         return True
 
@@ -879,6 +898,12 @@ class WorkflowOrchestrator:
         verification: Optional[VerificationResult] = None,
     ) -> bool:
         """Handle task failure event."""
+        for wdata in self._active_workflows.values():
+            td = wdata.get("tasks", {}).get(task_id)
+            if td and td.get("status") in _TERMINAL_STATUSES:
+                logger.warning("Ignoring failure for terminal task %s (status=%s)", task_id, td["status"])
+                return False
+
         # Update assignment status
         for wdata in self._active_workflows.values():
             td = wdata.get("tasks", {}).get(task_id)
@@ -904,7 +929,28 @@ class WorkflowOrchestrator:
                 verification=verification,
             ),
         )
+        self._check_workflow_completion_after_terminal(task_id)
         return success
+
+    def _check_workflow_completion_after_terminal(self, task_id: str) -> None:
+        """Check if all tasks are terminal and auto-complete the workflow."""
+        for workflow_id, wdata in self._active_workflows.items():
+            if task_id not in wdata.get("tasks", {}):
+                continue
+            tasks = wdata.get("tasks", {})
+            if not tasks:
+                return
+            terminal = {"completed", "failed", "archived"}
+            if all(t.get("status") in terminal for t in tasks.values()):
+                completed = sum(1 for t in tasks.values() if t.get("status") == "completed")
+                total = len(tasks)
+                summary = f"All {total} tasks finished ({completed} completed, {total - completed} failed/archived)"
+                self._log(f"[orchestrator] Workflow {workflow_id} auto-completing: {summary}")
+                try:
+                    self.complete_workflow(workflow_id, summary=summary)
+                except Exception:
+                    logger.debug("Auto-complete workflow failed", exc_info=True)
+            return
 
     def on_heartbeat(
         self,
@@ -918,7 +964,7 @@ class WorkflowOrchestrator:
         note = str(message or "").strip()
         self.engine.record_heartbeat(tid, progress, note)
         state = self.engine.get_task(tid)
-        heartbeat_at = time.time()
+        heartbeat_at = float(getattr(state, "last_heartbeat", None) or time.time())
         agent_name = ""
         for wdata in self._active_workflows.values():
             td = wdata.get("tasks", {}).get(tid)
@@ -927,7 +973,14 @@ class WorkflowOrchestrator:
             td["status"] = TASK_STATUS_RUNNING
             if progress is not None:
                 td["progress_pct"] = progress
-            td["last_heartbeat"] = getattr(state, "last_heartbeat", None) if state is not None else heartbeat_at
+            td["last_heartbeat"] = heartbeat_at
+            td.update(
+                self._build_progress_stall_fields(
+                    tracked=td,
+                    progress=progress,
+                    heartbeat_at=heartbeat_at,
+                )
+            )
             if note:
                 td["message"] = note
             agent_name = str(td.get("agent_name") or td.get("agent_id") or "").strip()
@@ -939,55 +992,259 @@ class WorkflowOrchestrator:
             agent_name=agent_name or str(getattr(state, "agent_id", "") or "").strip(),
         )
 
-    def check_stalled_tasks(self, threshold_seconds: int = 300) -> List[str]:
-        """Return running task IDs whose last heartbeat exceeds the threshold.
+    ASSIGNED_STALL_THRESHOLD_SECONDS = 120
 
-        Also emits MonitorAlert warnings via check_silent_agent for any
-        running task that has been silent longer than threshold_seconds.
-        Monitor calls are best-effort and never raise.
+    def check_stalled_tasks(self, threshold_seconds: int = 300) -> List[str]:
+        """Return task IDs whose last heartbeat exceeds the threshold.
+
+        Checks both RUNNING and ASSIGNED tasks. ASSIGNED tasks use a
+        shorter threshold (120s) since a worker that never starts is
+        likely stuck.
         """
         threshold = int(threshold_seconds)
         now = time.time()
         stalled: List[str] = []
         for task in self.engine.list_tasks(status=WorkflowTaskStatus.RUNNING):
-            last_beat = task.last_heartbeat
-            if last_beat is None:
-                # No heartbeat ever — use assigned_at or task start as reference
-                last_beat = getattr(task, "assigned_at", None) or getattr(task, "started_at", None)
-                if last_beat is None:
-                    continue  # cannot determine age — skip
-            if now - last_beat > threshold:
-                stalled.append(task.task.id)
-                self._notify_foreman_task_update(
-                    task_id=task.task.id,
-                    new_status="stalled",
-                    summary=self._build_stalled_summary(
-                        agent_id=task.agent_id,
-                        threshold_seconds=threshold,
-                        idle_seconds=int(now - last_beat),
-                        progress_pct=task.progress_pct,
-                    ),
+            self._check_running_task_stall(
+                task=task,
+                threshold=threshold,
+                now=now,
+                stalled=stalled,
+            )
+        for task in self.engine.list_tasks(status=WorkflowTaskStatus.ASSIGNED):
+            effective = self._effective_stall_threshold(task, threshold)
+            assigned_threshold = min(effective, self.ASSIGNED_STALL_THRESHOLD_SECONDS)
+            ref_time = getattr(task, "assigned_at", None)
+            if ref_time is None:
+                continue
+            if now - ref_time > assigned_threshold:
+                self._handle_stalled_task(
+                    task=task,
+                    threshold=assigned_threshold,
+                    now=now,
+                    last_beat=ref_time,
+                    stalled=stalled,
                 )
-                # Monitor alert (best-effort)
-                try:
-                    alert = check_silent_agent(
-                        task_id=task.task.id,
-                        assigned_at=last_beat,
-                        last_event_at=last_beat,
-                        now=now,
-                        timeout_s=float(threshold),
-                    )
-                    if alert:
-                        logger.warning(
-                            "Monitor alert: %s — %s",
-                            alert.alert_type,
-                            alert.message,
-                            extra={"evidence": alert.evidence},
-                        )
-                        self._record_violation(alert)
-                except Exception:
-                    logger.debug("Monitor check failed", exc_info=True)
         return stalled
+
+    @staticmethod
+    def _stalled_task_reference_time(task: TaskState) -> Optional[float]:
+        if task.last_heartbeat is not None:
+            return task.last_heartbeat
+        return getattr(task, "assigned_at", None) or getattr(task, "started_at", None)
+
+    @staticmethod
+    def _build_progress_stall_fields(
+        *,
+        tracked: Dict[str, Any],
+        progress: Optional[int],
+        heartbeat_at: float,
+    ) -> Dict[str, Any]:
+        if progress is None:
+            return {
+                "progress_heartbeat_count": 0,
+                "progress_stall_since": None,
+                "progress_stall_pct": None,
+            }
+        if tracked.get("progress_stall_pct") != progress:
+            return {
+                "progress_heartbeat_count": 1,
+                "progress_stall_since": heartbeat_at,
+                "progress_stall_pct": progress,
+            }
+        count = int(tracked.get("progress_heartbeat_count") or 0) + 1
+        return {
+            "progress_heartbeat_count": count,
+            "progress_stall_since": tracked.get("progress_stall_since") or heartbeat_at,
+            "progress_stall_pct": progress,
+        }
+
+    def _effective_stall_threshold(self, task: TaskState, default_threshold: int) -> int:
+        """Return an elevated stall threshold for slow runtimes like codex."""
+        agent_id = task.agent_id
+        if not agent_id:
+            return default_threshold
+        try:
+            actors = self._load_enabled_peer_actors()
+            for actor in actors:
+                if str(actor.get("id", "")) == agent_id:
+                    runtime = str(actor.get("runtime", "")).lower()
+                    if runtime == "codex":
+                        return max(default_threshold, CODEX_STALL_THRESHOLD_SECONDS)
+                    break
+        except Exception:
+            pass
+        return default_threshold
+
+    def _check_running_task_stall(
+        self,
+        *,
+        task: TaskState,
+        threshold: int,
+        now: float,
+        stalled: List[str],
+    ) -> None:
+        threshold = self._effective_stall_threshold(task, threshold)
+        last_beat = self._stalled_task_reference_time(task)
+        if last_beat is None:
+            return
+        if now - last_beat > threshold:
+            self._handle_stalled_task(
+                task=task,
+                threshold=threshold,
+                now=now,
+                last_beat=last_beat,
+                stalled=stalled,
+            )
+            return
+        alert = self._progress_stall_alert(
+            task=task,
+            now=now,
+            stagnant_timeout_s=float(threshold),
+        )
+        if alert is None:
+            return
+        self._handle_stalled_task(
+            task=task,
+            threshold=threshold,
+            now=now,
+            last_beat=task.last_heartbeat or last_beat,
+            stalled=stalled,
+            alert=alert,
+        )
+
+    def _progress_stall_alert(
+        self,
+        *,
+        task: TaskState,
+        now: float,
+        stagnant_timeout_s: float,
+    ) -> Optional[MonitorAlert]:
+        if task.last_heartbeat is None:
+            return None
+        tracked = self._tracked_task_data(task.task.id)
+        if not tracked:
+            return None
+        first_heartbeat_at = tracked.get("progress_stall_since")
+        if first_heartbeat_at is None:
+            return None
+        return check_progress_stall(
+            task_id=task.task.id,
+            heartbeat_count=int(tracked.get("progress_heartbeat_count") or 0),
+            last_progress_pct=task.progress_pct,
+            first_heartbeat_at=float(first_heartbeat_at),
+            last_heartbeat_at=float(task.last_heartbeat),
+            now=now,
+            stagnant_timeout_s=stagnant_timeout_s,
+        )
+
+    def _tracked_task_data(self, task_id: str) -> Optional[Dict[str, Any]]:
+        for wdata in self._active_workflows.values():
+            task_data = wdata.get("tasks", {}).get(task_id)
+            if task_data:
+                return task_data
+        return None
+
+    def _handle_stalled_task(
+        self,
+        *,
+        task: TaskState,
+        threshold: int,
+        now: float,
+        last_beat: float,
+        stalled: List[str],
+        alert: Optional[MonitorAlert] = None,
+    ) -> None:
+        task_id = task.task.id
+        stalled.append(task_id)
+        auto_reassign = self._stall_auto_reassign_enabled(task_id)
+        self._notify_foreman_task_update(
+            task_id=task_id,
+            new_status="stalled",
+            summary=self._stalled_task_summary(
+                task=task,
+                threshold=threshold,
+                now=now,
+                last_beat=last_beat,
+                auto_reassign=auto_reassign,
+                alert=alert,
+            ),
+        )
+        if alert is None:
+            self._record_stalled_monitor_violation(
+                task_id=task_id,
+                threshold=threshold,
+                now=now,
+                last_beat=last_beat,
+            )
+        else:
+            self._record_monitor_alert(alert)
+        if auto_reassign:
+            self.retry_task(task_id)
+            logger.info("auto-reassigned stalled task", extra={"task_id": task_id})
+
+    def _stall_auto_reassign_enabled(self, task_id: str) -> bool:
+        state = self.engine.get_task(task_id)
+        if state is None:
+            return False
+        meta = self.engine.get_workflow_meta(state.workflow_id)
+        return bool(meta and meta.stall_auto_reassign)
+
+    def _stalled_task_summary(
+        self,
+        *,
+        task: TaskState,
+        threshold: int,
+        now: float,
+        last_beat: float,
+        auto_reassign: bool,
+        alert: Optional[MonitorAlert] = None,
+    ) -> str:
+        if alert is None:
+            summary = self._build_stalled_summary(
+                agent_id=task.agent_id,
+                threshold_seconds=threshold,
+                idle_seconds=int(now - last_beat),
+                progress_pct=task.progress_pct,
+            )
+        else:
+            summary = alert.message
+        if not auto_reassign:
+            return summary
+        return f"{summary} auto-reassigned via stall_auto_reassign"
+
+    def _record_stalled_monitor_violation(
+        self,
+        *,
+        task_id: str,
+        threshold: int,
+        now: float,
+        last_beat: float,
+    ) -> None:
+        try:
+            alert = check_silent_agent(
+                task_id=task_id,
+                assigned_at=last_beat,
+                last_event_at=last_beat,
+                now=now,
+                timeout_s=float(threshold),
+            )
+            if alert:
+                self._record_monitor_alert(alert)
+        except Exception:
+            logger.debug("Monitor check failed", exc_info=True)
+
+    def _record_monitor_alert(self, alert: MonitorAlert) -> None:
+        try:
+            logger.warning(
+                "Monitor alert: %s — %s",
+                alert.alert_type,
+                alert.message,
+                extra={"evidence": alert.evidence},
+            )
+            self._record_violation(alert)
+        except Exception:
+            logger.debug("Monitor check failed", exc_info=True)
 
     def _notify_foreman_task_update(
         self,
@@ -1267,7 +1524,37 @@ class WorkflowOrchestrator:
         result["reason"] = "unknown_event_type"
         return result
 
-    def retry_task(self, task_id: str) -> Dict[str, Any]:
+    def _reset_retry_shadow_task(self, workflow_id: str, task_id: str) -> None:
+        workflow_data = self._active_workflows.get(workflow_id)
+        if workflow_data is None:
+            return
+        tracked = workflow_data.get("tasks", {}).get(task_id)
+        if not tracked:
+            return
+        tracked["status"] = TASK_STATUS_PENDING
+        tracked["agent_id"] = ""
+        tracked["agent_name"] = ""
+        tracked.pop("assignment_attempt_id", None)
+        tracked.pop("error_message", None)
+
+    def _persist_retry_assignment(self, workflow_id: str, task_id: str, assign_agent_id: str) -> str:
+        agent_id = str(assign_agent_id or "").strip()
+        if not agent_id:
+            return ""
+        workflow_data = self._active_workflows.get(workflow_id)
+        assignment_map = self._normalize_assignment_map(workflow_data.get("assignment_map") if workflow_data else None)
+        if not assignment_map:
+            meta = self.engine.get_workflow_meta(workflow_id)
+            assignment_map = self._normalize_assignment_map(meta.assignment_map if meta else None)
+        assignment_map[task_id] = agent_id
+        if workflow_data is not None:
+            workflow_data["assignment_map"] = dict(assignment_map)
+        set_workflow_meta = getattr(self.engine, "set_workflow_meta", None)
+        if callable(set_workflow_meta):
+            set_workflow_meta(workflow_id, assignment_map=assignment_map)
+        return agent_id
+
+    def retry_task(self, task_id: str, assign_agent_id: str = "") -> Dict[str, Any]:
         """Foreman decision: request a retry after verification failure."""
         tid = str(task_id or "").strip()
         if not tid:
@@ -1275,23 +1562,55 @@ class WorkflowOrchestrator:
         state = self.engine.get_task(tid)
         if state is None:
             raise ValueError(f"task not found: {tid}")
-
+        if state.status == WorkflowTaskStatus.ASSIGNED:
+            self.engine.report_worker_started(tid, state.agent_id or "unknown")
+            self.engine.fail_task(tid, "assigned but never started - retry requested")
+        elif state.status == WorkflowTaskStatus.RUNNING:
+            self.engine.fail_task(tid, "stalled - auto-retry requested")
         self.engine.retry_after_verification(tid)
-
-        # Keep progress API consistent: treat retry as returning to pending.
-        for wdata in self._active_workflows.values():
-            td = wdata.get("tasks", {}).get(tid)
-            if td:
-                td["status"] = TASK_STATUS_PENDING
-                td["agent_id"] = ""
-                td["agent_name"] = ""
-                td.pop("assignment_attempt_id", None)
-                td.pop("error_message", None)
-                break
-
+        self._reset_retry_shadow_task(state.workflow_id, tid)
+        assigned_to = self._persist_retry_assignment(state.workflow_id, tid, assign_agent_id)
         self._resuggest_ready_tasks(state.workflow_id)
+        return {
+            "accepted": True,
+            "task_id": tid,
+            "action": "retry_requested",
+            "workflow_id": state.workflow_id,
+            "assigned_to": assigned_to,
+        }
 
-        return {"accepted": True, "task_id": tid, "action": "retry_requested", "workflow_id": state.workflow_id}
+    def manual_assign_task(self, task_id: str, agent_id: str) -> None:
+        tid = str(task_id or "").strip()
+        aid = str(agent_id or "").strip()
+        if not tid:
+            raise ValueError("task_id is required")
+        if not aid:
+            raise ValueError("agent_id is required")
+        state = self.engine.get_task(tid)
+        if state is None:
+            raise ValueError(f"task not found: {tid}")
+        if state.status in (WorkflowTaskStatus.ASSIGNED, WorkflowTaskStatus.RUNNING):
+            return
+        if state.status not in (WorkflowTaskStatus.READY, WorkflowTaskStatus.PLANNED):
+            raise ValueError(f"task not assignable: {tid} status={state.status.value}")
+        batch_id = str(state.batch_id or "").strip()
+        if not batch_id or state.status == WorkflowTaskStatus.PLANNED:
+            batch_id = f"{MANUAL_ASSIGN_BATCH_PREFIX}-{tid}-{int(time.time())}"
+            self.engine.register_batch(batch_id, [tid])
+        self.engine.approve_batch(
+            batch_id,
+            [{
+                "task_id": tid,
+                "agent_id": aid,
+                "assigned_by": ORCHESTRATOR_SERVICE_ACTOR,
+                "claimed_paths": list(state.task.claimed_paths or []),
+            }],
+        )
+        self.engine.report_worker_started(tid, aid)
+        tracked = self._track_task_ref(state.workflow_id, state.task, status=TASK_STATUS_RUNNING)
+        tracked["agent_id"] = aid
+        tracked["agent_name"] = aid
+        self._task_to_agent[tid] = aid
 
     def block_task(self, task_id: str, reason: str) -> Dict[str, Any]:
         """Foreman decision: block a task with a human-readable reason.
@@ -1384,7 +1703,7 @@ class WorkflowOrchestrator:
         self._log(f"[orchestrator] Verification for {workflow_id}: {outcome}")
         self._record_external_verification(verification, task_id)
 
-        if outcome == "passed":
+        if outcome in {"passed", "force_passed"}:
             # Check if workflow should complete
             state = self.reporter.get_state()
             if state and state.current_batch_id:
@@ -1436,17 +1755,54 @@ class WorkflowOrchestrator:
         self.engine.record_verification_result(task_id, verification)
 
     def _check_batch_completion(self, workflow_id: Optional[str]) -> None:
-        """Check if current batch is complete."""
+        """Check if current batch is complete and run batch-level post-checks."""
         state = self.reporter.get_state()
         if not state:
             return
 
-        # Count tasks in current batch
         batch_tasks = state.get_current_batch_tasks()
         pending = sum(1 for t in batch_tasks if t.status.value in ("pending", "running"))
 
         if pending == 0 and batch_tasks:
+            completed = sum(1 for t in batch_tasks if t.status.value == "completed")
+            failed = sum(1 for t in batch_tasks if t.status.value == "failed")
+            self._log(
+                f"[orchestrator] Batch complete: {completed} passed, {failed} failed "
+                f"out of {len(batch_tasks)} tasks"
+            )
             self.reporter.on_batch_completed()
+            self._run_batch_e2e_if_configured(workflow_id)
+
+    def _run_batch_e2e_if_configured(self, workflow_id: Optional[str]) -> None:
+        """BP-5: Run batch E2E command in background thread (non-blocking)."""
+        if not workflow_id:
+            return
+        wf_meta = self.engine.get_workflow_meta(workflow_id)
+        if not wf_meta or not wf_meta.plan_path:
+            return
+        try:
+            from ...ralph.plan_io import load_plan
+            plan = load_plan(Path(wf_meta.plan_path))
+        except Exception:
+            return
+        batch_e2e_command = plan.batch_e2e_command
+        if not batch_e2e_command:
+            return
+        timeout = plan.batch_e2e_timeout or 300
+        import threading
+        def _run() -> None:
+            try:
+                result = self.ralph.verify_batch_e2e(batch_e2e_command, timeout=timeout)
+                if result.get("success"):
+                    self._log(f"[orchestrator] Batch E2E passed for workflow {workflow_id}")
+                else:
+                    self._log(
+                        f"[orchestrator] Batch E2E failed for workflow {workflow_id}: "
+                        f"exit={result.get('exit_code')} stderr={result.get('stderr', '')[:200]}"
+                    )
+            except Exception:
+                logger.debug("Batch E2E check failed", exc_info=True)
+        threading.Thread(target=_run, daemon=True).start()
 
     def complete_workflow(
         self,
@@ -1456,6 +1812,25 @@ class WorkflowOrchestrator:
     ) -> bool:
         """Mark workflow as complete."""
         self._log(f"[orchestrator] Completing workflow {workflow_id}")
+
+        # Collect counts BEFORE cleanup (Codex review: pop destroys the data)
+        wdata = self._active_workflows.get(workflow_id, {})
+        tasks = wdata.get("tasks", {})
+        completed_count = sum(1 for t in tasks.values() if t.get("status") == "completed")
+        failed_count = sum(1 for t in tasks.values() if t.get("status") in {"failed", "archived"})
+        total = len(tasks)
+
+        # Emit ledger event (RO-77)
+        try:
+            self.engine.emit_workflow_terminal(
+                workflow_id,
+                completed_count=completed_count,
+                failed_count=failed_count,
+                total=total,
+                summary=summary,
+            )
+        except Exception:
+            logger.debug("Failed to emit workflow terminal event", exc_info=True)
 
         # Clean up
         self._active_workflows.pop(workflow_id, None)

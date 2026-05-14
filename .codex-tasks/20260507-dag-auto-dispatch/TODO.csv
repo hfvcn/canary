@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect DAG auto-dispatch and IPC workflow submit flow,DONE,Target methods and state fields identified,,2026-05-07T00:00:00,0,Confirmed unmapped downstream tasks only notified and IPC register path dropped auto_process.
+2,Implement orchestrator and IPC propagation changes,DONE,Code updates applied in orchestrator and IPC handler,,2026-05-07T00:00:00,0,Added fallback dispatch for skipped_ids and persisted auto_process through submit paths.
+3,Add focused regression tests,DONE,tests/test_dag_auto_dispatch.py covers mapped, fallback, disabled, and IPC propagation cases,,2026-05-07T00:00:00,0,Added four targeted pytest cases in tests/test_dag_auto_dispatch.py.
+4,Run targeted pytest validation,DONE,python -m pytest tests/test_dag_auto_dispatch.py -v passes,python -m pytest tests/test_dag_auto_dispatch.py -v,2026-05-07T00:00:00,0,Passed with 4/4 tests.

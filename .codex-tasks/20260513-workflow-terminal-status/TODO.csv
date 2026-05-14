@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current progress code and test patterns,DONE,Relevant implementation and fixtures identified,rg -n "summarize_progress|ProgressStatus" tests src,2026-05-13T21:23:05+08:00,0,
+2,Implement dynamic workflow status,DONE,summarize_progress computes completed failed running idle states,python -m pytest tests/test_workflow_terminal_status.py -v,2026-05-13T21:23:05+08:00,0,
+3,Add terminal status unit tests,DONE,New test file covers requested six cases,python -m pytest tests/test_workflow_terminal_status.py -v,2026-05-13T21:23:05+08:00,0,
+4,Run focused validation,DONE,Focused pytest command passes,python -m pytest tests/test_workflow_terminal_status.py -v,2026-05-13T21:23:05+08:00,0,

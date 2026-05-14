@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect plan and existing verification flow,DONE,Relevant code paths and existing models are identified,rg "_verify_completion_with_agent|mock_tests|build_task_prompt" src tests,2026-05-13,0,
+2,Implement mock_tests execution and sanitized summaries,DONE,Agent-mode verification executes mock_tests and fails on any failed verify command,python -m pytest tests/test_mock_tests_execution.py -v,2026-05-13,0,
+3,Confirm worker prompt does not render mock_tests,DONE,Prompt builder excludes mock_tests by construction and documents boundary,python -m pytest tests/test_mock_tests_execution.py -v,2026-05-13,0,
+4,Add adversarial tests,DONE,Tests cover pass/fail/no-mock/prompt-leak/summary-sanitization/retry context,python -m pytest tests/test_mock_tests_execution.py -v,2026-05-13,0,
+5,Run final verification,DONE,Specified pytest command passes,python -m pytest tests/test_mock_tests_execution.py -v,2026-05-13,0,

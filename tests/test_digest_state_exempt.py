@@ -139,7 +139,7 @@ def test_task_definition_change_triggers_digest_veto(tmp_path: Path, monkeypatch
         lambda *a, **kw: _verification("T1", workflow_id),
     )
 
-    plan_path.write_text(_yaml_plan().replace("foo works", "foo still works"), encoding="utf-8")
+    plan_path.write_text(_yaml_plan().replace("src/foo.py", "src/bar.py"), encoding="utf-8")
 
     assert WorkflowOrchestrator._compute_structural_digest(plan_path) != digest
 
@@ -177,12 +177,24 @@ def test_structural_digest_ignores_state_section_only(tmp_path: Path) -> None:
     assert compute_structural_plan_digest(plan_a) == compute_structural_plan_digest(plan_b)
 
 
-def test_structural_digest_changes_when_task_definitions_change(tmp_path: Path) -> None:
+def test_verification_change_does_not_alter_structural_digest(tmp_path: Path) -> None:
+    """RO-61: verification is operational — changing it must NOT affect digest."""
     plan_a = tmp_path / "plan-a.json"
     plan_b = tmp_path / "plan-b.json"
     plan_a.write_text(_json_plan(), encoding="utf-8")
     changed = json.loads(_json_plan())
     changed["tasks"][0]["verification"]["command"] = "pytest tests/test_bar.py -q"
+    plan_b.write_text(json.dumps(changed, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    assert compute_structural_plan_digest(plan_a) == compute_structural_plan_digest(plan_b)
+
+
+def test_structural_field_change_alters_digest(tmp_path: Path) -> None:
+    plan_a = tmp_path / "plan-a.json"
+    plan_b = tmp_path / "plan-b.json"
+    plan_a.write_text(_json_plan(), encoding="utf-8")
+    changed = json.loads(_json_plan())
+    changed["tasks"][0]["claimed_paths"] = ["src/bar.py"]
     plan_b.write_text(json.dumps(changed, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     assert compute_structural_plan_digest(plan_a) != compute_structural_plan_digest(plan_b)

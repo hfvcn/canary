@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate current resubmit implementation,DONE,Plan and affected code/test paths are identified,"rg ""process_batch_suggestion|register_and_suggest_inner|resolve_workflow_id"" src tests",2026-05-13T19:16:34+08:00,0,fast-context call was cancelled by environment; precise rg used
+2,Implement existing-task rejection guard,DONE,process_batch_suggestion and register_and_suggest_inner reject existing task ids before registration,python -m py_compile src/cccc/daemon/foreman/assignment_batches.py src/cccc/daemon/foreman/workflow_id_resolution.py,2026-05-13T19:20:52+08:00,0,
+3,Update and add rejection tests,DONE,Tests cover existing new and mixed task id submit semantics,python -m pytest tests/test_resubmit_reject.py -v,2026-05-13T19:20:52+08:00,0,
+4,Run final verification,DONE,Requested targeted test passes within 60 seconds,python -m pytest tests/test_resubmit_reject.py -v,2026-05-13T19:20:52+08:00,0,

@@ -727,6 +727,91 @@ def _check_issue_coverage(plan: Plan) -> List[ValidationIssue]:
     return issues
 
 
+def _check_task_addresses_disjoint(plan: Plan) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+
+    # Check 1: Single task with mixed-prefix addresses
+    for t in plan.tasks:
+        if len(t.addresses) <= 1:
+            continue
+        prefixes: Set[str] = set()
+        for addr in t.addresses:
+            # Extract prefix: everything before the first dash+digit
+            m = re.match(r"^([A-Za-z]+(?:-[A-Za-z]+)*)", addr)
+            if m:
+                prefixes.add(m.group(1))
+        if len(prefixes) > 1:
+            groups: Dict[str, List[str]] = {}
+            for addr in t.addresses:
+                m = re.match(r"^([A-Za-z]+(?:-[A-Za-z]+)*)", addr)
+                prefix = m.group(1) if m else "unknown"
+                groups.setdefault(prefix, []).append(addr)
+            issues.append(ValidationIssue(
+                code="W_TASK_ADDRESSES_DISJOINT",
+                severity="warning",
+                message=(
+                    f"task '{t.id}' addresses issues from different domains: "
+                    f"{', '.join(sorted(prefixes))}"
+                ),
+                task_ids=[t.id],
+                evidence={"task_id": t.id, "address_groups": groups},
+            ))
+
+    # Check 2: Same issue addressed by multiple tasks
+    issue_to_tasks: Dict[str, List[str]] = {}
+    for t in plan.tasks:
+        for addr in t.addresses:
+            issue_to_tasks.setdefault(addr, []).append(t.id)
+    for issue_id, task_ids in issue_to_tasks.items():
+        if len(task_ids) > 1:
+            issues.append(ValidationIssue(
+                code="H_DUPLICATE_ISSUE_ADDRESS",
+                severity="hint",
+                message=(
+                    f"issue '{issue_id}' is addressed by multiple tasks: "
+                    f"{', '.join(sorted(task_ids))}"
+                ),
+                task_ids=sorted(task_ids),
+                evidence={"issue_id": issue_id, "addressing_tasks": sorted(task_ids)},
+            ))
+
+    return issues
+
+
+def _check_mock_tests_completeness(plan: Plan) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    for t in plan.tasks:
+        if not t.verification or not getattr(t.verification, "mock_tests", None):
+            continue
+        mode = getattr(t, "verification_mode", "ralph") or "ralph"
+        if mode == "ralph":
+            issues.append(ValidationIssue(
+                code="H_MOCK_TESTS_ON_RALPH_MODE",
+                severity="hint",
+                message=(
+                    f"task '{t.id}' has mock_tests but verification_mode='ralph'; "
+                    "mock_tests only run in agent/challenge mode"
+                ),
+                task_ids=[t.id],
+            ))
+        for mt in t.verification.mock_tests:
+            if not mt.name.strip():
+                issues.append(ValidationIssue(
+                    code="E_MOCK_TEST_MISSING_NAME",
+                    severity="error",
+                    message=f"task '{t.id}' has a mock_test with empty name",
+                    task_ids=[t.id],
+                ))
+            if not mt.verify_command.strip():
+                issues.append(ValidationIssue(
+                    code="E_MOCK_TEST_MISSING_VERIFY_COMMAND",
+                    severity="error",
+                    message=f"task '{t.id}' mock_test '{mt.name}' has no verify_command",
+                    task_ids=[t.id],
+                ))
+    return issues
+
+
 # ---------------------------------------------------------------------------
 # 11. Forbidden flows — anti-bypass declarations
 # ---------------------------------------------------------------------------
@@ -1160,3 +1245,44 @@ def _extract_paths_from_command(command: str) -> List[str]:
         if has_slash or has_ext:
             paths.append(token)
     return paths
+
+
+def _check_batch_e2e_command(plan: "Plan") -> List["ValidationIssue"]:
+    """W_BATCH_E2E_NO_COMMAND: multi-batch plans without batch_e2e_command."""
+    from ..models import Plan, ValidationIssue
+
+    if plan.batch_e2e_command:
+        return []
+
+    dep_layers = _count_dag_layers(plan)
+    if dep_layers <= 1:
+        return []
+
+    return [ValidationIssue(
+        code="W_BATCH_E2E_NO_COMMAND",
+        severity="warning",
+        message=(
+            f"plan has {dep_layers} dependency layers but no batch_e2e_command — "
+            "cross-task integration won't be verified between batches"
+        ),
+        evidence={"dag_layers": dep_layers},
+    )]
+
+
+def _count_dag_layers(plan: "Plan") -> int:
+    """Count the number of DAG layers (batch boundaries) in the plan."""
+    task_map = {t.id: t for t in plan.tasks}
+    completed = set(plan.state.completed_task_ids) if plan.state else set()
+    layers = 0
+    remaining = {t.id for t in plan.tasks} - completed
+    while remaining:
+        ready = {
+            tid for tid in remaining
+            if all(d in completed or d not in remaining for d in task_map[tid].depends_on)
+        }
+        if not ready:
+            break
+        layers += 1
+        remaining -= ready
+        completed |= ready
+    return layers

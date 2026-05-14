@@ -208,12 +208,15 @@ def verify(
     checks: List[Dict[str, Any]] = []
     outcome = "passed"
     for spec in specs:
-        check = _run_check(
-            name=spec["name"],
-            command=spec["command"],
-            project_root=project_root,
-            expected_exit_code=spec["expected_exit_code"],
-        )
+        kwargs: Dict[str, Any] = {
+            "name": spec["name"],
+            "command": spec["command"],
+            "project_root": project_root,
+            "expected_exit_code": spec["expected_exit_code"],
+        }
+        if spec["timeout"] is not None:
+            kwargs["timeout"] = spec["timeout"]
+        check = _run_check(**kwargs)
         checks.append(check)
         if check["outcome"] != "passed" and spec["required"]:
             outcome = check["outcome"]
@@ -262,6 +265,27 @@ def _verify_with_agent(
 
 _SOURCE_CONTEXT_MAX_BYTES = 50_000
 _SOURCE_FILE_MAX_BYTES = 16_000
+_SOURCE_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx"}
+
+
+def _source_files_in_directory(directory: Path) -> List[Path]:
+    return [
+        path
+        for path in sorted(directory.rglob("*"), key=lambda item: str(item))
+        if path.is_file() and path.suffix in _SOURCE_EXTENSIONS
+    ]
+
+
+def _trim_source_text(text: str, total: int) -> str:
+    if len(text) > _SOURCE_FILE_MAX_BYTES:
+        text = (
+            text[:_SOURCE_FILE_MAX_BYTES]
+            + f"\n... (truncated at {_SOURCE_FILE_MAX_BYTES} bytes)"
+        )
+    remaining = _SOURCE_CONTEXT_MAX_BYTES - total
+    if len(text) > remaining:
+        text = text[:remaining] + "\n... (truncated)"
+    return text
 
 
 def _read_claimed_paths(
@@ -274,13 +298,30 @@ def _read_claimed_paths(
         if total >= _SOURCE_CONTEXT_MAX_BYTES:
             break
         full = project_root / rel_path
+        if full.is_dir():
+            source_files = _source_files_in_directory(full)
+            if not source_files:
+                result[rel_path] = "<file not found>"
+                continue
+            for source_file in source_files:
+                if total >= _SOURCE_CONTEXT_MAX_BYTES:
+                    break
+                rel_source = source_file.relative_to(project_root).as_posix()
+                try:
+                    text = source_file.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    result[rel_source] = "<read error>"
+                    continue
+                text = _trim_source_text(text, total)
+                result[rel_source] = text
+                total += len(text)
+            continue
         if not full.is_file():
             result[rel_path] = "<file not found>"
             continue
         try:
             text = full.read_text(encoding="utf-8", errors="replace")
-            if len(text) > _SOURCE_FILE_MAX_BYTES:
-                text = text[:_SOURCE_FILE_MAX_BYTES] + f"\n... (truncated at {_SOURCE_FILE_MAX_BYTES} bytes)"
+            text = _trim_source_text(text, total)
             result[rel_path] = text
             total += len(text)
         except Exception:
@@ -304,6 +345,15 @@ def _git_diff_for_files(
         )
         diff = (proc.stdout or "").strip()
         if not diff:
+            head_proc = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(project_root),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if head_proc.returncode != 0:
+                return "<empty diff — project has no prior commits, files are newly created>"
             return "<empty diff — files are unchanged from HEAD>"
         if len(diff) > _SOURCE_CONTEXT_MAX_BYTES:
             diff = diff[:_SOURCE_CONTEXT_MAX_BYTES] + "\n... (truncated)"
@@ -324,12 +374,15 @@ def _run_verification_pre_check(
         return {"status": "skipped", "reason": reason}
     results: List[Dict[str, Any]] = []
     for spec in specs:
-        check = _run_check(
-            name=spec["name"],
-            command=spec["command"],
-            project_root=project_root,
-            expected_exit_code=spec["expected_exit_code"],
-        )
+        kwargs: Dict[str, Any] = {
+            "name": spec["name"],
+            "command": spec["command"],
+            "project_root": project_root,
+            "expected_exit_code": spec["expected_exit_code"],
+        }
+        if spec["timeout"] is not None:
+            kwargs["timeout"] = spec["timeout"]
+        check = _run_check(**kwargs)
         results.append(check)
     all_passed = all(c["outcome"] == "passed" for c in results)
     return {
@@ -359,6 +412,7 @@ def _resolve_verification_specs(task: TaskSpec) -> tuple[List[Dict[str, Any]], s
                 "command": check.command,
                 "required": check.required,
                 "expected_exit_code": check.expected_exit_code,
+                "timeout": check.timeout,
             }
             for check in v.checks
         ], None
@@ -373,6 +427,7 @@ def _resolve_verification_specs(task: TaskSpec) -> tuple[List[Dict[str, Any]], s
             "command": cmd_text,
             "required": True,
             "expected_exit_code": v.expected_exit_code,
+            "timeout": None,
         }
     ], None
 
@@ -391,8 +446,10 @@ def _run_check(
     command: str,
     project_root: Path,
     expected_exit_code: int = 0,
+    timeout: Optional[int] = None,
 ) -> Dict[str, Any]:
     start = time.monotonic()
+    actual_timeout = timeout or _VERIFY_TIMEOUT
     command_text = command.strip()
     if not command_text:
         return {
@@ -407,7 +464,7 @@ def _run_check(
             cwd=str(project_root),
             capture_output=True,
             text=True,
-            timeout=_VERIFY_TIMEOUT,
+            timeout=actual_timeout,
             shell=True,
         )
         duration_ms = int((time.monotonic() - start) * 1000)

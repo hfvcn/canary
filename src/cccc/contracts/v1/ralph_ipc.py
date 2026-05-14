@@ -47,6 +47,7 @@ VerificationOutcome = Literal[
     "skipped_blocked",  # Verification was skipped and completion is blocked
     "timeout",        # Verification timed out
     "agent_pending",  # Awaiting external agent verification (RA-3)
+    "force_passed",   # Force-complete override — verification skipped, task completed
 ]
 
 
@@ -57,6 +58,18 @@ class VerificationCheckSpec(BaseModel):
     command: str
     required: bool = True
     expected_exit_code: int = 0
+    timeout: Optional[int] = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class MockTestCase(BaseModel):
+    name: str
+    input: Dict[str, Any] = Field(default_factory=dict)
+    expected_output: Dict[str, Any] = Field(default_factory=dict)
+    setup_command: str = ""
+    verify_command: str = ""
+    description: str = ""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -71,6 +84,8 @@ class VerificationSpec(BaseModel):
     covers_paths: List[str] = Field(default_factory=list)
     covers_flows: List[str] = Field(default_factory=list)
     expected_exit_code: int = 0
+    cleanup_patterns: Optional[List[str]] = None
+    mock_tests: Optional[List[MockTestCase]] = None
 
 
 class TaskRef(BaseModel):
@@ -99,6 +114,9 @@ class TaskRef(BaseModel):
     provides: List[Dict[str, Any]] = Field(default_factory=list)
     consumes: List[Dict[str, Any]] = Field(default_factory=list)
     addresses: List[str] = Field(default_factory=list)
+
+    # BP-2: module decomposition (advisory, rendered in worker prompt)
+    modules: Optional[List[Dict[str, Any]]] = None
 
     model_config = ConfigDict(extra="ignore")
 

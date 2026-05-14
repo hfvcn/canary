@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read plan and relevant code,DONE,Plan goal and current branch logic understood,test -f plans/fix-v5-v27-remaining.yaml,2026-05-13T00:00:00+08:00,0,
+2,Implement mismatch-enforced verification,DONE,Force complete skips only when no mismatch,python -m pytest tests/test_completer_mismatch_verification.py -v,2026-05-13T00:00:00+08:00,0,
+3,Add completer mismatch tests,DONE,Four requested scenarios are covered,python -m pytest tests/test_completer_mismatch_verification.py -v,2026-05-13T00:00:00+08:00,0,
+4,Run targeted verification,DONE,Targeted pytest passes,python -m pytest tests/test_completer_mismatch_verification.py -v,2026-05-13T00:00:00+08:00,0,

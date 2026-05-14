@@ -136,6 +136,8 @@ class TestRalphStateTTL:
 
         original = {k: dict(v) for k, v in _RALPH_STATE.items()}
         try:
+            for bucket in _RALPH_STATE:
+                _RALPH_STATE[bucket] = {}
             _RALPH_STATE["pending_restarts"]["medium-1"] = {
                 "_created_at": time.time() - 120,  # 2 min ago
                 "workflow_id": "wf-medium",

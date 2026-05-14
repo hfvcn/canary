@@ -1,0 +1,446 @@
+# Plan: v28 残留问题 + 蓝图最小可行路径
+#
+# 来源：todo/问题清单-v5-ralph.md § 一/二/三
+# 工作流：findings.md § 〇 经验证的工作流程
+#
+# 已确认关闭（代码+测试已实现，本轮标记）：
+#   RO-57: re-submit reject (test_resubmit_reject.py + test_resubmit_workflow_id.py: 12 passed)
+#   RO-65: challenge degradation (test_challenge_degradation.py: 4 passed)
+#   RO-67: --compact flag (test_compact_validate.py: 14 passed)
+#   RO-68: cleanup_patterns (test_verification_cleanup.py: 5 passed)
+#   RO-71: completer_mismatch verification enforced (test_completer_mismatch_verification.py: 4 passed)
+#
+# 根因分析：
+#   RO-74: prompt_builder.py build_task_prompt() 中有 COMPLETION PROTOCOL 段落
+#     （line 457-468），但只在中段出现一次。Codex 等 worker 容易忽略。
+#     修复：在 prompt 开头增加 completion reminder（mandatory），末尾再加一次。
+#   RO-75: progress_report.py summarize_progress() line 199 硬编码
+#     "status": "running"。当 total > 0 且 completed == total 时应为
+#     "completed"；当 failed > 0 且 running + pending == 0 时应为 "failed"。
+#   RL-7: 多个不相关 issue 合并为一个 task 时 Ralph 不报警。新增
+#     W_TASK_ADDRESSES_DISJOINT 规则：检查 task.addresses 中的 issue 是否
+#     属于同一功能域（至少共享前缀或 claimed_paths 交集）。
+#   BP-1: plan.yaml 缺少 mock_tests 字段，verification agent 模式仅做
+#     Gemini 被动代码审查而非执行预设测试用例。最小可行路径：
+#     (a) VerificationSpec 新增 mock_tests 字段
+#     (b) verify gate agent 模式执行 mock_tests
+#     (c) build_task_prompt 不透传 mock_tests 给 worker（对抗性）
+#
+# 设计原则：
+#   #2  按功能切片拆分，不按文件拆
+#   #9  先跑通一条路径再扩展
+#   #11 verification 必须真正跑命令
+#   #13 结构校验 + 代码审查互补
+#
+# 批次预期（Codex 审查修正后）：
+#   Batch 1: T1, T2, T3 — 独立修复（不同文件，无路径冲突）
+#   Batch 2: T4 — BP-1 schema（depends T3，共享 coverage.py）
+#   Batch 3: T5 — BP-1 gate（depends [T1, T4]，共享 prompt_builder.py + coverage.py）
+#   Batch 4: T-int — 集成验证
+#   Batch 5: T6 — 能力指南
+#
+# Codex 审查修正（2026-05-13）：
+#   - T4 增加 depends_on: [T3]（共享 coverage.py）
+#   - T5 增加 depends_on: [T1, T4]（共享 prompt_builder.py）
+#   - T1 验收改为命名 section 存在+相对位置，不用 exact count
+#   - T5 增加 mock_tests failure summary 脱敏验收
+#   - T-int 命令补全量 pytest + 自身文件
+#   - T3 补 duplicate issue hint 验收
+#   - T4 goal 补 ralph-mode mock_tests hint 描述
+
+schema_version: "1.0.0"
+
+required_issues:
+  - "RO-74"
+  - "RO-75"
+  - "RL-7"
+  - "BP-1"
+
+semantic_mode: "off"
+auto_infer: false
+
+state:
+  completed_task_ids:
+    - T1
+    - T2
+    - T3
+    - T4
+    - T5
+    - T-int
+    - T6
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_AGENT_REVIEW_FAILED
+  - W_AGENT_REVIEW_SKIPPED
+  - W_UNCLAIMED_TEST_FOR_SOURCE
+  - W_VERIFICATION_BEHAVIOR_MISMATCH
+  - W_VERIFICATION_TARGET_MISSING
+  - W_NO_FAILURE_PATH
+  - W_PLAN_SCOPE_UNUSED
+  - W_VERIFICATION_CROSS_SCOPE
+  - W_TEST_COVERAGE_GAP
+  - W_CROSS_BOUNDARY_WITHOUT_GLUE
+
+tasks:
+  # ---------------------------------------------------------------
+  # T1: RO-74 — 增强 completion protocol 可见性
+  # ---------------------------------------------------------------
+  - id: T1
+    title: "auto-dispatch prompt 首尾重复 cccc task complete 指令"
+    addresses:
+      - "RO-74"
+    goal_behavior: |
+      修改 src/cccc/daemon/foreman/prompt_builder.py 的 build_task_prompt()：
+
+      1. 在 task_id section（line 349-353）之后，立即追加一个 mandatory section
+         "completion_reminder_top"，文本为：
+         "⚠️ IMPORTANT: When done, you MUST run: cccc task complete {task.id} --changed-file <path> --evidence \"summary\""
+
+      2. 在现有的 completion_protocol section（line 464-468）之后、context_store
+         section 之前，追加一个 mandatory section "completion_reminder_bottom"，
+         文本为：
+         "REMINDER: Do not forget to run `cccc task complete {task.id}` when finished. This is required to trigger verification."
+
+      两个新 section 都设 mandatory=True，确保不被 budget truncation 截断。
+      现有的 completion_protocol section 保持不变。
+    acceptance_criteria: |
+      1. build_task_prompt() 输出包含命名 section "completion_reminder_top"、
+         "completion_protocol"、"completion_reminder_bottom" 三个
+      2. "completion_reminder_top" 出现在 "task_id" 之后、"goal_behavior" 之前
+      3. "completion_reminder_bottom" 是最后一个 mandatory section（optional sections
+         如 context_store 可在其后，但所有 mandatory 中它排最末）
+      4. 单测验证三个命名 section 存在及相对位置顺序
+      5. _RUNTIME_HINTS 中已有的 "cccc task complete" 不计入（那是独立渠道）
+    claimed_paths:
+      - src/cccc/daemon/foreman/prompt_builder.py
+      - tests/test_prompt_completion_reminder.py
+    verification:
+      level: unit
+      checks:
+        - name: prompt-completion-reminder-test
+          command: "python -m pytest tests/test_prompt_completion_reminder.py -v"
+    provides:
+      - name: completion_reminder_triple
+        kind: runtime_capability
+
+  # ---------------------------------------------------------------
+  # T2: RO-75 — workflow 全部完成后自动转终态
+  # ---------------------------------------------------------------
+  - id: T2
+    title: "workflow progress 终态检测"
+    addresses:
+      - "RO-75"
+    goal_behavior: |
+      修改 src/cccc/daemon/foreman/progress_report.py 的 summarize_progress()
+      方法（line 198 附近）：
+
+      将硬编码的 "status": "running" 替换为动态计算：
+
+      ```python
+      total = len(self._state.tasks)
+      completed = self._state.count_by_status(ProgressStatus.COMPLETED)
+      failed = self._state.count_by_status(ProgressStatus.FAILED)
+      running = self._state.count_by_status(ProgressStatus.RUNNING)
+      pending = self._state.count_by_status(ProgressStatus.PENDING)
+
+      if total > 0 and completed == total:
+          status = "completed"
+      elif total > 0 and (running + pending) == 0 and failed > 0:
+          status = "failed"
+      else:
+          status = "running"
+      ```
+
+      这样：
+      - 全部 task completed → "completed"
+      - 部分 failed + 无 running/pending → "failed"
+      - 其他情况 → "running"（保持现有行为）
+    acceptance_criteria: |
+      1. 全部 task COMPLETED 时 status == "completed"
+      2. 部分 task FAILED + 无 running/pending 时 status == "failed"
+      3. 有 running 或 pending task 时 status == "running"
+      4. 空 state（无 tasks）时 status == "idle"（已有逻辑不变）
+      5. 单测覆盖所有 4 种状态
+    claimed_paths:
+      - src/cccc/daemon/foreman/progress_report.py
+      - tests/test_workflow_terminal_status.py
+    verification:
+      level: unit
+      checks:
+        - name: terminal-status-test
+          command: "python -m pytest tests/test_workflow_terminal_status.py -v"
+    provides:
+      - name: workflow_terminal_status
+        kind: runtime_capability
+
+  # ---------------------------------------------------------------
+  # T3: RL-7 — W_TASK_ADDRESSES_DISJOINT 规则
+  # ---------------------------------------------------------------
+  - id: T3
+    title: "新增 W_TASK_ADDRESSES_DISJOINT 检测 task 合并不相关 issue"
+    addresses:
+      - "RL-7"
+    goal_behavior: |
+      在 src/cccc/ralph/validation_rules/coverage.py 中新增
+      _check_task_addresses_disjoint() 函数（在 _check_issue_coverage 之后）：
+
+      对每个 task，如果 task.addresses 长度 > 1，检查 addresses 中的 issue
+      是否具有内聚性：
+      1. 构建 issue_id → addressing_task_ids 的映射
+      2. 对每个 task，如果 len(task.addresses) > 1：
+         a. 检查 addresses 中的 issue 是否共享前缀（如 RO-74 和 RO-75 共享 "RO-"）
+         b. 如果前缀完全不同（如 "RO-74" 和 "RL-7"），emit warning
+      3. 同时检查：如果同一 issue_id 出现在多个 task 的 addresses 中，emit hint
+         （重复认领不一定是问题但值得注意）
+
+      输出 ValidationIssue：
+      - code: "W_TASK_ADDRESSES_DISJOINT"
+      - severity: "warning"
+      - message 描述哪个 task 包含了不同前缀的 issue
+      - evidence: {"task_id": ..., "address_groups": {"RO": [...], "RL": [...]}}
+
+      在 validation_rules/__init__.py 中 export，在 validator.py 的
+      _collect_structural_issues() 中调用。
+    acceptance_criteria: |
+      1. task.addresses 含同前缀 issue 不报警（如 ["RO-74", "RO-75"]）
+      2. task.addresses 含不同前缀 issue 报 warning（如 ["RO-74", "RL-7"]）
+      3. task.addresses 只有 1 个 issue 不报警
+      4. 空 addresses 不报警
+      5. 同一 issue_id 出现在多个 task 的 addresses 中时 emit hint
+         （code: "H_DUPLICATE_ISSUE_ADDRESS"）
+      6. 单测覆盖上述 5 种场景
+    claimed_paths:
+      - src/cccc/ralph/validation_rules/coverage.py
+      - src/cccc/ralph/validation_rules/__init__.py
+      - src/cccc/ralph/validator.py
+      - tests/test_task_addresses_disjoint.py
+    verification:
+      level: unit
+      checks:
+        - name: disjoint-addresses-test
+          command: "python -m pytest tests/test_task_addresses_disjoint.py -v"
+    provides:
+      - name: task_addresses_disjoint_rule
+        kind: validation_rule
+
+  # ---------------------------------------------------------------
+  # T4: BP-1a — plan schema 支持 mock_tests 字段
+  # ---------------------------------------------------------------
+  - id: T4
+    title: "VerificationSpec 新增 mock_tests 字段 + Ralph 校验"
+    depends_on:
+      - T3
+    addresses:
+      - "BP-1"
+    goal_behavior: |
+      1. 在 src/cccc/contracts/v1/ralph_ipc.py 的 VerificationSpec（line 66-76）
+         新增 mock_tests 字段：
+
+         ```python
+         class MockTestCase(BaseModel):
+             name: str
+             input: Dict[str, Any] = Field(default_factory=dict)
+             expected_output: Dict[str, Any] = Field(default_factory=dict)
+             setup_command: str = ""
+             verify_command: str = ""
+             description: str = ""
+
+         class VerificationSpec(BaseModel):
+             # ... existing fields ...
+             mock_tests: Optional[List[MockTestCase]] = None
+         ```
+
+      2. 在 src/cccc/ralph/models.py 的 TaskSpec.Verification 中同步
+         mock_tests 字段（与 VerificationSpec 对齐）。
+
+      3. 在 src/cccc/ralph/validation_rules/coverage.py 新增
+         _check_mock_tests_completeness() 函数：
+         - verification_mode == "agent" 或 "challenge" 的 task 如果有 mock_tests，
+           每个 MockTestCase 必须有非空 name + verify_command
+         - mock_tests 为空时不报错（兼容现有 plan）
+
+      4. plan_io.py 中确保 mock_tests 字段能被 YAML 解析和序列化。
+
+      5. verification_mode="ralph" 的 task 如果配置了 mock_tests，emit hint
+         （code: "H_MOCK_TESTS_ON_RALPH_MODE"，severity: "hint"），提示
+         mock_tests 只在 agent/challenge 模式下执行，ralph 模式会忽略。
+    acceptance_criteria: |
+      1. plan.yaml 中 task.verification.mock_tests 字段可被解析
+      2. MockTestCase 必须有 name 和 verify_command
+      3. verification_mode="ralph" 的 task 有 mock_tests 时 emit hint（不阻塞）
+      4. 现有 plan.yaml 无 mock_tests 时解析不受影响
+      5. 单测覆盖 schema 解析 + 校验规则
+    claimed_paths:
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/plan_io.py
+      - src/cccc/ralph/validation_rules/coverage.py
+      - tests/test_mock_tests_schema.py
+    verification:
+      level: unit
+      checks:
+        - name: mock-tests-schema-test
+          command: "python -m pytest tests/test_mock_tests_schema.py -v"
+    provides:
+      - name: mock_tests_schema
+        kind: data_contract
+
+  # ---------------------------------------------------------------
+  # T5: BP-1b — verify gate agent 模式执行 mock_tests
+  # ---------------------------------------------------------------
+  - id: T5
+    title: "verify gate agent 模式执行 mock_tests（对抗性）"
+    depends_on:
+      - T1
+      - T4
+    addresses:
+      - "BP-1"
+    goal_behavior: |
+      1. 修改 src/cccc/daemon/foreman/ralph_service.py 的
+         _verify_completion_with_agent()（line 813-851）：
+         - 在调用 Gemini agent 之前，检查 task 是否有 mock_tests
+         - 如果有 mock_tests，优先执行 mock_tests（使用 subprocess.run，
+           与 _run_verification_check() 类似的模式）
+         - mock_tests 的执行结果加入 VerificationResult.checks
+         - 任何一个 mock_test verify_command 失败即整体 outcome="failed"
+         - mock_tests 全通过后再可选调用 Gemini agent（如果配置了）
+
+      2. 修改 src/cccc/daemon/foreman/prompt_builder.py 的 build_task_prompt()：
+         - 确保 mock_tests 内容**不**出现在 worker 的 prompt 中
+         - 即使 task 有 mock_tests，worker 只看到 acceptance_criteria
+         - 这保证了对抗性：worker 不能直接针对 mock_tests 硬编码通过
+
+      3. mock_test 执行流程：
+         a. 如果有 setup_command，先执行 setup
+         b. 执行 verify_command
+         c. 检查 exit code
+         d. 超时使用 verification check 的全局超时设置
+
+      4. mock_tests 失败后的 retry context 脱敏：
+         - VerificationResult.summary 对 worker 可见部分不包含 mock_tests 的
+           name、verify_command、input、expected_output、stdout/stderr
+         - 使用泛化错误消息，如 "verification failed: N of M mock tests did not pass"
+         - 详细结果保留在 VerificationResult.checks 中供 Foreman/日志查看
+         - context_store 中存储的 last_error 同样使用脱敏 summary
+    acceptance_criteria: |
+      1. agent 模式 task 有 mock_tests 时执行 mock_tests
+      2. mock_tests 失败时 verification outcome="failed"
+      3. mock_tests 全通过 + 无 Gemini → outcome="passed"
+      4. worker prompt 中不包含 mock_tests 内容
+      5. 无 mock_tests 的 agent 模式仍走原有 Gemini 路径
+      6. mock_tests 失败后 retry prompt 中的 last_error 不包含 mock_tests 细节
+      7. 单测覆盖 mock_tests 执行 + 对抗性遮蔽 + retry context 脱敏
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/daemon/foreman/prompt_builder.py
+      - tests/test_mock_tests_execution.py
+    consumes:
+      - name: mock_tests_schema
+        from: T4
+    verification:
+      level: unit
+      checks:
+        - name: mock-tests-execution-test
+          command: "python -m pytest tests/test_mock_tests_execution.py -v"
+    provides:
+      - name: mock_tests_execution
+        kind: runtime_capability
+
+  # ---------------------------------------------------------------
+  # T-int: 集成验证（覆盖多 task 的跨边界测试）
+  # ---------------------------------------------------------------
+  - id: T-int
+    title: "集成验证：全流程 regression"
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T5
+    role: integration
+    goal_behavior: |
+      运行全量 pytest 套件确认 T1~T5 的改动没有引入回归。
+      同时运行各 task 的独立测试确认功能正确。
+    acceptance_criteria: |
+      1. 新增测试文件全部 pass
+      2. 全量 pytest 0 failure（full regression）
+    claimed_paths:
+      - tests/test_v29_integration.py
+    verification:
+      level: integration
+      checks:
+        - name: new-tests
+          command: "python -m pytest tests/test_prompt_completion_reminder.py tests/test_workflow_terminal_status.py tests/test_task_addresses_disjoint.py tests/test_mock_tests_schema.py tests/test_mock_tests_execution.py tests/test_v29_integration.py -v"
+        - name: full-regression
+          command: "python -m pytest -q"
+      covers:
+        tasks:
+          - T1
+          - T2
+          - T3
+          - T4
+          - T5
+
+  # ---------------------------------------------------------------
+  # T6: 能力指南生成（依赖全部代码修复完成）
+  # ---------------------------------------------------------------
+  - id: T6
+    title: "生成 foreman-capability-guide.md"
+    depends_on:
+      - T-int
+    addresses:
+      - "RO-74"
+      - "RO-75"
+      - "RL-7"
+      - "BP-1"
+    role: leaf
+    goal_behavior: |
+      启动代码探索 agent 读取当前源码，生成 docs/foreman-capability-guide.md。
+      必须覆盖：
+      - CLI 所有 flag（特别是本轮新增的 mock_tests）
+      - verification 模式和 shell 执行语义（含 mock_tests 执行流）
+      - DAG gating 行为
+      - stall detection 阈值和覆盖范围
+      - plan schema 字段（含 mock_tests, MockTestCase）
+      - auto-dispatch + assignment_map 机制
+      - completion protocol（首尾重复指令）
+      - workflow 终态检测逻辑
+      - W_TASK_ADDRESSES_DISJOINT 新规则说明
+
+      不可复用旧版——每轮代码都在变。
+    acceptance_criteria: |
+      1. docs/foreman-capability-guide.md 存在且非空
+      2. 包含 mock_tests 相关文档
+      3. 包含 completion protocol 首尾重复说明
+      4. 包含 workflow 终态说明
+      5. 包含 W_TASK_ADDRESSES_DISJOINT 规则说明
+    claimed_paths:
+      - docs/foreman-capability-guide.md
+    verification:
+      level: compile
+      checks:
+        - name: guide-exists
+          command: "test -s docs/foreman-capability-guide.md"
+
+critical_flows:
+  - id: mock_tests_verification_flow
+    description: "agent 模式 verification 执行 mock_tests 而非仅 Gemini 审查"
+    entrypoints:
+      - src/cccc/daemon/foreman/ralph_service.py::_verify_completion_with_agent
+    test_created_by:
+      - T5
+
+  - id: workflow_terminal_status_flow
+    description: "workflow progress 根据 task 状态计算终态"
+    entrypoints:
+      - src/cccc/daemon/foreman/progress_report.py::summarize_progress
+    test_created_by:
+      - T2
+
+forbidden_flows:
+  - id: mock_tests_leak_to_worker
+    description: "mock_tests 内容不得出现在 worker prompt 中"
+    test_created_by:
+      - T5

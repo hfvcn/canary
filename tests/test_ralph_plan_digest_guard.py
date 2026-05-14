@@ -69,10 +69,16 @@ def _register_running_task(
 
 
 def _write_plan(plan_path: Path, content: str = "tasks: []") -> str:
-    """Write a plan file and return its structural digest."""
+    """Write a plan file and return its structural digest.
+
+    Shorthand strings (no ``:``) produce structurally distinct plans by
+    varying ``claimed_paths`` (a structural field included in the digest).
+    """
     rendered = content
     if ":" not in content and not content.lstrip().startswith("{"):
-        rendered = f"tasks:\n  - id: T1\n    title: {content!r}\n"
+        rendered = (
+            f"tasks:\n  - id: T1\n    claimed_paths:\n      - {content!r}\n"
+        )
     plan_path.write_text(rendered, encoding="utf-8")
     return compute_structural_plan_digest(plan_path)
 
@@ -483,6 +489,68 @@ class TestPostHocAdvisory:
 # ---------------------------------------------------------------------------
 # PreTransitionVetoed class behavior
 # ---------------------------------------------------------------------------
+
+class TestOperationalFieldsExcluded:
+    """RO-61: Operational fields (verification, title, goal_behavior) excluded from digest."""
+
+    def test_verification_command_change_same_digest(self, tmp_path):
+        plan_path = tmp_path / "plan.yaml"
+        plan_path.write_text(
+            "tasks:\n  - id: T1\n    claimed_paths: [src/]\n"
+            "    verification:\n      level: integration\n      command: pytest tests/\n",
+            encoding="utf-8",
+        )
+        digest_before = compute_structural_plan_digest(plan_path)
+
+        plan_path.write_text(
+            "tasks:\n  - id: T1\n    claimed_paths: [src/]\n"
+            "    verification:\n      level: integration\n      command: sh -c 'pytest tests/'\n",
+            encoding="utf-8",
+        )
+        digest_after = compute_structural_plan_digest(plan_path)
+
+        assert digest_before == digest_after
+
+    def test_title_change_same_digest(self, tmp_path):
+        plan_path = tmp_path / "plan.yaml"
+        plan_path.write_text("tasks:\n  - id: T1\n    title: Old title\n", encoding="utf-8")
+        d1 = compute_structural_plan_digest(plan_path)
+
+        plan_path.write_text("tasks:\n  - id: T1\n    title: New title\n", encoding="utf-8")
+        d2 = compute_structural_plan_digest(plan_path)
+
+        assert d1 == d2
+
+    def test_structural_change_different_digest(self, tmp_path):
+        plan_path = tmp_path / "plan.yaml"
+        plan_path.write_text("tasks:\n  - id: T1\n    depends_on: []\n", encoding="utf-8")
+        d1 = compute_structural_plan_digest(plan_path)
+
+        plan_path.write_text("tasks:\n  - id: T1\n    depends_on: [T0]\n", encoding="utf-8")
+        d2 = compute_structural_plan_digest(plan_path)
+
+        assert d1 != d2
+
+    def test_claimed_paths_change_different_digest(self, tmp_path):
+        plan_path = tmp_path / "plan.yaml"
+        plan_path.write_text("tasks:\n  - id: T1\n    claimed_paths: [src/]\n", encoding="utf-8")
+        d1 = compute_structural_plan_digest(plan_path)
+
+        plan_path.write_text("tasks:\n  - id: T1\n    claimed_paths: [lib/]\n", encoding="utf-8")
+        d2 = compute_structural_plan_digest(plan_path)
+
+        assert d1 != d2
+
+    def test_goal_behavior_change_same_digest(self, tmp_path):
+        plan_path = tmp_path / "plan.yaml"
+        plan_path.write_text("tasks:\n  - id: T1\n    goal_behavior: old\n", encoding="utf-8")
+        d1 = compute_structural_plan_digest(plan_path)
+
+        plan_path.write_text("tasks:\n  - id: T1\n    goal_behavior: new\n", encoding="utf-8")
+        d2 = compute_structural_plan_digest(plan_path)
+
+        assert d1 == d2
+
 
 class TestPreTransitionVetoed:
     """Verify the exception class itself works correctly."""

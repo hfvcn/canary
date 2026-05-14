@@ -37,6 +37,7 @@ FUNCTION_SIGNATURES = {
         "workflow_id",
         "project_root",
         "daemon_request_fn",
+        "assign_agent_id",
     ],
     "block_task": [
         "group_id",

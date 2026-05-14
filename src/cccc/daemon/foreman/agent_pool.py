@@ -405,7 +405,6 @@ class AgentPoolManager:
                 runtime_domain_map = {
                     "codex": ["backend", "general"],
                     "claude": ["frontend", "backend", "general"],
-                    "gemini": ["general"],
                 }
                 domains = runtime_domain_map.get(peer_runtime, ["general"])
                 if inferred_domain in domains:

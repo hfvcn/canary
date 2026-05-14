@@ -32,7 +32,7 @@ from .models import (
 )
 from .plan_io import compute_structural_plan_digest
 from .workspace_index import WorkspaceIndex
-from .rules_advisory import check_goal_hardcoded_awareness, check_inline_assertions
+from .rules_advisory import check_goal_hardcoded_awareness, check_inline_assertions, check_verification_command_syntax
 
 # Import all check functions from the validation_rules subpackage (RO-31)
 from .validation_rules import (
@@ -60,6 +60,8 @@ from .validation_rules import (
     _check_critical_flow_levels,
     _check_critical_flow_worker_only_verification,
     _check_issue_coverage,
+    _check_task_addresses_disjoint,
+    _check_mock_tests_completeness,
     _check_forbidden_flows,
     _check_finding_refs,
     _check_suppress_flows,
@@ -70,9 +72,12 @@ from .validation_rules import (
     _check_suppress_unused,
     _check_plan_scope_unused,
     _has_issue_codes,
+    _check_batch_e2e_command,
+    _check_module_consistency,
     _check_contracts,
     _check_contract_verification_coverage,
     _check_contract_dep_alignment,
+    _check_cross_task_io_contracts,
 )
 # Re-export internal helpers used by tests (backward compatibility)
 from .validation_rules.coverage import _covered_flow_summary  # noqa: F401
@@ -207,6 +212,7 @@ def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
     issues.extend(_check_dead_verification_command(plan))
     issues.extend(_check_covers_not_exercised(plan))
     issues.extend(check_inline_assertions(plan))
+    issues.extend(check_verification_command_syntax(plan))
     issues.extend(_check_failure_path(plan))
     issues.extend(_check_verification_behavior_match(plan))
     issues.extend(_check_duplicate_verification_commands(plan))
@@ -224,6 +230,8 @@ def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
     issues.extend(_check_suppress_flows(plan))
     issues.extend(_check_finding_refs(plan))
     issues.extend(_check_issue_coverage(plan))
+    issues.extend(_check_task_addresses_disjoint(plan))
+    issues.extend(_check_mock_tests_completeness(plan))
     issues.extend(_check_implicit_serialization(plan))
     issues.extend(_check_shared_file_verification(plan))
     issues.extend(_check_integration_spine(plan))
@@ -237,6 +245,9 @@ def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
     issues.extend(_check_duplicate_ids(plan))
     issues.extend(_check_critical_flow_no_entrypoints(plan))
     issues.extend(_check_plan_scope_unused(plan))
+    issues.extend(_check_batch_e2e_command(plan))
+    issues.extend(_check_cross_task_io_contracts(plan))
+    issues.extend(_check_module_consistency(plan))
 
     # CMP-5: H_SUPPRESS_UNUSED runs last — needs the full issue code set
     all_issue_codes = {i.code for i in issues}

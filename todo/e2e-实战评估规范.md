@@ -462,3 +462,14 @@ cat ${PROJECT_DIR}/WORKFLOW_EVALUATION.md
 | v17 | 2026-05-02 | 2/5 | 2/5 | 3/5 | 2.3/5 | +challenge mode首次运行 +structural digest; verify gate cwd P0 bug; challenge假阳性; Worker 100%可靠 |
 | v18 | 2026-05-03 | 3/5 | 2/5 | 3/5 | 2.7/5 | +RO-41 cwd fix +RO-43 retry resuggest; 0 CRITICAL; auto-dispatch 3/5; challenge假阳性仍是瓶颈 |
 | v19 | 2026-05-03 | 3/5 | 3/5 | 3/5 | 3.0/5 | +RO-44 --force override; 自动化率88.9%历史新高; depends_on首次通过; challenge假阳性唯一瓶颈 |
+| v20 | 2026-05-03 | 3/5 | 5/5 | 3/5 | 3.7/5 | +RO-42证据注入 +RL-3 shell拆分 +RL-5折叠; 过程首次满分; 100%自动分发; directory paths未展开新bug |
+| v21 | 2026-05-07 | 3/5 | 4/5 | 3.5/5 | 3.5/5 | +RO-45~50代码修复; 0 CRITICAL(v20全修); Gemini challenge 3x失败; scope误报+管道exit code新bug; 83.3%自动闭环 |
+| v22 | 2026-05-07 | 2/5 | 3/5 | 3/5 | 2.7/5 | +RO-54 auto-dispatch首次验证 +RO-48 stall首次触发; Gemini 0%可靠+3 CRITICAL; auto-dispatch异常路径断裂; daemon未重启致RO-51未生效 |
+| v23 | 2026-05-11 | 3/5 | 3/5 | 3.5/5 | 3.2/5 | DAG+auto-dispatch连续稳定; 100%自动分发; digest guard过严致verification全跳过; shell语义新P0; Gemini 0%可靠 |
+| v24 | 2026-05-11 | 2/5 | 4.5/5 | 4/5 | 3.5/5 | +RO-61 structural digest生效; verification 6/6全部真正执行; 8min历史最快; 跨栈语义监察缺口致结果分低 |
+| v25 | 2026-05-11 | 3/5 | 4/5 | 4/5 | 3.7/5 | PATCH/PUT不再混用(验收标准有效); 1 CRITICAL(CORS缺失); T1 stale artifact致2次retry; DAG+auto-dispatch稳定; 100%自动分发 |
+| v26 | 2026-05-13 | 2/5 | 3/5 | 4/5 | 3.0/5 | CORS首次双重拦截(RO-69验证); 3 CRITICAL(跨board/position/FK); Gemini连续5轮0%可靠; verification命令变形新bug; 66.7%自动闭环; auto-dispatch稳定 |
+| v27 | 2026-05-13 | 2/5 | 4/5 | 4/5 | 3.3/5 | Gemini排除成功(0 gemini worker); 零force-complete+3/3 verification_passed; 同类3 CRITICAL; Codex前端stall新问题; 过程+1归因verification命令质量提升 |
+| v28 | 2026-05-13 | 3/5 | 5/5 | 4.5/5 | 4.2/5 | **历史最高**; 0 CRITICAL实现bug(验收标准引导); 过程满分(10/10); 100%自动分发+零retry+零force-complete; FK测试伪覆盖唯一结果缺陷; worker可靠100%(codex+claude) |
+| v29 | 2026-05-13 | 2/5 | 4/5 | 4/5 | 3.3/5 | v30新能力全验证(BP-1拦截+BP-3渲染+RO-76报错); codex 5/5 stall(0%可靠); 8任务暴露跨任务CRITICAL(proxy路径+负position); mock_tests首次实战拦截; RO-77终态无事件/RO-78 workflow_id mismatch/RO-79 verify_command检查 |
+| v32 | 2026-05-14 | 4/5 | 5/5 | 4/5 | 4.3/5 | **新历史最高**; RO-77/78修复确认; 0 CRITICAL; 过程满分(10/10+workflow.completed); 100%自动化+零retry; 瓶颈转向plan编写体验(validate迭代5次); worker可靠100%(codex+claude) |

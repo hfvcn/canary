@@ -1,0 +1,544 @@
+# Plan: RO-57/63/65/68/70/71/73 — v22~v27 残留问题修复
+#
+# 来源：todo/问题清单-v5-ralph.md § 一-A3~A7 + 问题清单.md FIX-E2E-7
+# 工作流：findings.md § 〇 经验证的工作流程
+#
+# 已确认关闭（代码已实现）：
+#   RO-60: _ENV_VAR_PREFIX_RE 检测 VAR=val 格式，_has_shell_operators() line 100
+#   RO-64: check_stalled_tasks() 已覆盖 ASSIGNED 状态（120s 阈值）
+#   RO-67: --compact flag 已完整实现
+#
+# 根因分析：
+#   RO-57: workflow_id_resolution.py 的 resolve_workflow_id_for_tasks() 已实现
+#     复用逻辑，但问题在于 CLI 层 `cccc workflow submit` 不强制传递已有 task
+#     的 workflow_id。当 Foreman 对已有 task 执行 submit（而非 retry），
+#     CLI 生成新的 workflow_id（如 kanban-v22-t4），daemon 端虽然尝试解析
+#     但 _existing_workflow_ids() 依赖 engine 中已有 task 状态——如果 task
+#     是通过新 submit 重新注册的，engine 中不存在旧 task state，因此解析
+#     失败回退为新 workflow_id。修复：submit 时检测已有 task，拒绝并提示
+#     使用 retry。
+#   RO-63: retry_after_verification() line 500 只接受 VERIFYING/FAILED，
+#     但 fail_task() 已接受 ASSIGNED。对称性缺失。
+#   RO-65: _failed_agent_verification() 返回 overall_outcome="failed"，
+#     _challenge_verification_result() 将非 "passed" 都当 "failed"。
+#     Gemini 网络错误应降级为 "degraded"（worker-only pass + warning）。
+#   RO-68: verification runner 在 project_root 执行 checks，retry 后
+#     前次产生的 *.db/__pycache__ 等副作用文件残留影响验证。
+#   RO-70: 不是 runtime bug，是 Foreman 编写的 verification 命令脆弱。
+#     通过能力指南引导使用 resilient 命令。
+#   RO-71: force-complete 跳过 verification 但 completer_mismatch 仍会
+#     在 auto_start_assigned_task_for_completion() 中被检测。当 force-
+#     complete + completer_mismatch 同时发生时，verification_skipped 和
+#     completer_mismatch 并存。修复：completer_mismatch 时强制 verification
+#     不可跳过。
+#   RO-73: stall detection 只检查 heartbeat timeout，不检查
+#     "有 heartbeat 但无文件写入"的场景。需新增文件写入进度维度。
+#
+# 设计原则：
+#   #2  按功能切片拆分，不按文件拆
+#   #9  先跑通一条路径再扩展
+#   #11 verification 必须真正跑命令
+#   #13 结构校验 + 代码审查互补
+#
+# Codex 审查修正（2026-05-13）：
+#   - T1: 新增 workflow_id_resolution.py + test_resubmit_workflow_id.py 到 claimed_paths
+#   - T3: 不修改共用的 _failed_agent_verification()，改为在 _verify_completion_with_challenge()
+#     中检测依赖不可用错误并降级，不引入新 VerificationOutcome 枚举值
+#   - T4: 新增 models.py 到 claimed_paths（cleanup_patterns 需经过 plan schema 透传）；
+#     注入点改为 _verify_completion_with_worker() 入口（而非 _execute_verification_checks）
+#   - T5: mismatch 检测改为在 process_completed_event() 中直接计算（不依赖 auto_start
+#     传递），因为 RUNNING 状态 completion 不经过 auto_start 路径
+#   - T6: 降级为 progress_pct 停滞检测（利用 TaskState 已有字段），避免改动 engine/IPC/CLI
+#   - T-int: 移除 --timeout=120（依赖 pytest-timeout 未安装）
+#
+# 批次预期：
+#   Batch 1: T1, T2, T5, T6 — 独立修复（无路径冲突）
+#   Batch 1b: T3, T4 — ralph_service.py 共享，Ralph 会隐式串行
+#   Batch 2: T7 — 能力指南（依赖全部代码修复完成）
+#   Batch 3: T-int — 集成验证
+
+schema_version: "1.0.0"
+
+required_issues:
+  - "RO-57"
+  - "RO-63"
+  - "RO-65"
+  - "RO-68"
+  - "RO-70"
+  - "RO-71"
+  - "RO-73"
+
+semantic_mode: "off"
+auto_infer: false
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_AGENT_REVIEW_FAILED
+  - W_AGENT_REVIEW_SKIPPED
+  - W_UNCLAIMED_TEST_FOR_SOURCE
+  - W_TEST_COVERAGE_GAP
+  - W_VERIFICATION_TARGET_MISSING
+  - W_VERIFICATION_NO_CHECKS
+  - W_VERIFICATION_COMPLEX_SHELL_SKIPPED
+  - W_CROSS_BOUNDARY_WITHOUT_GLUE
+  - W_NO_FAILURE_PATH
+  - W_PLAN_SCOPE_UNUSED
+  - W_VERIFICATION_BEHAVIOR_MISMATCH
+  - W_ISOLATED_TASK
+  - W_DISCONNECTED_COMPONENTS
+  - W_IMPLICIT_SERIALIZATION
+  - W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION
+  - W_FLOW_OWNER_NO_VERIFICATION
+  - W_INDIRECT_TEST_IMPORT
+  - W_DYNAMIC_TEST_IMPORT_OPAQUE
+  - W_COVERS_NOT_EXERCISED
+
+critical_entrypoints:
+  - src/cccc/cli/workflow_cmds.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - src/cccc/daemon/foreman/ralph_service.py
+  - src/cccc/daemon/foreman/verification_gate.py
+  - src/cccc/daemon/foreman/workflow_monitor.py
+  - src/cccc/kernel/workflow_state_engine.py
+
+critical_flows:
+  - id: resubmit_rejects_existing_tasks
+    description: >
+      cccc workflow submit 检测到 plan 中 task_id 已存在于 engine 时，
+      拒绝提交并提示使用 cccc workflow retry。
+    entrypoints:
+      - src/cccc/daemon/foreman/assignment_batches.py
+    required_verification_level: unit
+
+  - id: retry_accepts_assigned
+    description: >
+      cccc workflow retry TASK_ID 在 ASSIGNED 状态下成功执行，
+      task 状态重置为 READY。
+    entrypoints:
+      - src/cccc/kernel/workflow_state_engine.py
+    required_verification_level: unit
+
+  - id: challenge_degrades_on_error
+    description: >
+      challenge mode 中 Gemini 网络错误时，worker checks 已通过则
+      降级为 passed + W_CHALLENGE_DEGRADED warning。
+    entrypoints:
+      - src/cccc/daemon/foreman/ralph_service.py
+    required_verification_level: unit
+
+  - id: verification_cleanup_before_retry
+    description: >
+      verification retry 前按 cleanup_patterns 清理前次产生的副作用文件。
+    entrypoints:
+      - src/cccc/daemon/foreman/ralph_service.py
+    required_verification_level: unit
+
+  - id: completer_mismatch_forces_verification
+    description: >
+      completer_mismatch 发生时，即使 hook_ctx.force_complete=True，
+      verification 仍然执行（不跳过）。
+    entrypoints:
+      - src/cccc/daemon/foreman/verification_gate.py
+    required_verification_level: unit
+
+  - id: file_write_stall_detection
+    description: >
+      有 heartbeat 但无文件写入超过阈值时，触发 file_write_stall 告警。
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_monitor.py
+    required_verification_level: unit
+
+forbidden_flows:
+  - id: resubmit_creates_new_workflow_id
+    description: >
+      submit 不得为已存在于 engine 的 task 创建新 workflow_id。
+    test_created_by:
+      - T1
+    required_verification_level: unit
+
+  - id: assigned_retry_rejected
+    description: >
+      ASSIGNED 状态的 task 调用 retry 不得被拒绝。
+    test_created_by:
+      - T2
+    required_verification_level: unit
+
+  - id: gemini_error_hard_fails_task
+    description: >
+      Gemini 网络错误不得在 worker checks 已通过时直接 fail 整个 task。
+    test_created_by:
+      - T3
+    required_verification_level: unit
+
+tasks:
+  # ---------------------------------------------------------------
+  # T1: RO-57 — re-submit 已有 task 拒绝并提示 retry
+  # ---------------------------------------------------------------
+  - id: T1
+    title: "re-submit 已有 task 检测与拒绝"
+    addresses:
+      - "RO-57"
+    goal_behavior: |
+      当 `cccc workflow submit` 被调用时，在 assignment_batches.py 的
+      `_register_batch_inputs()` 入口处（或更早，在 `process_batch_suggestion()`
+      入口），对每个 task_ref.id 调用 `engine.get_task(task_ref.id)` 检查是否
+      已存在于 engine 中。
+
+      如果发现已有 task（status 非 None），则：
+      1. 收集所有已存在的 task_id 列表
+      2. 返回 BatchEvaluationResult(decision="rejected",
+         reason=f"tasks_already_exist: {existing_ids}. Use 'cccc workflow retry' instead")
+      3. 不创建新 workflow_id，不注册 batch
+
+      这样 Foreman 收到拒绝后，会看到清晰的错误信息引导使用 retry。
+    acceptance_criteria: |
+      1. submit 包含已有 task_id 时返回 rejected + 提示消息
+      2. submit 全新 task_id 时正常注册（不受影响）
+      3. 单测覆盖：已有 task reject + 全新 task pass + 混合场景
+    claimed_paths:
+      - src/cccc/daemon/foreman/assignment_batches.py
+      - src/cccc/daemon/foreman/workflow_id_resolution.py
+      - tests/test_resubmit_reject.py
+      - tests/test_resubmit_workflow_id.py
+    verification:
+      level: unit
+      checks:
+        - name: resubmit-reject-test
+          command: "python -m pytest tests/test_resubmit_reject.py -v"
+    provides:
+      - name: resubmit_guard
+        kind: runtime_capability
+
+  # ---------------------------------------------------------------
+  # T2: RO-63 — retry 接受 ASSIGNED 状态
+  # ---------------------------------------------------------------
+  - id: T2
+    title: "retry_after_verification 扩展接受 ASSIGNED 状态"
+    addresses:
+      - "RO-63"
+    goal_behavior: |
+      修改 workflow_state_engine.py 的 `retry_after_verification()` 方法
+      （line 500），将状态前置条件从
+        {WorkflowTaskStatus.VERIFYING, WorkflowTaskStatus.FAILED}
+      扩展为
+        {WorkflowTaskStatus.VERIFYING, WorkflowTaskStatus.FAILED, WorkflowTaskStatus.ASSIGNED}
+
+      当 prev.status == ASSIGNED 时，task 同样重置为 READY + 清空 agent_id/attempt_id。
+      这与 fail_task() 已接受 ASSIGNED（line 403）保持对称。
+
+      同时将方法名的验证语义保持一致——ASSIGNED 状态 retry 的语义是
+      "assigned worker 未启动或 stalled，回收并重新分配"。
+    acceptance_criteria: |
+      1. ASSIGNED 状态 task 调用 retry 成功，状态变为 READY
+      2. VERIFYING/FAILED 状态 retry 不受影响
+      3. RUNNING/COMPLETED 状态 retry 仍被拒绝
+      4. ledger 中出现 KIND_RETRY_REQUESTED 事件
+    claimed_paths:
+      - src/cccc/kernel/workflow_state_engine.py
+      - tests/test_retry_assigned.py
+    verification:
+      level: unit
+      checks:
+        - name: retry-assigned-test
+          command: "python -m pytest tests/test_retry_assigned.py -v"
+
+  # ---------------------------------------------------------------
+  # T3: RO-65 — challenge mode Gemini 错误降级
+  # ---------------------------------------------------------------
+  - id: T3
+    title: "challenge mode Gemini 不可达时 graceful degradation"
+    addresses:
+      - "RO-65"
+    goal_behavior: |
+      不修改 `_failed_agent_verification()` — 它被 agent 模式和 challenge 模式
+      共用，改它会影响 agent 模式语义。
+
+      改为在 `_verify_completion_with_challenge()` 中（line 634-659）处理降级：
+      在调用 `_verify_completion_with_agent()` 之后、调用
+      `_challenge_verification_result()` 之前，检查 agent_result：
+      - 如果 agent_result.overall_outcome == "failed" 且
+        agent_result.summary 包含 "agent verification failed:"（由
+        _failed_agent_verification 生成的错误信息前缀），则判定为
+        依赖不可用错误（非验证判定失败）
+      - 此时直接返回 worker_result，但追加 warning
+        "W_CHALLENGE_DEGRADED: agent verification unavailable ({detail}), falling back to worker-only"
+      - challenge_outcome 设为 None（无 challenge 结果）
+
+      如果 agent_result.overall_outcome == "failed" 但 summary 不含
+      该前缀（说明是 agent 真正判定 failed），则正常走
+      `_challenge_verification_result()`，不降级。
+
+      这样：
+      - Gemini 网络错误 → worker-only pass + degradation warning
+      - Gemini 审查返回 failed → 真正 fail
+      - agent 模式不受影响（`_failed_agent_verification()` 不变）
+      - 不引入新的 VerificationOutcome 枚举值
+    acceptance_criteria: |
+      1. Gemini 网络错误（OSError/ECONNRESET）时 challenge 降级，task 通过
+      2. Gemini 返回 "failed" 判定时仍然 fail（不降级）
+      3. W_CHALLENGE_DEGRADED warning 出现在 verification 结果 warnings 中
+      4. agent 模式（非 challenge）不受影响
+      5. VerificationResult.overall_outcome 仍为合法枚举值（passed/failed）
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - tests/test_challenge_degradation.py
+    verification:
+      level: unit
+      checks:
+        - name: challenge-degradation-test
+          command: "python -m pytest tests/test_challenge_degradation.py -v"
+
+  # ---------------------------------------------------------------
+  # T4: RO-68 — verification retry 前清理 artifact
+  # ---------------------------------------------------------------
+  - id: T4
+    title: "verification retry 前清理副作用文件"
+    addresses:
+      - "RO-68"
+    goal_behavior: |
+      在 ralph_service.py 的 `_verify_completion_with_worker()` 方法入口处
+      （在 `_resolve_verification_specs()` 之前），增加 artifact 清理步骤。
+      注意：不在 `_execute_verification_checks()` 中注入，因为后者只有
+      `(VerificationCheckSpec, command)` 元组，无法访问 task_ref.claimed_paths。
+
+      实现步骤：
+      1. 在 ralph_ipc.py 的 Verification model（或 task 级别）中新增可选字段
+         `cleanup_patterns: Optional[List[str]]`（默认 None）
+      2. 在 models.py 的 plan schema Verification/CheckSpec 中同步新增该字段，
+         确保 TaskSpec.to_task_ref() 正确透传到 TaskRef
+      3. 在 `_verify_completion_with_worker()` 入口新增 `_cleanup_artifacts()`
+         私有方法：
+         - 从 task_ref.verification.cleanup_patterns 读取模式列表
+         - 默认值 ["*.db", "__pycache__", "*.pyc", ".pytest_cache"]
+         - 对每个 claimed_path（限目录型），在 project_root/claimed_path 下
+           glob.glob(pattern, recursive=True)
+         - 使用 shutil.rmtree for dirs, os.remove for files
+         - 日志记录清理结果（info 级别）
+
+      限制：只清理 claimed_paths 范围内的文件，不清理项目根目录全局文件。
+    acceptance_criteria: |
+      1. verification 执行前 claimed_paths 下的 *.db 文件被清理
+      2. claimed_paths 外的文件不受影响
+      3. 无 cleanup_patterns 配置时使用默认列表
+      4. 清理日志记录存在
+      5. VerificationCheckSpec roundtrip 测试通过（cleanup_patterns 可选字段）
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - src/cccc/ralph/models.py
+      - tests/test_verification_cleanup.py
+      - tests/test_ralph_ipc.py
+    verification:
+      level: unit
+      checks:
+        - name: verification-cleanup-test
+          command: "python -m pytest tests/test_verification_cleanup.py -v"
+
+  # ---------------------------------------------------------------
+  # T5: RO-71 — completer_mismatch 时不允许跳过 verification
+  # ---------------------------------------------------------------
+  - id: T5
+    title: "completer_mismatch 时强制 verification"
+    addresses:
+      - "RO-71"
+    goal_behavior: |
+      修改 verification_gate.py 的 `process_completed_event()` 中
+      force_complete 分支（line 138-147）。
+
+      关键问题（Codex 审查发现）：ASSIGNED→auto_start 路径可以传递 mismatch
+      到 result dict，但 RUNNING 状态的 completion 不经过 auto_start，直接
+      走到 force_complete 分支。因此不能依赖 auto_start 的检测结果。
+
+      修正方案：在 `process_completed_event()` 中，在 force_complete 分支
+      之前，直接计算 completer_mismatch：
+      1. 从 `state.agent_id` 获取 assigned agent
+      2. 从 `payload.get("agent_id")` 获取 completing agent
+      3. 调用 `check_completer_mismatch(task_id, assigned_agent, completing_agent)`
+      4. 如果有 mismatch alert 且 force_complete=True：
+         - 不跳过 verification，走正常 ralph_service.verify_completion() 路径
+         - 在 result 中标记 `"force_complete_overridden": True`
+         - 在 verification 结果 warnings 中追加
+           "W_FORCE_COMPLETE_WITH_MISMATCH: completer mismatch detected, verification enforced"
+      5. 如果无 mismatch 且 force_complete=True：正常跳过 verification
+
+      同时在 `auto_start_assigned_task_for_completion()` 中保持现有 mismatch
+      检测不变（它处理 BLOCK 模式）。
+    acceptance_criteria: |
+      1. force_complete + completer_mismatch → verification 执行（不跳过）
+      2. force_complete 无 mismatch → verification 仍跳过（不影响正常路径）
+      3. 非 force_complete + completer_mismatch → 正常 verification（不影响）
+      4. verification 结果中有 W_FORCE_COMPLETE_WITH_MISMATCH warning
+    claimed_paths:
+      - src/cccc/daemon/foreman/verification_gate.py
+      - tests/test_completer_mismatch_verification.py
+    verification:
+      level: unit
+      checks:
+        - name: mismatch-verification-test
+          command: "python -m pytest tests/test_completer_mismatch_verification.py -v"
+
+  # ---------------------------------------------------------------
+  # T6: RO-73 — 文件写入 stall 检测
+  # ---------------------------------------------------------------
+  - id: T6
+    title: "heartbeat-without-file-writes stall 检测"
+    addresses:
+      - "RO-73"
+    goal_behavior: |
+      Codex 审查发现 TaskState 无 last_file_write_at 字段，heartbeat 事件
+      也不携带文件写入信息。完整实现需改动 engine/IPC/CLI 多层，scope 过大。
+
+      采用降级方案：利用 heartbeat 的 `message` 字段（已有，worker 在
+      heartbeat 中携带描述性文本如"创建 backend 目录"→"运行 pytest"）。
+
+      实现步骤：
+      1. 在 workflow_monitor.py 新增 `check_progress_stall()` 检测函数：
+         ```python
+         def check_progress_stall(
+             task_id: str,
+             heartbeat_count: int,
+             last_progress_pct: Optional[float],
+             first_heartbeat_at: float,
+             last_heartbeat_at: float,
+             now: float,
+             min_heartbeats: int = 5,
+             stagnant_timeout_s: float = 300,
+         ) -> Optional[MonitorAlert]:
+         ```
+         逻辑：
+         - 如果 heartbeat_count >= min_heartbeats 且
+           last_progress_pct 在连续 stagnant_timeout_s 内未变化
+           → 返回 progress_stall alert
+         - 利用 TaskState 已有的 progress_pct 字段（record_heartbeat
+           已存储）
+         - 如果 progress_pct 为 None（worker 未上报进度），则跳过此检测
+
+      2. 在 workflow_orchestrator.py 的 check_stalled_tasks() 中集成：
+         - 对 RUNNING 状态且有 heartbeat 的 task，额外调用
+           check_progress_stall()
+         - 从 TaskState 的 last_heartbeat/progress_pct 提取数据
+         - alert 独立于 silent_agent（互补，不重复）
+
+      3. 在能力指南（T7）中推荐前端任务使用 claude runtime 而非 codex
+         （降低 stall 概率）
+
+      注意：这是一个增量检测维度，不替代现有的 heartbeat timeout 检测。
+    acceptance_criteria: |
+      1. 有 heartbeat 且 progress_pct 停滞超阈值 → progress_stall alert
+      2. 有 heartbeat 且 progress_pct 持续变化 → 无 alert
+      3. progress_pct 为 None → 跳过检测
+      4. 无 heartbeat → 由现有 check_silent_agent 处理，不重复告警
+      5. 单测覆盖所有分支
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_monitor.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - tests/test_file_write_stall.py
+    verification:
+      level: unit
+      checks:
+        - name: file-write-stall-test
+          command: "python -m pytest tests/test_file_write_stall.py -v"
+
+  # ---------------------------------------------------------------
+  # T7: RO-70 + RO-73 — 能力指南更新
+  # ---------------------------------------------------------------
+  - id: T7
+    title: "能力指南更新：resilient verification 命令 + 前端 worker 推荐"
+    addresses:
+      - "RO-70"
+      - "RO-73"
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T4
+      - T5
+      - T6
+    goal_behavior: |
+      通过代码探索 agent 读取当前源码，重新生成
+      docs/foreman-capability-guide.md。必须覆盖：
+
+      1. CLI 所有 flag（特别是本轮新增的）
+      2. verification 模式（ralph/agent/challenge）和 shell 执行语义
+         包括 VAR=val 检测、pipefail 注入
+      3. DAG gating 行为和 auto-dispatch 机制
+      4. stall detection：heartbeat timeout + ASSIGNED timeout +
+         **新增 file_write_stall 维度**
+      5. plan schema 字段，包括 cleanup_patterns
+      6. assignment_map 机制和 retry --assign
+      7. **RO-70 指导**：verification 命令应使用 resilient 写法
+         （如 `cd dir && pytest` 而非假设特定 import 风格），
+         避免依赖 worker 实现细节
+      8. **RO-73 指导**：前端任务推荐使用 claude runtime 而非 codex
+      9. challenge degradation 行为：Gemini 不可达时 worker-only pass
+      10. completer_mismatch 与 verification 的交互规则
+      11. re-submit 已有 task 的拒绝行为和 retry 替代方案
+
+      不可复用旧版——每轮代码都在变。
+    acceptance_criteria: |
+      1. 指南覆盖以上全部 11 个主题
+      2. 所有 CLI flag 与当前代码匹配
+      3. 指南中无引用已删除或重命名的函数/参数
+    claimed_paths:
+      - docs/foreman-capability-guide.md
+    verification:
+      level: unit
+      checks:
+        - name: guide-exists
+          command: "test -f docs/foreman-capability-guide.md"
+
+  # ---------------------------------------------------------------
+  # T-int: 集成验证
+  # ---------------------------------------------------------------
+  - id: T-int
+    title: "集成验证：全量回归 + 新功能交叉"
+    addresses:
+      - "RO-57"
+      - "RO-63"
+      - "RO-65"
+      - "RO-68"
+      - "RO-71"
+      - "RO-73"
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T4
+      - T5
+      - T6
+    goal_behavior: |
+      运行全量 pytest 确认无回归。重点验证新功能之间的交叉场景：
+      1. re-submit 被拒后 retry（T1→T2 交叉）
+      2. ASSIGNED stall → retry → re-assign（T2→T6 交叉）
+      3. challenge degradation 后 retry（T3→T2 交叉）
+      4. completer_mismatch + force_complete（T5 单独验证）
+    acceptance_criteria: |
+      1. 全量 pytest 0 failures
+      2. 新增测试全部 pass
+      3. 无新增 flaky test
+    claimed_paths:
+      - tests/test_v27_integration.py
+    verification:
+      level: integration
+      covers:
+        tasks:
+          - T1
+          - T2
+          - T3
+          - T4
+          - T5
+          - T6
+      checks:
+        - name: full-regression
+          command: "python -m pytest tests/ -x"
+        - name: new-tests
+          command: "python -m pytest tests/test_resubmit_reject.py tests/test_retry_assigned.py tests/test_challenge_degradation.py tests/test_verification_cleanup.py tests/test_completer_mismatch_verification.py tests/test_file_write_stall.py -v"
+        - name: cross-task-integration
+          command: "python -m pytest tests/test_v27_integration.py -v"
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []

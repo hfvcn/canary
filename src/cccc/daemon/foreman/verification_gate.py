@@ -20,6 +20,9 @@ from .workflow_monitor import (
 logger = logging.getLogger("cccc.daemon.foreman.orchestrator")
 
 COMPLETER_MISMATCH_BLOCKED_REASON = "completer_mismatch_blocked"
+FORCE_COMPLETE_MISMATCH_WARNING = (
+    "W_FORCE_COMPLETE_WITH_MISMATCH: completer mismatch detected, verification enforced"
+)
 
 
 def auto_start_assigned_task_for_completion(
@@ -135,17 +138,29 @@ def process_completed_event(
         attempt_id=attempt_id,
     )
 
-    if hook_ctx.get("force_complete"):
+    assigned_agent = str(getattr(state, "agent_id", "") or "").strip()
+    completing_agent = str(payload.get("agent_id") or "").strip()
+    has_mismatch = bool(check_completer_mismatch(task_id, assigned_agent, completing_agent))
+    force_complete = bool(hook_ctx.get("force_complete"))
+
+    if force_complete and not has_mismatch:
         logger.warning("force_complete: skipping verification gate for task %s", task_id)
         verification = VerificationResult(
             verification_id=f"ver-forced-{task_id}",
             workflow_id=state.workflow_id,
             task_id=task_id,
-            overall_outcome="passed",
+            overall_outcome="force_passed",
             checks=[],
             summary="verification skipped: foreman force-complete override",
         )
     else:
+        if force_complete:
+            logger.warning(
+                "force_complete: completer mismatch detected for task %s; verification enforced",
+                task_id,
+            )
+            result["force_complete_overridden"] = True
+            result.setdefault("warnings", []).append(FORCE_COMPLETE_MISMATCH_WARNING)
         try:
             verification = ralph_service.verify_completion(
                 task_id,
@@ -162,6 +177,10 @@ def process_completed_event(
                 checks=[],
                 summary=f"verification_error: {e}",
             )
+        if force_complete:
+            verification = verification.model_copy(
+                update={"warnings": [*verification.warnings, FORCE_COMPLETE_MISMATCH_WARNING]}
+            )
 
     engine.record_verification_result(task_id, verification, hook_ctx=hook_ctx)
     result["verification_outcome"] = verification.overall_outcome
@@ -170,7 +189,7 @@ def process_completed_event(
         # RA-3: agent verification — task stays in VERIFYING, just notify
         notification_outcome = "agent_pending"
         context_error = ""
-    elif verification.overall_outcome == "passed":
+    elif verification.overall_outcome in {"passed", "force_passed"}:
         on_task_completed_fn(
             task_id=task_id,
             agent_id=agent_id,
@@ -179,6 +198,16 @@ def process_completed_event(
             workflow_id=payload.get("workflow_id") or state.workflow_id,
             verification=verification,
         )
+        # BP-4: check cross-task output contract (non-blocking warning)
+        try:
+            _check_output_contract(
+                engine=engine,
+                task_id=task_id,
+                task_ref=state.task,
+                changed_files=list(changed_files),
+            )
+        except Exception:
+            logger.debug("Output contract check failed", exc_info=True)
         notification_outcome = "passed"
         context_error = ""
     elif verification.overall_outcome in {"skipped", "skipped_blocked"}:
@@ -266,3 +295,46 @@ def process_failed_event(
         last_error=error_message,
     )
     return result
+
+
+def _check_output_contract(
+    *,
+    engine: Any,
+    task_id: str,
+    task_ref: Any,
+    changed_files: List[str],
+) -> None:
+    """BP-4: Check if task's changed files satisfy expected_output contract.
+
+    Emits a contract_violation warning event if expected output paths are not
+    covered by actual changed files. Non-blocking — for observability only.
+    """
+    expected_output = getattr(task_ref, "expected_output", None) or {}
+    if not expected_output:
+        return
+
+    expected_paths = expected_output.get("paths", [])
+    if not expected_paths or not isinstance(expected_paths, list):
+        return
+
+    changed_set = set(changed_files)
+    missing_paths = [p for p in expected_paths if p not in changed_set]
+    if not missing_paths:
+        return
+
+    try:
+        engine.record_verification_warning(
+            task_id,
+            warning_type="contract_violation",
+            message=(
+                f"task '{task_id}' expected output paths {missing_paths} "
+                f"not in changed files"
+            ),
+            evidence={
+                "missing_paths": missing_paths,
+                "changed_files": list(changed_files)[:20],
+                "expected_paths": expected_paths,
+            },
+        )
+    except Exception:
+        logger.debug("Failed to record contract violation", exc_info=True)

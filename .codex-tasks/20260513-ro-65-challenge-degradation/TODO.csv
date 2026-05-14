@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm T3 behavior and existing challenge flow,DONE,Plan and current code inspected,test -f plans/fix-v5-v27-remaining.yaml,2026-05-13,0,fast-context returned cancelled; used rg and targeted reads
+2,Implement challenge degradation in ralph_service.py,DONE,Unavailable agent failures return worker result with W_CHALLENGE_DEGRADED warning,python -m py_compile src/cccc/daemon/foreman/ralph_service.py,2026-05-13,0,
+3,Add challenge degradation unit tests,DONE,New test file covers unavailable agent genuine failure warning and agent mode,python -m pytest tests/test_challenge_degradation.py -v,2026-05-13,0,
+4,Run requested verification,DONE,Requested pytest command passes,python -m pytest tests/test_challenge_degradation.py -v,2026-05-13,0,also ran tests/ralph/test_adversarial_gate.py after syncing old assertion

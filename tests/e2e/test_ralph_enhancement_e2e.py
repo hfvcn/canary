@@ -33,12 +33,13 @@ def _write_plan(plan_path: Path, *, with_unknown_flow: bool) -> Path:
     covers = {"tasks": ["T1"], "paths": ["tests/test_app.py"]}
     if with_unknown_flow:
         covers["flows"] = ["ghost-flow"]
+    claimed = ["src/app.py", "src/extra.py"] if with_unknown_flow else ["src/app.py"]
     payload = {
         "schema_version": "1.0.0",
         "tasks": [{
             "id": "T1",
             "title": "Enhancement task",
-            "claimed_paths": ["src/app.py"],
+            "claimed_paths": claimed,
             "goal_behavior": "Keep the app stable under verification.",
             "acceptance_criteria": "app tests pass",
             "verification": {

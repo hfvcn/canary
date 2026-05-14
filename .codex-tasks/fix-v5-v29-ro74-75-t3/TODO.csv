@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing validation and test construction,DONE,Relevant rule/export/validator/test patterns identified,rg plus file reads,2026-05-13,0,
+2,Implement new coverage rule and validator wiring,DONE,New function exported and invoked without unrelated edits,python -m py_compile src/cccc/ralph/validation_rules/coverage.py src/cccc/ralph/validation_rules/__init__.py src/cccc/ralph/validator.py,2026-05-13,0,
+3,Add focused tests for five acceptance scenarios,DONE,New test file covers same-prefix mixed-prefix single empty duplicate cases,python -m pytest tests/test_task_addresses_disjoint.py -v,2026-05-13,0,
+4,Run requested verification,DONE,Specified pytest command passes,python -m pytest tests/test_task_addresses_disjoint.py -v,2026-05-13,0,

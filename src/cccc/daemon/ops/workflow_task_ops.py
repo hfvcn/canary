@@ -176,11 +176,14 @@ def fail_task(group_id, task_id, agent_id, message, workflow_id, project_root, d
         return _classify_error(exc)
 
 
-def retry_task(group_id, task_id, workflow_id, project_root, daemon_request_fn):
+def retry_task(group_id, task_id, workflow_id, project_root, daemon_request_fn, *, assign_agent_id=""):
     try:
         orchestrator = _get_orchestrator_or_raise(group_id, project_root, daemon_request_fn)
         _get_state_or_raise(orchestrator, task_id, workflow_id)
-        result = orchestrator.retry_task(_normalize_text("task_id", task_id))
+        result = orchestrator.retry_task(
+            _normalize_text("task_id", task_id),
+            assign_agent_id=str(assign_agent_id or "").strip(),
+        )
         return _success(result)
     except Exception as exc:
         return _classify_error(exc)

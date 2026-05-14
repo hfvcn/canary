@@ -1,0 +1,536 @@
+# Plan: RO-45 ~ RO-50 — 问题清单 v5 最后 6 项待实施修复
+#
+# 来源：todo/问题清单-v5-ralph.md 所有未解决改进项（RO-45 ~ RO-50）
+# 工作流：findings.md § 〇 经验证的工作流程
+# Codex 审查：2026-05-04，6 项反馈均已纳入
+#
+# Codex 审查修正：
+#   - T3: retry_after_verification() 已将任务置为 READY，resuggest 也拾起 READY
+#     → 机制正常。真实问题是 stall 任务处于 RUNNING 状态，而
+#     retry_after_verification() 只接受 VERIFYING/FAILED。
+#     修改为：retry_task 先检查 RUNNING 状态并 fail 转 FAILED 再重试。
+#   - T4 拆分：RO-48（stall auto-reassign）需要 WorkflowMeta 新字段 + 状态
+#     转换修复，与 RO-49（timeout 可配置）完全独立 → 拆为 T4a + T4b。
+#   - T4a: claimed_paths 补充 WorkflowMeta 字段所在的 workflow_state_types.py，
+#     以及 check_stalled_tasks 中 RUNNING→FAILED 的转换。
+#   - T4b: claimed_paths 补充 models.py（CheckSpec.timeout）和 core.py
+#     （_run_check timeout 透传）。
+#   - T5: 不使用 engine.get_task() 避免破坏现有测试。改为从 _active_workflows
+#     缓存检查 terminal 状态。增加回归验证命令覆盖现有测试。
+#
+# 设计原则：
+#   - #2  按功能切片拆分，不按文件拆
+#   - #9  先跑通一条路径再扩展 — P1 > P2
+#   - #11 verification 必须真正跑命令
+#   - #13 结构校验 + 代码审查互补
+#
+# 批次预期：
+#   Batch 1: T1, T2, T3, T4a, T4b, T5  — 独立修复（无互相依赖）
+#   Batch 2: T-int                       — 集成验证（依赖全部修复）
+
+schema_version: "1.0.0"
+
+required_issues:
+  - "RO-45"
+  - "RO-46"
+  - "RO-47"
+  - "RO-48"
+  - "RO-49"
+  - "RO-50"
+
+semantic_mode: "off"
+auto_infer: false
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_AGENT_REVIEW_FAILED
+  - W_AGENT_REVIEW_SKIPPED
+  - W_UNCLAIMED_TEST_FOR_SOURCE
+  - W_TEST_COVERAGE_GAP
+  - W_VERIFICATION_TARGET_MISSING
+  - W_VERIFICATION_NO_CHECKS
+  - W_VERIFICATION_COMPLEX_SHELL_SKIPPED
+  - W_CROSS_BOUNDARY_WITHOUT_GLUE
+  - W_NO_FAILURE_PATH
+  - W_PLAN_SCOPE_UNUSED
+  - W_VERIFICATION_BEHAVIOR_MISMATCH
+
+critical_entrypoints:
+  - src/cccc/daemon/foreman/ralph_service.py
+  - src/cccc/ralph/core.py
+  - src/cccc/ralph/agent.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+
+critical_flows:
+  - id: dir_claimed_paths_expansion
+    description: >
+      _read_claimed_paths() 在两处实现（ralph_service.py 和 core.py）
+      均需展开 is_dir() 路径为其中的源文件列表，保持行为一致。
+    entrypoints:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/core.py
+    required_verification_level: unit
+
+  - id: challenge_empty_diff_new_project
+    description: >
+      challenge agent prompt（agent.py）在 git diff 为空且项目无前序 commit
+      时不应错误判定 CREATE/MODIFY 任务失败。git diff 辅助函数在
+      ralph_service.py 和 core.py 均需传递 "no prior commits" 上下文。
+    entrypoints:
+      - src/cccc/ralph/agent.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/core.py
+    required_verification_level: unit
+
+  - id: terminal_state_guard
+    description: >
+      on_task_failed() 在 workflow_orchestrator.py 中必须对 terminal
+      状态（completed, archived）的 task 跳过状态覆写和通知转发。
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+    required_verification_level: unit
+
+forbidden_flows:
+  - id: no_completed_task_failure_overwrite
+    description: >
+      on_task_failed() 不得将 COMPLETED 状态的 task 覆写为 FAILED，
+      也不得向 Foreman 发送 COMPLETED task 的失败通知。
+    test_created_by:
+      - T5
+    required_verification_level: unit
+
+state:
+  completed_task_ids: []
+  running_tasks: []
+  failed_task_ids: []
+
+# ================================================================
+# T1: 展开目录型 claimed_paths (RO-45, P1)
+# ================================================================
+
+tasks:
+  - id: T1
+    title: "Expand directory claimed_paths to source files in _read_claimed_paths"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-45"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/core.py
+      - tests/test_read_claimed_paths_dir.py
+    awareness_paths:
+      - src/cccc/ralph/agent.py
+    goal_behavior: >
+      修改两处 _read_claimed_paths() 函数，当 claimed_paths 条目是目录时
+      递归枚举目录中的源文件并逐个读取。
+
+      1. ralph_service.py:787 _read_claimed_paths(self, task_ref) — 在
+         full_path.is_file() 检查（line 794）前添加 full_path.is_dir() 分支：
+         用 sorted(full_path.rglob("*")) 枚举文件，过滤 _SOURCE_EXTENSIONS
+         匹配的后缀（.py, .ts, .tsx, .js, .jsx），对每个文件读取内容
+         加入 result dict（key 为相对于 self.project_root 的路径）。
+         仍受 SOURCE_CONTEXT_MAX_BYTES（line 56）和
+         SOURCE_FILE_MAX_BYTES（line 57）限制。
+
+      2. core.py:267 _read_claimed_paths(claimed_paths, project_root) — 同样
+         在 full.is_file() 检查（line 277）前添加 full.is_dir() 分支。
+         使用 _SOURCE_CONTEXT_MAX_BYTES（line 263）和
+         _SOURCE_FILE_MAX_BYTES（line 264）。行为与 ralph_service.py 一致。
+
+      3. 在两个文件中各定义 _SOURCE_EXTENSIONS = {".py", ".ts", ".tsx",
+         ".js", ".jsx"}（或共享定义）。
+
+      4. 目录展开时按 str(path) 排序，保证结果确定性。
+
+      5. 如果目录不存在或展开后无匹配文件，标记为 "<file not found>"。
+    acceptance_criteria: >
+      1. claimed_paths 含目录路径时，该目录下的源文件内容被正确读取。
+      2. 目录路径本身不出现在 result 中，展开后的各文件路径出现。
+      3. SOURCE_CONTEXT_MAX_BYTES 总量限制仍然生效。
+      4. 不存在的目录仍标记为 "<file not found>"。
+      5. ralph_service.py 和 core.py 两处行为一致。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_read_claimed_paths_dir.py -xvs"
+      covers:
+        tasks: [T1]
+        flows: [dir_claimed_paths_expansion]
+    provides:
+      - name: dir_expansion_behavior
+        kind: behavior
+    consumes: []
+
+  # ================================================================
+  # T2: challenge agent git diff 新项目兼容 (RO-46, P1)
+  # ================================================================
+
+  - id: T2
+    title: "Handle empty git diff for new projects in challenge agent"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-46"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/ralph/agent.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/core.py
+      - tests/test_challenge_empty_diff.py
+    awareness_paths: []
+    goal_behavior: >
+      修改 git diff 为空时的处理逻辑，区分"文件未修改"和"新项目无 commit"：
+
+      1. ralph_service.py:814 _git_diff_for_files(self, changed_files) — 当
+         git diff HEAD 返回空 stdout 且 changed_files 非空时，检查是否
+         存在 HEAD commit：运行 git rev-parse HEAD（cwd=self.project_root，
+         timeout=GIT_COMMAND_TIMEOUT_SECONDS），如果 returncode != 0
+         说明无 commit，返回 "<empty diff — project has no prior commits,
+         files are newly created>" 而非 "files are unchanged from HEAD"。
+
+      2. core.py:291 _git_diff_for_files(changed_files, project_root) — 同样
+         修改（line 306 处空 diff 判断），保持行为一致。使用 timeout=10
+         （与已有的 git diff timeout 一致）。
+
+      3. agent.py:237 build_verification_prompt() — 在 rule 3（line 237-242）
+         之后追加 rule 3b：
+         "3b. If git_diff states 'project has no prior commits' and the task
+         creates new files, this is expected — judge based on source_code and
+         verification_output, not the diff."
+
+      注意：changed_files 为空时的行为不变（仍返回 "no changed files"）。
+    acceptance_criteria: >
+      1. 新项目（无 HEAD commit）首个 task 的 git diff 返回含
+         "no prior commits" 的消息。
+      2. agent prompt 包含 rule 3b 处理 "no prior commits"。
+      3. 有 commit 但文件未修改的场景仍返回 "unchanged from HEAD"。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_challenge_empty_diff.py -xvs"
+      covers:
+        tasks: [T2]
+        flows: [challenge_empty_diff_new_project]
+    provides:
+      - name: new_project_diff_handling
+        kind: behavior
+    consumes: []
+
+  # ================================================================
+  # T3: retry 对 RUNNING 状态 stall 任务的支持 (RO-47, P1)
+  # ================================================================
+
+  - id: T3
+    title: "Allow retry_task to handle RUNNING tasks via fail-then-retry"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-47"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/kernel/workflow_state_engine.py
+      - tests/test_retry_running_task.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/assignment_batches.py
+      - src/cccc/kernel/workflow_state_types.py
+    goal_behavior: >
+      v20 的实际问题：T2 从 gemini stall 后处于 RUNNING 状态，
+      retry_after_verification()（workflow_state_engine.py:478）只接受
+      VERIFYING 或 FAILED，导致 retry_task() 失败。Foreman 需手工
+      fail→retry→re-submit→re-assign 共 5 步。
+
+      修复方案：
+
+      1. workflow_orchestrator.py:1270 retry_task() — 在调用
+         engine.retry_after_verification() 前检查 task 状态：
+         如果 state.status == WorkflowTaskStatus.RUNNING，先调用
+         engine.fail_task(tid, "stalled — auto-retry requested") 将状态
+         转为 FAILED，再调用 engine.retry_after_verification(tid)。
+
+      2. 确认 engine.fail_task() 存在且接受 RUNNING→FAILED 转换。
+         如果不存在，在 workflow_state_engine.py 中新增：
+         def fail_task(self, task_id, reason) — 将 RUNNING task 转为
+         FAILED，记录 ledger event。
+
+      3. retry_task() 之后的 _resuggest_ready_tasks() 已正确工作
+         （retry_after_verification 将 task 置为 READY，resuggest 拾起
+         READY 状态，auto_dispatch 用 assignment_map 重新分配）。
+         不需要修改 assignment_map 逻辑。
+
+      4. 编写测试：注册 workflow(auto_dispatch=True, assignment_map=
+         {T1: agent-a}) → T1 进入 RUNNING → retry_task(T1) →
+         验证 T1 状态变为 READY（或通过 auto-dispatch 变为 ASSIGNED）。
+    acceptance_criteria: >
+      1. retry_task() 对 RUNNING 状态的 task 不抛异常。
+      2. RUNNING task retry 后自动进入 READY 并被 auto-dispatch 分配。
+      3. VERIFYING/FAILED 状态的 retry 行为不变。
+      4. assignment_map 在 retry 后被正确使用。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_retry_running_task.py -xvs"
+      covers:
+        tasks: [T3]
+        flows: []
+    provides:
+      - name: retry_running_support
+        kind: behavior
+    consumes: []
+
+  # ================================================================
+  # T4a: stall detection 自动重分配 (RO-48, P1)
+  # ================================================================
+
+  - id: T4a
+    title: "Add stall_auto_reassign to WorkflowMeta and check_stalled_tasks"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-48"
+    depends_on:
+      - T3
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/kernel/workflow_state_types.py
+      - tests/test_stall_auto_reassign.py
+    awareness_paths:
+      - src/cccc/kernel/workflow_state_engine.py
+      - src/cccc/kernel/workflow_snapshot.py
+      - src/cccc/daemon/foreman/assignment_batches.py
+    goal_behavior: >
+      使 stall detection 触发后能自动重分配，将 Foreman 干预从 5 步降为 0 步。
+      依赖 T3 的 retry_task RUNNING 支持。
+
+      1. workflow_state_types.py:58 WorkflowMeta — 增加字段：
+         stall_auto_reassign: bool = False
+         （frozen dataclass 用 field(default=False)）
+
+      2. workflow_orchestrator.py:942 check_stalled_tasks() — 增加逻辑：
+         对每个 stalled task，检查其 workflow 的 WorkflowMeta.stall_auto_reassign。
+         如果为 True，调用 self.retry_task(task_id)（依赖 T3 支持 RUNNING 重试）。
+         在 stall summary 中注明 "auto-reassigned via stall_auto_reassign"。
+
+      3. workflow_orchestrator.py register_workflow() — 接受
+         stall_auto_reassign 参数并写入 WorkflowMeta。
+
+      4. stall_auto_reassign=False（默认）时行为完全不变——仅通知。
+    acceptance_criteria: >
+      1. WorkflowMeta 有 stall_auto_reassign 字段，默认 False。
+      2. check_stalled_tasks 对 stall_auto_reassign=True 的 workflow
+         自动调用 retry_task。
+      3. stall_auto_reassign=False 时行为不变。
+      4. 不影响 snapshot 恢复（新字段有默认值）。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_stall_auto_reassign.py -xvs"
+      covers:
+        tasks: [T4a]
+        flows: []
+    provides:
+      - name: stall_auto_reassign
+        kind: behavior
+    consumes:
+      - name: retry_running_support
+        from_task: T3
+
+  # ================================================================
+  # T4b: verification timeout 可配置 (RO-49, P2)
+  # ================================================================
+
+  - id: T4b
+    title: "Add configurable timeout to verification checks"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-49"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - src/cccc/ralph/models.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/core.py
+      - tests/test_verification_timeout.py
+    awareness_paths: []
+    goal_behavior: >
+      允许 plan.yaml 中为每个 verification check 配置超时时间。
+
+      1. ralph_ipc.py:53 VerificationCheckSpec — 增加可选字段：
+         timeout: Optional[int] = None  # seconds
+
+      2. models.py:33 CheckSpec — 同样增加：
+         timeout: Optional[int] = None  # seconds
+
+      3. ralph_service.py:919 _run_verification_check() — 增加
+         timeout 参数（Optional[int] = None），实际超时值为
+         timeout or VERIFICATION_COMMAND_TIMEOUT_SECONDS（line 50，60s）。
+         在 subprocess.run 的 timeout 参数使用此值。
+
+      4. ralph_service.py:834 _run_verification_pre_check() — 从
+         VerificationCheckSpec 取 timeout 并传给 _run_verification_check。
+
+      5. core.py:388 _run_check() — 增加 timeout 参数
+         （Optional[int] = None），实际超时值为
+         timeout or _VERIFY_TIMEOUT（line 384，120s）。
+
+      6. core.py:318 _run_verification_pre_check() — 从 spec dict
+         取 timeout 并传给 _run_check。
+    acceptance_criteria: >
+      1. VerificationCheckSpec 和 CheckSpec 有 Optional[int] timeout 字段。
+      2. _run_verification_check 使用 spec timeout（如有），否则用默认。
+      3. _run_check 使用 spec timeout（如有），否则用 _VERIFY_TIMEOUT。
+      4. 现有不带 timeout 的 spec 行为不变（使用默认值）。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_verification_timeout.py -xvs"
+      covers:
+        tasks: [T4b]
+        flows: []
+    provides:
+      - name: configurable_verification_timeout
+        kind: behavior
+    consumes: []
+
+  # ================================================================
+  # T5: 已完成任务不接收失败通知 (RO-50, P2)
+  # ================================================================
+
+  - id: T5
+    title: "Guard on_task_failed against terminal-state tasks"
+    role: leaf
+    type: backend
+    addresses:
+      - "RO-50"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - tests/test_terminal_state_guard.py
+    awareness_paths:
+      - src/cccc/kernel/workflow_state_types.py
+      - src/cccc/daemon/foreman/verification_gate.py
+      - tests/test_foreman_workflow.py
+      - tests/test_worker_collaboration_integration.py
+    goal_behavior: >
+      在 on_task_failed()（workflow_orchestrator.py:872）开头增加
+      terminal state 检查。注意：不使用 engine.get_task() 因为现有测试
+      （test_foreman_workflow.py:859, test_worker_collaboration_integration.py:191）
+      调用 on_task_failed 时未在 engine 中注册 task，get_task 会返回 None。
+
+      改用 _active_workflows 缓存检查：
+
+      1. 在 on_task_failed 的 for loop（line 883-888）之前，先遍历
+         _active_workflows 查找该 task 的当前状态：
+         ```
+         for wdata in self._active_workflows.values():
+             td = wdata.get("tasks", {}).get(task_id)
+             if td and td.get("status") in _TERMINAL_STATUSES:
+                 logger.warning("Ignoring failure for terminal task %s (status=%s)",
+                                task_id, td["status"])
+                 return False
+         ```
+
+      2. 定义 _TERMINAL_STATUSES = {"completed", "archived"} 在文件顶部
+         常量区（在 TASK_STATUS_FAILED 之后）。
+
+      3. FAILED 和 BLOCKED 状态不在 terminal 集合中——它们应正常接收
+         失败事件。
+
+      4. 如果 task 不在 _active_workflows 中（未注册），正常继续处理
+         （保持现有测试兼容性）。
+    acceptance_criteria: >
+      1. COMPLETED 状态 task 收到 on_task_failed 时 return False，
+         不触发状态覆写、不发送通知。
+      2. ARCHIVED 状态同理。
+      3. RUNNING/FAILED/BLOCKED 状态正常处理。
+      4. 未在 _active_workflows 中注册的 task 正常处理（现有测试不破）。
+      5. 现有 test_foreman_workflow.py 和
+         test_worker_collaboration_integration.py 测试仍通过。
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_terminal_state_guard.py tests/test_foreman_workflow.py tests/test_worker_collaboration_integration.py -xvs"
+      covers:
+        tasks: [T5]
+        flows: [terminal_state_guard]
+    provides:
+      - name: terminal_guard
+        kind: behavior
+    consumes: []
+
+  # ================================================================
+  # T-int: 全量集成验证
+  # ================================================================
+
+  - id: T-int
+    title: "Integration validation: RO-45 ~ RO-50 all fixes"
+    role: integration
+    type: backend
+    addresses:
+      - "RO-45"
+      - "RO-46"
+      - "RO-47"
+      - "RO-48"
+      - "RO-49"
+      - "RO-50"
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T4a
+      - T4b
+      - T5
+    claimed_paths:
+      - tests/test_v5_ro45_50_integration.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/core.py
+      - src/cccc/ralph/agent.py
+    goal_behavior: >
+      编写集成测试验证所有 6 项修复的端到端协同，并运行全量回归：
+
+      1. dir_expansion_in_challenge: 含目录型 claimed_paths 的 task →
+         _read_claimed_paths 返回展开后的文件内容（非 "<file not found>"）。
+
+      2. new_project_no_false_failure: 无 commit 项目 → git diff 返回
+         "no prior commits" → challenge agent prompt 包含 rule 3b。
+
+      3. retry_running_task: RUNNING task → retry_task → 状态变为
+         READY → auto-dispatch 重新分配。
+
+      4. stall_auto_reassign: stall + stall_auto_reassign=True →
+         自动 retry。
+
+      5. configurable_timeout: CheckSpec(timeout=5) → _run_check
+         使用 5s 而非默认值。
+
+      6. terminal_guard: COMPLETED task → on_task_failed → return
+         False，状态不变。
+
+      验证命令包含全量 pytest 以确认无回归。
+    acceptance_criteria: >
+      1. 新集成测试全部通过。
+      2. 全量 python -m pytest 无新增失败。
+    verification:
+      level: e2e
+      command: "python -m pytest tests/test_v5_ro45_50_integration.py -xvs && python -m pytest --tb=short -q"
+      covers:
+        tasks: [T1, T2, T3, T4a, T4b, T5, T-int]
+        flows:
+          - dir_claimed_paths_expansion
+          - challenge_empty_diff_new_project
+          - terminal_state_guard
+    provides: []
+    consumes:
+      - name: dir_expansion_behavior
+        from_task: T1
+      - name: new_project_diff_handling
+        from_task: T2
+      - name: retry_running_support
+        from_task: T3
+      - name: stall_auto_reassign
+        from_task: T4a
+      - name: configurable_verification_timeout
+        from_task: T4b
+      - name: terminal_guard
+        from_task: T5

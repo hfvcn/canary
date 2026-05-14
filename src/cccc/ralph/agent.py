@@ -17,9 +17,10 @@ import json
 import logging
 import os
 import subprocess
+import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 import yaml
 
@@ -31,10 +32,13 @@ GEMINI_PROVIDER = "gemini-cli"
 STUB_PROVIDER = "stub"
 GEMINI_FLASH_MODEL = "flash"
 GEMINI_TIMEOUT_SECONDS = 120
-GEMINI_WARMUP_TIMEOUT_SECONDS = 30
+GEMINI_WARMUP_TIMEOUT_SECONDS = 60
+GEMINI_JSON_RETRY_ATTEMPTS = 2
+GEMINI_JSON_RETRY_DELAY_SECONDS = 2
 GEMINI_WARMUP_PROMPT = 'Return exactly this JSON: {"ok": true}'
 ALLOWED_CONFIDENCE = frozenset({"low", "medium", "high"})
 ADVISORY_NOTICE = "Agent suggestions are advisory only and have no decision authority."
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -184,14 +188,13 @@ class RalphAgent:
             git_diff=git_diff,
             verification_output=verification_output,
         )
-        result = subprocess.run(
-            self._gemini_command(prompt),
-            capture_output=True,
-            check=True,
-            text=True,
-            timeout=self.config.timeout_seconds,
+        task_id = str(task.id)
+        return self._run_gemini_json_retry(
+            prompt,
+            parser=lambda stdout: _parse_agent_verification_payload(stdout, task_id),
+            operation=f"verification for task {task_id}",
+            fallback=lambda: _degraded_agent_verification_result(task_id),
         )
-        return _parse_agent_verification_payload(result.stdout, str(task.id))
 
     def _build_verification_prompt(
         self,
@@ -240,6 +243,9 @@ class RalphAgent:
             "to VERIFY, ENSURE, CHECK, AUDIT, or REVIEW existing code, "
             "an empty diff is expected — judge based on source_code and "
             "verification_output instead.\n"
+            "3b. If git_diff states 'project has no prior commits' and the "
+            "task creates new files, this is expected — judge based on "
+            "source_code and verification_output, not the diff.\n"
             "4. If verification_output.status is 'passed' (all compile/test "
             "checks succeeded), do NOT fabricate failures. Only fail the "
             "task if you find a concrete gap between goal_behavior and the "
@@ -269,6 +275,13 @@ class RalphAgent:
 
     def _review_with_gemini(self, issues: list[ValidationIssue]) -> list[AgentSuggestion]:
         prompt = self._build_gemini_prompt(issues)
+        return self._run_gemini_json_retry(
+            prompt,
+            parser=lambda stdout: self._parse_gemini_output(stdout, issues),
+            operation="review",
+        )
+
+    def _run_gemini_prompt(self, prompt: str) -> str:
         result = subprocess.run(
             self._gemini_command(prompt),
             capture_output=True,
@@ -276,7 +289,47 @@ class RalphAgent:
             text=True,
             timeout=self.config.timeout_seconds,
         )
-        return self._parse_gemini_output(result.stdout, issues)
+        return result.stdout
+
+    def _run_gemini_json_retry(
+        self,
+        prompt: str,
+        *,
+        parser: Callable[[str], T],
+        operation: str,
+        fallback: Callable[[], T] | None = None,
+    ) -> T:
+        first_error: GeminiResponseError | None = None
+        for attempt in range(1, GEMINI_JSON_RETRY_ATTEMPTS + 1):
+            try:
+                return parser(self._run_gemini_prompt(prompt))
+            except GeminiResponseError as exc:
+                if first_error is None:
+                    first_error = exc
+                if attempt == GEMINI_JSON_RETRY_ATTEMPTS:
+                    return self._raise_or_fallback(first_error, fallback)
+                log.warning(
+                    "Gemini %s returned invalid JSON on attempt %d/%d: %s",
+                    operation,
+                    attempt,
+                    GEMINI_JSON_RETRY_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(GEMINI_JSON_RETRY_DELAY_SECONDS)
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                if first_error is not None:
+                    return self._raise_or_fallback(first_error, fallback)
+                raise
+        raise AssertionError("Gemini retry loop exited without a result")
+
+    def _raise_or_fallback(
+        self,
+        exc: GeminiResponseError,
+        fallback: Callable[[], T] | None,
+    ) -> T:
+        if fallback is not None:
+            return fallback()
+        raise exc
 
     def _gemini_command(
         self,
@@ -563,6 +616,17 @@ def _agent_verification_check(item: object) -> Dict[str, Any]:
         "name": str(item.get("name", "")).strip() or "agent_simulation",
         "outcome": outcome,
         "message": str(item.get("message", "")).strip(),
+    }
+
+
+def _degraded_agent_verification_result(task_id: str) -> Dict[str, Any]:
+    return {
+        "task_id": task_id,
+        "outcome": "failed",
+        "reason": "Verification blocked: Gemini response unparseable after retry — "
+                  "cannot confirm task correctness; treat as failed",
+        "checks": [],
+        "degraded": True,
     }
 
 
@@ -1171,7 +1235,7 @@ RULE_VERSION_REGISTRY: Dict[str, int] = {
     "W_COVERS_CLAIM_UNVERIFIABLE": 1,
     "E_FORBIDDEN_FLOW_UNCOVERED": 1,
     "E_FORBIDDEN_FLOW_LEVEL_TOO_WEAK": 1,
-    "W_IMPLICIT_SERIALIZATION": 1,
+    "W_SHARED_PATH_NO_DEPENDENCY": 1,
     "W_SHARED_FILE_PARTIAL_VERIFICATION": 1,
     "W_CROSS_BOUNDARY_WITHOUT_GLUE": 1,
     "E_MISSING_INTEGRATION_SPINE": 1,

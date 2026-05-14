@@ -26,7 +26,7 @@ _SEED_DATA: Dict[str, Dict[str, Any]] = {
     "W_ISOLATED_TASK": {"count": 2, "last_plan": "batch-g2", "last_time": "2026-04-07"},
     "W_NO_FAILURE_PATH": {"count": 3, "last_plan": "batch-g2", "last_time": "2026-04-07"},
     "W_FLOW_OWNER_NO_VERIFICATION": {"count": 2, "last_plan": "batch-c", "last_time": "2026-04-06"},
-    "W_IMPLICIT_SERIALIZATION": {"count": 1, "last_plan": "batch-g2", "last_time": "2026-04-07"},
+    "W_SHARED_PATH_NO_DEPENDENCY": {"count": 1, "last_plan": "batch-g2", "last_time": "2026-04-07"},
     "W_VERIFICATION_BEHAVIOR_MISMATCH": {"count": 2, "last_plan": "batch-g2", "last_time": "2026-04-07"},
     "W_VERIFICATION_COMPLEX_SHELL_SKIPPED": {"count": 2, "last_plan": "batch-g2", "last_time": "2026-04-07"},
 }

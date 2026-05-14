@@ -2636,6 +2636,19 @@ class TestVerifyShellOperators:
         from cccc.daemon.foreman.ralph_service import _has_shell_operators
         assert _has_shell_operators('echo "unterminated') is True
 
+    def test_env_var_prefix_detected(self):
+        """RO-60: VAR=value command requires shell."""
+        from cccc.daemon.foreman.ralph_service import _has_shell_operators
+        assert _has_shell_operators("PYTHONPATH=backend python -c 'import app'") is True
+
+    def test_env_var_multiple_detected(self):
+        from cccc.daemon.foreman.ralph_service import _has_shell_operators
+        assert _has_shell_operators("FOO=1 BAR=2 python test.py") is True
+
+    def test_env_var_not_false_positive_on_equals_in_args(self):
+        from cccc.daemon.foreman.ralph_service import _has_shell_operators
+        assert _has_shell_operators("pytest --key=value tests/") is False
+
     def test_is_trivial_echo(self):
         from cccc.daemon.foreman.ralph_service import _is_trivial_command
         assert _is_trivial_command("echo done") is True
@@ -2697,6 +2710,16 @@ class TestVerifyShellExecution:
             expected_exit_code=0,
         )
         assert result.outcome == "failed"
+
+    def test_env_var_prefix_executes_via_shell(self, tmp_path):
+        """RO-60: VAR=value cmd should execute through shell, not fail with ENOENT."""
+        svc = self._make_service(tmp_path)
+        result = svc._run_verification_check(
+            command="MY_TEST_VAR=hello python -c 'import os; print(os.environ[\"MY_TEST_VAR\"])'",
+            expected_exit_code=0,
+        )
+        assert result.outcome == "passed"
+        assert "hello" in result.details.get("stdout", "")
 
 
 # ---------------------------------------------------------------------------

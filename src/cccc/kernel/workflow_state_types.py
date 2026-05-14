@@ -32,6 +32,9 @@ KIND_PLAN_DIGEST_DIVERGENCE_POST_HOC = "workflow.plan_digest_divergence_post_hoc
 KIND_TRANSITION_REJECTED = "workflow.transition_rejected"
 KIND_MONITOR_MODE_CHANGED = "workflow.monitor_mode_changed"
 KIND_VERIFICATION_AGENT_PENDING = "workflow.verification_agent_pending"
+KIND_WORKFLOW_COMPLETED = "workflow.completed"
+KIND_WORKFLOW_FAILED = "workflow.failed"
+KIND_CONTRACT_VIOLATION = "workflow.contract_violation"
 
 
 class WorkflowTaskStatus(str, Enum):
@@ -63,6 +66,7 @@ class WorkflowMeta:
     plan_path: str = ""
     plan_digest: str = ""
     auto_dispatch: bool = False
+    stall_auto_reassign: bool = field(default=False)
     assignment_map: Dict[str, str] = field(default_factory=dict)
 
 

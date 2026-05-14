@@ -106,9 +106,9 @@ def test_register_submits_ready_suggestion_to_batch_processor(tmp_path, monkeypa
     monkeypatch.setattr(orchestrator.ralph, "suggest_ready_batch", lambda *args, **kwargs: suggestion)
 
     monkeypatch.setattr(
-        orchestrator,
+        orchestrator._assignment_controller,
         "process_batch_suggestion",
-        lambda ready_suggestion, *, auto_start_agents=True: captured.update(
+        lambda ready_suggestion, *, auto_start_agents=True, allowed_existing_task_ids=None: captured.update(
             suggestion=ready_suggestion,
             auto_start_agents=auto_start_agents,
         ),

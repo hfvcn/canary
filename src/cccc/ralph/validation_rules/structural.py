@@ -218,12 +218,15 @@ def _check_implicit_serialization(plan: Plan) -> List[ValidationIssue]:
                 pair = frozenset([t1.id, t2.id])
                 if pair not in reported:
                     reported.add(pair)
+                    overlap = [a for a in ws1 for b in ws2 if _paths_overlap(a, b)]
                     issues.append(ValidationIssue(
-                        code="W_IMPLICIT_SERIALIZATION",
-                        severity="hint",
-                        message=f"tasks '{t1.id}' and '{t2.id}' share claimed_paths but have no "
-                                f"explicit depends_on — Ralph will serialize them via write-set conflict",
+                        code="W_SHARED_PATH_NO_DEPENDENCY",
+                        severity="warning",
+                        message=f"tasks '{t1.id}' and '{t2.id}' claim overlapping paths "
+                                f"({', '.join(overlap[:3])}) but have no explicit depends_on — "
+                                f"add depends_on if ordering matters, or split claimed_paths to avoid write conflicts",
                         task_ids=[t1.id, t2.id],
+                        evidence={"shared_paths": overlap[:5]},
                     ))
 
     return issues
@@ -486,3 +489,36 @@ def _is_cross_task_verifier(verification: Verification | None) -> bool:
         and verification.level in ("integration", "e2e")
         and len(verification.covers.tasks) >= 2
     )
+
+
+def _check_module_consistency(plan: Plan) -> List[ValidationIssue]:
+    """E_MODULE_DUPLICATE_ID / E_MODULE_UNKNOWN_DEP: validate module decomposition."""
+    issues: List[ValidationIssue] = []
+    for task in plan.tasks:
+        if not task.modules:
+            continue
+        module_ids: set[str] = set()
+        for mod in task.modules:
+            if mod.id in module_ids:
+                issues.append(ValidationIssue(
+                    code="E_MODULE_DUPLICATE_ID",
+                    severity="error",
+                    message=f"task '{task.id}' has duplicate module id '{mod.id}'",
+                    task_ids=[task.id],
+                    evidence={"module_id": mod.id},
+                ))
+            module_ids.add(mod.id)
+        for mod in task.modules:
+            for dep in mod.internal_depends_on:
+                if dep not in module_ids:
+                    issues.append(ValidationIssue(
+                        code="E_MODULE_UNKNOWN_DEP",
+                        severity="error",
+                        message=(
+                            f"task '{task.id}' module '{mod.id}' depends on "
+                            f"unknown module '{dep}'"
+                        ),
+                        task_ids=[task.id],
+                        evidence={"module_id": mod.id, "unknown_dep": dep},
+                    ))
+    return issues

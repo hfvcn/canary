@@ -112,7 +112,7 @@ class TestDigestStateExemptE2E:
         orchestrator.engine.report_worker_started("T-up", "w1")
 
         data = yaml.safe_load(plan_path.read_text())
-        data["tasks"][0]["title"] = "CHANGED TITLE"
+        data["tasks"][0]["claimed_paths"] = ["src/changed.py"]
         plan_path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True))
 
         from cccc.kernel.workflow_state_types import PreTransitionVetoed
@@ -241,3 +241,129 @@ class TestDocsCleanup:
         mcp_tools = ["cccc_message_send", "cccc_task", "cccc_bootstrap", "cccc_help", "cccc_capability_use", "cccc_coordination"]
         found = [tool for tool in mcp_tools if tool in content]
         assert not found, f"MCP tool references still in docs: {found}"
+
+
+# ---------------------------------------------------------------------------
+# 5. RO-62: force-complete emits verification_skipped, not verification_passed
+# ---------------------------------------------------------------------------
+
+
+class TestForceCompleteEvent:
+    def test_force_complete_emits_verification_skipped(self, orchestrator: WorkflowOrchestrator, tmp_path: Path, monkeypatch):
+        """RO-62: force-complete should produce verification_skipped, not verification_passed."""
+        from cccc.kernel.workflow_state_types import KIND_VERIFICATION_PASSED, KIND_VERIFICATION_SKIPPED
+        from cccc.contracts.v1.ralph_ipc import TaskEvent
+
+        monkeypatch.setattr(orchestrator.reporter, "on_task_completed", lambda *a, **kw: True)
+        monkeypatch.setattr(orchestrator.reporter, "on_task_failed", lambda *a, **kw: True)
+
+        task = TaskRef(id="T-fc", title="force me", type="backend")
+        orchestrator.engine.register_task(task, "wf-fc")
+        orchestrator.engine.register_batch("b-fc", ["T-fc"])
+        orchestrator.engine.approve_batch("b-fc", [{"task_id": "T-fc", "agent_id": "w1", "claimed_paths": []}])
+        orchestrator.engine.report_worker_started("T-fc", "w1")
+
+        result = orchestrator.apply_task_event(
+            TaskEvent(
+                task_id="T-fc",
+                event_type="completed",
+                payload={"agent_id": "w1", "duration_seconds": 1, "changed_files": []},
+            ),
+            force_complete=True,
+        )
+
+        assert result["accepted"] is True
+        assert result.get("verification_outcome") == "force_passed"
+
+        ledger_path = orchestrator.group.ledger_path
+        if ledger_path.exists():
+            events = [json.loads(line) for line in ledger_path.read_text().splitlines() if line.strip()]
+            event_kinds = [e["kind"] for e in events]
+            assert KIND_VERIFICATION_SKIPPED in event_kinds
+            assert KIND_VERIFICATION_PASSED not in event_kinds
+
+
+# ---------------------------------------------------------------------------
+# 6. RO-63: ASSIGNED tasks can be retried and failed
+# ---------------------------------------------------------------------------
+
+
+class TestAssignedRetryFail:
+    def test_retry_assigned_task(self, orchestrator: WorkflowOrchestrator, monkeypatch):
+        """RO-63: retry should work on ASSIGNED tasks."""
+        monkeypatch.setattr(orchestrator.reporter, "on_task_completed", lambda *a, **kw: True)
+        monkeypatch.setattr(orchestrator.reporter, "on_task_failed", lambda *a, **kw: True)
+
+        task = TaskRef(id="T-as", title="assigned task", type="backend")
+        orchestrator.engine.register_task(task, "wf-as")
+        orchestrator.engine.register_batch("b-as", ["T-as"])
+        orchestrator.engine.approve_batch("b-as", [{"task_id": "T-as", "agent_id": "gemini-1", "claimed_paths": []}])
+
+        state = orchestrator.engine.get_task("T-as")
+        assert state is not None
+        assert state.status == WorkflowTaskStatus.ASSIGNED
+
+        result = orchestrator.retry_task("T-as")
+        assert result["accepted"] is True
+
+        state = orchestrator.engine.get_task("T-as")
+        assert state is not None
+        assert state.status == WorkflowTaskStatus.READY
+
+    def test_fail_assigned_task(self, orchestrator: WorkflowOrchestrator):
+        """RO-63: fail should work on ASSIGNED tasks at engine level."""
+        task = TaskRef(id="T-af", title="fail me", type="backend")
+        orchestrator.engine.register_task(task, "wf-af")
+        orchestrator.engine.register_batch("b-af", ["T-af"])
+        orchestrator.engine.approve_batch("b-af", [{"task_id": "T-af", "agent_id": "gemini-1", "claimed_paths": []}])
+
+        state = orchestrator.engine.get_task("T-af")
+        assert state.status == WorkflowTaskStatus.ASSIGNED
+
+        orchestrator.engine.fail_task("T-af", "worker never started")
+
+        state = orchestrator.engine.get_task("T-af")
+        assert state is not None
+        assert state.status == WorkflowTaskStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# 7. RO-64: stall detection covers ASSIGNED tasks
+# ---------------------------------------------------------------------------
+
+
+class TestAssignedStallDetection:
+    def test_stalled_assigned_task_detected(self, orchestrator: WorkflowOrchestrator, monkeypatch):
+        """RO-64: ASSIGNED tasks that exceed threshold should be detected as stalled."""
+        import time
+
+        monkeypatch.setattr(orchestrator.reporter, "on_task_completed", lambda *a, **kw: True)
+        monkeypatch.setattr(orchestrator.reporter, "on_task_failed", lambda *a, **kw: True)
+
+        task = TaskRef(id="T-st", title="stall me", type="backend")
+        orchestrator.engine.register_task(task, "wf-st")
+        orchestrator.engine.register_batch("b-st", ["T-st"])
+        orchestrator.engine.approve_batch(
+            "b-st",
+            [{"task_id": "T-st", "agent_id": "gemini-1", "claimed_paths": [],
+              "assigned_at": time.time() - 200}],
+        )
+
+        state = orchestrator.engine.get_task("T-st")
+        assert state.status == WorkflowTaskStatus.ASSIGNED
+
+        stalled = orchestrator.check_stalled_tasks(threshold_seconds=300)
+        assert "T-st" in stalled
+
+    def test_fresh_assigned_task_not_stalled(self, orchestrator: WorkflowOrchestrator, monkeypatch):
+        """ASSIGNED tasks within threshold should not be flagged."""
+        monkeypatch.setattr(orchestrator.reporter, "on_task_completed", lambda *a, **kw: True)
+        monkeypatch.setattr(orchestrator.reporter, "on_task_failed", lambda *a, **kw: True)
+
+        task = TaskRef(id="T-fs", title="fresh", type="backend")
+        orchestrator.engine.register_task(task, "wf-fs")
+        orchestrator.engine.register_batch("b-fs", ["T-fs"])
+        orchestrator.engine.approve_batch("b-fs", [{"task_id": "T-fs", "agent_id": "w1", "claimed_paths": []}])
+
+        stalled = orchestrator.check_stalled_tasks(threshold_seconds=300)
+        assert "T-fs" not in stalled

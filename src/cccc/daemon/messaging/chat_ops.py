@@ -25,6 +25,7 @@ from ...util.time import utc_now_iso
 from .delivery import get_headless_targets_for_message, queue_chat_message
 
 logger = logging.getLogger("cccc.daemon.server")
+_TRUSTED_SENDER_PREFIXES = ("foreman", "service")
 
 
 def _error(code: str, message: str, *, details: Optional[Dict[str, Any]] = None) -> DaemonResponse:
@@ -226,6 +227,28 @@ def _normalize_refs(raw: Any) -> list[dict[str, Any]]:
     return refs
 
 
+def _is_trusted_sender(by: str, _group: Any) -> bool:
+    sender = str(by or "").strip()
+    if sender == "system":
+        return True
+    return sender.startswith(_TRUSTED_SENDER_PREFIXES)
+
+
+def _get_group_orchestrator(group: Any) -> Any:
+    from ..foreman.workflow_orchestrator import get_orchestrator
+
+    return get_orchestrator(str(getattr(group, "group_id", "") or "").strip())
+
+
+def _maybe_manual_assign_task(group: Any, by: str, task_id: str, to_tokens: list[str]) -> None:
+    if not task_id or not to_tokens or not _is_trusted_sender(by, group):
+        return
+    orchestrator = _get_group_orchestrator(group)
+    if orchestrator is None:
+        return
+    orchestrator.manual_assign_task(task_id, to_tokens[0])
+
+
 def _notify_headless_targets(
     *,
     group: Any,
@@ -278,6 +301,7 @@ def handle_send(
     group_id = str(args.get("group_id") or "").strip()
     text = str(args.get("text") or "")
     by = str(args.get("by") or "user").strip()
+    task_id = str(args.get("task_id") or "").strip()
     priority = str(args.get("priority") or "normal").strip() or "normal"
     reply_required = coerce_bool(args.get("reply_required"))
     src_group_id = str(args.get("src_group_id") or "").strip()
@@ -484,6 +508,10 @@ def handle_send(
         automation_on_new_message(group)
     except Exception:
         pass
+    try:
+        _maybe_manual_assign_task(group, by, task_id, to_tokens)
+    except Exception as exc:
+        logger.warning("send --task state transition failed: %s", exc)
 
     return DaemonResponse(ok=True, result={"event": event})
 

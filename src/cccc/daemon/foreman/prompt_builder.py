@@ -63,8 +63,9 @@ class PromptBudget:
 
     Mandatory sections (Task ID, Title, Goal Behavior, Acceptance Criteria,
     Ralph-mode Verification Command, Do-Not-Ignore Issues, Recommended Tests,
-    Forbidden Actions) are never truncated.  If they exceed 40% of the budget the class
-    raises ``PromptMinimaOverflow`` (code ``E_PROMPT_MINIMA_OVERFLOW``).
+    Forbidden Actions, Completion Reminders) are never truncated.  If they
+    exceed 40% of the budget the class raises ``PromptMinimaOverflow`` (code
+    ``E_PROMPT_MINIMA_OVERFLOW``).
 
     Remaining sections are included in priority order:
         contract > blockers > verification_command > recommended_tests
@@ -95,6 +96,8 @@ class PromptBudget:
         "do_not_ignore_issues",
         "recommended_tests",
         "forbidden_actions",
+        "completion_reminder_top",
+        "completion_reminder_bottom",
     })
 
     def __init__(self, budget: Optional[int] = None):
@@ -352,6 +355,14 @@ def build_task_prompt(
         mandatory=True,
     ))
     sections.append(_PromptSection(
+        name="completion_reminder_top",
+        text=(
+            f"⚠️ IMPORTANT: When done, you MUST run: cccc task complete {task.id} "
+            f'--changed-file <path> --evidence "summary"'
+        ),
+        mandatory=True,
+    ))
+    sections.append(_PromptSection(
         name="title",
         text=f"Title: {task.title}",
         mandatory=True,
@@ -369,11 +380,48 @@ def build_task_prompt(
             mandatory=True,
         ))
     if _should_include_verification_command(task):
+        # mock_tests are adversarial gate inputs and must never be rendered to workers.
         sections.append(_PromptSection(
             name="verification_command",
             text=f"Verification Command: {task.verification.command}",
             mandatory=True,
             priority=PromptBudget.PRIORITY_MAP.get("verification_command", 30),
+        ))
+    # BP-3: Expected I/O spec — structured black-box contract for workers
+    expected_input = getattr(task, "expected_input", None) or {}
+    expected_output = getattr(task, "expected_output", None) or {}
+    if expected_input or expected_output:
+        io_lines = ["Expected I/O Contract (your implementation must satisfy this):"]
+        if expected_input:
+            io_lines.append(f"  Input:  {expected_input}")
+        if expected_output:
+            io_lines.append(f"  Output: {expected_output}")
+        sections.append(_PromptSection(
+            name="expected_io",
+            text="\n".join(io_lines),
+            mandatory=True,
+        ))
+    # BP-2: Module decomposition — advisory structure for worker guidance
+    modules = getattr(task, "modules", None)
+    if modules:
+        mod_lines = ["Module Decomposition (recommended implementation structure):"]
+        for mod in modules:
+            mid = mod.get("id", "?") if isinstance(mod, dict) else getattr(mod, "id", "?")
+            desc = mod.get("description", "") if isinstance(mod, dict) else getattr(mod, "description", "")
+            inp = mod.get("input_spec", {}) if isinstance(mod, dict) else getattr(mod, "input_spec", {})
+            out = mod.get("output_spec", {}) if isinstance(mod, dict) else getattr(mod, "output_spec", {})
+            deps = mod.get("internal_depends_on", []) if isinstance(mod, dict) else getattr(mod, "internal_depends_on", [])
+            mod_lines.append(f"  [{mid}] {desc}")
+            if inp:
+                mod_lines.append(f"    Input:  {inp}")
+            if out:
+                mod_lines.append(f"    Output: {out}")
+            if deps:
+                mod_lines.append(f"    Depends on: {', '.join(deps)}")
+        sections.append(_PromptSection(
+            name="modules",
+            text="\n".join(mod_lines),
+            mandatory=False,
         ))
     # Do-not-ignore issues — from task attribute or computed from issues list
     do_not_ignore = getattr(task, "do_not_ignore_issues", None)
@@ -464,6 +512,14 @@ def build_task_prompt(
     sections.append(_PromptSection(
         name="completion_protocol",
         text=completion_protocol,
+        mandatory=True,
+    ))
+    sections.append(_PromptSection(
+        name="completion_reminder_bottom",
+        text=(
+            f"REMINDER: Do not forget to run `cccc task complete {task.id}` when "
+            f"finished. This is required to trigger verification."
+        ),
         mandatory=True,
     ))
 

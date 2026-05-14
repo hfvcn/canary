@@ -265,9 +265,11 @@ def handle_ralph_register_and_suggest(
             suggestion_id=args.get("suggestion_id"),
             rationale=str(args.get("rationale", "")),
             estimated_parallelism=int(args.get("estimated_parallelism", len(tasks))),
+            auto_process=bool(args.get("auto_process", False)),
             auto_dispatch=bool(args.get("auto_dispatch", False)),
             assignment_map=_normalize_assignment_map(args.get("assignment_map")),
             auto_start_agents=bool(args.get("auto_start_agents", True)),
+            stall_auto_reassign=bool(args.get("stall_auto_reassign", False)),
             assignments=dict(args.get("assignments") or {}),
             fallback_allowed=bool(args.get("fallback_allowed", False)),
             plan_path=str(args.get("plan_path") or "").strip(),
@@ -318,13 +320,16 @@ def _try_process_batch(
             orchestrator._daemon_request_fn = daemon_request_fn
         orchestrator._ensure_active_workflow(
             suggestion.workflow_id,
+            auto_process=bool(args.get("auto_process", False)),
             auto_dispatch=bool(args.get("auto_dispatch", False)),
+            stall_auto_reassign=bool(args.get("stall_auto_reassign", False)),
             assignment_map=_normalize_assignment_map(args.get("assignment_map")),
             auto_start_agents=bool(args.get("auto_start_agents", True)),
         )
         orchestrator.engine.set_workflow_meta(
             suggestion.workflow_id,
             auto_dispatch=bool(args.get("auto_dispatch", False)),
+            stall_auto_reassign=bool(args.get("stall_auto_reassign", False)),
             assignment_map=_normalize_assignment_map(args.get("assignment_map")),
         )
 
@@ -1001,6 +1006,7 @@ def handle_ralph_task_retry(args: Dict[str, Any]) -> DaemonResponse:
     project_root = _resolve_group_project_root(group_id, args.get("project_root"))
     task_id = str(args.get("task_id") or "").strip()
     workflow_id = str(args.get("workflow_id") or "").strip()
+    assign_agent_id = str(args.get("assign_agent_id") or "").strip()
 
     if not group_id:
         return _error("missing_group_id", "Missing group_id")
@@ -1014,6 +1020,7 @@ def handle_ralph_task_retry(args: Dict[str, Any]) -> DaemonResponse:
             workflow_id=workflow_id,
             project_root=project_root,
             daemon_request_fn=None,
+            assign_agent_id=assign_agent_id,
         )
     )
 

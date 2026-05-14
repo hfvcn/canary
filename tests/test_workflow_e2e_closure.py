@@ -127,7 +127,7 @@ class TestPhasedSubmission(unittest.TestCase):
         captured_batches: list[list[str]] = []
         foreman_notifications: list[dict] = []
 
-        def fake_process_batch_suggestion(suggestion, *, auto_start_agents=True):
+        def fake_process_batch_suggestion(suggestion, *, auto_start_agents=True, allowed_existing_task_ids=None):
             captured_batches.append([task.id for task in suggestion.tasks])
             return SimpleNamespace(suggestion=suggestion, approved_tasks=list(suggestion.tasks), decision="approved")
 
@@ -144,7 +144,7 @@ class TestPhasedSubmission(unittest.TestCase):
 
         orchestrator_module._ORCHESTRATORS["test-group"] = orchestrator
         try:
-            with patch.object(orchestrator, "process_batch_suggestion", side_effect=fake_process_batch_suggestion), \
+            with patch.object(orchestrator._assignment_controller, "process_batch_suggestion", side_effect=fake_process_batch_suggestion), \
                  patch.object(orchestrator, "_notify_foreman_task_update", side_effect=fake_notify):
                 result = orchestrator.register_and_suggest(tasks, "wf-phased", auto_start_agents=False)
 

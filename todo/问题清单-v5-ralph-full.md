@@ -1274,10 +1274,584 @@ RO 改进在 v13 中的验证效果：
 > **解决**：`--auto-dispatch --assignment-map` + DAG gating + RO-39 修复 + RO-44 --force 联合作用
 > **E2E 验证**：v19 自动化率 88.9%（8/9 批次自动），Foreman 只需一次 `cccc workflow submit`
 
-### v17-v19 版本趋势
+### RO-42 challenge verification 假阳性 — ✅ v20 核心修复验证通过（残留子问题拆分为 RO-45/46）
+> **来源**：2026-05-02 E2E v17 实战；v18/v19 连续印证
+> **解决**：commit bc32665 实现 `_run_verification_pre_check()` + `verification_output` / `source_code` / `git_diff` 三类证据注入 daemon-path agent
+> **压力测试**：13 个 live Gemini 测试全部正确判定（改进前 0/5 → 改进后 13/13），幻觉率从 100% 降为 0%
+> **E2E v20 验证**：5 任务中 4 个一次通过 challenge，1 个重试后通过（首次失败因 RO-45/46 子问题）；过程分从 3/5 跃升至 5/5
+> **残留**：拆分为 RO-45（directory paths 未展开）和 RO-46（新项目 git diff 为空）
+
+### RL-3 含 shell 操作符的验证命令被跳过 — ✅ bc32665 实现 shell operator 拆分
+> **来源**：2026-05-02 fix-v5-remaining 计划轮次
+> **解决**：commit bc32665 实现 quote-aware scanning 将 &&/; 拆分为子命令逐个执行，不再整体 skip
+> **测试**：`tests/ralph/test_shell_operator_split.py` 覆盖
+> **E2E v20**：本轮 plan.yaml 无 && 命令，未触发，但代码已验证
+
+### RL-5 W_INDIRECT_TEST_IMPORT 对高 import 文件爆炸 — ✅ bc32665 实现 ≥10 条折叠
+> **来源**：2026-05-02 fix-v5-remaining 计划轮次
+> **解决**：commit bc32665 对 ≥10 条 W_INDIRECT_TEST_IMPORT hints 折叠为单条摘要
+> **测试**：`tests/ralph/test_indirect_import_fold.py` 覆盖
+> **E2E v20**：本轮 plan.yaml 结构简单无大量 import，未触发，但代码已验证
+
+### RO-30 RalphService 运行时接口与文档设计漂移 — ✅ bc32665 修复文档
+> **来源**：2026-04-24 Codex 设计审查
+> **解决**：commit bc32665 替换 cccc_message_send 引用为 CLI 等价命令；新增 Ralph 三形态描述（CLI 静态验证 / daemon 内 verify gate / Agent 审查）
+> **E2E v20**：文档与代码职责一致
+
+### RO-49 verification check 默认 60s 超时对集成测试过短 — ✅ v21 E2E 验证通过
+> **来源**：2026-05-03 E2E v20 T5 验证超时
+> **解决**：`VerificationCheckSpec` 和 `CheckSpec` 增加 `Optional[int] timeout`；`_run_verification_check` 和 `_run_check` 优先使用 spec timeout，fallback 到默认值
+> **测试**：`tests/test_verification_timeout.py`（5 passed）
+> **E2E v21 验证**：T6 run_integration check 180s timeout（实际 3650ms），T4 install check 120s timeout（实际 1675ms）。自定义 timeout 被引擎正确使用
+
+### RO-50 已完成任务收到虚假失败通知 — ✅ v21 E2E 验证通过
+> **来源**：2026-05-03 E2E v20 Foreman inbox 混乱
+> **解决**：`on_task_failed()` 检查 `_active_workflows` 中 task 的 terminal 状态（completed/archived），跳过覆写和通知
+> **测试**：`tests/test_terminal_state_guard.py`（4 passed）+ `test_foreman_workflow.py` 回归通过
+> **E2E v21 验证**：T1 的 3 次失败全在最终 completed 之前（retry 循环中）。完成后无虚假失败通知
+
+### RO-54 下游 auto-dispatch 需手工 re-submit — ✅ v22 E2E happy path 验证通过（残留异常路径 → RO-55）
+> **来源**：2026-05-07 E2E v21 Foreman 体验反馈
+> **代码修复**：`_auto_dispatch_ready_tasks()` 方法 + `_resuggest_ready_tasks()` 中调用（workflow_orchestrator.py:696-814）；`WorkflowMeta.auto_dispatch` + `assignment_map` 字段
+> **单测**：`tests/test_dag_auto_dispatch.py`（4 passed）
+> **E2E v22 验证**：✅ T1→T2→T3 全部通过 `-auto` 后缀批次自动分发，零 Foreman 干预。batch IDs: `ralph-51cbd0177c9e-auto`(T2), `ralph-68c39feb22c6-auto`(T3)
+> **残留**：stall→fail→retry 后 auto-dispatch 断裂（→ RO-55），因 `auto_dispatch` 设置未持久化到 engine 级
+
+### RO-48 stall detection 无自动重分配 — ✅ v22 E2E stall detection 首次真实触发
+> **来源**：2026-05-03 E2E v20 Foreman 体验反馈
+> **代码修复**：`WorkflowMeta.stall_auto_reassign` + `_handle_stalled_task` + `check_stalled_tasks()` sweep
+> **单测**：`tests/test_stall_auto_reassign.py`（4 passed）
+> **E2E v22 验证**：✅ T4 Gemini worker 315s 零输出 → `monitor_violation` at threshold=300s → Foreman 收到 `status: stalled` 通知。触发了自动 retry（`workflow.retry_requested`），但 retry 路由回原 stalled worker（→ RO-56）。Foreman 手工创建 `frontend-worker-2`(claude) 并重新分配
+
+## v22 新发现问题（2026-05-07 E2E v22）
+
+### RO-55 retry-reassign 后 auto-dispatch 断裂 — ✅ v23 E2E 验证通过
+
+> **来源**：2026-05-07 E2E v22 T4 stall→retry 后 T5/T6 需手工提交
+- **严重度**：High — 直接导致自动化率从 100%（v20）降至 33%
+- **现象**：T4 stall→fail→retry→manual re-submit 后，`auto_dispatch` 和 `assignment_map` 丢失，T5/T6 回退为 `tasks_ready` 需 Foreman 手工 `cccc workflow submit`
+- **日志证据**：T5 batch `2a82d3a4-fcf2`（手工），T6 batch `bdd278f1-9fc6`（手工），均无 `-auto` 后缀
+- **根因**：`auto_dispatch` 和 `assignment_map` 仅存在于 orchestrator 的 `_active_workflows` 字典，manual re-submit 创建新 batch 时无法继承
+- **改进方案**：将 `auto_dispatch` 和 `assignment_map` 持久化到 `WorkflowMeta`（engine 级），retry/re-submit 后从 engine 读取
+- **验收标准**：T4 stall→retry 后，T5 仍通过 `-auto` 批次自动分发
+- **v23 验证**：✅ T1 retry 后 auto_dispatch 和 assignment_map 持续生效，T2/T3/T4 均通过 `-auto` 批次自动分发（batch IDs: `ralph-58706f453a16-auto`, `ralph-1bfb397b4345-auto`, `ralph-1477adfa5264-auto`）
+
+### RO-56 retry 不支持 --assign 切换 worker（P1，v22 发现）
+
+> **来源**：2026-05-07 E2E v22 Foreman 体验反馈
+- **严重度**：Medium — retry 自动发回原 stalled worker，需 3 步手工操作
+- **现象**：`cccc workflow retry T4` 自动分配给已 stalled 的 `frontend-worker`（gemini），而非新创建的 `frontend-worker-2`（claude）
+- **日志证据**：`retry_requested` 后 `batch_approved` 仍分配给 `frontend-worker`（事件 `70e3ccbf`、`7134d51d`）
+- **根因**：retry 使用 assignment_map 中的原始 agent_id，无法指定替代 worker
+- **改进方案**：添加 `cccc workflow retry TASK_ID --assign ACTOR_ID` 标志
+- **验收标准**：retry 可一步完成 worker 切换
+
+### RO-57 re-submit 创建隐式 workflow_id（P1，v22 发现）
+
+> **来源**：2026-05-07 E2E v22 T4 re-submit 后 worker 报 workflow_id_mismatch
+- **严重度**：Medium — `cccc task complete T4` 报错，需 Foreman 用 `--workflow-id` 显式指定
+- **日志证据**：T6 worker 自报 `workflow_id_mismatch`（事件 `30685512`）
+- **根因**：单独 `cccc workflow submit` 已有 task 时创建子 workflow-id（如 `kanban-v22-t4`）
+- **改进方案**：re-submit 已有 task 时应重用原 workflow_id
+- **验收标准**：worker `cccc task complete` 无需指定 `--workflow-id`
+
+### RO-58 `cccc send` 不更新引擎状态（P1，v22 发现）
+
+> **来源**：2026-05-07 E2E v22 T4 手工发送后 worker 无法 complete
+- **严重度**：Medium — 手工 `cccc send` 绕过引擎，task 仍在 `ready` 状态
+- **根因**：chat message 不触发引擎状态转换
+- **改进方案**：当 `cccc send --to WORKER` 的消息包含 `[Foreman Assignment] Task ID: XXX` 时，自动将 task 状态推进到 `running`
+- **验收标准**：手工发送后 worker 可直接 `cccc task complete`
+
+### RO-59 batch 注册含已完成 task 报 E_INTERNAL_REGISTER（P1，v22 发现）
+
+> **来源**：2026-05-07 E2E v22 Foreman 尝试提交 T1+T4 批次
+- **严重度**：Medium — 2 次 `ralph_internal_error`
+- **日志证据**：事件 `cc62724c`（06:12:14）和 `d2707a8c`（06:16:41），`ValueError: cannot register batch: task T1 in non-batchable status completed`
+- **根因**：batch 注册不过滤已完成 task
+- **改进方案**：batch 注册时自动跳过已完成的 task（或 Foreman 端在提交前过滤）
+- **验收标准**：包含已完成 task 的 batch 不报错，自动过滤
+
+### RO-47 retry 后 auto-dispatch assignment-map 丢失 — ✅ v23 E2E 验证通过
+
+> **来源**：2026-05-03 E2E v20 Foreman 体验反馈
+- **严重度**：Medium — T2 重试后不继承原始 assignment-map，需手工 re-submit
+- **根因（Codex 审查修正）**：stall 任务处于 RUNNING，`retry_after_verification()` 只接受 VERIFYING/FAILED → retry 直接报错
+- **实现**：`retry_task()` 对 RUNNING 先调 `fail_task()` 转 FAILED 再 retry；新增 `engine.fail_task()` 方法
+- **单测**：`tests/test_retry_running_task.py`（2 passed）
+- **v21 验证**：✅ T1 retry 3 次均被重新分配到 backend-worker。但 Foreman 仍需手工 re-submit（→ RO-54）
+- **v23 验证**：✅ T1 retry 后自动重新分配到 worker-be，后续 T2/T3/T4 通过 auto-dispatch 继续自动分发
+
+---
+
+## v23 新发现问题（2026-05-11 E2E v23）
+
+### RO-60 verification 命令 shell 语义（P0，v23 发现）
+
+> **来源**：2026-05-11 E2E v23 T1 验证失败
+- **严重度**：High — 直接导致正确代码验证失败 + 触发 digest divergence 级联
+- **现象**：verification check command `PYTHONPATH=backend python -c '...'` 被 subprocess 解释为查找名为 `PYTHONPATH=backend` 的可执行文件，报 `[Errno 2] No such file or directory`
+- **日志证据**：`workflow.verification_failed` 事件 18:00:42，check `test` outcome=`failed`，message=`test failed to start: [Errno 2] No such file or directory: 'PYTHONPATH=backend'`
+- **根因**：`ralph_service.py` 的 verification runner 对不含 shell 操作符（`&&`, `||`, `|`, `;`）的命令使用 `subprocess.run(shlex.split(cmd))`，不经过 shell。`VAR=val cmd` 是 shell 语法，不是 exec 语法
+- **改进方案**：(A) 扩展 shell 操作符检测增加 `VAR=` 模式（`re.search(r'\b\w+=\S+ ', cmd)`）；或 (B) Ralph validate 对 verification command 中的 `VAR=val` 模式发出 `W_VERIFICATION_SHELL_SYNTAX` warning
+- **验收标准**：`PYTHONPATH=backend python -c '...'` 格式的命令能正确执行
+
+### RO-61 plan_digest_divergence 分级（P0，v23 发现）
+
+> **来源**：2026-05-11 E2E v23 全流程被 digest guard 阻塞
+- **严重度**：High — 20 次 divergence 事件，4/4 任务需 `--force` 完成
+- **现象**：Foreman 修改 plan.yaml 的 verification command（从 `PYTHONPATH=...` 改为 `sh -c '...'`）后，所有 workflow 操作（task complete, fail, retry）被 digest guard 拒绝
+- **日志证据**：20x `workflow.plan_digest_divergence` + 4x `plan_digest_divergence_post_hoc`
+- **根因**：digest guard 对 plan.yaml 做全文 hash，不区分核心字段（task ID / depends_on / claimed_paths）和运维字段（verification.checks.command）
+- **改进方案**：将 digest 分为 structural digest（核心字段：task id, depends_on, claimed_paths, role, type）和 operational digest（运维字段：verification.checks.command, goal_behavior）。structural 变更严格 guard，operational 变更只发 advisory warning
+- **验收标准**：修改 verification command 后 task complete 不被 digest guard 阻塞
+
+### RO-62 force-complete 产生 verification_passed 事件（P1，v23 发现）
+
+> **来源**：2026-05-11 E2E v23 交叉验证
+- **严重度**：Medium — 语义误导，Foreman 和日志分析可能将 skipped 误判为 passed
+- **现象**：`--force` 跳过验证的 task 产生 `workflow.verification_passed` 事件，summary 为 `verification skipped: foreman force-complete override`
+- **日志证据**：T2/T3/T4 的 `workflow.verification_passed` 事件 checks=[]，summary=`verification skipped: foreman force-complete override`
+- **根因**：force-complete 路径复用了 verification_passed 事件类型
+- **改进方案**：force-complete 应产生 `verification_skipped` 或 `verification_overridden` 事件（同 FIX-5 原则）
+- **验收标准**：force-complete 不产生 `verification_passed` 事件
+
+### RO-63 ASSIGNED 状态不可 retry/fail（P1，v23 发现）
+
+> **来源**：2026-05-11 E2E v23 T3 Gemini stall 后无法回收
+- **严重度**：Medium — Foreman 无干净途径回收 stalled assigned task
+- **现象**：`cccc workflow retry T3` 拒绝操作（"task not retryable: status=assigned"），`cccc workflow fail T3` 也因 digest divergence 被拒
+- **根因**：retry/fail 的状态前置条件只接受 RUNNING/VERIFYING/FAILED，不接受 ASSIGNED
+- **改进方案**：扩展 retry 和 fail 的状态前置条件，增加 ASSIGNED
+- **验收标准**：ASSIGNED 状态的 task 可以 retry 或 fail
+
+### RO-64 stall detection 不覆盖 ASSIGNED 状态（P1，v23 发现）
+
+> **来源**：2026-05-11 E2E v23 T3 Gemini 5+ 分钟无响应
+- **严重度**：Medium — ASSIGNED 但未启动的 worker 不会被 stall detection 发现
+- **现象**：worker-fe (Gemini) 分配 T3 后完全沉默 5+ 分钟，无 `workflow.task_stalled` 事件
+- **根因**：`check_stalled_tasks()` 只扫描 RUNNING 状态的 task（`engine.get_tasks_by_status("running")`）
+- **改进方案**：增加 ASSIGNED 状态的超时检测（独立阈值，如 assigned_threshold=120s，区别于 running_threshold=300s）
+- **验收标准**：ASSIGNED 超过阈值的 task 触发 stall 告警
+
+---
+
+### v17-v23 版本趋势
 
 | 版本 | 日期 | 结果 | 过程 | 体验 | 综合 | 自动化率 | 关键修复 |
 |------|------|------|------|------|------|----------|----------|
 | v17 | 2026-05-02 | 2/5 | 2/5 | 3/5 | 2.3/5 | 20% | challenge mode 首次运行；verify gate cwd P0 bug |
 | v18 | 2026-05-03 | 3/5 | 2/5 | 3/5 | 2.7/5 | 60% | +RO-41 cwd fix |
 | v19 | 2026-05-03 | 3/5 | 3/5 | 3/5 | 3.0/5 | 88.9% | +RO-44 --force; depends_on 首次通过 |
+| v20 | 2026-05-03 | 3/5 | 5/5 | 3/5 | 3.7/5 | 100% | +RO-42 证据注入; 过程首次满分; Codex 审查 4 CRITICAL |
+| v21 | 2026-05-07 | 3/5 | 4/5 | 3.5/5 | 3.5/5 | 83.3% | +RO-45~50 代码修复; 0 CRITICAL; Gemini challenge 3x 失败 |
+| v22 | 2026-05-07 | 2/5 | 3/5 | 3/5 | 2.7/5 | 33% | +RO-54 auto-dispatch ✅ +RO-48 stall ✅; Gemini 0% 可靠; auto-dispatch 异常路径断裂(RO-55) |
+| v23 | 2026-05-11 | 3/5 | 3/5 | 3.5/5 | 3.2/5 | 100%分发/0%闭环 | +RO-47 ✅ +RO-55 ✅; DAG+auto-dispatch 稳定; digest guard 过严; shell 语义新 P0 |
+| v24 | 2026-05-11 | 2/5 | 4.5/5 | 4/5 | 3.5/5 | 100%分发/67%自动 | +RO-61 structural digest ✅; verification 6/6 全部真正执行; 8min 历史最快; PATCH vs PUT 老 bug 重现 |
+
+---
+
+## v24 E2E 验证归档（2026-05-11）
+
+### 已验证通过（迁入 full）
+
+#### RO-61 plan_digest_divergence 分级 — ✅ v24 验证通过
+
+> v24 验证：ledger 中无任何 `plan_digest_divergence` 事件。structural digest 区分生效——verification、goal_behavior、title 等 operational 字段变更不再触发 digest guard 阻塞。v23 的 20 次 divergence + 4 次 force-complete → v24 的 0 次。
+> 实现：`plan_io.py:compute_structural_plan_digest()` 剥离 `_TASK_OPERATIONAL_KEYS`（verification, verification_mode, goal_behavior, acceptance_criteria, title）后计算 SHA256。`workflow_orchestrator.py` pre-transition hook 使用 structural digest 比较。
+> 单测：`test_ralph_plan_digest_guard.py`（5 tests：verification_command_change_same_digest, title_change_same_digest, structural_change_different_digest, claimed_paths_change_different_digest, goal_behavior_change_same_digest）
+
+### 代码已修复，v24 间接验证（保留在短版观察）
+
+#### RO-60 verification 命令 shell 语义 — ⚠️ 代码修复已验证（单测），E2E 未直接触发
+
+> v24 验证状态：代码修复已通过单测（`test_ralph_standalone.py` 4 tests：env_var_detected, env_var_multiple_detected, env_var_not_false_positive_on_equals_in_args, env_var_prefix_executes_via_shell）。但 v24 E2E 中 Foreman 未使用 `VAR=val cmd` 格式（全部用 `cd dir && cmd`），核心修复路径未被直接触发。
+> 实现：`ralph_service.py:_has_shell_operators()` 增加 `_ENV_VAR_PREFIX_RE` 正则检测。
+
+#### RO-62/63/64 — ⚠️ v24 中未触发对应场景
+
+> v24 中无 force-complete 事件（RO-62）、无 ASSIGNED 状态 retry/fail（RO-63）、无 ASSIGNED stall（RO-64），因 workers 全部正常运行。这些代码修复待后续有触发场景时验证。
+
+### v24 新发现
+
+#### RO-65 challenge mode Gemini 不可达应 graceful degradation（P1）
+
+> **来源**：2026-05-11 E2E v24 T2 首次 verification
+- **严重度**：Medium — 导致 1 次 retry（本轮自愈，但非必然）
+- **现象**：T2 worker checks（app-import + routes-registered）全部 passed，但 challenge mode 因 Gemini CLI ECONNRESET（`cloudcode-pa.googleapis.com`）直接报 failed
+- **日志证据**：`workflow.verification_failed` 事件 06:39:31，T2 challenge 报 `Error authenticating: _GaxiosError: request to cloudcode-pa.googleapis.com/v1internal:loadCodeAssist failed`
+- **根因**：`ralph_service.py` challenge 失败时仅当 payload 含 `degraded:true` 时走降级路径；Gemini CLI 网络错误不产生 `degraded` payload，直接返回 `failed`
+- **Foreman 反馈**："The auto-upgrade should degrade gracefully — if the challenge agent is unavailable, the task should pass with a warning, not fail entirely"
+- **改进方案**：Gemini CLI 网络错误（ECONNRESET/timeout/auth failure）时自动设置 `degraded=True`，走 `W_CHALLENGE_DEGRADED` warning 路径
+- **验收标准**：Gemini 不可达时 challenge 降级为 worker-only + warning，不 fail task
+
+#### RO-67 ralph validate 噪音过大（P2）
+
+> **来源**：2026-05-11 E2E v24 Foreman 体验反馈
+- **严重度**：Low — 不影响功能，影响 Foreman 体验
+- **现象**：6 task plan 产出 15 warnings + 32 hints，信噪比过低
+- **Foreman 反馈**："Signal-to-noise ratio needs improvement for small projects"
+- **改进方案**：新增 `--compact` 模式只显示 actionable 项（errors + 高 confidence warnings）
+- **验收标准**：`--compact` 模式输出 ≤10 项
+
+---
+
+### 结果分持续低迷根因分析——监察机制缺口
+
+**现象**：24 轮 E2E 中，结果指标只有 v13 拿过 4/5，其余全在 2-3/5 徘徊。过程和体验已稳定提升，唯独结果分无法突破。问题不在产出物本身（Worker 的代码能力已到位），而在**监察机制未能在完成时拦截这些 bug**。
+
+**CRITICAL bug 归类（按监察机制缺口分）**：
+
+| 版本 | CRITICAL 类别 | 当前机制为何漏检 | 应由哪个机制拦截 |
+|------|--------------|----------------|-----------------|
+| v1/v24 | FK 未启用 | verification 只跑 happy-path 单测 | challenge agent：检查 SQLite 是否启用 PRAGMA foreign_keys |
+| v14/v20/v24 | 前端 PATCH vs 后端 PUT | 各栈 verification 独立，不做跨栈接口检查 | challenge agent：对比 API client HTTP method 与 router decorator |
+| v20/v24 | position 无边界校验 | 单测只覆盖正常值 | challenge agent：构造负数/超界反例 |
+| v17 | verify gate cwd bug | 基础设施 bug | 已修复 |
+| v22 | Gemini 输出 CRITICAL | Worker 不可靠 | 已通过 runtime 选择规避 |
+
+**监察机制现状与缺口**：
+
+```
+verification checks（命令验证）
+  ✅ 能力：运行 pytest/tsc/build，检查各组件独立可用
+  ❌ 盲区：跨栈接口一致性、边界/防御性检查
+  → 原因：checks 由 Foreman 在 plan.yaml 中手写，Foreman 倾向写 happy-path 检查
+
+challenge agent（Gemini 对抗审查）
+  ✅ 能力：读源码+diff，语义审查，理论上可检测跨文件不一致
+  ❌ 盲区 1：仅对 critical_flow entrypoint 触发，前端 UI 组件不在其中
+  ❌ 盲区 2：Gemini 不可靠（网络/auth），降级后变成空操作
+  → 原因：触发范围过窄 + 降级策略不足
+
+integration task verification（T6 级跨栈验证）
+  ✅ 能力：覆盖多 task 的 covers_tasks/covers_flows
+  ❌ 盲区：T6 的 verification checks 只跑 "pytest + npm build"，不含跨栈 HTTP 调用
+  → 原因：能力指南和计划模板没有引导 Foreman 写跨栈集成检查
+```
+
+**核心结论**：过程机制（调度、分发、digest guard）已到 4.5/5，结果分的天花板完全在**验证深度**——"各组件独立正确"不等于"组合后正确"。现有三道防线（checks、challenge、integration）都没有覆盖"跨栈接口匹配"这个最高频的 CRITICAL 类别。
+
+**监察机制增强方向**：
+
+1. **challenge agent 触发范围扩展（P0 效果）**
+   - 现状：仅 claimed_paths 命中 critical_flow.entrypoints 时触发
+   - 方案：当 plan 同时包含前端 API client 文件（`*/api/*.ts`）和后端 router 文件（`*/routers/*.py`）时，对 integration task 强制触发 challenge，prompt 中注入"对比 API client 的 fetch method 与 router decorator，检查是否一致"
+   - 验收：PATCH vs PUT 类 bug 被 challenge agent 拦截
+
+2. **challenge agent 降级策略修复（RO-65，已记录）**
+   - 现状：Gemini 网络错误 → task failed
+   - 方案：降级为 worker-only passed + `W_CHALLENGE_DEGRADED`
+   - 验收：Gemini 不可达不阻塞任务完成
+
+3. **integration verification 模板引导（capability guide 层面）**
+   - 现状：能力指南告诉 Foreman "每个 task 至少 compile + test 两步"
+   - 方案：增加 "integration task 的 verification 必须包含至少一个跨栈调用检查"示例，如 `cd backend && python -c "from fastapi.testclient import TestClient; from app.main import app; c=TestClient(app); r=c.put('/api/tasks/1/move', json={...}); assert r.status_code != 405"`
+   - 验收：T6 的 verification checks 能检测到前后端 HTTP method 不匹配
+
+4. **Ralph validate 新规则（长期，静态分析方向）**
+   - 方案：`W_CROSS_STACK_NO_INTEGRATION_CHECK` — 当 plan 同时有 `api/client.ts` 和 `routers/*.py` 在 claimed_paths 中，但 integration task 的 verification checks 不含跨栈命令时发出 warning
+   - 验收：纯静态分析层面提醒 Foreman 补充跨栈检查
+
+---
+
+## v26 E2E 验证归档（2026-05-13）
+
+> 综合 3.0/5（结果 2/5，过程 3/5，体验 4/5）
+> 总耗时 ~19 分钟 / 3 tasks / Workers: Codex(3/3 100%) + Gemini(0/1 0%)
+> 评估报告：[e2e-实战评估报告-v26.md](./e2e-实战评估报告-v26.md)
+
+### 已验证通过（迁入 full）
+
+#### RO-62 force-complete 产生 verification_passed 事件 — ✅ v26 验证通过
+
+> v26 验证：T1 force-complete 产生 `workflow.verification_skipped` 事件（而非 `verification_passed`），事件 summary 为 `verification skipped: foreman force-complete override`。语义正确。
+> 实现：`workflow_state_engine.py` force-complete 路径使用 `verification_skipped` 事件类型。
+> 状态：从短版移除。
+
+#### RO-69 verification 缺少跨栈集成 check — ✅ v26 验证通过
+
+> v26 验证：验收标准明确要求 "Backend 必须配置 CORS（allow_origins 包含前端地址）" + "有集成验证（前后端联调 smoke test，包含 CORS 验证）"。T3 integration test 包含 CORS OPTIONS 预检验证，检查 `Access-Control-Allow-Origin` 头。Codex 对抗审查确认 CORS 配置 OK。
+> v14/v22/v25 反复出现的 CORS 缺失问题在 v26 首次被双重拦截：验收标准 + 集成测试。
+> 关键：这不是代码修复，而是**验收标准引导**生效——在任务描述中明确要求 CORS 配置和集成验证。
+> 状态：从短版移除。
+
+### 代码已修复，v26 间接验证（保留在短版观察）
+
+#### RO-45/46/51 — ⚠️ v26 中 T1 force-complete 跳过 challenge，目录展开/git diff/scope 检查路径未被触发
+
+> 连续 6 轮（v21-v26）未被直接触发。代码修复存在但缺少 E2E 覆盖。
+
+#### RO-60 verification 命令 shell 语义 — ⚠️ Foreman 未使用 `VAR=val` 格式
+
+> v26 Foreman 全部使用 `cd dir && cmd` 格式，`VAR=val` 修复路径连续 3 轮（v24-v26）未被触发。
+
+### v26 新发现
+
+#### RO-70 verification 命令被 runtime 变形（P1，v26 发现）
+
+> **来源**：2026-05-13 E2E v26 T1 verification_failed
+- **严重度**：Medium — 导致 1 次 false negative + force-complete，自动闭环率降至 66.7%
+- **现象**：plan.yaml 中 import-check 命令为 `cd backend && python -c 'from main import app'`，但 Codex worker 创建了 package-style import（`from backend.api import ...`），verification 执行 plan 中命令失败
+- **日志证据**：`06:30:41 workflow.verification_failed` T1 `import-check exited with 1 (expected 0)`
+- **根因**：plan.yaml 的 verification 命令假设特定 import 风格，但 worker 可能用不同代码组织方式。plan 阶段无法预知 worker 实现细节
+- **Foreman 反馈**："The foreman doesn't know what import style the worker will use — verification commands should be more resilient"
+- **改进方案**：能力指南建议使用 resilient 验证命令（如仅检查 `pytest` 通过，或使用 `importlib.import_module()`）
+- **验收标准**：下一轮 verification 命令不因 import 风格差异而失败
+
+#### RO-71 completer_mismatch 应更严格处理（P2，v26 发现）
+
+> **来源**：2026-05-13 E2E v26 T1 force-complete
+- **严重度**：Low — 功能不受影响但审计链断裂
+- **现象**：T1 由 planner 执行 `task complete`（而非 assigned worker-be），产生 `completer_mismatch` 警告但 verification_skipped
+- **日志证据**：`06:31:40 workflow.verification_warning` T1 `completer_mismatch: completed by planner, assigned to worker-be`
+- **根因**：force-complete 允许任何 actor 完成 task，且跳过 verification
+- **改进方案**：completer_mismatch 时 verification 应升级为 mandatory（不允许 skip）
+- **验收标准**：completer_mismatch + verification_skipped 不同时出现
+
+#### RO-72 retry 后 worker 类型错配 — ✅ v27 E2E 验证通过
+
+> **来源**：2026-05-13 E2E v26 T2 Gemini stall → retry
+- **严重度**：Low — 功能上 Codex 完成了 frontend task，但分配语义不精确
+- **现象**：T2 (frontend) Gemini stall 后 retry 分配给 worker-be (Codex/backend worker)
+- **v27 验证**：T2 (frontend) Codex stall 后 Foreman 自主创建 worker-fe2 (claude)，task type=frontend 与 worker 类型匹配。非代码修复，而是 Foreman 行为改善（Gemini 排除后 Foreman 不再复用 backend worker，而是创建新的类型匹配 worker）
+
+---
+
+## v27 E2E 验证归档（2026-05-13）
+
+> 综合 3.3/5（结果 2/5，过程 4/5，体验 4/5）
+> 总耗时 ~19 分钟 / 3 tasks / Workers: claude(3/3 100%) + codex(0/1 0% stall)
+> 变更点：Gemini 从 worker 分配中移除（agent_pool.py + 能力指南），仅保留 Ralph challenge agent
+> 评估报告：[e2e-实战评估报告-v27.md](./e2e-实战评估报告-v27.md)
+
+### 已验证通过（迁入 full）
+
+#### RO-72 retry 后 worker 类型错配 — ✅ v27 验证通过
+
+> v27 验证：T2 (frontend) Codex stall 后 Foreman 创建 worker-fe2 (claude)，类型匹配。v26 中 frontend task 被分配给 backend worker 的问题未重现。
+
+### 代码已修复，v27 间接验证
+
+#### RO-70 verification 命令变形 — ⚠️ v27 未重现
+
+> v27 T1 verification 9 checks 全部 passed（含 challenge mode）。Foreman 写了更 resilient 的 verification 命令。但不确定是否稳定修复——可能是 Foreman 行为偶发改善而非系统性修复。
+
+#### RO-71 completer_mismatch — ⚠️ v27 未触发
+
+> v27 零 force-complete，零 completer_mismatch。验证场景未被触发。
+
+### v27 新发现
+
+#### RO-73 Codex 前端任务 stall（P1，v27 发现）
+
+> **来源**：2026-05-13 E2E v27 T2 worker-fe (codex)
+- **严重度**：Medium — 导致 12 min 浪费 + 1 次手工 retry
+- **现象**：Codex worker scaffold 了 Vite 项目并安装了 @hello-pangea/dnd，但从未写入 kanban 组件代码。有 heartbeat 但 12+ 分钟无文件修改
+- **日志证据**：`08:20:33 workflow.task_failed` T2 "Codex worker active with heartbeats but no file modifications after 12 minutes"
+- **根因**：Codex runtime 对复杂前端组件生成能力不足或卡在内部推理
+- **Foreman 反馈**："Codex scaffolded project but never wrote components; no visibility into what worker is doing"
+- **改进方案**：(A) 能力指南推荐前端任务使用 claude runtime；(B) stall detection 增加"有 heartbeat 但无文件写入超 5 min"检测
+- **验收标准**：前端任务不因 Codex stall 需要手工 retry
+
+---
+
+## v28 E2E 验证归档（2026-05-13）
+
+> 综合 4.2/5（结果 3/5，过程 5/5，体验 4.5/5）——**历史最高**
+> 总耗时 ~8 分钟 / 504s engine time / 3 tasks / Workers: codex(2/2 100%) + claude(1/1 100%)
+> 评估报告：[e2e-实战评估报告-v28.md](./e2e-实战评估报告-v28.md)
+
+### 已验证通过（迁入 full）
+
+#### RO-51 scope 目录匹配 — ✅ v28 验证通过
+> Worker scope 正确限定在项目目录内，未出现 scope 误报。
+
+#### RO-52 Gemini JSON 解析 — ✅ v28 验证通过（间接）
+> v28 未使用 Gemini worker，Gemini 仅用于 Ralph challenge agent，JSON 解析正常。
+
+#### RO-70 prompt 引导零命令变形 — ✅ v28 验证通过
+> 3/3 任务 verification checks 全部正确执行，零命令变形。
+
+#### RO-73 claude runtime 零 stall — ✅ v28 验证通过
+> worker-fe (claude) 完成 T3 (frontend)，零 stall，100% 可靠。
+
+### v28 新发现
+
+#### RO-74 Worker prompt 首尾重复 cccc task complete（P2）
+> Worker prompt 中 completion reminder 出现在 top 和 bottom 两处，Foreman 观察到冗余提醒消息。
+> **v30 修复**：确认 top+bottom 两处是设计意图（确保 Worker 不遗漏），非 bug。
+
+#### RO-75 workflow 全部完成后自动转终态（P1）
+> v28 workflow 完成后需人工确认。
+> **v30 修复**：workflow_state_engine 在所有任务进入终态后自动转 completed。
+
+---
+
+## v30 代码修复归档（2026-05-13）
+
+> 修复条目：RO-74/75/76、RL-21、BP-1/BP-3
+> 验证：全量 pytest 2616 passed / 0 failed / 120 skipped
+> E2E v29 实战验证：全部通过
+
+### RO-74 prompt 首尾重复 cccc task complete — ✅ 确认设计意图
+> top（mandatory）+ bottom（reminder）两处 completion 提醒是刻意设计，确保 Worker 不遗漏。非 bug。
+
+### RO-75 workflow 自动转终态 — ✅ v29 E2E 部分验证
+> workflow_state_engine 在所有任务终态后自动转 `kind=completed`。
+> **v29 新发现**：状态机生效但 ledger 缺少 `workflow.completed` 事件 → RO-77。
+
+### RO-76 validate 错误附带字段建议+示例+--show-schema — ✅ v29 E2E 验证
+> Foreman 确认 validate 报告了 covers_flows 无效字段、mock_tests.input 格式要求等。
+
+### RL-21 W_SHARED_PATH_NO_DEPENDENCY — ✅ 代码已实现，v29 未触发
+> `_check_implicit_serialization` 升级为 `W_SHARED_PATH_NO_DEPENDENCY`（warning 级别），消息包含冲突路径和建议。v29 plan 无路径冲突，未触发。
+
+### BP-1 mock_tests 集成 agent 验证 — ✅ v29 E2E 首次实战拦截
+> mock_tests 在 T1 verification 中成功拦截问题（mock_test_2 的 verify_command 有 Python 逻辑错误），verification_failed → 修复 → 第二次 pass。**首次在真实 E2E 中证明对抗性验证价值。**
+
+### BP-3 expected_input/output 渲染到 worker prompt — ✅ v29 E2E 验证
+> Foreman 确认 "expected_input/expected_output contracts were rendered into worker prompts, helping workers understand interfaces"。
+
+---
+
+## v29 E2E 验证归档（2026-05-13）
+
+> 综合 3.3/5（结果 2/5，过程 4/5，体验 4/5）
+> 总耗时 ~30 分钟（含 codex stall 重试）/ 167s engine time / 8 tasks
+> Workers: claude(8/8 100%) + codex(0/5 0% stall)
+> 评估报告：[e2e-实战评估报告-v29.md](./e2e-实战评估报告-v29.md)
+
+### v30 新能力验证结果
+
+| 能力 | 验证结果 |
+|------|---------|
+| BP-1 mock_tests | ✅ 首次实战拦截（T1 verification_failed → fix → pass）|
+| BP-3 expected_input/output | ✅ 渲染到 worker prompt 确认 |
+| RO-75 auto-terminal | ⚠️ 状态机生效（status=completed），缺 ledger 事件 → RO-77 |
+| RO-76 validate 报错质量 | ✅ Foreman 确认 |
+| RL-21 shared path warning | 未触发（plan 无冲突路径）|
+
+### v29 新发现
+
+#### RO-77 workflow 自动终态缺少 ledger 事件（P1）
+
+> **来源**：2026-05-13 E2E v29 Codex 过程审查
+- **严重度**：Medium — 状态机生效但日志审计无法确认
+- **现象**：`cccc workflow status` 返回 `kind=completed`，但 ledger 161 条事件中无 `workflow.completed` 事件
+- **根因**：workflow_state_engine 转终态时更新内部状态但未发射 ledger 事件
+- **改进方案**：转终态时发射 `workflow.completed` / `workflow.failed` 事件
+- **验收标准**：下一轮实战中 ledger 包含 `workflow.completed` 事件
+
+#### RO-78 Foreman retry 创建新 workflow_id（P2）
+
+> **来源**：2026-05-13 E2E v29 T8 retry
+- **严重度**：Low — 需用户一次手工指导恢复
+- **现象**：Foreman 用 `kanban-v1-fix` 新 workflow_id 重新注册 T8，触发 `E_INTERNAL_REGISTER: workflow_id mismatch for task T1`
+- **根因**：Foreman 对 retry CLI 语义理解不准确
+- **改进方案**：能力指南明确 retry 语义；或 engine 对已有 workflow 的 resubmit 自动归并
+- **验收标准**：Foreman retry 不创建新 workflow_id
+
+#### RO-79 mock_test verify_command Python 错误无法 validate 检测（P2）
+
+> **来源**：2026-05-13 E2E v29 T1 mock_test_2
+- **严重度**：Low — validate 通过但 verification 时失败，需一次 retry
+- **现象**：mock_test_2 verify_command 含 `python -c 'if False ...'` 逻辑错误，validate 通过但 verification 失败
+- **根因**：ralph validate 不解析 verify_command 中的 Python 代码
+- **改进方案**：对 `python -c` 类 verify_command 做 `compile()` 语法检查
+- **验收标准**：Python 语法错误的 verify_command 在 validate 阶段报 warning
+
+---
+
+## v31 代码修复归档（2026-05-14）
+
+> 修复条目：RO-77/78/79、BP-2/BP-4/BP-5
+> 验证：全量 pytest 2628 passed / 0 failed / 120 skipped
+> E2E v32 实战验证：RO-77 ✅ / RO-78 ✅ / BP-2 ✅ / BP-4 ✅ / RO-79 未触发 / BP-5 未使用
+
+### RO-77 workflow 终态 ledger 事件 — ✅ v32 E2E 验证通过
+> complete_workflow 在 cleanup 前 emit `workflow.completed` / `workflow.failed` 事件。
+> v32 E2E 18:37:03 ledger 包含 `workflow.completed` 事件，data 显示 `completed_count=4, failed_count=0`。
+
+### RO-78 retry workflow_id 解析 — ✅ v32 E2E 验证通过
+> register_and_suggest_inner 调用 resolve_workflow_id_for_tasks，retry 不再 mismatch。
+> v32 E2E 零 retry/error 事件，无 workflow_id_mismatch。
+
+### RO-79 python -c 语法检查接入 validate — ⚠️ 代码已实现，v32 未触发
+> check_verification_command_syntax 接入 validate。v32 plan 中 verify_command 无 python -c 语法错误，未直接触发。
+
+### BP-2 ModuleSpec 模型 + prompt 渲染 + 验证规则 — ✅ v32 E2E 验证通过
+> ModuleSpec Pydantic 模型、TaskRef 传递、prompt_builder 渲染、_check_module_consistency 验证规则。
+> v32 plan.yaml 使用 module_spec，元数据在 task_registered 事件中正确传递。
+
+### BP-4 provides/consumes 静态验证 + 运行时 contract check — ✅ v32 E2E 验证通过
+> _check_cross_task_io_contracts 静态验证 + _check_output_contract 运行时 check。
+> v32 plan_validated 事件含契约验证。provides/consumes 从 plan.yaml 正确传递到 task_registered 事件。
+
+### BP-5 batch_e2e_command/timeout + verify_batch_e2e() — ⚠️ 代码已实现，v32 未使用
+> batch_e2e_command/timeout Plan 字段 + verify_batch_e2e() + batch completion 触发（非阻塞线程）+ W_BATCH_E2E_NO_COMMAND 验证规则。
+> v32 Foreman 未设置 batch_e2e_command 字段，W_BATCH_E2E_NO_COMMAND warning 已输出但 Foreman 未响应。
+
+---
+
+## v32 E2E 验证归档（2026-05-14）
+
+> **综合 4.3/5（历史新高）**（结果 4/5，过程 5/5，体验 4/5）
+> 总耗时 ~13 分钟 / 4 tasks / DAG: T1→(T2||T3)→T4
+> Workers: codex(3/3 100%) + claude(1/1 100%) = 4/4 100%
+> 评估报告：[e2e-实战评估报告-v32.md](./e2e-实战评估报告-v32.md)
+
+### v31 修复验证结果
+
+| 能力 | 验证结果 |
+|------|---------|
+| RO-77 workflow.completed 事件 | ✅ 18:37:03 事件确认，data 含 completed_count/failed_count |
+| RO-78 retry workflow_id | ✅ 零 retry/error 事件 |
+| RO-79 python -c 语法检查 | 未触发（本轮无语法错误） |
+| BP-2 ModuleSpec | ✅ plan.yaml module_spec 正确传递到 task_registered |
+| BP-4 provides/consumes | ✅ plan_validated 含契约验证，task_registered 含 provides/consumes |
+| BP-5 batch_e2e_command | 未使用（Foreman 未设置） |
+
+### v32 Codex 审查结果
+
+| 维度 | 审查者 | 结果 |
+|------|--------|------|
+| 结果指标 | Codex 对抗式代码审查 | 0 CRITICAL, 8 WARN, 21 OK → 4/5 |
+| 过程指标 | Codex 工作流日志分析 | 10/10 必检项 positive + 3 额外检查通过 → 5/5 |
+| 体验指标 | Foreman WORKFLOW_EVALUATION.md | 自评 4.2/5, 零手工干预执行阶段 → 4/5 |
+
+### v32 关键亮点
+- **过程指标连续两轮满分**（v28+v32）
+- **结果指标首次达到 4/5**（0 CRITICAL 实现 bug）
+- **100% 自动化率**（auto-dispatch + DAG gating + verification 全自动）
+- **零 stall/failure/retry**
+- **瓶颈转移**：从"机制是否工作"→"plan 编写体验优化"
+
+### v32 新发现
+
+#### UX-1 provides/consumes 格式文档与 schema 不一致（P2）
+
+> **来源**：2026-05-14 E2E v32 Foreman 反馈
+- **严重度**：Low — 增加 validate 迭代次数（5 次 vs 预期 2-3 次）
+- **现象**：Foreman 用字符串格式声明 provides（`provides: "backend_api"`），被 validate 拒绝，需改为 `{name: "backend_api", kind: "api"}` 对象格式。capability guide 示例用 `mode` 但 schema 要求 `level`
+- **根因**：foreman-capability-guide.md 中 provides/consumes 示例不够精确
+- **改进方案**：在 foreman-capability-guide.md 增加完整 provides/consumes 示例（含 from_task 字段），与 `ralph validate --show-schema` 输出一致
+- **验收标准**：下一轮实战中 Foreman validate 迭代 ≤3 次
+
+#### UX-2 Greenfield 项目 W_VERIFICATION_SHAPE_UNKNOWN 大量重复（P2）
+
+> **来源**：2026-05-14 E2E v32 Foreman 反馈
+- **严重度**：Low — 噪音影响 Foreman 判断
+- **现象**：4 任务 plan 产生 17 warnings + 20 hints，W_VERIFICATION_SHAPE_UNKNOWN ×12 占主要噪音
+- **根因**：验证规则不区分 greenfield 项目和已有项目
+- **改进方案**：`--compact` 模式或 warning 分级（actionable vs informational）
+- **验收标准**：同类 4 任务 plan 验证输出 ≤10 条 warning/hint
+
+#### UX-3 E_VERIFICATION_TARGET_MISSING_FILE 在 greenfield 应为 warning（P2）
+
+> **来源**：2026-05-14 E2E v32 Foreman 反馈
+- **严重度**：Low — 需 suppress_codes workaround
+- **现象**：T4 integration task 的 verification 目标文件由上游 task 创建，但 validate 阶段该文件不存在，报 E_VERIFICATION_TARGET_MISSING_FILE（error 级别）
+- **根因**：validate 在执行前运行，无法预知上游 task 将创建哪些文件
+- **改进方案**：当 verification target 所在路径被上游 task 的 claimed_paths 覆盖时，降级为 warning
+- **验收标准**：上游 task claim 的路径中的 verification target 不再报 error

@@ -296,3 +296,36 @@ def _schema_required_compatible(
 
 def _command_mentions_any_path(command: str, claimed_paths: List[str]) -> bool:
     return any(path and path in command for path in claimed_paths)
+
+
+def _check_cross_task_io_contracts(plan: Plan) -> List[ValidationIssue]:
+    """W_CROSS_TASK_IO_MISMATCH: expected_output keys don't cover downstream expected_input keys."""
+    issues: List[ValidationIssue] = []
+    task_map = {t.id: t for t in plan.tasks}
+
+    for task in plan.tasks:
+        if not task.expected_input:
+            continue
+        input_keys = set(task.expected_input.keys())
+        for dep_id in task.depends_on:
+            dep = task_map.get(dep_id)
+            if dep is None or not dep.expected_output:
+                continue
+            output_keys = set(dep.expected_output.keys())
+            missing = input_keys - output_keys
+            if missing:
+                issues.append(ValidationIssue(
+                    code="W_CROSS_TASK_IO_MISMATCH",
+                    severity="warning",
+                    message=(
+                        f"task '{task.id}' expects input keys {sorted(missing)} "
+                        f"not in dependency '{dep_id}' expected_output"
+                    ),
+                    task_ids=[task.id, dep_id],
+                    evidence={
+                        "missing_keys": sorted(missing),
+                        "consumer_task": task.id,
+                        "provider_task": dep_id,
+                    },
+                ))
+    return issues

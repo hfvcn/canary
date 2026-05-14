@@ -66,3 +66,4 @@ include = ["cccc*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
+addopts = "-n auto"

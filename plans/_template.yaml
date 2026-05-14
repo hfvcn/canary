@@ -1,0 +1,287 @@
+# ============================================================================
+# CCCC Plan Template — 按需复制并填写
+# ============================================================================
+#
+# 使用方式：
+#   cp plans/_template.yaml plans/fix-<描述>.yaml
+#   编辑后运行：ralph validate plans/fix-<描述>.yaml --no-agent --compact
+#
+# 流程：计划生成 → Ralph 验证 → Codex 审查 → 并行执行 → 能力指南 → 实测
+# 详见：todo/findings.md § 〇
+#
+# 字段速查（完整定义见 src/cccc/ralph/models.py）：
+#
+#   Plan 顶层：
+#     schema_version    "1.0.0"（启用严格模式）
+#     tasks             TaskSpec[]
+#     required_issues   string[]  — 必须被 task.addresses 覆盖
+#     suppress_codes    string[]  — 降级为 hint 的规则 code
+#     suppress_instances SuppressInstance[]  — 带 lease 的精细抑制
+#     semantic_mode     "off" | "advisory" | "strict"
+#     auto_infer        bool
+#     plan_scope        string[]  — 计划涉及的顶层目录
+#     critical_entrypoints string[]  — 关键入口文件
+#     critical_flows    CriticalFlow[]
+#     forbidden_flows   ForbiddenFlow[]
+#     finding_refs      FindingRef[]
+#     registration_invariants RegistrationInvariant[]
+#     suppress_flows    string[]  — 豁免的 flow id
+#     state             PlanState  — 运行时状态（通常由 suggest 自动管理）
+#
+#   TaskSpec：
+#     id                string（唯一标识，如 T1）
+#     title             string
+#     role              "leaf" | "integration" | "verification"
+#     type              "frontend" | "backend" | "general"
+#     depends_on        string[]  — 依赖的 task id
+#     claimed_paths     string[]  — 此 task 修改的文件（相对项目根目录）
+#     awareness_paths   string[]  — 此 task 需要了解但不修改的文件
+#     goal_behavior     string（多行）— 修改目标和方法
+#     acceptance_criteria string（多行）— 可验证的验收标准
+#     verification_mode "ralph" | "agent" | "challenge"
+#     verification      Verification（见下）
+#     provides          Contract[]  — 此 task 提供的产出
+#     consumes          Contract[]  — 此 task 依赖的输入
+#     addresses         string[]  — 此 task 解决的 issue id（对应 required_issues）
+#     failure_path      string  — 失败时的处理路径
+#     semantic          SemanticBlock（可选，symbol 级别注解）
+#
+#   Verification：
+#     level             "compile" | "unit" | "integration" | "e2e"
+#     command           string  — 单条验证命令（简单场景）
+#     checks            CheckSpec[]  — 多条验证命令（复杂场景）
+#     covers            VerificationCovers  — 此验证覆盖的范围
+#     expected_exit_code int（默认 0）
+#     cleanup_patterns  string[]（可选）— retry 前清理的 glob 模式
+#
+#   CheckSpec：
+#     name              string
+#     command           string
+#     required          bool（默认 true）
+#     expected_exit_code int（默认 0）
+#     timeout           int（秒，可选）
+#
+#   VerificationCovers（解决 E_MISSING_INTEGRATION_SPINE 的关键）：
+#     tasks             string[]  — 此验证覆盖的 task id 列表
+#     paths             string[]  — 覆盖的文件路径
+#     flows             string[]  — 覆盖的 critical_flow id
+#
+#   Contract：
+#     name              string
+#     kind              string  — "artifact" | "runtime_capability" | "api_endpoint" | ...
+#     from              string（alias for from_task）— 提供方 task id
+#     schema_hint       string | dict
+#
+#   CriticalFlow（注意：字段是 id 不是 name）：
+#     id                string
+#     description       string
+#     entrypoints       string[]  — 格式 "file::function"
+#     test_created_by   string[]  — 由哪些 task 创建测试
+#     required_verification_level  "compile" | "unit" | "integration" | "e2e"（默认 integration）
+#
+#   ForbiddenFlow（注意：没有 entrypoints/segments 字段）：
+#     id                string
+#     description       string
+#     test_created_by   string[]
+#     required_verification_level  默认 "e2e"
+#
+#   FindingRef：
+#     id                string
+#     mitigation        string
+#     enforced_by       string[]
+#
+#   RegistrationInvariant：
+#     name              string
+#     description       string
+#     registry_file     string
+#     registry_symbol   string
+#
+#   SuppressInstance（带 lease 的精细抑制）：
+#     code              string  — 要抑制的规则 code
+#     owner             string  — 负责人
+#     expiry            string  — ISO 日期，如 "2026-12-31"
+#     review_after      string  — ISO 日期
+#
+# 常见 suppress_codes（按需添加，只抑制确实不适用的）：
+#   E_CRITICAL_ENTRYPOINT_UNOWNED    — 关键入口文件未被任何 task claim
+#   E_CRITICAL_FLOW_UNCOVERED        — 关键流未被任何 task 验证覆盖
+#   E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED — 关键流入口未被 claim
+#   E_AGENT_REVIEW_FAILED            — agent 审查失败（网络/配额）
+#   W_AGENT_REVIEW_SKIPPED           — agent 审查被跳过
+#   W_UNCLAIMED_TEST_FOR_SOURCE      — 源文件有相关测试未被 claim
+#   W_VERIFICATION_BEHAVIOR_MISMATCH — goal 含运行时行为但验证只是 unit
+#   W_VERIFICATION_TARGET_MISSING    — 验证引用的测试文件只有自己 claim
+#   W_NO_FAILURE_PATH                — 涉及 assignment 操作但无 failure 描述
+#   W_PLAN_SCOPE_UNUSED              — plan_scope 引用的文件无 task claim
+#   W_VERIFICATION_CROSS_SCOPE       — 验证命令引用了其他 task 的文件
+#   W_TEST_COVERAGE_GAP              — 源文件有相关测试未被验证覆盖
+#   W_CROSS_BOUNDARY_WITHOUT_GLUE    — 跨路径边界依赖无集成验证
+#
+# 常见 error 及修复：
+#   E_MISSING_INTEGRATION_SPINE
+#     → 添加一个 role: integration 的 task，其 verification.covers.tasks 列出 ≥2 个 task
+#   E_NO_CROSS_TASK_VERIFICATION
+#     → 同上，确保 verification.level 为 integration 或 e2e
+#   E_UNCOVERED_REQUIRED_ISSUE
+#     → 确保每个 required_issues 中的 id 都出现在至少一个 task.addresses 中
+#   E_CYCLE_DETECTED
+#     → 检查 depends_on 是否形成环
+# ============================================================================
+
+schema_version: "1.0.0"
+
+# --- 此计划要解决的问题（必须被 task.addresses 覆盖）---
+required_issues:
+  - "ISSUE-1"
+  # - "ISSUE-2"
+
+# --- 语义模式（通常 off，高风险修改可用 advisory）---
+semantic_mode: "off"
+auto_infer: false
+
+# --- 抑制不适用的规则（按需添加，保持最小集）---
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - W_AGENT_REVIEW_SKIPPED
+  # 按需取消注释：
+  # - W_UNCLAIMED_TEST_FOR_SOURCE
+  # - W_VERIFICATION_BEHAVIOR_MISMATCH
+  # - W_VERIFICATION_TARGET_MISSING
+
+# ============================================================================
+# Tasks
+# ============================================================================
+
+tasks:
+  # --- 叶子任务（独立修复，无依赖）---
+  - id: T1
+    title: "简短描述修改内容"
+    addresses:
+      - "ISSUE-1"
+    goal_behavior: |
+      修改 src/path/to/file.py 的 function_name()（line N）：
+
+      具体描述修改逻辑...
+    acceptance_criteria: |
+      1. 条件 A 满足时行为 X
+      2. 条件 B 满足时行为 Y
+      3. 单测覆盖上述场景
+    claimed_paths:
+      - src/path/to/file.py
+      - tests/test_new_feature.py
+    verification:
+      level: unit
+      checks:
+        - name: feature-test
+          command: "python -m pytest tests/test_new_feature.py -v"
+    provides:
+      - name: feature_capability
+        kind: runtime_capability
+
+  # --- 有依赖的任务 ---
+  # - id: T2
+  #   title: "依赖 T1 的后续任务"
+  #   depends_on:
+  #     - T1
+  #   addresses:
+  #     - "ISSUE-1"
+  #   goal_behavior: |
+  #     ...
+  #   acceptance_criteria: |
+  #     ...
+  #   claimed_paths:
+  #     - src/another/file.py
+  #     - tests/test_another.py
+  #   consumes:
+  #     - name: feature_capability
+  #       from: T1
+  #   verification:
+  #     level: unit
+  #     checks:
+  #       - name: another-test
+  #         command: "python -m pytest tests/test_another.py -v"
+
+  # --- 集成验证任务（解决 E_MISSING_INTEGRATION_SPINE）---
+  # 当 plan 有 >3 个 task 时必须有此类 task
+  # - id: T-int
+  #   title: "集成验证：全流程 regression"
+  #   depends_on:
+  #     - T1
+  #     # - T2
+  #   role: integration
+  #   goal_behavior: |
+  #     运行全量 pytest 套件确认改动没有引入回归。
+  #   acceptance_criteria: |
+  #     1. 新增测试全部 pass
+  #     2. 全量 pytest 0 failure
+  #   claimed_paths:
+  #     - tests/test_integration.py
+  #   verification:
+  #     level: integration
+  #     checks:
+  #       - name: new-tests
+  #         command: "python -m pytest tests/test_new_feature.py -v"
+  #       - name: full-regression
+  #         command: "python -m pytest -q"
+  #     covers:                          # <-- 关键：声明覆盖哪些 task
+  #       tasks:
+  #         - T1
+  #         # - T2
+
+  # --- 能力指南（放在最后，依赖全部修复完成）---
+  # - id: T-guide
+  #   title: "生成 foreman-capability-guide.md"
+  #   depends_on:
+  #     - T-int
+  #   role: leaf
+  #   addresses:
+  #     - "ISSUE-1"
+  #   goal_behavior: |
+  #     读取当前源码生成 docs/foreman-capability-guide.md
+  #   acceptance_criteria: |
+  #     1. 文件存在且非空
+  #   claimed_paths:
+  #     - docs/foreman-capability-guide.md
+  #   verification:
+  #     level: compile
+  #     checks:
+  #       - name: guide-exists
+  #         command: "test -s docs/foreman-capability-guide.md"
+
+# ============================================================================
+# Plan-level declarations（可选，按需启用）
+# ============================================================================
+
+# --- 关键流（声明端到端流程，Ralph 检查覆盖）---
+# critical_flows:
+#   - id: my_critical_flow
+#     description: "描述此端到端流程"
+#     entrypoints:
+#       - src/path/to/file.py::entry_function
+#     test_created_by:
+#       - T1
+#     required_verification_level: integration  # 默认值
+
+# --- 禁止流（声明不应存在的路径，需要负面测试）---
+# forbidden_flows:
+#   - id: bypass_auth_flow
+#     description: "认证不可被绕过"
+#     test_created_by:
+#       - T1
+#     required_verification_level: e2e  # 默认值
+
+# --- Finding 引用（关联 findings.md 中的教训）---
+# finding_refs:
+#   - id: finding-compile-not-run
+#     mitigation: "验证命令必须真正执行，不只是编译"
+#     enforced_by:
+#       - T1
+
+# --- 注册不变量（新增项必须注册到某个 registry）---
+# registration_invariants:
+#   - name: "IPC op dispatch"
+#     description: "新增 IPC op 必须在 handler 中注册"
+#     registry_file: src/cccc/daemon/ralph_ipc_handler.py
+#     registry_symbol: _DISPATCH_TABLE

@@ -41,6 +41,7 @@ class BatchEvaluationResult:
         suggestion: Original suggestion from Ralph
         approved_tasks: Tasks approved for execution
         rejected_tasks: Tasks rejected from the batch
+        skipped_task_ids: Tasks skipped before batch registration
         assignments: Task-to-agent assignments
         decision: Overall batch decision
         reason: Decision rationale
@@ -49,6 +50,7 @@ class BatchEvaluationResult:
     suggestion: ReadyBatchSuggestion
     approved_tasks: List[TaskRef] = field(default_factory=list)
     rejected_tasks: List[TaskRef] = field(default_factory=list)
+    skipped_task_ids: List[str] = field(default_factory=list)
     assignments: List[TaskAssignment] = field(default_factory=list)
     decision: BatchDecisionType = "approved"
     reason: str = ""

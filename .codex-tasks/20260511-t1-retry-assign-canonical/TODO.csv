@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current retry flow and workflow metadata paths,DONE,All target files and current retry tests reviewed,,2026-05-11T00:00:00,0,Confirmed auto-dispatch reads workflow_data assignment_map before engine meta.
+2,Implement assign_agent_id threading and canonical assignment_map persistence,DONE,CLI to orchestrator path accepts assign and retry_task updates workflow_data plus engine meta,,2026-05-11T00:00:00,0,Updated CLI parser, workflow command, IPC handler, task ops, and orchestrator retry persistence.
+3,Add focused retry assign tests,DONE,New tests cover assign update no-assign stability and assigned_to return field,,2026-05-11T00:00:00,0,Added tests/test_retry_assign.py with three focused cases.
+4,Run requested pytest verification,DONE,Specified pytest command passes,python -m pytest tests/test_retry_assign.py tests/test_retry_running_task.py -v,2026-05-11T00:00:00,0,Requested pytest passed; extra ops regression checks also passed.

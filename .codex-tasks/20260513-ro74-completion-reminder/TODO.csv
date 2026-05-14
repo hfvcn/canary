@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect prompt builder and existing tests,DONE,Relevant section order and test helper style are understood,rg -n "build_task_prompt|completion_protocol" src tests,2026-05-13,0,
+2,Implement mandatory completion reminder sections,DONE,Top and bottom reminders are added with required names and text,python -m pytest tests/test_prompt_completion_reminder.py -v,2026-05-13,0,
+3,Add focused prompt completion reminder tests,DONE,Tests verify output content order and mandatory retention,python -m pytest tests/test_prompt_completion_reminder.py -v,2026-05-13,0,
+4,Run validation,DONE,Requested pytest command passes,python -m pytest tests/test_prompt_completion_reminder.py -v,2026-05-13,0,

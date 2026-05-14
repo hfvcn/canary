@@ -194,22 +194,17 @@ class ProgressReporter:
             self._build_task_detail(task)
             for task in self._state.tasks.values()
         ]
+        task_counts = self._build_task_counts(self._state)
 
         return {
-            "status": "running",
+            "status": self._resolve_workflow_status(task_counts),
             "workflow_id": self._state.workflow_id,
             "current_batch": self._state.current_batch_id,
             "batches": {
                 "total": self._state.total_batches,
                 "completed": self._state.completed_batches,
             },
-            "tasks": {
-                "total": len(self._state.tasks),
-                "completed": self._state.count_by_status(ProgressStatus.COMPLETED),
-                "failed": self._state.count_by_status(ProgressStatus.FAILED),
-                "running": self._state.count_by_status(ProgressStatus.RUNNING),
-                "pending": self._state.count_by_status(ProgressStatus.PENDING),
-            },
+            "tasks": task_counts,
             "duration": {
                 "workflow_seconds": self._state.get_workflow_duration(),
                 "batch_seconds": self._state.get_batch_duration(),
@@ -217,6 +212,29 @@ class ProgressReporter:
             "task_details": task_details,
             "recent_events": self._event_history[-10:],
         }
+
+    def _build_task_counts(self, state: ProgressState) -> Dict[str, int]:
+        return {
+            "total": len(state.tasks),
+            "completed": state.count_by_status(ProgressStatus.COMPLETED),
+            "failed": state.count_by_status(ProgressStatus.FAILED),
+            "running": state.count_by_status(ProgressStatus.RUNNING),
+            "pending": state.count_by_status(ProgressStatus.PENDING),
+        }
+
+    @staticmethod
+    def _resolve_workflow_status(task_counts: Dict[str, int]) -> str:
+        total = task_counts["total"]
+        completed = task_counts["completed"]
+        failed = task_counts["failed"]
+        running = task_counts["running"]
+        pending = task_counts["pending"]
+
+        if total > 0 and completed == total:
+            return "completed"
+        if total > 0 and (running + pending) == 0 and failed > 0:
+            return "failed"
+        return "running"
 
     # ========== Event Handlers ==========
 

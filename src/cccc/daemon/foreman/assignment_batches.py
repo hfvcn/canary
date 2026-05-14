@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
 from ...contracts.v1.ralph_ipc import ReadyBatchSuggestion, RestartSuggestion, TaskRef
+from ...kernel.workflow_state_types import WorkflowTaskStatus
 from .agent_pool import TaskAssignment
 from .assignment_constants import (
     FORBIDDEN_FLOWS_KEY,
@@ -15,6 +17,20 @@ from .assignment_constants import (
     TASK_STATUS_PENDING,
 )
 from .workflow import BatchEvaluationResult
+from .workflow_id_resolution import (
+    ensure_tasks_are_new,
+    reject_if_tasks_already_exist,
+    resolve_suggestion_workflow_id_for_resubmit,
+    resolve_workflow_id_for_tasks,
+)
+
+logger = logging.getLogger("cccc.daemon.foreman.assignment_batches")
+
+_BATCHABLE_TASK_STATUSES = {
+    WorkflowTaskStatus.PLANNED,
+    WorkflowTaskStatus.READY,
+    WorkflowTaskStatus.DEFERRED,
+}
 
 
 class AssignmentBatchMixin:
@@ -25,25 +41,55 @@ class AssignmentBatchMixin:
         suggestion: ReadyBatchSuggestion,
         *,
         auto_start_agents: bool = True,
+        allowed_existing_task_ids: set[str] | None = None,
     ) -> BatchEvaluationResult:
+        rejected = self._reject_existing_tasks_for_submit(
+            suggestion,
+            allowed_task_ids=allowed_existing_task_ids,
+        )
+        if rejected is not None:
+            return rejected
+        suggestion, resolution_rejection = resolve_suggestion_workflow_id_for_resubmit(
+            suggestion,
+            self._owner.engine.get_task,
+        )
+        if resolution_rejection is not None:
+            return resolution_rejection
         workflow_id = suggestion.workflow_id
         batch_id = suggestion.suggestion_id
         self._owner._log(f"[orchestrator] Processing batch {batch_id} for workflow {workflow_id}")
-        workflow_data = self._register_batch_inputs(suggestion)
+        original_suggestion = suggestion
+        suggestion, workflow_data, skipped_task_ids = self._register_batch_inputs(suggestion)
+        if suggestion is None:
+            workflow_data["batches"].append(batch_id)
+            return self._reject_batch(
+                batch_id,
+                BatchEvaluationResult(
+                    suggestion=original_suggestion,
+                    approved_tasks=[],
+                    rejected_tasks=list(original_suggestion.tasks),
+                    skipped_task_ids=skipped_task_ids,
+                    decision="rejected",
+                    reason="all_tasks_completed_or_non_batchable",
+                ),
+            )
 
         deferred_result = self.defer_batch_for_single_writer(suggestion)
         if deferred_result is not None:
+            deferred_result.skipped_task_ids = list(skipped_task_ids)
             workflow_data["batches"].append(batch_id)
             return deferred_result
 
         pressure_result = self.defer_batch_for_cross_workflow_pressure(suggestion)
         if pressure_result is not None:
+            pressure_result.skipped_task_ids = list(skipped_task_ids)
             workflow_data["batches"].append(batch_id)
             return pressure_result
 
         result = self._evaluate_batch(suggestion)
         workflow_data["batches"].append(batch_id)
         result = self._apply_authorized_fallback(suggestion, result)
+        result.skipped_task_ids = list(skipped_task_ids)
         if result.decision == "rejected":
             return self._reject_batch(batch_id, result)
 
@@ -54,18 +100,60 @@ class AssignmentBatchMixin:
             self._owner._start_assigned_agents(result)
         return result
 
-    def _register_batch_inputs(self, suggestion: ReadyBatchSuggestion) -> Dict[str, Any]:
+    def _reject_existing_tasks_for_submit(
+        self,
+        suggestion: ReadyBatchSuggestion,
+        *,
+        allowed_task_ids: set[str] | None = None,
+    ) -> BatchEvaluationResult | None:
+        return reject_if_tasks_already_exist(
+            suggestion,
+            self._owner.engine.get_task,
+            allowed_task_ids=allowed_task_ids,
+        )
+
+    def _register_batch_inputs(
+        self,
+        suggestion: ReadyBatchSuggestion,
+    ) -> tuple[ReadyBatchSuggestion | None, Dict[str, Any], List[str]]:
         workflow_id = suggestion.workflow_id
         batch_id = suggestion.suggestion_id
         for task in suggestion.tasks:
             self._owner.engine.register_task(task, workflow_id)
             self._owner._track_task_ref(workflow_id, task)
-        states = [self._owner.engine.get_task(t.id) for t in suggestion.tasks]
-        if not all(state and state.batch_id == batch_id for state in states):
+        states = {task.id: self._owner.engine.get_task(task.id) for task in suggestion.tasks}
+        skipped_task_ids = self._non_batchable_task_ids(suggestion, states)
+        if skipped_task_ids:
+            suggestion = self._trim_non_batchable_tasks(suggestion, skipped_task_ids)
+            logger.info("batch %s: skipping non-batchable tasks %s", batch_id, skipped_task_ids)
+        states_to_register = [self._owner.engine.get_task(task.id) for task in suggestion.tasks]
+        if suggestion.tasks and not all(state and state.batch_id == batch_id for state in states_to_register):
             self._owner.engine.register_batch(batch_id, [t.id for t in suggestion.tasks])
         workflow_data = self._owner._ensure_active_workflow(workflow_id, started_at=suggestion.created_at)
         self._record_prompt_projection_metadata(suggestion, workflow_data)
-        return workflow_data
+        if not suggestion.tasks:
+            return None, workflow_data, skipped_task_ids
+        return suggestion, workflow_data, skipped_task_ids
+
+    @staticmethod
+    def _non_batchable_task_ids(
+        suggestion: ReadyBatchSuggestion,
+        states: Dict[str, Any],
+    ) -> List[str]:
+        return [
+            task.id
+            for task in suggestion.tasks
+            if states.get(task.id) and states[task.id].status not in _BATCHABLE_TASK_STATUSES
+        ]
+
+    @staticmethod
+    def _trim_non_batchable_tasks(
+        suggestion: ReadyBatchSuggestion,
+        skipped_task_ids: List[str],
+    ) -> ReadyBatchSuggestion:
+        skipped = set(skipped_task_ids)
+        batchable_tasks = [task for task in suggestion.tasks if task.id not in skipped]
+        return suggestion.model_copy(update={"tasks": batchable_tasks})
 
     def _record_prompt_projection_metadata(
         self,
@@ -236,11 +324,19 @@ class AssignmentBatchMixin:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         task_refs = [TaskRef.model_validate(task) for task in task_dicts]
+        ensure_tasks_are_new(
+            task_refs,
+            self._owner.engine.get_task,
+        )
+        workflow_id = resolve_workflow_id_for_tasks(
+            task_refs, workflow_id, self._owner.engine.get_task,
+        )
         self._owner._ensure_active_workflow(
             workflow_id,
             auto_process=kwargs.get("auto_process"),
             auto_start_agents=kwargs.get("auto_start_agents"),
             auto_dispatch=kwargs.get("auto_dispatch"),
+            stall_auto_reassign=kwargs.get("stall_auto_reassign"),
             assignment_map=kwargs.get("assignment_map"),
         )
         self._store_workflow_meta(workflow_id, kwargs)
@@ -255,10 +351,20 @@ class AssignmentBatchMixin:
         )
         ready_task_ids = [task.id for task in suggestion.tasks] if suggestion else []
         if suggestion and suggestion.tasks:
-            self._submit_ready_suggestion(suggestion, kwargs)
+            self._submit_ready_suggestion(
+                suggestion,
+                kwargs,
+                allowed_existing_task_ids={task.id for task in task_refs},
+            )
         return {"registered": len(task_refs), "submitted": len(ready_task_ids), "ready_task_ids": ready_task_ids}
 
-    def _submit_ready_suggestion(self, suggestion: ReadyBatchSuggestion, kwargs: Dict[str, Any]) -> None:
+    def _submit_ready_suggestion(
+        self,
+        suggestion: ReadyBatchSuggestion,
+        kwargs: Dict[str, Any],
+        *,
+        allowed_existing_task_ids: set[str] | None = None,
+    ) -> None:
         if kwargs.get("suggestion_id"):
             suggestion.suggestion_id = str(kwargs["suggestion_id"])
         if kwargs.get("rationale"):
@@ -279,9 +385,10 @@ class AssignmentBatchMixin:
         if kwargs.get(FORBIDDEN_FLOWS_KEY):
             suggestion.forbidden_flows = list(kwargs[FORBIDDEN_FLOWS_KEY])
         suggestion.fallback_allowed = bool(kwargs.get("fallback_allowed", False))
-        self._owner.process_batch_suggestion(
+        self.process_batch_suggestion(
             suggestion,
             auto_start_agents=bool(kwargs.get("auto_start_agents", True)),
+            allowed_existing_task_ids=allowed_existing_task_ids,
         )
 
     def _store_workflow_meta(self, workflow_id: str, kwargs: Dict[str, Any]) -> None:
@@ -293,6 +400,7 @@ class AssignmentBatchMixin:
             plan_path=plan_path,
             plan_digest=plan_digest,
             auto_dispatch=kwargs.get("auto_dispatch"),
+            stall_auto_reassign=kwargs.get("stall_auto_reassign"),
             assignment_map=kwargs.get("assignment_map"),
         )
 

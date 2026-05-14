@@ -1,0 +1,401 @@
+# Plan: RO-56 ~ RO-59 — v22 新发现问题修复
+#
+# 来源：todo/问题清单-v5-ralph.md § 一-A3 (v22 新发现)
+# 工作流：findings.md § 〇 经验证的工作流程
+# Codex 审查：2026-05-11，4 项 HIGH/MEDIUM 反馈已纳入
+#
+# Codex 审查修正：
+#   - T1: 不能只改 tracked task 的 agent_id，必须写入 canonical assignment_map
+#     （workflow_data["assignment_map"] + engine.set_workflow_meta()）。
+#   - T2: workflow_id 复用必须在 process_batch_suggestion() 入口处解析，而非
+#     _register_batch_inputs() 内部；mixed workflow_ids 直接 fail。
+#     补充 workflow_state_engine.py 到 claimed_paths（register_task 幂等化）。
+#   - T3: 放弃纯 regex 方案（可伪造 + 状态前置条件不匹配）。改用 `cccc send --task TASK_ID`
+#     显式标志 + 仅允许 Foreman (sender=foreman 或 service) 触发状态转换。
+#     状态链路应为：READY→ASSIGNED→RUNNING（先 approve 再 start），不能直接
+#     对 READY 调 report_worker_started()。
+#   - T4: 过滤后必须同步裁剪 suggestion.tasks 和所有按 task_id 索引的 metadata；
+#     全部 skipped 时返回显式 stale_batch 结果（非静默 return）。
+#
+# 设计原则：
+#   - #2  按功能切片拆分，不按文件拆
+#   - #9  先跑通一条路径再扩展
+#   - #11 verification 必须真正跑命令
+#   - #13 结构校验 + 代码审查互补
+#
+# 根因分析：
+#   RO-56: retry_task() 清空 _active_workflows 中的 agent_id/agent_name，
+#     但 _auto_dispatch_ready_tasks() 实际读取 workflow_data["assignment_map"]。
+#     需要覆盖 assignment_map[task_id] = new_agent_id 才能真正改变派发目标。
+#   RO-57: process_batch_suggestion() line 29 先缓存 workflow_id = suggestion.workflow_id，
+#     后续所有步骤（_record_assignment_details, _report_batch_started）都使用该值。
+#     如果 _register_batch_inputs() 内部发现应复用旧 workflow_id，但不同步修改 suggestion，
+#     则产生分叉状态。必须在入口处解析 canonical workflow_id。
+#   RO-58: handle_send() 是纯消息投递层，不应承担状态机职责。
+#     正确做法：在 CLI 层添加 --task 标志，当指定 task 时走 orchestrator 的
+#     approve+start 路径（READY→ASSIGNED→RUNNING），消息投递作为 side-effect。
+#   RO-59: register_batch() 对 non-batchable 任务 raise ValueError，但上游
+#     _register_batch_inputs() 传入了未过滤的 suggestion.tasks。
+#     过滤应在 suggestion 边界统一执行（裁剪 tasks + metadata），且全部 skipped
+#     应返回显式 batch_rejected 结果。
+#
+# 批次预期：
+#   Batch 1: T1, T2, T3, T4  — 独立修复（无互相依赖）
+#   Batch 2: T-int            — 集成验证
+
+schema_version: "1.0.0"
+
+required_issues:
+  - "RO-56"
+  - "RO-57"
+  - "RO-58"
+  - "RO-59"
+
+semantic_mode: "off"
+auto_infer: false
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_AGENT_REVIEW_FAILED
+  - W_AGENT_REVIEW_SKIPPED
+  - W_UNCLAIMED_TEST_FOR_SOURCE
+  - W_TEST_COVERAGE_GAP
+  - W_VERIFICATION_TARGET_MISSING
+  - W_VERIFICATION_NO_CHECKS
+  - W_VERIFICATION_COMPLEX_SHELL_SKIPPED
+  - W_CROSS_BOUNDARY_WITHOUT_GLUE
+  - W_NO_FAILURE_PATH
+  - W_PLAN_SCOPE_UNUSED
+  - W_VERIFICATION_BEHAVIOR_MISMATCH
+  - W_ISOLATED_TASK
+  - W_DISCONNECTED_COMPONENTS
+  - W_IMPLICIT_SERIALIZATION
+  - W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION
+  - W_FLOW_OWNER_NO_VERIFICATION
+  - W_INDIRECT_TEST_IMPORT
+  - W_DYNAMIC_TEST_IMPORT_OPAQUE
+
+critical_entrypoints:
+  - src/cccc/cli/main.py
+  - src/cccc/cli/workflow_cmds.py
+  - src/cccc/daemon/ralph_ipc_handler.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
+  - src/cccc/daemon/messaging/chat_ops.py
+  - src/cccc/kernel/workflow_state_engine.py
+  - src/cccc/daemon/foreman/assignment_batches.py
+
+critical_flows:
+  - id: retry_with_worker_override
+    description: >
+      cccc workflow retry TASK --assign ACTOR 必须覆盖 canonical assignment_map
+      （workflow_data["assignment_map"] + engine workflow_meta），使后续
+      _auto_dispatch_ready_tasks() 使用新 worker。
+    entrypoints:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+    required_verification_level: unit
+
+  - id: resubmit_preserves_workflow_id
+    description: >
+      process_batch_suggestion() 入口处解析 canonical workflow_id：
+      如果 suggestion 中的 task 已注册且共享同一 workflow_id，则覆盖
+      suggestion.workflow_id 后再进入后续流程，确保所有步骤使用同一 ID。
+    entrypoints:
+      - src/cccc/daemon/foreman/assignment_batches.py
+    required_verification_level: unit
+
+  - id: send_task_flag_dispatches
+    description: >
+      cccc send --task TASK_ID --to WORKER 通过 orchestrator 的 approve+start
+      路径将 task 从 READY→ASSIGNED→RUNNING，消息投递作为 side-effect。
+      仅 Foreman/service sender 可触发。
+    entrypoints:
+      - src/cccc/daemon/messaging/chat_ops.py
+    required_verification_level: unit
+
+  - id: batch_register_filters_completed
+    description: >
+      suggestion 边界统一裁剪：_register_batch_inputs() 过滤 non-batchable
+      tasks，同步裁剪 suggestion.tasks 和所有 per-task metadata。
+      全部 skipped 时返回 batch_rejected 结果（不静默成功）。
+    entrypoints:
+      - src/cccc/daemon/foreman/assignment_batches.py
+    required_verification_level: unit
+
+forbidden_flows:
+  - id: no_retry_assign_breaking_change
+    description: >
+      retry_task() 在 assign_agent_id 为空时行为必须与修改前完全一致。
+    test_created_by:
+      - T1
+    required_verification_level: unit
+
+  - id: no_send_task_spoofing
+    description: >
+      非 Foreman/service sender 不得通过 --task 标志触发状态转换。
+      普通 user/worker 发送包含 task 格式的消息时不应触发状态变更。
+    test_created_by:
+      - T3
+    required_verification_level: unit
+
+  - id: no_silent_batch_success_on_all_skipped
+    description: >
+      当 batch 中所有 task 都被过滤时，不得返回 ok=true 或静默成功。
+      必须返回显式的 batch_rejected/stale_batch 结果。
+    test_created_by:
+      - T4
+    required_verification_level: unit
+
+tasks:
+  # ---------------------------------------------------------------
+  # T1: RO-56 — retry 支持 --assign 切换 worker（写入 assignment_map）
+  # ---------------------------------------------------------------
+  - id: T1
+    title: "Add --assign flag to `cccc workflow retry` writing to canonical assignment_map"
+    type: backend
+    role: leaf
+    addresses:
+      - "RO-56"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/cli/main.py
+      - src/cccc/cli/workflow_cmds.py
+      - src/cccc/daemon/ralph_ipc_handler.py
+      - src/cccc/daemon/ops/workflow_task_ops.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - tests/test_retry_assign.py
+    goal_behavior: |
+      1. main.py: 为 p_workflow_retry parser 添加 `--assign` 可选参数。
+      2. workflow_cmds.py: cmd_workflow_retry 读取 args.assign 并传入 request 的 assign_agent_id 字段。
+      3. ralph_ipc_handler.py: handle_ralph_task_retry 从 args 提取 assign_agent_id 传给 retry_task()。
+      4. workflow_task_ops.py: retry_task() 接受 assign_agent_id="" 参数传给 orchestrator.retry_task()。
+      5. workflow_orchestrator.py: retry_task(self, task_id, assign_agent_id=""):
+         - 完成正常 retry 流程（fail_task if RUNNING → retry_after_verification）。
+         - 如果 assign_agent_id 非空：
+           a. 获取 workflow_data = _active_workflows[workflow_id]。
+           b. 更新 workflow_data["assignment_map"][task_id] = assign_agent_id（覆盖原 worker）。
+           c. 同步到 engine: engine.set_workflow_meta(workflow_id, assignment_map=updated_map)。
+         - 调用 _resuggest_ready_tasks() 时，_auto_dispatch_ready_tasks 将使用新的 assignment_map。
+         - 返回 {"accepted": True, "assigned_to": assign_agent_id} 当 override 生效。
+      6. 不加 --assign 时所有行为保持不变（assignment_map 不被修改）。
+    acceptance_criteria: |
+      - `cccc workflow retry T4 --assign frontend-worker-2` → ok=true, assignment_map[T4]=frontend-worker-2
+      - 后续 _auto_dispatch_ready_tasks 将 T4 派给 frontend-worker-2
+      - 不加 --assign → 行为与修改前完全一致
+      - 回归：tests/test_retry_running_task.py 无失败
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_retry_assign.py tests/test_retry_running_task.py -v"
+      covers:
+        flows:
+          - retry_with_worker_override
+    provides:
+      - name: retry_assign_flag
+        kind: artifact
+
+  # ---------------------------------------------------------------
+  # T2: RO-57 — re-submit 在入口处解析 canonical workflow_id
+  # ---------------------------------------------------------------
+  - id: T2
+    title: "Re-submit resolves canonical workflow_id at process_batch_suggestion entry"
+    type: backend
+    role: leaf
+    addresses:
+      - "RO-57"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/daemon/foreman/assignment_batches.py
+      - src/cccc/kernel/workflow_state_engine.py
+      - tests/test_resubmit_workflow_id.py
+    goal_behavior: |
+      1. assignment_batches.py: process_batch_suggestion() 入口（line 29 之后）插入 canonical workflow_id 解析：
+         - 对 suggestion.tasks 中每个 task，调用 engine.get_task(task.id)。
+         - 收集已注册 task 的 existing_workflow_ids（去重）。
+         - 如果 existing_workflow_ids 恰好 1 个且 != suggestion.workflow_id：
+           修改 suggestion = suggestion.model_copy(update={"workflow_id": existing_wf_id})，
+           log.info("resubmit: reusing existing workflow_id=%s", existing_wf_id)。
+         - 如果 existing_workflow_ids > 1 个且互不相同：
+           直接返回 BatchEvaluationResult(decision="rejected", reason="mixed_workflow_ids")。
+         - 如果所有 task 都是新的或 existing_workflow_id == suggestion.workflow_id：保持不变。
+      2. workflow_state_engine.py: register_task() 增加幂等语义：
+         - 如果 task 已注册且 workflow_id 相同：跳过（不 raise，不重复 append event）。
+         - 如果 task 已注册但 workflow_id 不同：raise ValueError("workflow_id mismatch")。
+      3. 后续所有步骤（_record_assignment_details, _report_batch_started 等）
+         自动使用修正后的 suggestion.workflow_id。
+    acceptance_criteria: |
+      - T4(已注册,wf="kanban-v22") re-submit with wf="kanban-v22-retry" → suggestion 被修正为 "kanban-v22"
+      - T4+T5 属于不同 workflow_ids 的 re-submit → rejected "mixed_workflow_ids"
+      - 全新 task → 使用 --workflow-id 提供的值
+      - register_task() 对同 task+同 wf 幂等
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_resubmit_workflow_id.py -v"
+      covers:
+        flows:
+          - resubmit_preserves_workflow_id
+    provides:
+      - name: resubmit_workflow_id_reuse
+        kind: artifact
+
+  # ---------------------------------------------------------------
+  # T3: RO-58 — cccc send --task 显式触发 approve+start
+  # ---------------------------------------------------------------
+  - id: T3
+    title: "`cccc send --task TASK_ID` triggers orchestrator approve+start path"
+    type: backend
+    role: leaf
+    addresses:
+      - "RO-58"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/cli/main.py
+      - src/cccc/cli/messaging_cmds.py
+      - src/cccc/daemon/messaging/chat_ops.py
+      - src/cccc/daemon/ralph_ipc_handler.py
+      - tests/test_send_state_transition.py
+    goal_behavior: |
+      1. main.py: 为 send 命令的 parser 添加 `--task` 可选参数（help="Task ID to assign via this message"）。
+      2. messaging_cmds.py: cmd_send 读取 args.task，传入 daemon request 的 task_id 字段。
+      3. chat_ops.py: handle_send() 从 args 读取 task_id：
+         - 如果 task_id 非空 AND to_tokens 非空 AND sender 为受信来源（by 以 "foreman"/"service" 开头或 by == group 的 foreman actor_id）：
+           a. 消息正常投递（先于状态转换，确保投递不受状态失败影响）。
+           b. 在消息投递成功后，尝试状态转换：
+              - 获取 group 的 orchestrator（lazy import helper）。
+              - 调用 orchestrator.manual_assign_task(task_id, to_tokens[0]) — 新方法。
+              - 异常被 try/except 捕获并 logger.warning（不阻塞返回）。
+      4. workflow_orchestrator.py 新增 manual_assign_task(task_id, agent_id):
+         - 获取 task state，检查 status 是否为 READY/PLANNED。
+         - 如果是：构造单 task batch，调用 engine.approve_batch(batch_id, [{task_id, agent_id}])
+           → 状态变为 ASSIGNED。
+         - 然后调用 engine.report_worker_started(task_id, agent_id) → 状态变为 RUNNING。
+         - 如果 task 已经是 ASSIGNED/RUNNING：跳过（幂等）。
+         - 如果 task 不存在或状态不可操作：raise ValueError。
+      5. 不带 --task 时所有行为完全不变。
+      6. 非受信 sender（普通 user/worker）即使带 --task 也只投递消息不触发状态变更（日志警告）。
+    acceptance_criteria: |
+      - `cccc send --to backend-worker --task T4 "..."` by foreman → T4: ready→assigned→running
+      - 不带 --task → 纯消息投递，无状态变更
+      - 非受信 sender 带 --task → 消息投递正常，状态不变，日志警告
+      - task 不存在 → 消息投递正常，日志错误
+      - task 已是 running → 幂等，无异常
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_send_state_transition.py -v"
+      covers:
+        flows:
+          - send_task_flag_dispatches
+    provides:
+      - name: send_task_dispatch
+        kind: artifact
+
+  # ---------------------------------------------------------------
+  # T4: RO-59 — batch 注册统一裁剪 non-batchable tasks
+  # ---------------------------------------------------------------
+  - id: T4
+    title: "Batch registration filters non-batchable tasks at suggestion boundary"
+    type: backend
+    role: leaf
+    addresses:
+      - "RO-59"
+    depends_on: []
+    claimed_paths:
+      - src/cccc/kernel/workflow_state_engine.py
+      - src/cccc/daemon/foreman/assignment_batches.py
+      - tests/test_batch_filter_completed.py
+    goal_behavior: |
+      1. assignment_batches.py: _register_batch_inputs() 在注册完 tasks 后、调用 register_batch() 前：
+         - 对每个 task 查询 engine.get_task(t.id).status。
+         - 收集 non-batchable tasks（status not in {PLANNED, READY, DEFERRED}）为 skipped_ids。
+         - 如果 skipped_ids 非空：
+           a. 裁剪 suggestion = suggestion.model_copy(update={"tasks": [t for t in suggestion.tasks if t.id not in skipped_ids]})。
+           b. 更新传入到后续步骤的 suggestion 引用。
+           c. logger.info("batch %s: skipping non-batchable tasks %s", batch_id, skipped_ids)。
+         - 如果裁剪后 suggestion.tasks 为空（全部 skipped）：
+           返回特殊空 workflow_data 并设置标记（由调用方返回 rejected 结果）。
+      2. assignment_batches.py: process_batch_suggestion() 检查 _register_batch_inputs() 返回值：
+         - 如果返回标记 all_skipped=True：
+           返回 BatchEvaluationResult(decision="rejected", reason="all_tasks_completed_or_non_batchable",
+           skipped_task_ids=skipped_ids)。
+      3. workflow_state_engine.py: register_batch() 保留 ValueError 作为 defense-in-depth，
+         但实际不应再触发（上层已过滤）。如果仍然触发（逻辑 bug），错误会被上层 catch 并转为 rejected。
+      4. 部分 skipped 时：后续 _evaluate_batch()、approve_batch() 只处理剩余 tasks。
+    acceptance_criteria: |
+      - Batch [T1(completed), T4(ready), T5(planned)] → 注册 T4+T5，ok=true
+      - Batch [T1(completed), T2(completed)] → rejected "all_tasks_completed_or_non_batchable"
+      - Batch [T3(ready), T4(planned)] → 正常注册（无 skip），ok=true
+      - 结果中包含 skipped_task_ids 字段
+      - 全量 pytest 无回归
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_batch_filter_completed.py -v"
+      covers:
+        flows:
+          - batch_register_filters_completed
+    provides:
+      - name: batch_filter_completed
+        kind: artifact
+
+  # ---------------------------------------------------------------
+  # T-int: 集成验证
+  # ---------------------------------------------------------------
+  - id: T-int
+    title: "Integration test covering all v22 fixes together"
+    type: backend
+    role: integration
+    addresses:
+      - "RO-56"
+      - "RO-57"
+      - "RO-58"
+      - "RO-59"
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T4
+    claimed_paths:
+      - tests/test_v22_integration.py
+    goal_behavior: |
+      集成测试验证所有 4 个修复协同工作：
+      1. test_retry_with_assign_updates_assignment_map: retry --assign 实际更新 assignment_map，
+         后续 _auto_dispatch_ready_tasks 正确使用新 worker。
+      2. test_resubmit_resolves_canonical_wf_id: 已注册 task re-submit → 整条链路使用原 workflow_id，
+         包括 _record_assignment_details 和 batch started 报告。
+      3. test_send_task_flag_full_transition: cccc send --task T4 --to worker by foreman
+         → task READY→ASSIGNED→RUNNING，消息正常投递。
+      4. test_batch_mixed_with_rejection: batch [completed, ready] → 裁剪后正常处理；
+         batch [completed, completed] → rejected 结果。
+      5. 负例：retry 无 --assign 保持不变；非受信 sender 带 --task 不触发状态。
+    acceptance_criteria: |
+      - 全部集成测试通过
+      - 全量 pytest 无新增失败
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_v22_integration.py -v && python -m pytest tests/ -x --timeout=60 -q"
+      covers:
+        tasks:
+          - T1
+          - T2
+          - T3
+          - T4
+        flows:
+          - retry_with_worker_override
+          - resubmit_preserves_workflow_id
+          - send_task_flag_dispatches
+          - batch_register_filters_completed
+        forbidden_flows:
+          - no_retry_assign_breaking_change
+          - no_send_task_spoofing
+          - no_silent_batch_success_on_all_skipped
+    provides:
+      - name: v22_integration_verified
+        kind: artifact
+    consumes:
+      - name: retry_assign_flag
+        kind: artifact
+      - name: resubmit_workflow_id_reuse
+        kind: artifact
+      - name: send_task_dispatch
+        kind: artifact
+      - name: batch_filter_completed
+        kind: artifact

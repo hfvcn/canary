@@ -224,7 +224,7 @@ def test_build_daemon_request_consistent() -> None:
         for key, value in expected_core.items():
             assert req["args"][key] == value
 
-    assert cli_req == adapter_helpers.build_daemon_request("send", **expected_core)
+    assert cli_req == adapter_helpers.build_daemon_request("send", **expected_core, task_id="")
     assert http_req == adapter_helpers.build_daemon_request(
         "send",
         **expected_core,

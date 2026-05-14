@@ -1,15 +1,12 @@
-"""Runtime anomaly detection for Foreman workflows.
-
-Pure logic module — no imports from daemon/orchestrator internals.
-All functions are stateless and testable in isolation.
-"""
+"""Pure runtime anomaly detection for Foreman workflows."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional
 
+from cccc.kernel.claimed_paths import normalize_path as _normalize_path
 from cccc.kernel.claimed_paths import paths_overlap as _paths_overlap
 
 
@@ -40,17 +37,13 @@ def get_default_config() -> MonitorConfig:
 
 @dataclass
 class MonitorAlert:
-    alert_type: str   # "silent_agent" | "path_deviation" | "completer_mismatch" | "file_overstepping" | "unauthorized_subagent"
+    alert_type: str   # "silent_agent" | "progress_stall" | "path_deviation" | "completer_mismatch" | "file_overstepping" | "unauthorized_subagent"
     severity: str     # "warning" | "error"
     task_id: str      # affected task (empty string when not task-scoped)
     message: str      # human-readable description
     evidence: Dict    # structured data for debugging
     mode: MonitorMode = MonitorMode.OBSERVE
 
-
-# ---------------------------------------------------------------------------
-# Check: silent agent
-# ---------------------------------------------------------------------------
 
 def check_silent_agent(
     task_id: str,
@@ -60,8 +53,6 @@ def check_silent_agent(
     timeout_s: float = 300,
 ) -> Optional[MonitorAlert]:
     """Alert if no events within timeout after assignment."""
-    # Use last_event_at if it exists and is later than assigned_at,
-    # otherwise fall back to assigned_at as the reference point.
     reference = last_event_at if last_event_at > assigned_at else assigned_at
     elapsed = now - reference
     if elapsed >= timeout_s:
@@ -84,9 +75,46 @@ def check_silent_agent(
     return None
 
 
-# ---------------------------------------------------------------------------
-# Check: path deviation (agent using direct messaging for task assignment)
-# ---------------------------------------------------------------------------
+def check_progress_stall(
+    task_id: str,
+    heartbeat_count: int,
+    last_progress_pct: Optional[float],
+    first_heartbeat_at: float,
+    last_heartbeat_at: float,
+    now: float,
+    min_heartbeats: int = 5,
+    stagnant_timeout_s: float = 300,
+) -> Optional[MonitorAlert]:
+    """Alert when the current progress value survives enough heartbeats."""
+    if last_progress_pct is None:
+        return None
+    if heartbeat_count < min_heartbeats:
+        return None
+
+    elapsed = now - first_heartbeat_at
+    if elapsed < stagnant_timeout_s:
+        return None
+
+    return MonitorAlert(
+        alert_type="progress_stall",
+        severity="warning",
+        task_id=task_id,
+        message=(
+            f"Task {task_id!r} progress stayed at {last_progress_pct:g}% "
+            f"for {elapsed:.0f}s (timeout={stagnant_timeout_s}s)"
+        ),
+        evidence={
+            "heartbeat_count": heartbeat_count,
+            "min_heartbeats": min_heartbeats,
+            "progress_pct": last_progress_pct,
+            "first_heartbeat_at": first_heartbeat_at,
+            "last_heartbeat_at": last_heartbeat_at,
+            "now": now,
+            "elapsed_s": elapsed,
+            "stagnant_timeout_s": stagnant_timeout_s,
+        },
+    )
+
 
 _ASSIGN_KEYWORDS = frozenset(["assign", "please take", "your task", "handle task"])
 
@@ -96,14 +124,8 @@ def check_path_deviation(
     event_type: str,       # e.g. "message_send"
     event_payload: dict,   # event details
 ) -> Optional[MonitorAlert]:
-    """Detect agent using direct messaging to assign tasks.
-
-    Fires when a ``message_send`` event contains task-assignment language
-    (e.g. the word "assign" together with what looks like a task reference)
-    instead of going through the proper ``workflow.task_assigned`` channel.
-    """
+    """Detect direct-message task assignment instead of workflow channel use."""
     if event_type == "workflow.task_assigned":
-        # Proper channel — no deviation
         return None
 
     content: str = ""
@@ -135,10 +157,6 @@ def check_path_deviation(
     )
 
 
-# ---------------------------------------------------------------------------
-# Check: unauthorized subagent
-# ---------------------------------------------------------------------------
-
 def check_unauthorized_subagent(
     agent_id: str,
     known_agents: set,
@@ -157,10 +175,6 @@ def check_unauthorized_subagent(
         },
     )
 
-
-# ---------------------------------------------------------------------------
-# Check: completer mismatch
-# ---------------------------------------------------------------------------
 
 def check_completer_mismatch(
     task_id: str,
@@ -187,33 +201,24 @@ def check_completer_mismatch(
     )
 
 
-# ---------------------------------------------------------------------------
-# Check: file overstepping
-# ---------------------------------------------------------------------------
-
 def check_file_overstepping(
     task_id: str,
     changed_files: List[str],
     claimed_paths: List[str],
 ) -> Optional[MonitorAlert]:
-    """Detect worker modifying files outside claimed scope.
-
-    A changed file is considered *in scope* if it overlaps with at least one
-    claimed path (using the same overlap semantics as ralph.core._paths_overlap).
-    An alert lists every out-of-scope file.
-    """
+    """Detect worker modifying files outside claimed scope."""
     if not changed_files:
         return None
-
-    # If no claimed paths are given we treat it as global scope (no restriction)
     if not claimed_paths:
         return None
 
+    normalized_claimed_paths = [_normalize_path(path) for path in claimed_paths]
+    normalized_changed_files = [_normalize_path(path) for path in changed_files]
     overstepping: List[str] = []
-    for f in changed_files:
-        in_scope = any(_paths_overlap(f, cp) for cp in claimed_paths)
+    for path in normalized_changed_files:
+        in_scope = any(_paths_overlap(path, claimed_path) for claimed_path in normalized_claimed_paths)
         if not in_scope:
-            overstepping.append(f)
+            overstepping.append(path)
 
     if not overstepping:
         return None
@@ -228,14 +233,10 @@ def check_file_overstepping(
         ),
         evidence={
             "overstepping_files": overstepping,
-            "claimed_paths": claimed_paths,
-            "changed_files": changed_files,
+            "claimed_paths": normalized_claimed_paths,
+            "changed_files": normalized_changed_files,
         },
     )
-# ---------------------------------------------------------------------------
-# Pre-transition hook factories (ARCH-12 / ARCH-9)
-# ---------------------------------------------------------------------------
-
 def create_completer_mismatch_hook():
     def hook(kind, data, engine):
         from ...kernel.workflow_state_types import KIND_TASK_REPORTED_COMPLETED, TransitionRejected

@@ -115,6 +115,7 @@ class WorkflowEngine:
         plan_path: str = "",
         plan_digest: str = "",
         auto_dispatch: Optional[bool] = None,
+        stall_auto_reassign: Optional[bool] = None,
         assignment_map: Optional[Dict[str, str]] = None,
     ) -> None:
         """Store metadata for a workflow."""
@@ -132,6 +133,11 @@ class WorkflowEngine:
                 bool(auto_dispatch)
                 if auto_dispatch is not None
                 else (previous.auto_dispatch if previous else False)
+            ),
+            stall_auto_reassign=(
+                bool(stall_auto_reassign)
+                if stall_auto_reassign is not None
+                else (previous.stall_auto_reassign if previous else False)
             ),
             assignment_map=normalized_map or dict(previous.assignment_map if previous else {}),
         )
@@ -229,6 +235,9 @@ class WorkflowEngine:
         if not tid:
             raise ValueError("task.id is required")
         if tid in self._tasks:
+            existing = self._tasks[tid]
+            if existing.workflow_id != wf:
+                raise ValueError(f"workflow_id mismatch for task {tid}")
             return
         self._append(kind=wt.KIND_TASK_REGISTERED, data={"workflow_id": wf, "task": task.model_dump()})
         self._tasks[tid] = TaskState(task=task, workflow_id=wf, status=WorkflowTaskStatus.PLANNED)
@@ -380,20 +389,23 @@ class WorkflowEngine:
             self._processed_completion_keys.add(idem)
         self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.VERIFYING, last_completion_idempotency_key=idem)
 
+    def fail_task(self, task_id: str, reason: str, *, hook_ctx: Optional[Dict[str, Any]] = None) -> None:
+        self._fail_running_task(task_id, {"reason": str(reason or "").strip()}, hook_ctx=hook_ctx)
+
     def report_worker_failed(self, task_id: str, error: Dict[str, Any], *, hook_ctx: Optional[Dict[str, Any]] = None) -> None:
+        self._fail_running_task(task_id, dict(error or {}), hook_ctx=hook_ctx)
+
+    def _fail_running_task(self, task_id: str, error: Dict[str, Any], *, hook_ctx: Optional[Dict[str, Any]] = None) -> None:
         tid = str(task_id or "").strip()
         if not tid:
             raise ValueError("task_id is required")
         prev = self._require_task(tid)
-        if prev.status != WorkflowTaskStatus.RUNNING:
+        if prev.status not in {WorkflowTaskStatus.RUNNING, WorkflowTaskStatus.ASSIGNED}:
             raise ValueError(f"task not fail-able: {tid} status={prev.status.value}")
+        data = {"workflow_id": prev.workflow_id, "task_id": tid, "error": dict(error or {})}
         # Pre-transition hooks — may raise PreTransitionVetoed
         try:
-            self._run_pre_transition_hooks(wt.KIND_TASK_FAILED, {
-                "workflow_id": prev.workflow_id,
-                "task_id": tid,
-                "error": dict(error or {}),
-            }, hook_ctx=hook_ctx)
+            self._run_pre_transition_hooks(wt.KIND_TASK_FAILED, data, hook_ctx=hook_ctx)
         except PreTransitionVetoed as exc:
             self._append(kind=wt.KIND_PLAN_DIGEST_DIVERGENCE, data={
                 "workflow_id": prev.workflow_id, "task_id": tid,
@@ -401,7 +413,7 @@ class WorkflowEngine:
                 "code": exc.code, "message": str(exc),
             })
             raise
-        self._append(kind=wt.KIND_TASK_FAILED, data={"workflow_id": prev.workflow_id, "task_id": tid, "error": dict(error or {})})
+        self._append(kind=wt.KIND_TASK_FAILED, data=data)
         self._flush_pending_hook_alerts()
         self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.FAILED)
 
@@ -417,6 +429,16 @@ class WorkflowEngine:
         if outcome == "agent_pending":
             # RA-3: agent verification requested — stay in VERIFYING, just log
             self._append(kind=wt.KIND_VERIFICATION_AGENT_PENDING, data=data)
+            return
+        if outcome == "force_passed":
+            self._record_verification_transition(
+                prev=prev,
+                task_id=tid,
+                kind=wt.KIND_VERIFICATION_SKIPPED,
+                data=data,
+                status=WorkflowTaskStatus.COMPLETED,
+                hook_ctx=hook_ctx,
+            )
             return
         if outcome == "passed":
             self._record_verification_transition(
@@ -475,7 +497,12 @@ class WorkflowEngine:
         if not tid:
             raise ValueError("task_id is required")
         prev = self._require_task(tid)
-        if prev.status not in {WorkflowTaskStatus.VERIFYING, WorkflowTaskStatus.FAILED}:
+        retryable_statuses = {
+            WorkflowTaskStatus.VERIFYING,
+            WorkflowTaskStatus.FAILED,
+            WorkflowTaskStatus.ASSIGNED,
+        }
+        if prev.status not in retryable_statuses:
             raise ValueError(f"task not retryable: {tid} status={prev.status.value}")
         self._append(kind=wt.KIND_RETRY_REQUESTED, data={"workflow_id": prev.workflow_id, "task_id": tid})
         self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.READY, agent_id="", attempt_id="")
@@ -492,6 +519,25 @@ class WorkflowEngine:
             "warning_type": warning_type,
             "message": message,
             "evidence": dict(evidence or {}),
+        })
+
+    def emit_workflow_terminal(
+        self,
+        workflow_id: str,
+        *,
+        completed_count: int,
+        failed_count: int,
+        total: int,
+        summary: str = "",
+    ) -> None:
+        """Emit workflow.completed or workflow.failed ledger event."""
+        kind = wt.KIND_WORKFLOW_COMPLETED if failed_count == 0 else wt.KIND_WORKFLOW_FAILED
+        self._append(kind=kind, data={
+            "workflow_id": str(workflow_id or "").strip(),
+            "completed_count": completed_count,
+            "failed_count": failed_count,
+            "total": total,
+            "summary": str(summary or ""),
         })
 
     def defer_task(self, task_id: str, reason: str) -> None:
@@ -571,6 +617,7 @@ class WorkflowEngine:
                     "plan_path": meta.plan_path,
                     "plan_digest": meta.plan_digest,
                     "auto_dispatch": meta.auto_dispatch,
+                    "stall_auto_reassign": meta.stall_auto_reassign,
                     "assignment_map": dict(meta.assignment_map),
                 }
                 for _, meta in sorted(self._workflow_meta.items())
@@ -622,7 +669,7 @@ class WorkflowEngine:
             wt.KIND_TASK_FAILED: self._apply_task_failed,
             wt.KIND_VERIFICATION_PASSED: self._apply_verification_passed,
             wt.KIND_VERIFICATION_SKIPPED: self._apply_verification_skipped,
-            wt.KIND_VERIFICATION_SKIPPED_BLOCKED: self._apply_verification_skipped,
+            wt.KIND_VERIFICATION_SKIPPED_BLOCKED: self._apply_verification_skipped_blocked,
             wt.KIND_VERIFICATION_FAILED: self._apply_verification_failed,
             wt.KIND_RETRY_REQUESTED: self._apply_retry_requested,
             wt.KIND_TASK_DEFERRED: self._apply_task_deferred,
@@ -707,6 +754,9 @@ class WorkflowEngine:
         self._apply_verification(kind=wt.KIND_VERIFICATION_PASSED, data=data)
 
     def _apply_verification_skipped(self, data: Dict[str, Any]) -> None:
+        self._apply_verification(kind=wt.KIND_VERIFICATION_SKIPPED, data=data)
+
+    def _apply_verification_skipped_blocked(self, data: Dict[str, Any]) -> None:
         self._apply_verification(kind=wt.KIND_VERIFICATION_SKIPPED_BLOCKED, data=data)
 
     def _apply_verification_failed(self, data: Dict[str, Any]) -> None:
@@ -718,7 +768,7 @@ class WorkflowEngine:
         prev = self._require_task(tid)
         next_status = (
             WorkflowTaskStatus.COMPLETED
-            if kind == wt.KIND_VERIFICATION_PASSED
+            if kind in {wt.KIND_VERIFICATION_PASSED, wt.KIND_VERIFICATION_SKIPPED}
             else WorkflowTaskStatus.FAILED
         )
         self._tasks[tid] = replace(prev, status=next_status, last_verification=verification)

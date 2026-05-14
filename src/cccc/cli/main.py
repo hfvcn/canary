@@ -243,6 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--priority", choices=["normal", "attention"], default="normal", help="Message priority")
     p_send.add_argument("--reply-required", action="store_true", help="Require recipients to reply")
     p_send.add_argument("--path", default="", help="Send message under this scope (path inside repo/scope)")
+    p_send.add_argument("--task", default="", help="Task ID to assign via this message")
     p_send.set_defaults(func=cmd_send)
 
     p_reply = sub.add_parser("reply", help="Reply to a message (IM-style, with quote)")
@@ -583,6 +584,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_workflow_retry = workflow_sub.add_parser("retry", help="Request retry for a task after verification failure")
     p_workflow_retry.add_argument("task_id", help="Task id")
     p_workflow_retry.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_workflow_retry.add_argument("--assign", default="", help="Override assignment target agent_id")
     p_workflow_retry.set_defaults(func=cmd_workflow_retry)
 
     p_workflow_fail = workflow_sub.add_parser("fail", help="Report task failure via task_event")

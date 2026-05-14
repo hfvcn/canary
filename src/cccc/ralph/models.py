@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
+from ..contracts.v1.ralph_ipc import MockTestCase
+
 
 # ---------------------------------------------------------------------------
 # Verification
@@ -37,6 +39,7 @@ class CheckSpec(BaseModel):
     command: str
     required: bool = True
     expected_exit_code: int = 0
+    timeout: Optional[int] = None
 
     model_config = ConfigDict(extra="ignore")
 
@@ -49,6 +52,8 @@ class Verification(BaseModel):
     checks: List[CheckSpec] = Field(default_factory=list)
     covers: VerificationCovers = Field(default_factory=VerificationCovers)
     expected_exit_code: int = 0
+    cleanup_patterns: Optional[List[str]] = None
+    mock_tests: Optional[List[MockTestCase]] = None
 
     model_config = ConfigDict(extra="ignore")
 
@@ -102,6 +107,18 @@ class SemanticBlock(BaseModel):
 TaskRole = Literal["leaf", "integration", "verification"]
 
 
+class ModuleSpec(BaseModel):
+    """BP-2: A sub-module within a task for parallel decomposition."""
+
+    id: str
+    description: str = ""
+    input_spec: Dict[str, Any] = Field(default_factory=dict)
+    output_spec: Dict[str, Any] = Field(default_factory=dict)
+    internal_depends_on: List[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class TaskSpec(BaseModel):
     """A single task in a plan — the unit of work assignment."""
 
@@ -127,6 +144,13 @@ class TaskSpec(BaseModel):
 
     semantic: Optional[SemanticBlock] = None
 
+    # BP-3: Structured I/O contract for black-box worker model
+    expected_input: Dict[str, Any] = Field(default_factory=dict)
+    expected_output: Dict[str, Any] = Field(default_factory=dict)
+
+    # BP-2: Optional module decomposition for parallel sub-task work
+    modules: Optional[List[ModuleSpec]] = None
+
     # Default: extra="ignore" (legacy).  Switched to "forbid" by
     # _apply_strict_schema() when Plan.schema_version is set.
     model_config = ConfigDict(extra="ignore")
@@ -142,13 +166,21 @@ class TaskSpec(BaseModel):
                 level=self.verification.level,
                 command=self.verification.command,
                 checks=[
-                    {"name": c.name, "command": c.command, "required": c.required, "expected_exit_code": c.expected_exit_code}
+                    {
+                        "name": c.name,
+                        "command": c.command,
+                        "required": c.required,
+                        "expected_exit_code": c.expected_exit_code,
+                        "timeout": c.timeout,
+                    }
                     for c in self.verification.checks
                 ],
                 covers_tasks=covers.tasks if covers else [],
                 covers_paths=covers.paths if covers else [],
                 covers_flows=covers.flows if covers else [],
                 expected_exit_code=self.verification.expected_exit_code,
+                cleanup_patterns=self.verification.cleanup_patterns,
+                mock_tests=self.verification.mock_tests,
             )
 
         return TaskRef(
@@ -165,6 +197,9 @@ class TaskSpec(BaseModel):
             provides=[c.model_dump() for c in self.provides],
             consumes=[c.model_dump() for c in self.consumes],
             addresses=self.addresses,
+            expected_input=self.expected_input,
+            expected_output=self.expected_output,
+            modules=[m.model_dump() for m in self.modules] if self.modules else None,
         )
 
 
@@ -327,6 +362,10 @@ class Plan(BaseModel):
     finding_refs: List[FindingRef] = Field(default_factory=list)
     registration_invariants: List[RegistrationInvariant] = Field(default_factory=list)
     suppress_flows: List[str] = Field(default_factory=list)
+
+    # BP-5: batch-level E2E verification command
+    batch_e2e_command: Optional[str] = None
+    batch_e2e_timeout: int = 300
 
     required_issues: List[str] = Field(default_factory=list)  # issue IDs that must be addressed
     suppress_codes: List[str] = Field(default_factory=list)

@@ -14,6 +14,7 @@ from .structural import (
     _check_role_constraints,
     _check_early_integration_checkpoint,
     _is_cross_task_verifier,
+    _check_module_consistency,
 )
 
 from .coverage import (
@@ -33,6 +34,8 @@ from .coverage import (
     _check_critical_flow_levels,
     _check_critical_flow_worker_only_verification,
     _check_issue_coverage,
+    _check_task_addresses_disjoint,
+    _check_mock_tests_completeness,
     _check_forbidden_flows,
     _check_finding_refs,
     _check_suppress_flows,
@@ -43,12 +46,14 @@ from .coverage import (
     _check_suppress_unused,
     _check_plan_scope_unused,
     _has_issue_codes,
+    _check_batch_e2e_command,
 )
 
 from .contracts import (
     _check_contracts,
     _check_contract_verification_coverage,
     _check_contract_dep_alignment,
+    _check_cross_task_io_contracts,
 )
 
 
@@ -81,6 +86,8 @@ def get_all_rules():
         _check_critical_flow_levels,
         _check_critical_flow_worker_only_verification,
         _check_issue_coverage,
+        _check_task_addresses_disjoint,
+        _check_mock_tests_completeness,
         _check_forbidden_flows,
         _check_finding_refs,
         _check_suppress_flows,
@@ -124,6 +131,8 @@ __all__ = [
     "_check_critical_flow_levels",
     "_check_critical_flow_worker_only_verification",
     "_check_issue_coverage",
+    "_check_task_addresses_disjoint",
+    "_check_mock_tests_completeness",
     "_check_forbidden_flows",
     "_check_finding_refs",
     "_check_suppress_flows",
