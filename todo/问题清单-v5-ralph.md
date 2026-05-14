@@ -114,6 +114,204 @@
 
 ---
 
+### UX-4 plan.yaml 模板维护 + 能力指南补全（P1）
+
+**优先级**：P1
+**影响维度**：体验
+**预期分数变化**：体验 4→4.5，间接提升结果（batch_e2e_command 触发后可拦截更多问题）
+
+**触发实例**：
+> v32 Foreman 不知道 `batch_e2e_command` 字段存在——capability guide 和 workflow doc 中都未提及。validate 输出 `W_BATCH_E2E_NO_COMMAND` 但淹没在 17 warnings 噪音中。同时 provides/consumes 格式（`{name, kind}` vs 字符串）、verification.level 取值、from_task 字段等均因文档不精确导致多次 validate 迭代。
+
+**根因**：foreman-capability-guide.md 靠人工扫描代码库生成，速度慢且必然遗漏新增字段。plan.yaml 模板（plans/_template.yaml）未包含所有字段的完整示例。
+
+**改进方案**：
+1. 更新 `plans/_template.yaml` 为**全字段模板**（含 batch_e2e_command、provides/consumes 完整格式、module_spec、suppress_codes 等），加注释说明每个字段用途和取值范围
+2. 在 foreman-capability-guide.md 中指向模板，并增加 provides/consumes、batch_e2e_command 的具体示例
+3. 此项为文档改动，零代码风险
+
+**验收标准**：
+- plans/_template.yaml 包含所有 Plan schema 字段
+- 下一轮 E2E Foreman validate 迭代 ≤3 次
+- Foreman 在 plan 中使用 batch_e2e_command
+
+---
+
+### UX-6 ralph flow 渐进式流程引导（P1）
+
+**优先级**：P1
+**影响维度**：体验 + 过程（工作流外流程的可靠性）
+**预期分数变化**：间接提升所有维度（消除观察者步骤遗漏）
+
+**触发实例**：
+> v32 E2E 中观察者（Claude Code）在 Phase 4 用内置 agent 代替 Codex（被用户纠正后才改），Phase 6 未主动执行（等用户提醒）。长上下文记忆衰减导致流程步骤遗漏。修复流程同理——Codex 审查、缺陷记录、能力指南生成等步骤在长对话中容易被跳过。
+
+**根因**：工作流外流程（修复流程、E2E 流程）完全依赖 AI 记忆文档约束，长上下文下记忆衰减导致步骤遗漏。且操作者自报式验证存在作弊/幻觉风险。
+
+#### 核心设计原则
+
+1. **渐进式披露**：每完成一步才显示下一步指令和验证标准，操作者 working set 永远只有一步
+2. **触发式自动检查**：操作者做完后运行 `ralph flow next`，Ralph 自动去检查证据，不依赖操作者自报内容
+3. **Codex 强制验证**：所有要求 Codex 的步骤，检查约定目录下 codex_bridge.py 输出 JSON 结构，内置 agent 无法产生此格式
+4. **失败不前进**：检查不通过时重新显示当前步骤指令和缺失项，不跳过
+
+#### 约定目录结构
+
+```
+{workspace}/
+  .ralph-flow/
+    state.json                # 流程状态
+    step-1-understand/        # 各步骤产出物目录
+    step-2-plan/
+    step-3-review/            # Codex 输出 JSON 放这里
+    step-4-gaps/
+    step-5-execute/           # 每个 batch 的 Codex 输出 JSON
+    step-6-verify/
+    step-7-guide/
+```
+
+#### state.json 结构
+
+```json
+{
+  "flow_type": "solve",
+  "workspace": "/path/to/project",
+  "started_at": "2026-05-14T18:00:00Z",
+  "current_step": 3,
+  "params": {
+    "test_cmd": "pytest",
+    "tracker": "todo/issues.md",
+    "guide_output": "docs/capability-guide.md"
+  },
+  "steps_completed": [1, 2],
+  "steps_failed": {"3": {"attempts": 1, "last_error": "no codex output"}}
+}
+```
+
+#### Codex 输出验证函数（通用）
+
+所有标注"Codex"的步骤共用同一验证逻辑：
+
+```python
+def validate_codex_output(dir_path, min_content_length=200):
+    """验证是真正的 Codex 执行而非内置 agent"""
+    # 扫描目录下所有 .json 文件
+    for f in dir_path.glob("*.json"):
+        data = json.load(f)
+        assert "SESSION_ID" in data           # codex_bridge 特有字段
+        assert UUID(data["SESSION_ID"])        # 合法 UUID
+        assert data.get("success") is True    # 执行成功
+        assert len(data.get("agent_messages", "")) > min_content_length  # 有实质内容
+    # 内置 agent 不产生此格式，无法伪造
+```
+
+#### 流程 A：问题解决（solve）
+
+启动：`ralph flow start solve --workspace /path --test-cmd "pytest" --tracker todo/issues.md --guide-output docs/capability-guide.md`
+
+| # | 阶段 | Ralph 自动检查 |
+|---|------|---------------|
+| 1 | **理解问题** | 放行（思考无可检产出物），显示下一步指令 |
+| 2 | **生成计划** | `plan.yaml` 存在 + `ralph validate plan.yaml --project-root {workspace}` 输出 0 error |
+| 3 | **Codex 审查** | `.ralph-flow/step-3-review/` 下 ≥1 个合法 Codex 输出（SESSION_ID UUID + agent_messages > 200 字符）|
+| 4 | **缺陷记录** | `--tracker` 文件 `git diff` 有新增行（确保不跳过记录步骤）|
+| 5 | **Codex 执行** | `.ralph-flow/step-5-execute/` 下 Codex 输出数量 ≥ `ralph suggest` 当前 batch 的 task 数；每个输出合法（SESSION_ID + agent_messages 非空）|
+| 6 | **全量验证** | 执行 `--test-cmd`，exit code = 0 |
+| 7 | **能力指南** | `--guide-output` 文件存在 + 修改时间 > flow 启动时间 + 文件大小 > 1KB |
+
+#### 流程 B：实战测试（e2e）
+
+启动：`ralph flow start e2e --workspace /tmp/cccc-e2e-vN --group GROUP_ID --cccc-root /path/to/cccc --version vN`
+
+| # | 阶段 | Ralph 自动检查 |
+|---|------|---------------|
+| 0 | **代码验证** | 执行 pytest，检查输出含 "0 failed"；ralph validate smoke 0 error |
+| 1 | **环境准备** | `$workspace` 存在 + `docs/` 下 4 个指定文件存在 + `cccc daemon status` 返回 running + `cccc actor list --group $group` 有 planner 且 runtime_state=running |
+| 2 | **任务下发** | `cccc tail --group $group` 中有 `chat.message` 事件 to planner，时间戳 > flow 启动时间 |
+| 3 | **监控等待** | `cccc workflow status --group $group` 显示 tasks.completed = tasks.total 且 tasks.failed = 0 |
+| 4 | **Codex 审查** | `.ralph-flow/step-4-review/` 下 ≥2 个合法 Codex 输出（结果审查 + 过程审查），每个 agent_messages > 500 字符 + `$workspace/WORKFLOW_EVALUATION.md` 存在且 > 500 字节 |
+| 5 | **报告合成** | `$cccc_root/todo/e2e-实战评估报告-$version.md` 存在 + 文件内容包含"评分摘要"和"交叉验证"字符串 |
+| 6 | **改进登记** | `git diff` 显示问题清单短版（问题清单-v5-ralph.md）和 full 版（问题清单-v5-ralph-full.md）都有变更 + 版本历史评分表（e2e-实战评估规范.md）有新增行 |
+
+#### CLI 交互示例
+
+```bash
+$ ralph flow start solve --workspace ./my-project --test-cmd "pytest"
+✅ 流程已创建：.ralph-flow/state.json
+📂 Codex 输出约定目录：.ralph-flow/step-{N}-{name}/
+
+── Step 1/7: 理解问题 ──────────────────────
+阅读代码和相关文档，定位问题根因和待修改的文件。
+准备好后运行：ralph flow next
+
+$ ralph flow next
+✅ Step 1 通过（无检查项）
+── Step 2/7: 生成计划 ──────────────────────
+生成 plan.yaml，包含任务分解、依赖、验证命令。
+检查项：plan.yaml 存在 + ralph validate 0 error
+准备好后运行：ralph flow next
+
+$ ralph flow next
+🔍 检查中...
+  ✅ plan.yaml 存在
+  ✅ ralph validate: 0 errors, 3 warnings
+✅ Step 2 通过
+── Step 3/7: Codex 审查 ──────────────────────
+用 codex_bridge.py 审查计划的合理性。
+⚠️  输出必须保存到：.ralph-flow/step-3-review/
+示例：python codex_bridge.py --cd . --PROMPT "审查" > .ralph-flow/step-3-review/review.json
+检查项：目录下有合法 Codex 输出（SESSION_ID + agent_messages > 200字符）
+准备好后运行：ralph flow next
+
+# 如果用了内置 agent 而非 Codex：
+$ ralph flow next
+🔍 检查中...
+  ❌ .ralph-flow/step-3-review/ 下无合法 Codex 输出
+     找到 0 个文件匹配 codex_bridge JSON 格式（需含 SESSION_ID + agent_messages）
+     提示：请使用 codex_bridge.py，不要使用内置 agent
+── Step 3/7: Codex 审查（重新显示）──────────
+...
+```
+
+#### 后续泛化
+
+solve 流程可直接用于任意项目问题解决，启动参数变化：
+- `--workspace`：不同项目目录
+- `--test-cmd`：不同测试命令（pytest/npm test/go test）
+- `--tracker`：不同问题追踪文件（可选）
+- `--guide-output`：不同能力指南路径（可选，CCCC 专用步骤）
+
+不传 `--tracker` 和 `--guide-output` 时对应步骤跳过，solve 流程退化为 5 步（理解→计划→审查→执行→验证）。
+
+**验收标准**：
+- `ralph flow start solve --workspace /path` 成功创建 `.ralph-flow/` 目录和 `state.json`
+- 每步 `ralph flow next` 自动检查对应产出物，无需操作者提交内容
+- Codex 步骤拒绝非 codex_bridge JSON 输出（无 SESSION_ID 或 agent_messages 为空）
+- 失败时重新显示当前步骤指令和缺失项
+- 完整走完一轮修复流程无步骤遗漏
+- solve 流程可在非 CCCC 项目中使用（`--tracker`/`--guide-output` 可选）
+
+---
+
+### UX-5 ralph guide 自动生成能力指南（P2）
+
+**优先级**：P2
+**影响维度**：体验 + 可维护性
+**预期分数变化**：体验 +0.5（长期）
+
+**触发实例**：
+> 每次修复后需要重新扫描代码库更新 foreman-capability-guide.md，耗时长且仍会遗漏。v31 新增 BP-2/4/5 三个能力但指南完全未更新，导致 v32 Foreman 不知道 batch_e2e_command 存在。
+
+**根因**：能力指南是手工文档，与代码不同步。
+
+**改进方案**：新增 `ralph guide` 子命令，从 Pydantic schema (Plan/TaskSpec/Verification/ModuleSpec) + validation rules (warning/error codes 枚举) + CLI --help 自动生成结构化能力指南。代码改了→guide 自动同步。
+
+**验收标准**：
+- `ralph guide` 输出包含所有 Plan schema 字段、所有验证规则代码、所有 CLI 命令
+- 输出与当前代码完全一致（无遗漏）
+
+---
+
 ## 二、未解决的 RL 改进项（Ralph 规则盲区）
 
 ### 已知盲区分类
@@ -177,7 +375,15 @@
 
 ---
 
-## 五、版本历史评分追踪
+## 五、后续方向
+
+### Modal 集成（待调研）
+
+将 Modal (modal.com) 云计算平台集成到 CCCC 系统中，潜在改进方向包括但不限于：Worker 执行环境隔离、并行 E2E 测试、验证步骤云端执行、Codex bridge 替代等。具体集成方案和优先级待后续讨论确定。
+
+---
+
+## 六、版本历史评分追踪
 
 | 版本 | 日期 | 结果 | 过程 | 体验 | 综合 | 关键变化 |
 |------|------|------|------|------|------|----------|
