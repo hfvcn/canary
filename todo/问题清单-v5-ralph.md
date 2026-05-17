@@ -525,8 +525,8 @@ plan 声明了 `flask`/`fastapi`/`requests` 相关依赖但 critical_flows 无�
 > **来源**：2026-05-17 E2E v38 流程体验
 - **严重度**：P2 — flow 引导缺失导致用户/agent 直接调用 codex CLI 而非使用 `collaborating-with-codex` skill
 - **现象**：flow step-4 instruction 说 "Use codex_bridge.py with dedicated review prompts"，但未说明应使用 Claude Code 的 `collaborating-with-codex` skill 来调度 Codex；实际操作者直接用 `codex exec` CLI，绕过了 skill 提供的 session 管理和格式化
-- **改进方案**：flow step-4 instruction 应明确引导："使用 /collaborating-with-codex skill 进行 review（或手动使用 codex_bridge.py）"；同时 `codex_bridge.py` 本身应存在于项目中或 flow 应检测到 skill 可用性
-- **验收标准**：下一轮 E2E agent 自动选择 skill 而非直接 CLI
+- **改进方案**：flow step-4 instruction 应明确引导："使用 /collaborating-with-codex skill 进行 review（或手动使用 codex_bridge.py）"；同时 `codex_bridge.py` 本身应存在于项目中或 flow 应检测到 skill 可用性。此外应提示 Codex review 任务放到后台执行（`run_in_background`），两个 review（results + process）可并行，避免串行等待浪费时间
+- **验收标准**：下一轮 E2E agent 使用 skill 且两个 review 并行执行
 
 #### FL-15 flow step-6 未引导写入新发现和归档已修复（P2）
 
