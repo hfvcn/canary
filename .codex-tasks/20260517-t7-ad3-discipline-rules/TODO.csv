@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current AD-3 implementation,DONE,Existing rule behavior and gaps are understood,sed discipline.py and test file,2026-05-17,0,Existing rules present; placeholder fences and retirement shape semantics need alignment
+2,Implement scoped rule/test updates,DONE,Five AD-3 rules match requested semantics,python -m pytest tests/test_aegis_discipline_rules.py -v,2026-05-17,0,Added code-fence placeholder coverage and migration/provider retirement coverage
+3,Run targeted validation and review diff,DONE,Target test passes and scoped diff is reviewed,python -m pytest tests/test_aegis_discipline_rules.py -v,2026-05-17,0,14 passed in 0.87s; reviewed scoped diff

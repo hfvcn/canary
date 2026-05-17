@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ...util.time import utc_now_iso
 
@@ -50,6 +50,20 @@ VerificationOutcome = Literal[
     "agent_pending",  # Awaiting external agent verification (RA-3)
     "force_passed",   # Force-complete override — verification skipped, task completed
 ]
+
+VerificationFailureType = Literal[
+    "task_quality",   # Worker/task output did not satisfy verification
+    "infra_error",    # Verifier infrastructure failed before judging quality
+    "timeout",        # Verification timed out
+]
+
+
+def _default_failure_type(outcome: str) -> VerificationFailureType:
+    if outcome == "infra_error":
+        return "infra_error"
+    if outcome == "timeout":
+        return "timeout"
+    return "task_quality"
 
 
 class VerificationCheckSpec(BaseModel):
@@ -178,10 +192,17 @@ class VerificationResult(BaseModel):
     checks: List[VerificationCheck] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
     summary: str = ""
+    failure_type: VerificationFailureType = "task_quality"
     challenge_outcome: str = ""
     created_at: str = Field(default_factory=utc_now_iso)
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def normalize_failure_type(self) -> "VerificationResult":
+        if self.failure_type == "task_quality":
+            self.failure_type = _default_failure_type(str(self.overall_outcome))
+        return self
 
 
 class RestartSuggestion(BaseModel):

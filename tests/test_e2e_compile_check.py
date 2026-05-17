@@ -52,3 +52,7 @@ def test_e2e_task_with_python_import_check_does_not_warn() -> None:
 
 def test_unit_task_without_compile_check_does_not_warn() -> None:
     assert WARNING_CODE not in _warning_codes(_plan("unit"))
+
+
+def test_api_task_without_compile_check_warns() -> None:
+    assert WARNING_CODE in _warning_codes(_plan("api"))

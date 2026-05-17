@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from cccc.ralph.models import (
     CheckSpec,
     CriticalFlow,
@@ -23,28 +25,35 @@ def _plan(
     description: str = "",
     surface_type: str | None = "url_input",
     temporal_pattern: str | None = None,
+    claimed_paths: list[str] | None = None,
     checks: list[CheckSpec] | None = None,
 ) -> Plan:
     checks = checks if checks is not None else [_check("unit behavior")]
+    paths = claimed_paths if claimed_paths is not None else [ENTRYPOINT]
     return Plan(
-        tasks=[_task(flow_id=flow_id, checks=checks)],
+        tasks=[_task(flow_id=flow_id, checks=checks, claimed_paths=paths)],
         critical_flows=[
             CriticalFlow(
                 id=flow_id,
                 description=description,
                 surface_type=surface_type,
                 temporal_pattern=temporal_pattern,
-                entrypoints=[ENTRYPOINT],
+                entrypoints=paths,
                 required_verification_level="unit",
             )
         ],
     )
 
 
-def _task(*, flow_id: str, checks: list[CheckSpec]) -> TaskSpec:
+def _task(
+    *,
+    flow_id: str,
+    checks: list[CheckSpec],
+    claimed_paths: list[str] | None = None,
+) -> TaskSpec:
     return TaskSpec(
         id="T1",
-        claimed_paths=[ENTRYPOINT],
+        claimed_paths=claimed_paths if claimed_paths is not None else [ENTRYPOINT],
         verification=Verification(
             level="unit",
             checks=checks,
@@ -70,8 +79,8 @@ def test_security_recipes_contain_required_payloads() -> None:
         "0177.0.0.1",
         "2130706433",
         "0x7f000001",
-        "::ffff:127.0.0.1",
-        "::1",
+        "[::ffff:127.0.0.1]",
+        "[::1]",
     ]
     assert auth_recipe["timing_safe_compare_patterns"]["python"] == (
         "secrets.compare_digest"
@@ -102,14 +111,20 @@ def test_gate_one_requires_security_keyword() -> None:
     assert _security_issues(plan) == []
 
 
-def test_gate_two_requires_surface_or_temporal_declaration() -> None:
+def test_url_recipe_does_not_require_surface_declaration() -> None:
     plan = _plan(surface_type=None)
 
-    assert _security_issues(plan) == []
+    issues = _security_issues(plan)
+
+    assert [issue.code for issue in issues] == ["W_SSRF_ENCODING_UNCOVERED"]
 
 
-def test_non_temporal_surface_ignores_temporal_pattern_alias() -> None:
-    plan = _plan(surface_type=None, temporal_pattern="url_input")
+def test_toctou_recipe_silent_without_temporal_pattern() -> None:
+    plan = _plan(
+        flow_id="stored_redirect",
+        description="stores a redirect target before using it",
+        surface_type=None,
+    )
 
     assert _security_issues(plan) == []
 
@@ -120,15 +135,42 @@ def test_gate_three_skips_when_check_covers_surface() -> None:
     assert _security_issues(plan) == []
 
 
-def test_auth_token_recipe_emits_timing_safe_hint() -> None:
-    plan = _plan(flow_id="admin_auth_token", surface_type="auth_token")
+def test_auth_token_recipe_emits_timing_safe_hint(tmp_path: Path) -> None:
+    source = tmp_path / "auth.py"
+    source.write_text(
+        "def allowed(provided_token, expected_token):\n"
+        "    return provided_token == expected_token\n"
+    )
+    plan = _plan(
+        flow_id="admin_auth_token",
+        surface_type=None,
+        claimed_paths=[str(source)],
+    )
 
     issues = _security_issues(plan)
 
     assert [issue.code for issue in issues] == ["W_AUTH_TIMING_UNSAFE"]
+    assert issues[0].severity == "hint"
+    assert issues[0].evidence["unsafe_compare_paths"] == [str(source)]
     assert issues[0].evidence["timing_safe_compare_patterns"]["go"] == (
         "subtle.ConstantTimeCompare"
     )
+
+
+def test_auth_token_recipe_skips_compare_digest(tmp_path: Path) -> None:
+    source = tmp_path / "auth.py"
+    source.write_text(
+        "import secrets\n"
+        "def allowed(provided_token, expected_token):\n"
+        "    return secrets.compare_digest(provided_token, expected_token)\n"
+    )
+    plan = _plan(
+        flow_id="admin_auth_token",
+        surface_type=None,
+        claimed_paths=[str(source)],
+    )
+
+    assert _security_issues(plan) == []
 
 
 def test_temporal_pattern_recipe_emits_toctou_hint() -> None:
@@ -142,6 +184,16 @@ def test_temporal_pattern_recipe_emits_toctou_hint() -> None:
 
     assert [issue.code for issue in issues] == ["W_VERIFICATION_TOCTOU_GAP"]
     assert issues[0].evidence["temporal_pattern"] == "store_then_use"
+    assert issues[0].evidence["two_phase_test_template"]
+
+
+def test_no_critical_flow_produces_zero_output() -> None:
+    plan = Plan(
+        tasks=[_task(flow_id=FLOW_ID, checks=[_check("unit behavior")])],
+        critical_flows=[],
+    )
+
+    assert _security_issues(plan) == []
 
 
 def test_validate_pipeline_includes_security_rule() -> None:

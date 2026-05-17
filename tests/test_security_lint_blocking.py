@@ -15,6 +15,7 @@ class _Engine:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
         self.recorded_verification: VerificationResult | None = None
+        self.failures: list[dict[str, Any]] = []
         self.warnings: list[dict[str, Any]] = []
 
     def report_worker_completion(
@@ -43,6 +44,9 @@ class _Engine:
 
     def record_verification_warning(self, task_id: str, **kwargs: Any) -> None:
         self.warnings.append({"task_id": task_id, **kwargs})
+
+    def record_verification_failure(self, task_id: str, **kwargs: Any) -> None:
+        self.failures.append({"task_id": task_id, **kwargs})
 
 
 class _PassingRalphService:
@@ -75,7 +79,8 @@ def test_source_file_with_debug_true_fails_verification(tmp_path: Path) -> None:
     assert not callbacks["completed"]
     assert callbacks["failed"]
     assert _security_check(verification).details["hits"][0]["file"] == "src/app.py"
-    assert engine.warnings[0]["warning_type"] == "security_lint"
+    assert engine.failures[0]["failure_type"] == "security_lint"
+    assert engine.warnings == []
 
 
 def test_test_file_with_debug_true_does_not_affect_verification(tmp_path: Path) -> None:
@@ -150,7 +155,7 @@ def _task_ref(changed_path: str) -> TaskRef:
         goal_behavior="Block debug=True before task completion.",
         acceptance_criteria="debug=True in non-test source files fails verification.",
         claimed_paths=[changed_path],
-        verification_mode="ralph",
+        verification_mode="challenge",
     )
 
 

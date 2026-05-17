@@ -435,6 +435,7 @@ class WorkflowEngine:
         if prev.status != WorkflowTaskStatus.VERIFYING:
             raise ValueError(f"task not verifying: {tid} status={prev.status.value}")
         outcome = str(getattr(result, "overall_outcome", "") or "").strip()
+        failure_type = str(getattr(result, "failure_type", "") or "").strip()
         data = {"workflow_id": prev.workflow_id, "task_id": tid, "verification": result.model_dump()}
         if outcome == "agent_pending":
             # RA-3: agent verification requested — stay in VERIFYING, just log
@@ -475,7 +476,7 @@ class WorkflowEngine:
                 hook_ctx=hook_ctx,
             )
             return
-        if outcome == "infra_error":
+        if outcome == "infra_error" or failure_type == "infra_error":
             self._record_verification_transition(
                 prev=prev,
                 task_id=tid,

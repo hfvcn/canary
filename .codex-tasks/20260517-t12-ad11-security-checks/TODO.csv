@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current CLI generator recipes and tests,DONE,Relevant behavior and assertions are understood,rg -n "generate-security-checks|generate_security_checks|SECURITY_RECIPES" src tests,2026-05-17T00:00:00+08:00,0,
+2,Implement deterministic recipe/category-based generation,DONE,Generator uses plan metadata and security flows without noisy output,python -m pytest tests/test_security_check_generator.py -v,2026-05-17T00:00:00+08:00,0,
+3,Verify CLI JSON output and requested tests,DONE,Requested pytest command passes,python -m pytest tests/test_security_check_generator.py -v,2026-05-17T00:00:00+08:00,0,

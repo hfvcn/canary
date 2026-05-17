@@ -10,7 +10,7 @@ from cccc.ralph.models import (
 )
 from cccc.ralph.validator import validate
 
-SECURITY_CODE = "E_AEGIS_SECURITY_CHECKS_MISSING"
+SECURITY_CODE = "E_AEGIS_SECURITY_CHAIN_MISSING"
 ENTRYPOINT = "src/auth.py"
 
 
@@ -36,11 +36,10 @@ def test_feature_without_security_flow_passes() -> None:
     assert SECURITY_CODE not in _error_codes(report)
 
 
-def test_fix_with_security_flow_and_empty_checks_reports_error() -> None:
+def test_fix_with_security_flow_and_empty_checks_passes() -> None:
     report = validate(_plan(intent="fix", checks=[]))
 
-    issue = _only_security_error(report)
-    assert issue.evidence["intent"] == "fix"
+    assert SECURITY_CODE not in _error_codes(report)
 
 
 def _plan(*, intent: str, checks: list[CheckSpec], flow_id: str = "ssrf_protection") -> Plan:

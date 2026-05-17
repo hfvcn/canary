@@ -15,6 +15,7 @@ import yaml
 
 from .agent import compute_capability_manifest, compute_ruleset_digest, get_ralph_version
 from cccc.kernel.claimed_paths import normalize_write_set as _normalize_write_set, paths_overlap as _paths_overlap
+from .contract_signatures import validate_provider_source_signatures
 from .filesystem_validator import validate_filesystem
 from .models import (
     CheckSpec,
@@ -138,7 +139,13 @@ def clear_extra_forbid_cache() -> None:
 
 
 # Ordered levels for comparison
-_LEVEL_ORDER: Dict[str, int] = {"compile": 0, "unit": 1, "integration": 2, "e2e": 3}
+_LEVEL_ORDER: Dict[str, int] = {
+    "compile": 0,
+    "unit": 1,
+    "api": 2,
+    "integration": 3,
+    "e2e": 4,
+}
 FATAL_STRUCTURAL_CODES = {"E_DUPLICATE_TASK_ID", "E_DEP_UNKNOWN", "E_DEP_SELF", "E_DEP_CYCLE"}
 # Severity rank for deterministic ordering: error (0) sorts before warning (1) before hint (2)
 _SEVERITY_RANK: Dict[str, int] = {"error": 0, "warning": 1, "hint": 2}
@@ -351,12 +358,13 @@ def validate_with_project(
     semantic_issues = _check_semantic_dependencies(plan, workspace)
     semantic_issues.extend(_check_semantic_unchecked_symbols(plan, semantic_provider))
     semantic_issues.extend(check_goal_hardcoded_awareness(plan, workspace))
+    signature_issues = validate_provider_source_signatures(plan, project_root=project_root)
     capability_issues = _check_capability_coverage(
         project_root=project_root,
         has_semantic=has_semantic,
         has_serena=has_serena,
     )
-    all_issues = structural_issues + fs_issues + semantic_issues + capability_issues
+    all_issues = structural_issues + fs_issues + semantic_issues + signature_issues + capability_issues
 
     # Apply suppression after combining structural + filesystem issues
     kept_issues, suppressed_hints = _apply_suppression(

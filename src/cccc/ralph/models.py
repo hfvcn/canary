@@ -19,7 +19,7 @@ from ..contracts.v1.ralph_ipc import MockTestCase
 # Verification
 # ---------------------------------------------------------------------------
 
-VerificationLevel = Literal["compile", "unit", "integration", "e2e"]
+VerificationLevel = Literal["compile", "unit", "api", "integration", "e2e"]
 
 
 class VerificationCovers(BaseModel):
@@ -133,10 +133,10 @@ class ModuleSpec(BaseModel):
 class RepairTrack(BaseModel):
     """Aegis repair discipline metadata for fix-oriented tasks."""
 
-    root_cause: Optional[str] = ""
-    canonical_owner: Optional[str] = ""
-    minimal_change: Optional[str] = ""
-    verification_method: Optional[str] = ""
+    root_cause: Optional[str] = None
+    canonical_owner: Optional[str] = None
+    minimal_change: Optional[str] = None
+    verification_method: Optional[str] = None
 
     model_config = ConfigDict(extra="ignore")
 
@@ -144,10 +144,10 @@ class RepairTrack(BaseModel):
 class RetirementTrack(BaseModel):
     """Aegis retirement discipline metadata for replacement/refactor tasks."""
 
-    old_owner: Optional[str] = ""
-    deletion_trigger: Optional[str] = ""
-    retained: Optional[bool] = False
-    retention_reason: Optional[str] = ""
+    old_owner: Optional[str] = None
+    deletion_trigger: Optional[str] = None
+    retained: Optional[bool] = None
+    retention_reason: Optional[str] = None
 
     model_config = ConfigDict(extra="ignore")
 
@@ -156,15 +156,17 @@ class AegisDiscipline(BaseModel):
     """Aegis execution discipline metadata attached to a task."""
 
     intent: Optional[
-        Literal["fix", "feature", "refactor", "test", "docs", "infra", "chore"]
+        Literal[
+            "fix", "feature", "refactor", "migration", "test", "docs", "infra", "chore"
+        ]
     ] = None
-    baseline_refs: Optional[List[str]] = Field(default_factory=list)
-    compat_boundary: Optional[str] = ""
+    repair_track: Optional[RepairTrack] = None
+    retirement_track: Optional[RetirementTrack] = None
+    baseline_refs: Optional[List[str]] = None
+    compat_boundary: Optional[str] = None
     patch_shape_triage: Optional[Union[str, Dict[str, Any], List[str]]] = None
     decision_review: Optional[Union[str, Dict[str, Any], List[str]]] = None
     drift_check: Optional[Union[str, Dict[str, Any], List[str]]] = None
-    repair_track: Optional[RepairTrack] = None
-    retirement_track: Optional[RetirementTrack] = None
 
     model_config = ConfigDict(extra="ignore")
 
@@ -209,7 +211,7 @@ class TaskSpec(BaseModel):
         default=None,
         description=(
             "Aegis execution discipline: intent, repair_track, retirement_track, "
-            "baseline_refs, compat_boundary, patch_shape_triage, decision_review, "
+            "baseline_refs, patch_shape_triage, compat_boundary, decision_review, "
             "drift_check."
         ),
     )

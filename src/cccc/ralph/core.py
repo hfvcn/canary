@@ -1,11 +1,12 @@
 """Ralph core algorithms — suggest ready batch, check dependencies, detect conflicts.
 
-Stateless: every function takes a Plan (or parts of it) and returns results.
-No daemon, no engine, no MCP — just pure computation on the plan file data.
+Most functions are pure computations on plan data. ``suggest`` can also project
+workflow task state from the ledger when a ledger path is provided.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from .models import (
     BlockedTask,
     Plan,
     PlanState,
+    RunningTask,
     TaskSpec,
     ValidationIssue,
     Verification,
@@ -39,6 +41,71 @@ from cccc.kernel.claimed_paths import (
 _logger = logging.getLogger("cccc.ralph.core")
 
 
+_LEDGER_STATUS_COMPLETED = "completed"
+_LEDGER_STATUS_COMPLETED_BY_OVERRIDE = "completed_by_override"
+_LEDGER_STATUS_PLANNED = "planned"
+_LEDGER_STATUS_READY = "ready"
+_LEDGER_STATUS_ASSIGNED = "assigned"
+_LEDGER_STATUS_RUNNING = "running"
+_LEDGER_STATUS_VERIFYING = "verifying"
+_LEDGER_STATUS_FAILED = "failed"
+_LEDGER_STATUS_DEFERRED = "deferred"
+_LEDGER_STATUS_BLOCKED = "blocked"
+_LEDGER_STATUS_CANCELLED = "cancelled"
+_LEDGER_STATUS_ARCHIVED = "archived"
+_LEDGER_DONE_STATUSES = {
+    _LEDGER_STATUS_COMPLETED,
+    _LEDGER_STATUS_COMPLETED_BY_OVERRIDE,
+}
+_LEDGER_ACTIVE_STATUSES = {
+    _LEDGER_STATUS_ASSIGNED,
+    _LEDGER_STATUS_RUNNING,
+    _LEDGER_STATUS_VERIFYING,
+}
+_LEDGER_FAILED_STATUSES = {
+    _LEDGER_STATUS_FAILED,
+    _LEDGER_STATUS_DEFERRED,
+    _LEDGER_STATUS_BLOCKED,
+    _LEDGER_STATUS_CANCELLED,
+    _LEDGER_STATUS_ARCHIVED,
+}
+
+_KIND_TASK_REGISTERED = "workflow.task_registered"
+_KIND_BATCH_REGISTERED = "workflow.batch_registered"
+_KIND_BATCH_APPROVED = "workflow.batch_approved"
+_KIND_TASK_STARTED = "workflow.task_started"
+_KIND_TASK_REPORTED_COMPLETED = "workflow.task_reported_completed"
+_KIND_TASK_FAILED = "workflow.task_failed"
+_KIND_VERIFICATION_PASSED = "workflow.verification_passed"
+_KIND_VERIFICATION_SKIPPED = "workflow.verification_skipped"
+_KIND_VERIFICATION_SKIPPED_BLOCKED = "workflow.verification_skipped_blocked"
+_KIND_VERIFICATION_FAILED = "workflow.verification_failed"
+_KIND_VERIFICATION_INFRA_ERROR = "workflow.verification_infra_error"
+_KIND_RETRY_REQUESTED = "workflow.retry_requested"
+_KIND_TASK_DEFERRED = "workflow.task_deferred"
+_KIND_TASK_CANCELLED = "workflow.task_cancelled"
+_KIND_FOREMAN_OVERRIDE = "workflow.foreman_override"
+_KIND_TASK_BLOCKED = "workflow.task_blocked"
+_WORKFLOW_STATUS_KINDS = {
+    _KIND_TASK_REGISTERED,
+    _KIND_BATCH_REGISTERED,
+    _KIND_BATCH_APPROVED,
+    _KIND_TASK_STARTED,
+    _KIND_TASK_REPORTED_COMPLETED,
+    _KIND_TASK_FAILED,
+    _KIND_VERIFICATION_PASSED,
+    _KIND_VERIFICATION_SKIPPED,
+    _KIND_VERIFICATION_SKIPPED_BLOCKED,
+    _KIND_VERIFICATION_FAILED,
+    _KIND_VERIFICATION_INFRA_ERROR,
+    _KIND_RETRY_REQUESTED,
+    _KIND_TASK_DEFERRED,
+    _KIND_TASK_CANCELLED,
+    _KIND_FOREMAN_OVERRIDE,
+    _KIND_TASK_BLOCKED,
+}
+
+
 # ---------------------------------------------------------------------------
 # Suggest ready batch
 # ---------------------------------------------------------------------------
@@ -50,6 +117,13 @@ class _SuggestContext:
     done: set[str]
     running_write_sets: List[List[str]]
     task_map: Dict[str, TaskSpec]
+
+
+@dataclass(frozen=True)
+class _LedgerTaskRuntime:
+    status: str
+    claimed_paths: tuple[str, ...]
+    workflow_id: str
 
 
 def _unlock_score(task_id: str, task_map: Dict[str, TaskSpec], state: PlanState) -> int:
@@ -107,8 +181,8 @@ def _suggest_rationale(
     return rationale
 
 
-def _suggest_context(plan: Plan) -> _SuggestContext:
-    state = plan.state
+def _suggest_context(plan: Plan, state: Optional[PlanState] = None) -> _SuggestContext:
+    state = state or plan.state
     running_write_sets = [
         _normalize_write_set(rt.claimed_paths) for rt in state.running_tasks
     ]
@@ -117,6 +191,294 @@ def _suggest_context(plan: Plan) -> _SuggestContext:
         done=set(state.completed_task_ids),
         running_write_sets=running_write_sets,
         task_map={task.id: task for task in plan.tasks},
+    )
+
+
+def _effective_plan_state(
+    plan: Plan,
+    *,
+    ledger_path: Optional[Path],
+    workflow_id: str,
+) -> PlanState:
+    if ledger_path is None:
+        return plan.state
+    return _plan_state_from_ledger(
+        plan=plan,
+        ledger_path=ledger_path,
+        workflow_id=workflow_id,
+    )
+
+
+def _plan_state_from_ledger(
+    *,
+    plan: Plan,
+    ledger_path: Path,
+    workflow_id: str,
+) -> PlanState:
+    ledger = Path(ledger_path)
+    if not ledger.exists():
+        raise FileNotFoundError(f"workflow ledger not found: {ledger}")
+    task_map = {task.id: task for task in plan.tasks if task.id}
+    statuses = _collect_ledger_task_statuses(
+        ledger_path=ledger,
+        task_map=task_map,
+        workflow_id=str(workflow_id or "").strip(),
+    )
+    if not statuses:
+        return plan.state
+    return _plan_state_from_ledger_statuses(statuses)
+
+
+def _collect_ledger_task_statuses(
+    *,
+    ledger_path: Path,
+    task_map: Dict[str, TaskSpec],
+    workflow_id: str,
+) -> Dict[str, _LedgerTaskRuntime]:
+    statuses: Dict[str, _LedgerTaskRuntime] = {}
+    for event in _iter_ledger_events(ledger_path):
+        statuses = _apply_ledger_event(
+            statuses=statuses,
+            event=event,
+            task_map=task_map,
+            workflow_id=workflow_id,
+        )
+    return statuses
+
+
+def _iter_ledger_events(ledger_path: Path):
+    for line_number, line in enumerate(
+        ledger_path.read_text(encoding="utf-8", errors="strict").splitlines(),
+        start=1,
+    ):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid workflow ledger JSON at {ledger_path}:{line_number}") from exc
+        if not isinstance(event, dict):
+            raise ValueError(f"invalid workflow ledger event at {ledger_path}:{line_number}")
+        yield event
+
+
+def _apply_ledger_event(
+    *,
+    statuses: Dict[str, _LedgerTaskRuntime],
+    event: Dict[str, Any],
+    task_map: Dict[str, TaskSpec],
+    workflow_id: str,
+) -> Dict[str, _LedgerTaskRuntime]:
+    kind = str(event.get("kind") or "").strip()
+    if kind not in _WORKFLOW_STATUS_KINDS:
+        return statuses
+    data = event.get("data")
+    if not isinstance(data, dict):
+        raise ValueError(f"workflow ledger event {kind} data must be a mapping")
+    result = dict(statuses)
+    if kind == _KIND_TASK_REGISTERED:
+        _apply_registered_event(result, data, task_map, workflow_id)
+    elif kind == _KIND_BATCH_REGISTERED:
+        _apply_batch_registered_event(result, data, task_map, workflow_id)
+    elif kind == _KIND_BATCH_APPROVED:
+        _apply_batch_approved_event(result, data, task_map, workflow_id)
+    else:
+        _apply_single_task_event(result, kind, data, task_map, workflow_id)
+    return result
+
+
+def _apply_registered_event(
+    statuses: Dict[str, _LedgerTaskRuntime],
+    data: Dict[str, Any],
+    task_map: Dict[str, TaskSpec],
+    workflow_id: str,
+) -> None:
+    if not _event_workflow_matches(data, workflow_id):
+        return
+    task_data = data.get("task") if isinstance(data.get("task"), dict) else {}
+    task_id = str(task_data.get("id") or "").strip()
+    if task_id not in task_map:
+        return
+    _set_ledger_status(
+        statuses,
+        task_id,
+        _LEDGER_STATUS_PLANNED,
+        _paths_from_task_data(task_data, task_map[task_id]),
+        str(data.get("workflow_id") or "").strip(),
+    )
+
+
+def _apply_batch_registered_event(
+    statuses: Dict[str, _LedgerTaskRuntime],
+    data: Dict[str, Any],
+    task_map: Dict[str, TaskSpec],
+    workflow_id: str,
+) -> None:
+    task_ids = data.get("task_ids") if isinstance(data.get("task_ids"), list) else []
+    for raw_task_id in task_ids:
+        task_id = str(raw_task_id or "").strip()
+        if task_id not in task_map or not _known_task_matches(statuses, task_id, workflow_id):
+            continue
+        _set_ledger_status(
+            statuses,
+            task_id,
+            _LEDGER_STATUS_READY,
+            task_map[task_id].claimed_paths,
+            _workflow_for_known_task(statuses, task_id),
+        )
+
+
+def _apply_batch_approved_event(
+    statuses: Dict[str, _LedgerTaskRuntime],
+    data: Dict[str, Any],
+    task_map: Dict[str, TaskSpec],
+    workflow_id: str,
+) -> None:
+    if not _event_workflow_matches(data, workflow_id):
+        return
+    assignments = data.get("assignments")
+    if not isinstance(assignments, list):
+        return
+    for item in assignments:
+        if isinstance(item, dict):
+            _apply_assignment_event(statuses, item, data, task_map)
+
+
+def _apply_assignment_event(
+    statuses: Dict[str, _LedgerTaskRuntime],
+    assignment: Dict[str, Any],
+    event_data: Dict[str, Any],
+    task_map: Dict[str, TaskSpec],
+) -> None:
+    task_id = str(assignment.get("task_id") or "").strip()
+    if task_id not in task_map:
+        return
+    _set_ledger_status(
+        statuses,
+        task_id,
+        _LEDGER_STATUS_ASSIGNED,
+        _paths_from_assignment(assignment, task_map[task_id]),
+        str(event_data.get("workflow_id") or "").strip(),
+    )
+
+
+def _apply_single_task_event(
+    statuses: Dict[str, _LedgerTaskRuntime],
+    kind: str,
+    data: Dict[str, Any],
+    task_map: Dict[str, TaskSpec],
+    workflow_id: str,
+) -> None:
+    if not _event_workflow_matches(data, workflow_id):
+        return
+    task_id = str(data.get("task_id") or "").strip()
+    if task_id not in task_map:
+        return
+    status = _status_for_single_task_event(kind)
+    _set_ledger_status(
+        statuses,
+        task_id,
+        status,
+        task_map[task_id].claimed_paths,
+        str(data.get("workflow_id") or "").strip(),
+    )
+
+
+def _status_for_single_task_event(kind: str) -> str:
+    if kind == _KIND_TASK_STARTED:
+        return _LEDGER_STATUS_RUNNING
+    if kind == _KIND_TASK_REPORTED_COMPLETED:
+        return _LEDGER_STATUS_VERIFYING
+    if kind in {_KIND_VERIFICATION_PASSED, _KIND_VERIFICATION_SKIPPED}:
+        return _LEDGER_STATUS_COMPLETED
+    if kind == _KIND_FOREMAN_OVERRIDE:
+        return _LEDGER_STATUS_COMPLETED_BY_OVERRIDE
+    if kind == _KIND_RETRY_REQUESTED:
+        return _LEDGER_STATUS_READY
+    if kind == _KIND_TASK_DEFERRED:
+        return _LEDGER_STATUS_DEFERRED
+    if kind == _KIND_TASK_CANCELLED:
+        return _LEDGER_STATUS_CANCELLED
+    if kind == _KIND_TASK_BLOCKED:
+        return _LEDGER_STATUS_BLOCKED
+    if kind == _KIND_VERIFICATION_INFRA_ERROR:
+        return _LEDGER_STATUS_VERIFYING
+    return _LEDGER_STATUS_FAILED
+
+
+def _set_ledger_status(
+    statuses: Dict[str, _LedgerTaskRuntime],
+    task_id: str,
+    status: str,
+    claimed_paths: List[str],
+    workflow_id: str,
+) -> None:
+    statuses[task_id] = _LedgerTaskRuntime(
+        status=status,
+        claimed_paths=tuple(_normalize_write_set(claimed_paths)),
+        workflow_id=workflow_id,
+    )
+
+
+def _event_workflow_matches(data: Dict[str, Any], workflow_id: str) -> bool:
+    if not workflow_id:
+        return True
+    return str(data.get("workflow_id") or "").strip() == workflow_id
+
+
+def _known_task_matches(
+    statuses: Dict[str, _LedgerTaskRuntime],
+    task_id: str,
+    workflow_id: str,
+) -> bool:
+    if not workflow_id:
+        return True
+    state = statuses.get(task_id)
+    return state is not None and state.workflow_id == workflow_id
+
+
+def _workflow_for_known_task(
+    statuses: Dict[str, _LedgerTaskRuntime],
+    task_id: str,
+) -> str:
+    state = statuses.get(task_id)
+    return state.workflow_id if state else ""
+
+
+def _paths_from_task_data(task_data: Dict[str, Any], task: TaskSpec) -> List[str]:
+    raw = task_data.get("claimed_paths")
+    if not isinstance(raw, list):
+        return task.claimed_paths
+    return [str(path or "").strip() for path in raw if str(path or "").strip()]
+
+
+def _paths_from_assignment(assignment: Dict[str, Any], task: TaskSpec) -> List[str]:
+    raw = assignment.get("claimed_paths")
+    if not isinstance(raw, list):
+        return task.claimed_paths
+    return [str(path or "").strip() for path in raw if str(path or "").strip()]
+
+
+def _plan_state_from_ledger_statuses(
+    statuses: Dict[str, _LedgerTaskRuntime],
+) -> PlanState:
+    completed = sorted(
+        task_id for task_id, state in statuses.items()
+        if state.status in _LEDGER_DONE_STATUSES
+    )
+    failed = sorted(
+        task_id for task_id, state in statuses.items()
+        if state.status in _LEDGER_FAILED_STATUSES
+    )
+    running = [
+        RunningTask(task_id=task_id, claimed_paths=list(state.claimed_paths))
+        for task_id, state in sorted(statuses.items())
+        if state.status in _LEDGER_ACTIVE_STATUSES
+    ]
+    return PlanState(
+        completed_task_ids=completed,
+        running_tasks=running,
+        failed_task_ids=failed,
     )
 
 
@@ -238,7 +600,12 @@ def _task_summaries(ready: List[str], task_map: Dict[str, TaskSpec]) -> Dict[str
     }
 
 
-def suggest(plan: Plan) -> BatchResult:
+def suggest(
+    plan: Plan,
+    *,
+    ledger_path: Optional[Path] = None,
+    workflow_id: str = "",
+) -> BatchResult:
     """Given a plan with current state, return which tasks are ready to run.
 
     A task is ready when:
@@ -247,7 +614,12 @@ def suggest(plan: Plan) -> BatchResult:
     3. Its claimed_paths don't conflict with running tasks' claimed_paths
     4. Its claimed_paths don't conflict with other ready tasks in this batch
     """
-    context = _suggest_context(plan)
+    state = _effective_plan_state(
+        plan,
+        ledger_path=ledger_path,
+        workflow_id=workflow_id,
+    )
+    context = _suggest_context(plan, state)
     eligible, blocked = _eligible_tasks(plan, context)
     ready, deferred, aegis_notes = _ready_from_eligible(eligible, context)
     blocked.extend(deferred)

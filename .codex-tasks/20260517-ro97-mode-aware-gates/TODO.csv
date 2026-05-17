@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current gate implementation,DONE,Existing mode-aware pattern and target gates are understood,rg verification_mode src/cccc/daemon/foreman/verification_gate.py,2026-05-17T20:06:44+0800,0,Reviewed _apply_aegis_evidence_gate and target functions.
+2,Implement mode-aware gate behavior,DONE,security_lint and input_robustness warn only outside challenge,python -m pytest tests/test_verification_mode_routing.py -v,2026-05-17T20:06:44+0800,0,Added mode checks and focused routing tests.
+3,Run requested verification,DONE,Requested pytest passes,python -m pytest tests/test_verification_mode_routing.py -v,2026-05-17T20:06:44+0800,0,10 passed; affected security gate tests also passed.

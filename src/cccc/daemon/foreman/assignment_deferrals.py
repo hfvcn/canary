@@ -11,7 +11,7 @@ from ...kernel.claimed_paths import (
     normalize_path as _normalize_path_fn,
     normalize_write_set as _normalize_write_set_fn,
 )
-from ...kernel.workflow_state_types import TaskState
+from ...kernel.workflow_state_types import TaskState, WorkflowTaskStatus
 from .admission import (
     build_deferred_result as _build_deferred_result,
     collect_running_claimed_paths,
@@ -29,9 +29,64 @@ from .assignment_constants import (
 )
 from .workflow import BatchEvaluationResult
 
+DEFERRED_ACTION_RETRY_WORKER = "retry_worker"
+DEFERRED_ACTION_RETRY_VERIFIER = "retry_verifier"
+DEFERRED_ACTION_FOREMAN_ACCEPT = "foreman_accept"
+DEFERRED_ACTION_CANCEL = "cancel"
+DEFERRED_RECOVERY_ACTIONS = frozenset(
+    {
+        DEFERRED_ACTION_RETRY_WORKER,
+        DEFERRED_ACTION_RETRY_VERIFIER,
+        DEFERRED_ACTION_FOREMAN_ACCEPT,
+        DEFERRED_ACTION_CANCEL,
+    }
+)
+
 
 class AssignmentDeferralMixin:
     """Handles single-writer and cross-workflow assignment deferrals."""
+
+    def recover_deferred_task(
+        self,
+        task_id: str,
+        action: str,
+        *,
+        reason: str = "",
+        evidence: Any = None,
+        assign_agent_id: str = "",
+        changed_files: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        tid = self._require_deferred_task_id(task_id)
+        action_name = self._normalize_recovery_action(action)
+        if action_name == DEFERRED_ACTION_RETRY_WORKER:
+            result = self._owner.retry_worker(tid, assign_agent_id=assign_agent_id)
+        elif action_name == DEFERRED_ACTION_RETRY_VERIFIER:
+            result = self._owner.retry_verifier(tid, changed_files=changed_files)
+        elif action_name == DEFERRED_ACTION_FOREMAN_ACCEPT:
+            result = self._owner.foreman_accept(tid, reason, evidence)
+        elif action_name == DEFERRED_ACTION_CANCEL:
+            result = self._owner.cancel_task(tid, reason)
+        else:
+            raise AssertionError(f"unreachable deferred recovery action: {action_name}")
+        return {**result, "recovery_action": action_name}
+
+    def _require_deferred_task_id(self, task_id: str) -> str:
+        tid = str(task_id or "").strip()
+        if not tid:
+            raise ValueError("task_id is required")
+        state = self._owner.engine.get_task(tid)
+        if state is None:
+            raise ValueError(f"task not found: {tid}")
+        if state.status != WorkflowTaskStatus.DEFERRED:
+            raise ValueError(f"task not deferred: {tid} status={state.status.value}")
+        return tid
+
+    @staticmethod
+    def _normalize_recovery_action(action: str) -> str:
+        action_name = str(action or "").strip()
+        if action_name not in DEFERRED_RECOVERY_ACTIONS:
+            raise ValueError(f"unsupported deferred recovery action: {action_name}")
+        return action_name
 
     def defer_batch_for_single_writer(
         self,

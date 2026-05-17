@@ -88,11 +88,12 @@ def validate_filesystem(
     for t in plan.tasks:
         all_plan_claimed.update(t.claimed_paths)
 
+    task_map = {task.id: task for task in plan.tasks}
     for task in plan.tasks:
         verification = task.verification
         if verification is None:
             continue
-        issues.extend(check_covers_paths_unverified(task))
+        issues.extend(check_covers_paths_unverified(task, task_map))
         projected = workspace.projected_paths(plan, task.id)
         # RV-24: upstream-only projected for self-verification detection
         upstream_projected = workspace.projected_paths(

@@ -41,17 +41,24 @@ ADVISORY_NOTICE = "Agent suggestions are advisory only and have no decision auth
 SECURITY_CHECKLIST_HEADER = "## Security Checklist"
 SECURITY_CHECKLIST_ITEMS = (
     (
-        ("input-validation", "input validation", "fts", "search", "xss", "injection"),
         (
-            "Verify: Are all user inputs validated? Can query operators be injected? "
+            "input-validation",
+            "input validation",
+            "fts",
+            "sql",
+            "xss",
+            "injection",
+        ),
+        (
+            "Verify: Are all user inputs validated? Can FTS5/SQL operators be injected? "
             "Are there resource limits (pagination, body size)?"
         ),
     ),
     (
-        ("ssrf", "url"),
+        ("ssrf",),
         (
             "Verify: Does URL validation handle encoded IPs, DNS rebinding, "
-            "redirect chains?"
+            "redirects?"
         ),
     ),
     (
@@ -61,7 +68,14 @@ SECURITY_CHECKLIST_ITEMS = (
         ),
     ),
 )
-CRITICAL_FLOW_NAME_FIELDS = ("id", "name", "title", "surface_type", "temporal_pattern")
+CRITICAL_FLOW_NAME_FIELDS = (
+    "id",
+    "name",
+    "title",
+    "description",
+    "surface_type",
+    "temporal_pattern",
+)
 T = TypeVar("T")
 
 
@@ -1210,6 +1224,144 @@ RULE_DOCS: Dict[str, _RuleDoc] = {
             "--suppress W_AEGIS_COMPLEX_MISSING_BASELINE on the CLI."
         ),
     ),
+    "W_AEGIS_PATCH_SHAPE_TRIAGE_MISSING": _RuleDoc(
+        description=(
+            "A task goal mentions fallback, adapter, or guard patch-shape work "
+            "but does not declare aegis.patch_shape_triage."
+        ),
+        why_it_matters=(
+            "Patch-shape work can create hidden alternate execution paths. "
+            "Triage metadata makes the intended shape and risk review explicit."
+        ),
+        fix_template=(
+            "Add patch-shape triage metadata:\n"
+            "  aegis:\n"
+            "    patch_shape_triage: guard is temporary and covered by tests"
+        ),
+        suppress_hint=(
+            "Add 'W_AEGIS_PATCH_SHAPE_TRIAGE_MISSING' to suppress_codes or pass "
+            "--suppress W_AEGIS_PATCH_SHAPE_TRIAGE_MISSING on the CLI."
+        ),
+    ),
+    "W_AEGIS_RIPPLE_TRIAGE_MISSING": _RuleDoc(
+        description=(
+            "A task changes shared, core, or multiply claimed paths without "
+            "downstream awareness_paths for affected dependents."
+        ),
+        why_it_matters=(
+            "Shared-path changes can break downstream modules even when the "
+            "local task verifies itself. Awareness paths expose the ripple area."
+        ),
+        fix_template=(
+            "Add downstream paths to awareness_paths:\n"
+            "  awareness_paths:\n"
+            "    - src/app/feature/cache_consumer.py"
+        ),
+        suppress_hint=(
+            "Add 'W_AEGIS_RIPPLE_TRIAGE_MISSING' to suppress_codes or pass "
+            "--suppress W_AEGIS_RIPPLE_TRIAGE_MISSING on the CLI."
+        ),
+    ),
+    "W_AEGIS_DECISION_HYGIENE_MISSING": _RuleDoc(
+        description=(
+            "A task goal introduces new-owner or duplicate-owner risk without "
+            "aegis.decision_review metadata."
+        ),
+        why_it_matters=(
+            "Ownership changes should record the review basis so duplicate "
+            "routing or competing owners do not become permanent ambiguity."
+        ),
+        fix_template=(
+            "Add decision review metadata:\n"
+            "  aegis:\n"
+            "    decision_review: owner selection reviewed against current router"
+        ),
+        suppress_hint=(
+            "Add 'W_AEGIS_DECISION_HYGIENE_MISSING' to suppress_codes or pass "
+            "--suppress W_AEGIS_DECISION_HYGIENE_MISSING on the CLI."
+        ),
+    ),
+    "W_AEGIS_DRIFT_CHECK_MISSING": _RuleDoc(
+        description=(
+            "A task decomposes into three or more modules without declaring "
+            "aegis.drift_check metadata."
+        ),
+        why_it_matters=(
+            "Multi-module work can drift between subtasks. A drift check names "
+            "the comparison or invariant used to keep the pieces aligned."
+        ),
+        fix_template=(
+            "Add drift-check metadata:\n"
+            "  aegis:\n"
+            "    drift_check: compare module outputs against shared contract"
+        ),
+        suppress_hint=(
+            "Add 'W_AEGIS_DRIFT_CHECK_MISSING' to suppress_codes or pass "
+            "--suppress W_AEGIS_DRIFT_CHECK_MISSING on the CLI."
+        ),
+    ),
+    "W_AEGIS_PLAN_NO_COMPAT_BOUNDARY": _RuleDoc(
+        description=(
+            "A plan has cross-task dependencies but no task declares an "
+            "aegis.compat_boundary."
+        ),
+        why_it_matters=(
+            "Dependent tasks need a named compatibility boundary so interface "
+            "expectations are explicit during staged execution."
+        ),
+        fix_template=(
+            "Declare the boundary on the owning task:\n"
+            "  aegis:\n"
+            "    compat_boundary: public cache API remains stable"
+        ),
+        suppress_hint=(
+            "Add 'W_AEGIS_PLAN_NO_COMPAT_BOUNDARY' to suppress_codes or pass "
+            "--suppress W_AEGIS_PLAN_NO_COMPAT_BOUNDARY on the CLI."
+        ),
+    ),
+    "E_AEGIS_RIPPLE_VERIFICATION_TOO_NARROW": _RuleDoc(
+        description=(
+            "A task modifies contract, shared, or core paths but its "
+            "verification only covers the task itself."
+        ),
+        why_it_matters=(
+            "Ripple-prone paths need cross-scope verification. Self-only "
+            "coverage can miss downstream contract or shared-module breakage."
+        ),
+        fix_template=(
+            "Expand verification coverage:\n"
+            "  verification:\n"
+            "    covers:\n"
+            "      tasks: [T1, T2]\n"
+            "      paths: [src/cccc/contracts/v1/ralph_ipc.py]"
+        ),
+        suppress_hint=(
+            "Add 'E_AEGIS_RIPPLE_VERIFICATION_TOO_NARROW' to suppress_codes or "
+            "pass --suppress E_AEGIS_RIPPLE_VERIFICATION_TOO_NARROW on the CLI."
+        ),
+    ),
+    "E_AEGIS_SECURITY_CHAIN_MISSING": _RuleDoc(
+        description=(
+            "A feature task declares a security critical flow but has no "
+            "security-related verification check in verification.checks."
+        ),
+        why_it_matters=(
+            "Feature plans that declare security concern need explicit tests. "
+            "Generic validation can miss auth, token, injection, XSS, SSRF, or "
+            "input-validation regressions."
+        ),
+        fix_template=(
+            "Add a security-related structured check:\n"
+            "  verification:\n"
+            "    checks:\n"
+            "      - name: ssrf behavior test\n"
+            "        command: python -m pytest tests/test_security.py -v"
+        ),
+        suppress_hint=(
+            "Add 'E_AEGIS_SECURITY_CHAIN_MISSING' to suppress_codes or pass "
+            "--suppress E_AEGIS_SECURITY_CHAIN_MISSING on the CLI."
+        ),
+    ),
     "E_MISSING_CLAIMED_PATHS": _RuleDoc(
         description="A task has no claimed_paths entries.",
         why_it_matters=(
@@ -1466,6 +1618,13 @@ RULE_VERSION_REGISTRY: Dict[str, int] = {
     "W_AEGIS_FIX_NO_REPAIR_TRACK": 1,
     "W_AEGIS_TDD_NO_TEST_PATH": 1,
     "W_AEGIS_COMPLEX_MISSING_BASELINE": 1,
+    "W_AEGIS_PATCH_SHAPE_TRIAGE_MISSING": 1,
+    "W_AEGIS_RIPPLE_TRIAGE_MISSING": 1,
+    "W_AEGIS_DECISION_HYGIENE_MISSING": 1,
+    "W_AEGIS_DRIFT_CHECK_MISSING": 1,
+    "W_AEGIS_PLAN_NO_COMPAT_BOUNDARY": 1,
+    "E_AEGIS_RIPPLE_VERIFICATION_TOO_NARROW": 1,
+    "E_AEGIS_SECURITY_CHAIN_MISSING": 1,
     # Filesystem rules
     "W_REGISTERED_PLAN_STALE": 1,
     "W_TEST_COVERAGE_GAP": 1,

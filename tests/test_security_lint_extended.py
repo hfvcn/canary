@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 
+import pytest
 import yaml
 
 from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationCheck, VerificationResult
@@ -19,6 +20,7 @@ class _Engine:
         self.project_root = project_root
         self.plan_path = plan_path
         self.recorded_verification: Optional[VerificationResult] = None
+        self.failures: list[dict[str, Any]] = []
         self.warnings: list[dict[str, Any]] = []
 
     def report_worker_completion(
@@ -48,6 +50,9 @@ class _Engine:
     def record_verification_warning(self, task_id: str, **kwargs: Any) -> None:
         self.warnings.append({"task_id": task_id, **kwargs})
 
+    def record_verification_failure(self, task_id: str, **kwargs: Any) -> None:
+        self.failures.append({"task_id": task_id, **kwargs})
+
     def get_task(self, task_id: str) -> Any:
         return SimpleNamespace(task=None, workflow_id="wf-1")
 
@@ -74,26 +79,48 @@ class _PassingRalphService:
         )
 
 
-def test_eval_in_source_records_security_warning(tmp_path: Path) -> None:
-    _write(tmp_path, "src/app.py", "value = eval(user_input)\n")
+@pytest.mark.parametrize(
+    ("content", "expected_type"),
+    [
+        ("value = eval(user_input)\n", "eval_call"),
+        ("exec(user_input)\n", "exec_call"),
+        ("try:\n    work()\nexcept:\n    recover()\n", "bare_except"),
+        ("app.run(host='0.0.0.0', debug=True)\n", "app_run_debug"),
+        ("api_key = \"dev-secret\"\n", "hardcoded_secret"),
+    ],
+)
+def test_security_lint_hit_blocks_challenge_completion(
+    tmp_path: Path,
+    content: str,
+    expected_type: str,
+) -> None:
+    _write(tmp_path, "src/app.py", content)
 
     engine, callbacks, result = _run_completed_event(tmp_path, "src/app.py")
 
+    verification = _recorded_verification(engine)
+    assert result["verification_outcome"] == "failed"
+    assert verification.overall_outcome == "failed"
+    assert not callbacks["completed"]
+    assert callbacks["failed"]
+    assert _single_security_failure_hit(engine, expected_type)["type"] == expected_type
+    assert not [
+        w for w in engine.warnings if w["warning_type"] == "security_lint"
+    ]
+
+
+def test_security_lint_whitelists_test_files(tmp_path: Path) -> None:
+    _write(tmp_path, "tests/test_app.py", "value = eval(user_input)\n")
+
+    engine, callbacks, result = _run_completed_event(tmp_path, "tests/test_app.py")
+
+    verification = _recorded_verification(engine)
     assert result["verification_outcome"] == "passed"
+    assert verification.overall_outcome == "passed"
     assert callbacks["completed"]
     assert not callbacks["failed"]
-    assert _single_security_hit(engine)["type"] == "eval"
-
-
-def test_bare_except_records_security_warning(tmp_path: Path) -> None:
-    _write(tmp_path, "src/app.py", "try:\n    work()\nexcept:\n    recover()\n")
-
-    engine, callbacks, result = _run_completed_event(tmp_path, "src/app.py")
-
-    assert result["verification_outcome"] == "passed"
-    assert callbacks["completed"]
-    assert not callbacks["failed"]
-    assert _single_security_hit(engine)["type"] == "bare_except"
+    assert engine.failures == []
+    assert engine.warnings == []
 
 
 def test_critical_flow_input_robustness_gap_blocks_completion(tmp_path: Path) -> None:
@@ -110,6 +137,7 @@ def test_critical_flow_input_robustness_gap_blocks_completion(tmp_path: Path) ->
     assert not callbacks["completed"]
     assert callbacks["failed"]
     assert robustness_check.details["critical_flows_with_input"] == ["search_flow"]
+    assert engine.failures[0]["failure_type"] == "input_robustness_gap"
     assert not [
         w for w in engine.warnings if w["warning_type"] == "input_robustness_gap"
     ]
@@ -162,7 +190,7 @@ def _task_ref(changed_path: str) -> TaskRef:
         goal_behavior="Extend security lint warnings and input robustness blocking.",
         acceptance_criteria="Security warnings are visible and robustness gaps block critical flows.",
         claimed_paths=[changed_path],
-        verification_mode="ralph",
+        verification_mode="challenge",
     )
 
 
@@ -213,14 +241,13 @@ def _write(project_root: Path, relative_path: str, content: str) -> None:
     target.write_text(content, encoding="utf-8")
 
 
-def _single_security_hit(engine: _Engine) -> dict[str, Any]:
-    security_warnings = [
-        w for w in engine.warnings if w["warning_type"] == "security_lint"
+def _single_security_failure_hit(engine: _Engine, expected_type: str) -> dict[str, Any]:
+    security_failures = [
+        f for f in engine.failures if f["failure_type"] == "security_lint"
     ]
-    assert len(security_warnings) == 1
-    hits = security_warnings[0]["evidence"]["hits"]
-    assert len(hits) == 1
-    return hits[0]
+    assert len(security_failures) == 1
+    hits = security_failures[0]["evidence"]["hits"]
+    return next(hit for hit in hits if hit["type"] == expected_type)
 
 
 def _recorded_verification(engine: _Engine) -> VerificationResult:

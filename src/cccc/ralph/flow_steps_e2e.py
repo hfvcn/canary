@@ -253,8 +253,10 @@ E2E_STEPS: list[StepSpec] = [
         name="improvement-register",
         description="Register improvements",
         instruction_text=(
-            "Update the issue tracker (short version). Flow checks git diff "
-            "for current-session marker additions."
+            "Update the issue trackers for this E2E round:\n"
+            "1. Write new findings discovered during this E2E round into the short tracker.\n"
+            "2. Move issues confirmed fixed (verified in this round) from the short tracker to the full version/archive.\n"
+            "3. Add a version marker line (for example v{N}) so git diff can detect current-session adds."
         ),
         check_fn=_check_improvement_register,
     ),

@@ -57,7 +57,7 @@ def _payload_from_call(call_args: tuple[object, ...]) -> dict[str, object]:
     assert request["op"] == "ralph_validate_event"
     args = request["args"]
     assert isinstance(args, dict)
-    assert args["kind"] == "workflow.plan_validated"
+    assert args["kind"] == "ralph.validate_result"
     payload = args["payload"]
     assert isinstance(payload, dict)
     return payload
@@ -67,7 +67,9 @@ def test_validate_success_emits_plan_validated_event(tmp_path: Path) -> None:
     plan_path = tmp_path / "plan.yaml"
     ledger_path = tmp_path / "ledger.jsonl"
     _write_plan(plan_path)
-    expected_digest = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    expected_digest = hashlib.sha256(
+        str(plan_path.resolve()).encode("utf-8"),
+    ).hexdigest()
 
     with (
         patch("cccc.ralph.cli.validate_with_project", return_value=ValidationReport(valid=True)),
@@ -77,7 +79,13 @@ def test_validate_success_emits_plan_validated_event(tmp_path: Path) -> None:
 
     assert rc == 0
     payload = _payload_from_call(call_daemon.call_args.args)
-    assert payload == {"errors": 0, "warnings": 0, "plan_digest": expected_digest}
+    assert payload == {
+        "error_count": 0,
+        "warning_count": 0,
+        "hint_count": 0,
+        "plan_path_digest": expected_digest,
+        "outcome": "passed",
+    }
 
 
 def test_validate_failure_emits_plan_validated_event_with_errors(tmp_path: Path) -> None:
@@ -94,8 +102,9 @@ def test_validate_failure_emits_plan_validated_event_with_errors(tmp_path: Path)
 
     assert rc == 1
     payload = _payload_from_call(call_daemon.call_args.args)
-    assert payload["errors"] == 1
-    assert int(payload["errors"]) > 0
+    assert payload["error_count"] == 1
+    assert int(payload["error_count"]) > 0
+    assert payload["outcome"] == "failed"
 
 
 def test_daemon_unavailable_does_not_block_validate(tmp_path: Path) -> None:

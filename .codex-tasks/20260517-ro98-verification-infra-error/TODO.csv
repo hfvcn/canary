@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect verification gate and tests,DONE,Relevant code paths and expected behavior are identified,rg -n "process_completed_event|verification_infra_error|failure_type" src tests,2026-05-17,0,
+2,Implement infra error status and retry behavior,DONE,Infra failures return infra_error/timeout without consuming worker retry count and retry verifier up to 2 attempts,python -m pytest tests/test_verification_infra_error.py -v,2026-05-17,0,
+3,Update IPC contract if needed,DONE,Contract accepts verification_infra_error and failure_type values,python -m pytest tests/test_verification_infra_error.py -v,2026-05-17,0,
+4,Run requested verification,DONE,Requested pytest command passes,python -m pytest tests/test_verification_infra_error.py -v,2026-05-17,0,

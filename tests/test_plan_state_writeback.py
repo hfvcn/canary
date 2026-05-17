@@ -7,14 +7,17 @@ import pytest
 import yaml
 
 import cccc.daemon.foreman.workflow_orchestrator as orchestrator_module
-from cccc.contracts.v1.ralph_ipc import TaskRef
+from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationResult
 from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+from cccc.ralph.core import suggest
+from cccc.ralph.plan_io import load_plan
 from cccc.ralph.plan_io import compute_structural_plan_digest
 
 
 TASK_ID = "T-plan"
 WORKFLOW_ID = "wf-plan-state"
 AGENT_ID = "worker-plan"
+NEXT_TASK_ID = "T-next"
 
 
 def _make_orchestrator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WorkflowOrchestrator:
@@ -76,6 +79,25 @@ state:
     )
 
 
+def _write_dependent_plan(plan_path: Path) -> None:
+    plan_path.write_text(
+        """\
+workflow_id: wf-plan-state
+tasks:
+  - id: T-plan
+    title: Preserve me
+    claimed_paths: ["src/plan.py"]
+  - id: T-next
+    title: Next task
+    depends_on: ["T-plan"]
+    claimed_paths: ["src/next.py"]
+state:
+  completed_task_ids: []
+""",
+        encoding="utf-8",
+    )
+
+
 def _complete(orchestrator: WorkflowOrchestrator) -> bool:
     return orchestrator.on_task_completed(
         TASK_ID,
@@ -83,6 +105,45 @@ def _complete(orchestrator: WorkflowOrchestrator) -> bool:
         3,
         ["src/plan.py"],
         workflow_id=WORKFLOW_ID,
+    )
+
+
+def _record_ledger_completion(orchestrator: WorkflowOrchestrator) -> None:
+    first = TaskRef(
+        id=TASK_ID,
+        title="Plan state task",
+        type="backend",
+        claimed_paths=["src/plan.py"],
+    )
+    next_task = TaskRef(
+        id=NEXT_TASK_ID,
+        title="Next task",
+        type="backend",
+        depends_on=[TASK_ID],
+        claimed_paths=["src/next.py"],
+    )
+    orchestrator.engine.register_task(first, WORKFLOW_ID)
+    orchestrator.engine.register_task(next_task, WORKFLOW_ID)
+    orchestrator.engine.register_batch("batch-ledger", [TASK_ID])
+    orchestrator.engine.approve_batch(
+        "batch-ledger",
+        [{"task_id": TASK_ID, "agent_id": AGENT_ID, "claimed_paths": ["src/plan.py"]}],
+    )
+    orchestrator.engine.report_worker_started(TASK_ID, AGENT_ID)
+    orchestrator.engine.report_worker_completion(
+        TASK_ID,
+        {"agent_id": AGENT_ID, "changed_files": ["src/plan.py"], "idempotency_key": "done-ledger"},
+    )
+    orchestrator.engine.record_verification_result(
+        TASK_ID,
+        VerificationResult(
+            verification_id="ver-ledger",
+            workflow_id=WORKFLOW_ID,
+            task_id=TASK_ID,
+            overall_outcome="passed",
+            checks=[],
+            summary="ok",
+        ),
     )
 
 
@@ -117,3 +178,23 @@ def test_plan_state_write_failure_does_not_crash_completion(
 
     assert _complete(orchestrator) is True
     assert orchestrator._active_workflows[WORKFLOW_ID]["tasks"][TASK_ID]["status"] == "completed"
+
+
+def test_suggest_reads_completed_task_from_workflow_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path = tmp_path / "plan.yaml"
+    _write_dependent_plan(plan_path)
+    orchestrator = _make_orchestrator(tmp_path, monkeypatch)
+    _record_ledger_completion(orchestrator)
+
+    plan = load_plan(plan_path)
+    result = suggest(
+        plan,
+        ledger_path=orchestrator.group.ledger_path,
+        workflow_id=WORKFLOW_ID,
+    )
+
+    assert plan.state.completed_task_ids == []
+    assert result.ready == [NEXT_TASK_ID]

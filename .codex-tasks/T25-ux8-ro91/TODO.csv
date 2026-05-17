@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate validation code,DONE,Relevant overlap and path validation files identified,rg structural claimed_paths goal_behavior,2026-05-17,0,
+2,Implement UX-8 overlap detail,DONE,Overlap warning names task pair and path,python -m pytest tests/test_overlap_detail.py -v,2026-05-17,0,
+3,Implement RO-91 incomplete claimed path warning,DONE,W_CLAIMED_PATH_INCOMPLETE emitted for goal_behavior file mentions absent from claimed_paths,python -m pytest tests/test_claimed_path_incomplete.py -v,2026-05-17,0,
+4,Run requested verification,DONE,Requested pytest command passes,python -m pytest tests/test_overlap_detail.py tests/test_claimed_path_incomplete.py -v,2026-05-17,0,

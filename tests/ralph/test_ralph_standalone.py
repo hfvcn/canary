@@ -2803,7 +2803,7 @@ class TestVerifyShellExecution:
             command="nonexistent_binary_xyz",
             expected_exit_code=0,
         )
-        assert result.outcome == "failed"
+        assert result.outcome in ("failed", "infra_error")
 
     def test_env_var_prefix_executes_via_shell(self, tmp_path):
         """RO-60: VAR=value cmd should execute through shell, not fail with ENOENT."""

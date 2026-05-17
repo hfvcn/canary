@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate flow warning failure logic,DONE,Relevant files and call path identified,rg and file reads complete,2026-05-17T00:00:00+08:00,0,"Found _check_guide advisory details in flow_engine.py; warnings originate from guide_generator.update_guide"
+2,Implement advisory warning handling,DONE,Warnings are displayed but do not fail flow step,targeted code inspection,2026-05-17T00:00:00+08:00,0,"Current _check_guide implementation already renders warnings as passed advisory details"
+3,Run requested pytest,DONE,tests/test_flow_guide_advisory.py passes,python -m pytest tests/test_flow_guide_advisory.py -v,2026-05-17T00:00:00+08:00,0,"2 passed in 0.92s"

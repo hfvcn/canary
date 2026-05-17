@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect target tests and implementation,DONE,Target test and _should_upgrade_to_challenge call shape are understood,rg "_should_upgrade_to_challenge|test_ralph_enhancement_surface_e2e" tests src,2026-05-17T20:00:00+08:00,0,Found E2E test in tests/e2e/test_ralph_enhancement_e2e.py; upgrade helper in RalphService.
+2,Implement FL-13 serial marker or race fix,IN_PROGRESS,E2E enhancement test is stable under xdist,python -m pytest tests/e2e/test_ralph_enhancement_e2e.py -v,,0,
+3,Add RO-101 dedicated unit tests,TODO,At least 3 direct _should_upgrade_to_challenge tests exist,python -m pytest tests/test_critical_flow_challenge_upgrade.py -v,,0,
+4,Run requested verification,TODO,Requested test command passes,python -m pytest tests/test_critical_flow_challenge_upgrade.py tests/test_flow_verify_xdist.py -v,,0,

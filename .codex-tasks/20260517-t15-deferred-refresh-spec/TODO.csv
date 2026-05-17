@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read current deferred and verify implementation,DONE,Relevant code and tests inspected,rg deferred refresh-spec,2026-05-17,0,Found partial implementation in state engine CLI and IPC verify handler
+2,Run target tests before editing,DONE,Actual failing behavior captured,python -m pytest tests/test_deferred_recovery.py tests/test_verify_refresh_spec.py -v,2026-05-17,0,Initial target suite already passed: 9 passed in 0.98s
+3,Implement missing T15 behavior,DONE,Deferred recovery and refresh-spec behavior are wired without silent fallbacks,python -m pytest tests/test_deferred_recovery.py tests/test_verify_refresh_spec.py -v,2026-05-17,0,Added explicit deferred recovery dispatcher and retry_verifier/cancel orchestrator paths
+4,Run specified verification,DONE,Target tests pass,python -m pytest tests/test_deferred_recovery.py tests/test_verify_refresh_spec.py -v,2026-05-17,0,12 passed in 0.97s with 60s timeout wrapper
+5,Review diff and close task,DONE,Only intended code/test/taskmaster files changed,git diff -- src/cccc/daemon/foreman/workflow_orchestrator.py src/cccc/daemon/foreman/assignment_deferrals.py tests/test_deferred_recovery.py tests/test_verify_refresh_spec.py,2026-05-17,0,Diff check passed for touched files

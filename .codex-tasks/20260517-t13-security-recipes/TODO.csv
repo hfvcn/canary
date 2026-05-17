@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing recipe implementation and tests,DONE,Relevant code and test expectations identified,rg/sed inspection,2026-05-17,0,
+2,Implement RO-92/93/94 recipe behavior,DONE,security_recipes.py matches requested behavior,python -m py_compile src/cccc/ralph/security_recipes.py tests/test_security_recipes.py,2026-05-17,0,
+3,Run requested test file,DONE,tests/test_security_recipes.py passes,python -m pytest tests/test_security_recipes.py -v,2026-05-17,1,First run exposed surface_type keyword overmatch; narrowed keyword text to id and description.
+4,Review changed files,DONE,Diff is scoped and no unrelated changes reverted,git diff -- src/cccc/ralph/security_recipes.py tests/test_security_recipes.py .codex-tasks/20260517-t13-security-recipes,2026-05-17,0,

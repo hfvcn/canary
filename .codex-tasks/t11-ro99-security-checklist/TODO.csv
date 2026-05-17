@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate prompt path and existing helpers,DONE,Relevant implementation and tests are identified,rg -n "_build_verification_prompt|critical_flows|Security Checklist" src tests,2026-05-17T20:05:00+08:00,0,
+2,Implement checklist injection,DONE,Prompt includes checklist only for matched security critical_flow keywords,python -m pytest tests/test_challenge_security_checklist.py -v,2026-05-17T20:08:10+08:00,0,
+3,Run requested test,DONE,Requested pytest command passes,python -m pytest tests/test_challenge_security_checklist.py -v,2026-05-17T20:08:10+08:00,0,8 passed
+4,Record result,DONE,Task artifacts reflect final validation,test -f .codex-tasks/t11-ro99-security-checklist/PROGRESS.md,2026-05-17T20:08:37+08:00,0,

@@ -79,6 +79,7 @@ TASK_STATUS_RUNNING = "running"
 TASK_STATUS_COMPLETED = "completed"
 TASK_STATUS_COMPLETED_BY_OVERRIDE = _WTS.COMPLETED_BY_OVERRIDE.value
 TASK_STATUS_FAILED = "failed"
+TASK_STATUS_VERIFICATION_INFRA_ERROR = "verification_infra_error"
 _COMPLETED_STATUSES = {TASK_STATUS_COMPLETED, TASK_STATUS_COMPLETED_BY_OVERRIDE}
 _TERMINAL_STATUSES = {TASK_STATUS_COMPLETED, TASK_STATUS_COMPLETED_BY_OVERRIDE, _WTS.CANCELLED.value, "archived"}
 TASK_STATUS_DEFERRED = _WTS.DEFERRED.value
@@ -770,6 +771,159 @@ class WorkflowOrchestrator:
                 return str(workflow_id or "")
         return ""
 
+    @staticmethod
+    def _validate_override_request(
+        task_id: str,
+        reason: str,
+        evidence: Any,
+    ) -> None:
+        if not task_id:
+            raise ValueError("task_id is required")
+        if not reason:
+            raise ValueError("reason is required")
+        if evidence is None:
+            raise ValueError("evidence is required")
+        if isinstance(evidence, str) and not evidence.strip():
+            raise ValueError("evidence is required")
+
+    def override_task(
+        self,
+        task_id: str,
+        reason: str,
+        evidence: Any,
+    ) -> Dict[str, Any]:
+        """Foreman decision: complete a task through an explicit override."""
+        tid = str(task_id or "").strip()
+        why = str(reason or "").strip()
+        self._validate_override_request(tid, why, evidence)
+
+        state = self.engine.get_task(tid)
+        if state is None:
+            raise ValueError(f"task not found: {tid}")
+
+        workflow_id = str(state.workflow_id or "")
+        tracked = self._tracked_task_data(tid)
+        self.engine.foreman_override_task(tid, why, evidence)
+        if tracked is not None:
+            tracked["status"] = TASK_STATUS_COMPLETED_BY_OVERRIDE
+            tracked["override_reason"] = why
+            tracked["override_evidence"] = evidence
+        agent_released = self._release_agent_for_task(tid, tracked)
+        self._resuggest_ready_tasks(workflow_id)
+        self._check_workflow_completion_after_terminal(tid)
+
+        return {
+            "accepted": True,
+            "task_id": tid,
+            "workflow_id": workflow_id,
+            "status": TASK_STATUS_COMPLETED_BY_OVERRIDE,
+            "agent_released": agent_released,
+        }
+
+    def recover_deferred_task(
+        self,
+        task_id: str,
+        action: str,
+        *,
+        reason: str = "",
+        evidence: Any = None,
+        assign_agent_id: str = "",
+        changed_files: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        return self._assignment_controller.recover_deferred_task(
+            task_id,
+            action,
+            reason=reason,
+            evidence=evidence,
+            assign_agent_id=assign_agent_id,
+            changed_files=changed_files,
+        )
+
+    def retry_worker(self, task_id: str, assign_agent_id: str = "") -> Dict[str, Any]:
+        """Recover a deferred task by sending it back through worker dispatch."""
+        self._require_deferred_task(task_id)
+        return self.retry_task(task_id, assign_agent_id=assign_agent_id)
+
+    def retry_verifier(
+        self,
+        task_id: str,
+        changed_files: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Recover a deferred task by rerunning verification without worker dispatch."""
+        state = self._require_deferred_task(task_id)
+        tid = str(task_id or "").strip()
+        files = [
+            str(path or "").strip()
+            for path in (changed_files or [])
+            if str(path or "").strip()
+        ]
+        verification = self.ralph.verify_completion(
+            tid,
+            files,
+            workflow_id=state.workflow_id,
+            task_ref=state.task,
+        )
+        self._store_shadow_verification(tid, verification)
+        return {
+            "accepted": True,
+            "task_id": tid,
+            "workflow_id": state.workflow_id,
+            "action": "retry_verifier",
+            "verification": verification.model_dump(),
+        }
+
+    def foreman_accept(
+        self,
+        task_id: str,
+        reason: str,
+        evidence: Any,
+    ) -> Dict[str, Any]:
+        """Recover a deferred task by accepting current evidence through override."""
+        self._require_deferred_task(task_id)
+        return self.override_task(task_id, reason, evidence)
+
+    def cancel_task(self, task_id: str, reason: str = "") -> Dict[str, Any]:
+        """Recover a deferred task by cancelling it."""
+        state = self._require_deferred_task(task_id)
+        tid = str(task_id or "").strip()
+        why = str(reason or "").strip()
+        tracked = self._tracked_task_data(tid)
+        self.engine.cancel_task(tid, why)
+        if tracked is not None:
+            tracked["status"] = _WTS.CANCELLED.value
+            tracked["error_message"] = why
+        agent_released = self._release_agent_for_task(tid, tracked)
+        self._check_workflow_completion_after_terminal(tid)
+        return {
+            "accepted": True,
+            "task_id": tid,
+            "workflow_id": state.workflow_id,
+            "status": _WTS.CANCELLED.value,
+            "agent_released": agent_released,
+        }
+
+    def _require_deferred_task(self, task_id: str) -> TaskState:
+        tid = str(task_id or "").strip()
+        if not tid:
+            raise ValueError("task_id is required")
+        state = self.engine.get_task(tid)
+        if state is None:
+            raise ValueError(f"task not found: {tid}")
+        if state.status != WorkflowTaskStatus.DEFERRED:
+            raise ValueError(f"task not deferred: {tid} status={state.status.value}")
+        return state
+
+    def _store_shadow_verification(
+        self,
+        task_id: str,
+        verification: VerificationResult,
+    ) -> None:
+        tracked = self._tracked_task_data(task_id)
+        if tracked is None:
+            return
+        tracked["last_verification"] = verification.model_dump()
+        tracked["verification_outcome"] = verification.overall_outcome
+
     def _resuggest_ready_tasks(self, workflow_id: Optional[str]) -> None:
         """WF-3: After a task completes, check if downstream tasks are now ready.
 
@@ -975,6 +1129,12 @@ class WorkflowOrchestrator:
             if td and td.get("status") in _TERMINAL_STATUSES:
                 logger.warning("Ignoring failure for terminal task %s (status=%s)", task_id, td["status"])
                 return False
+
+        if verification is not None and verification.failure_type == "infra_error":
+            return self._mark_verification_infra_error(
+                task_id,
+                verification.summary or error_message or "Verification infrastructure error",
+            )
 
         # Update assignment status
         failed_task: Optional[Dict[str, Any]] = None
@@ -1427,11 +1587,34 @@ class WorkflowOrchestrator:
     ) -> None:
         summary = str(evidence_summary or "").strip() or "(none provided)"
         files_text = ", ".join(str(path).strip() for path in changed_files if str(path).strip()) or "(none)"
+        if verification_outcome == "infra_error":
+            self._mark_verification_infra_error(
+                task_id,
+                f"evidence_summary={summary}, changed_files={files_text}",
+            )
+            return
         self._notify_foreman_task_update(
             task_id=task_id,
             new_status=f"verification_{verification_outcome}",
             summary=f"evidence_summary={summary}, changed_files={files_text}",
         )
+
+    def _mark_verification_infra_error(self, task_id: str, summary: str) -> bool:
+        tracked_task: Optional[Dict[str, Any]] = None
+        for wdata in self._active_workflows.values():
+            td = wdata.get("tasks", {}).get(task_id)
+            if td:
+                td["status"] = TASK_STATUS_VERIFICATION_INFRA_ERROR
+                td["error_message"] = summary
+                tracked_task = td
+                break
+        self._release_agent_for_task(task_id, tracked_task)
+        self._notify_foreman_task_update(
+            task_id=task_id,
+            new_status=TASK_STATUS_VERIFICATION_INFRA_ERROR,
+            summary=summary,
+        )
+        return True
 
     @staticmethod
     def _extract_evidence_summary(payload: Dict[str, Any]) -> str:
@@ -1718,6 +1901,7 @@ class WorkflowOrchestrator:
                 td["status"] = TASK_STATUS_FAILED
                 td["error_message"] = f"blocked: {reason}" if reason else "blocked"
                 break
+        self._release_agent_for_task(task_id)
 
     def _cascade_block(self, workflow_id: str, blocked_task_id: str, reason: str) -> List[str]:
         """Cascade BLOCKED to all downstream dependents via reverse DAG traversal."""
@@ -1784,6 +1968,12 @@ class WorkflowOrchestrator:
             if state and state.current_batch_id:
                 # Batch verification passed, mark complete
                 self.reporter.on_batch_completed()
+        elif outcome == "infra_error" or verification.failure_type == "infra_error":
+            reported_task_id = task_id or "unknown"
+            self._mark_verification_infra_error(
+                reported_task_id,
+                verification.summary or "Verification infrastructure error",
+            )
         elif outcome in ("skipped", "skipped_blocked", "failed", "timeout"):
             # Both skipped and failed count as failure
             reported_task_id = task_id or "unknown"
@@ -1804,6 +1994,7 @@ class WorkflowOrchestrator:
                     td["status"] = TASK_STATUS_FAILED
                     td["error_message"] = error_message
                     break
+            self._release_agent_for_task(task_id)
 
             self.reporter.on_task_failed(
                 reported_task_id,

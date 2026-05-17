@@ -7,7 +7,9 @@ from cccc.daemon.foreman.verification_gate import (
     AEGIS_EVIDENCE_CHECK_NAME,
     AEGIS_EVIDENCE_MISSING_ERROR,
     AEGIS_FIX_ROOT_CAUSE_WARNING,
+    AEGIS_REFACTOR_RETIREMENT_WARNING,
     _apply_aegis_evidence_gate,
+    _check_aegis_evidence,
 )
 
 
@@ -27,7 +29,9 @@ def test_empty_evidence_ralph_mode_warns_but_passes(evidence_text: str) -> None:
     result = _apply(evidence_text, _task_ref(verification_mode="ralph", aegis={"intent": "feature"}))
 
     assert result.overall_outcome == "passed"
-    assert result.checks == []
+    assert result.checks[-1].name == AEGIS_EVIDENCE_CHECK_NAME
+    assert result.checks[-1].outcome == "passed"
+    assert result.checks[-1].details["warnings"] == [AEGIS_EVIDENCE_MISSING_ERROR]
     assert AEGIS_EVIDENCE_MISSING_ERROR in result.warnings
 
 
@@ -38,8 +42,22 @@ def test_fix_evidence_without_root_cause_warns() -> None:
     )
 
     assert result.overall_outcome == "passed"
-    assert result.checks == []
+    assert result.checks[-1].name == AEGIS_EVIDENCE_CHECK_NAME
+    assert result.checks[-1].outcome == "passed"
+    assert result.checks[-1].details["warnings"] == [AEGIS_FIX_ROOT_CAUSE_WARNING]
     assert AEGIS_FIX_ROOT_CAUSE_WARNING in result.warnings
+
+
+def test_refactor_evidence_without_retirement_warns() -> None:
+    result = _apply(
+        "Reworked the module boundary and added regression coverage.",
+        _task_ref(verification_mode="agent", aegis={"intent": "refactor"}),
+    )
+
+    assert result.overall_outcome == "passed"
+    assert result.checks[-1].outcome == "passed"
+    assert result.checks[-1].details["warnings"] == [AEGIS_REFACTOR_RETIREMENT_WARNING]
+    assert AEGIS_REFACTOR_RETIREMENT_WARNING in result.warnings
 
 
 def test_good_evidence_passes() -> None:
@@ -61,10 +79,21 @@ def test_task_without_aegis_skips_evidence_gate() -> None:
     assert result.warnings == []
 
 
+def test_check_aegis_evidence_accepts_payload() -> None:
+    checks = _check_aegis_evidence(
+        {"evidence": {"summary": "done"}},
+        _task_ref(verification_mode="challenge", aegis={"intent": "feature"}),
+    )
+
+    assert checks[-1].name == AEGIS_EVIDENCE_CHECK_NAME
+    assert checks[-1].outcome == "failed"
+    assert checks[-1].details["errors"] == [AEGIS_EVIDENCE_MISSING_ERROR]
+
+
 def _apply(evidence_text: str, task_ref: TaskRef) -> VerificationResult:
     return _apply_aegis_evidence_gate(
         verification=_verification(task_ref.id),
-        evidence_text=evidence_text,
+        payload={"evidence_summary": evidence_text},
         task_ref=task_ref,
     )
 

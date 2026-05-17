@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current gate and tests,DONE,Relevant call path and tests identified,rg/sed reads complete,2026-05-17,0,Existing implementation was close but returned errors/warnings instead of VerificationCheck items.
+2,Patch Aegis evidence gate,DONE,_check_aegis_evidence accepts payload/task_ref and emits VerificationCheck items,python -m pytest tests/test_aegis_evidence_gate.py -v,2026-05-17,0,
+3,Run targeted verification,DONE,Targeted pytest passes,python -m pytest tests/test_aegis_evidence_gate.py -v,2026-05-17,0,11 passed; adjacent Aegis regression tests also passed.

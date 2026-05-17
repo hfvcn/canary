@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import shlex
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Mapping, Sequence
 
 from .models import TaskSpec, ValidationIssue
 
@@ -12,13 +12,17 @@ _WRAPPER_BASES = {"make", "tox", "bash", "sh"}
 _SHELL_OPERATORS = {"&&", "||", ";", "|", ">", ">>", "<", "2>", "2>>", "&"}
 
 
-def check_covers_paths_unverified(task: TaskSpec) -> List[ValidationIssue]:
+def check_covers_paths_unverified(
+    task: TaskSpec,
+    task_map: Mapping[str, TaskSpec] | None = None,
+) -> List[ValidationIssue]:
     """Warn when compile/unit verification commands reference uncovered literal paths."""
     verification = task.verification
     if verification is None or verification.level not in {"compile", "unit"}:
         return []
+    task_map = task_map or _self_task_map(task)
 
-    allowed_paths = list(task.claimed_paths) + list(verification.covers.paths)
+    allowed_paths = list(task.claimed_paths) + _effective_covers_paths(task, task_map)
     issues: List[ValidationIssue] = []
 
     issues.extend(
@@ -39,6 +43,50 @@ def check_covers_paths_unverified(task: TaskSpec) -> List[ValidationIssue]:
             )
         )
     return issues
+
+
+def _self_task_map(task: TaskSpec) -> Mapping[str, TaskSpec]:
+    verification = task.verification
+    if verification is None:
+        return {task.id: task}
+    covers = verification.covers
+    if not covers.paths and any(task_id != task.id for task_id in covers.tasks):
+        raise ValueError("task_map is required to auto-expand cross-task covers paths")
+    return {task.id: task}
+
+
+def _effective_covers_paths(
+    task: TaskSpec,
+    task_map: Mapping[str, TaskSpec],
+) -> List[str]:
+    verification = task.verification
+    if verification is None:
+        return []
+    covers = verification.covers
+    if covers.paths:
+        return _dedupe_paths(covers.paths)
+    return _covered_claimed_paths(covers.tasks, task_map)
+
+
+def _covered_claimed_paths(
+    task_ids: Sequence[str],
+    task_map: Mapping[str, TaskSpec],
+) -> List[str]:
+    paths: List[str] = []
+    for task_id in task_ids:
+        task = task_map.get(task_id)
+        if task is None:
+            continue
+        paths.extend(task.claimed_paths)
+    return _dedupe_paths(paths)
+
+
+def _dedupe_paths(paths: Sequence[str]) -> List[str]:
+    deduped: List[str] = []
+    for path in paths:
+        if path not in deduped:
+            deduped.append(path)
+    return deduped
 
 
 def _check_command(

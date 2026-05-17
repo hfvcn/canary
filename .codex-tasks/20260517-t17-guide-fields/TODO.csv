@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect schema guide generator tests,DONE,Relevant files and current expectations identified,rg/sed inspection,2026-05-17,0,Relevant files: models.py guide_generator.py guide_schema.py guide_rules.py guide_cli_reference.py cli.py tests
+2,Implement FL-4 field descriptions,DONE,Target fields have Field(description=...) metadata,python -m pytest tests/test_guide_description.py -v,2026-05-17,0,Passed: 1 test
+3,Implement UX-5 guide coverage,DONE,Guide includes Plan schema fields validation rule codes and CLI commands,python -m pytest tests/test_guide_generator_coverage.py -v,2026-05-17,0,Passed: 3 tests
+4,Run requested verification,DONE,Requested pytest command passes,python -m pytest tests/test_guide_description.py tests/test_guide_generator_coverage.py -v,2026-05-17,0,Passed: 4 tests

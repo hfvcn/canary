@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect validation rule placement,DONE,"Relevant validator files and tests are identified","test -f src/cccc/ralph/validation_rules/structural.py && test -f tests/test_e2e_compile_check.py",2026-05-17T00:00:00,0,Rule and targeted test already present; verifying behavior next
+2,Implement missing compile/import rule if needed,DONE,"W_E2E_MISSING_COMPILE_CHECK behavior matches acceptance criteria","python -m pytest tests/test_e2e_compile_check.py -v",2026-05-17T00:00:00,0,Added api verification level support and regression coverage
+3,Run targeted verification,DONE,"Targeted pytest command passes","python -m pytest tests/test_e2e_compile_check.py -v",2026-05-17T00:00:00,0,4 passed in 0.88s

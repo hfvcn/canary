@@ -20,7 +20,13 @@ from ..models import (
 
 
 # Ordered levels for comparison
-_LEVEL_ORDER: Dict[str, int] = {"compile": 0, "unit": 1, "integration": 2, "e2e": 3}
+_LEVEL_ORDER: Dict[str, int] = {
+    "compile": 0,
+    "unit": 1,
+    "api": 2,
+    "integration": 3,
+    "e2e": 4,
+}
 
 _SHALLOW_CHECK_NAME_TOKENS = ("compile", "py_compile", "import", "help", "cli_help", "syntax")
 _BEHAVIORAL_CHECK_NAME_TOKENS = ("test", "pytest", "behavior", "assert")

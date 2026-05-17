@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate existing contract model and signature validation flow,DONE,Relevant files and current behavior are identified,rg plus targeted file reads,2026-05-17T00:00:00+08:00,0,Contract.signatures exists; validate lacks provider-source advisory wiring
+2,Implement signatures field and advisory validation,DONE,Model and validation code support optional signatures without fallback behavior,python -m pytest tests/test_contract_signatures.py -v,2026-05-17T20:27:01+08:00,0,Provider provides.signatures source validation added
+3,Run requested test,DONE,Requested pytest command passes within 60 seconds,python subprocess timeout=60: python -m pytest tests/test_contract_signatures.py -v,2026-05-17T20:27:01+08:00,1,timeout binary missing on macOS; subprocess timeout passed with 7 tests
+4,Record final state,DONE,Task artifacts reflect validated completion,test -f .codex-tasks/t22-fl9-signatures/PROGRESS.md,2026-05-17T20:27:01+08:00,0,

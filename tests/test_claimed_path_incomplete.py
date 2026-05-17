@@ -47,12 +47,29 @@ def test_goal_file_reference_missing_from_claims_warns() -> None:
     assert issues[0].evidence["referenced_path"] == "src/missing.py"
 
 
-def test_awareness_path_satisfies_goal_file_reference() -> None:
+def test_goal_file_reference_in_awareness_paths_warns() -> None:
     plan = Plan.model_validate({
         "tasks": [
             _task(
                 goal_behavior="Write to config/app.yaml.",
                 awareness_paths=["config/app.yaml"],
+            ),
+        ],
+    })
+
+    report = validate(plan)
+
+    issues = _issues(report, "W_CLAIMED_PATH_INCOMPLETE")
+    assert len(issues) == 1
+    assert issues[0].evidence["referenced_path"] == "config/app.yaml"
+
+
+def test_claimed_path_satisfies_goal_file_reference() -> None:
+    plan = Plan.model_validate({
+        "tasks": [
+            _task(
+                goal_behavior="Add routes to app.py.",
+                claimed_paths=["app.py"],
             ),
         ],
     })

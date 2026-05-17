@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate verification failure release paths,DONE,Relevant implementation and tests identified,rg -n "on_verification_result|_update_shadow_blocked|_active_assignments|defer_batch_for_single_writer" src/cccc/daemon/foreman/workflow_orchestrator.py tests/test_deferred_recovery.py,2026-05-17T20:00:00+08:00,0,
+2,Implement agent release on verification failure,DONE,Both failed transitions call _release_agent_for_task,python -m pytest tests/test_deferred_recovery.py -v,2026-05-17T20:00:00+08:00,0,
+3,Add deferred recovery regressions,DONE,Tests prove agent release and later batch dispatch,python -m pytest tests/test_deferred_recovery.py -v,2026-05-17T20:01:00+08:00,0,
+4,Run focused validation,DONE,Requested pytest passes within 60 seconds,python -m pytest tests/test_deferred_recovery.py -v,2026-05-17T20:01:00+08:00,0,

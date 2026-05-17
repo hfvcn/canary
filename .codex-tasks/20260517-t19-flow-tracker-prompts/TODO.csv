@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate target prompts and tests,DONE,E2E and solve instruction_text locations plus relevant tests identified,rg "improvement-register|gaps|version marker|archive" src tests,2026-05-17T20:00:00+08:00,0,
+2,Update flow prompt instructions,DONE,Both prompts mention new findings archive resolved items and version marker,python -m py_compile src/cccc/ralph/flow_steps_e2e.py src/cccc/ralph/flow_engine.py,2026-05-17T20:01:00+08:00,0,
+3,Run requested validation,DONE,Requested archive prompt pytest passes,python -m pytest tests/test_flow_archive_prompt.py -v,2026-05-17T20:02:00+08:00,0,
+4,Review diff and close task,DONE,Only intended files changed and task progress recorded,git diff -- src/cccc/ralph/flow_steps_e2e.py src/cccc/ralph/flow_engine.py,2026-05-17T20:03:00+08:00,0,

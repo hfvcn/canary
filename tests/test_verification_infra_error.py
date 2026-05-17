@@ -76,8 +76,10 @@ def test_file_not_found_in_verify_records_infra_error_without_failure_retry() ->
 
     assert service.calls == 2
     assert result["verification_outcome"] == "passed"
+    assert result["verification_failure_type"] == "task_quality"
     assert result["verification_infra_retries"] == 1
     assert [item.overall_outcome for item in engine.recorded] == ["infra_error", "passed"]
+    assert [item.failure_type for item in engine.recorded] == ["infra_error", "task_quality"]
     assert callbacks["failed"] == []
     assert len(callbacks["completed"]) == 1
 
@@ -104,8 +106,9 @@ def test_ralph_service_missing_verifier_command_returns_infra_error(tmp_path: Pa
         task_ref=task,
     )
 
-    assert result.overall_outcome == "failed"
-    assert any("failed" in check.outcome for check in result.checks)
+    assert result.overall_outcome == "infra_error"
+    assert result.failure_type == "infra_error"
+    assert any("infra_error" in check.outcome for check in result.checks)
     assert "failed to start" in result.summary or result.summary
 
 
@@ -116,13 +119,15 @@ def test_normal_verification_failure_still_fails() -> None:
 
     assert service.calls == 1
     assert result["verification_outcome"] == "failed"
+    assert result["verification_failure_type"] == "task_quality"
     assert "verification_infra_retries" not in result
     assert [item.overall_outcome for item in engine.recorded] == ["failed"]
+    assert engine.recorded[0].failure_type == "task_quality"
     assert callbacks["completed"] == []
     assert len(callbacks["failed"]) == 1
 
 
-def test_infra_error_after_two_retries_escalates_to_failed() -> None:
+def test_infra_error_after_two_retries_escalates_to_foreman_decision() -> None:
     service = _SequenceRalphService(
         [FileNotFoundError("verifier missing") for _ in range(3)]
     )
@@ -130,16 +135,23 @@ def test_infra_error_after_two_retries_escalates_to_failed() -> None:
     engine, callbacks, result = _run_completed_event(service)
 
     assert service.calls == 3
-    assert result["verification_outcome"] == "failed"
+    assert result["verification_outcome"] == "infra_error"
+    assert result["verification_failure_type"] == "infra_error"
     assert result["verification_infra_retries"] == 2
     assert [item.overall_outcome for item in engine.recorded] == [
         "infra_error",
         "infra_error",
-        "failed",
+        "infra_error",
+    ]
+    assert [item.failure_type for item in engine.recorded] == [
+        "infra_error",
+        "infra_error",
+        "infra_error",
     ]
     assert VERIFICATION_INFRA_ESCALATED_WARNING in engine.recorded[-1].warnings
     assert callbacks["completed"] == []
-    assert len(callbacks["failed"]) == 1
+    assert callbacks["failed"] == []
+    assert callbacks["notifications"][0]["verification_outcome"] == "infra_error"
 
 
 def _run_completed_event(

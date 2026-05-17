@@ -129,3 +129,29 @@ def test_workflow_override_op_sets_status_and_ledger_event(workflow_orchestrator
     assert events[-1]["data"]["evidence"] == "unit test evidence"
     assert isinstance(events[-1]["data"]["timestamp"], float)
 
+
+def test_orchestrator_override_releases_agent_and_unblocks_dependency(workflow_orchestrator) -> None:
+    _, orchestrator = workflow_orchestrator
+    downstream_id = "T-downstream"
+    orchestrator.engine.register_task(TaskRef(id=TASK_ID, title="Override task"), WORKFLOW_ID)
+    orchestrator.engine.register_task(
+        TaskRef(id=downstream_id, title="Downstream task", depends_on=[TASK_ID]),
+        WORKFLOW_ID,
+    )
+    orchestrator.engine.register_batch("batch-override", [TASK_ID])
+    orchestrator.engine.approve_batch(
+        "batch-override",
+        [{"task_id": TASK_ID, "agent_id": "agent-override", "claimed_paths": []}],
+    )
+    orchestrator.engine.report_worker_started(TASK_ID, "agent-override")
+    orchestrator.foreman.pool_manager.assign_agent("agent-override", TASK_ID)
+
+    result = orchestrator.override_task(TASK_ID, "accepted", {"review": "manual"})
+
+    assert result["status"] == "completed_by_override"
+    assert result["agent_released"] is True
+    assert orchestrator.foreman.pool_manager.get_active_assignments() == {}
+    state = orchestrator.engine.get_task(TASK_ID)
+    assert state is not None
+    assert state.status == WorkflowTaskStatus.COMPLETED_BY_OVERRIDE
+    assert orchestrator.ralph.check_dependencies(downstream_id)["satisfied"] is True

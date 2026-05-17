@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect suspicious duration logic and test patterns,DONE,Relevant code paths and helpers identified,rg "SUSPICIOUS" src/cccc/daemon/foreman/ralph_service.py tests,2026-05-17T00:00:00+08:00,0,Found existing threshold and _is_trivial_command helper
+2,Implement known-fast command exemption,DONE,Exempt prefixes skip suspicious marking without changing other commands,python -m py_compile src/cccc/daemon/foreman/ralph_service.py,2026-05-17T00:00:00+08:00,0,py_compile passed
+3,Add or update suspicious exemption tests,DONE,Test file covers exempt and non-exempt behavior,test -f tests/test_suspicious_exempt.py,2026-05-17T00:00:00+08:00,0,Created focused pytest file
+4,Run requested pytest,DONE,Requested test command passes,python -m pytest tests/test_suspicious_exempt.py -v,2026-05-17T00:00:00+08:00,0,6 passed in 0.93s

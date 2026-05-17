@@ -6,7 +6,7 @@ Extracted from validator.py as a pure refactor (RO-31).
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, NamedTuple, Optional, Set
 
 from cccc.kernel.claimed_paths import normalize_write_set as _normalize_write_set, paths_overlap as _paths_overlap
 from ..graph_utils import transitive_deps, detect_cycle, find_components
@@ -28,11 +28,21 @@ E2E_COMPILE_CHECK_CODE = "W_E2E_MISSING_COMPILE_CHECK"
 COMPILE_REQUIRED_LEVELS = frozenset({"api", "e2e", "integration"})
 COMPILE_SKIP_LEVELS = frozenset({"compile", "unit"})
 PYTHON_IMPORT_TOKEN_RE = re.compile(r"\b(import|from)\b")
-GOAL_FILE_REFERENCE_RE = re.compile(
-    r"(?:modify|write|add|change|edit|update)\s+(?:to\s+)?"
-    r"(\S+\.(?:py|js|ts|yaml|json))",
+GOAL_FILE_PATH = r"([A-Za-z0-9_./\\-]+\.(?:py|js|ts|yaml|yml|json))"
+GOAL_DIRECT_FILE_REFERENCE_RE = re.compile(
+    rf"\b(?:add|modify|write|change|edit|update)\s+{GOAL_FILE_PATH}",
     re.IGNORECASE,
 )
+GOAL_TO_FILE_REFERENCE_RE = re.compile(
+    rf"\b(?:add|write)\b[^.\n;:]*?\bto\s+{GOAL_FILE_PATH}",
+    re.IGNORECASE,
+)
+
+
+class _OverlapClaim(NamedTuple):
+    task_id: str
+    display_path: str
+    normalized_path: str
 
 
 # ---------------------------------------------------------------------------
@@ -214,16 +224,16 @@ def _check_field_completeness(plan: Plan) -> List[ValidationIssue]:
 def _check_claimed_path_incomplete(plan: Plan) -> List[ValidationIssue]:
     issues: List[ValidationIssue] = []
     for task in plan.tasks:
-        known_paths = _known_task_paths(task)
+        claimed_paths = _normalize_task_paths(task.claimed_paths)
         for referenced_path in _goal_file_references(task.goal_behavior):
-            if _task_knows_path(referenced_path, known_paths):
+            if _task_claims_path(referenced_path, claimed_paths):
                 continue
             issues.append(ValidationIssue(
                 code=CLAIMED_PATH_INCOMPLETE_CODE,
                 severity="warning",
                 message=(
                     f"task '{task.id}' goal_behavior references '{referenced_path}' "
-                    "but it is not in claimed_paths or awareness_paths"
+                    "but it is not in claimed_paths"
                 ),
                 task_ids=[task.id],
                 evidence={
@@ -235,25 +245,29 @@ def _check_claimed_path_incomplete(plan: Plan) -> List[ValidationIssue]:
     return issues
 
 
-def _known_task_paths(task: TaskSpec) -> List[str]:
-    raw_paths = list(task.claimed_paths) + list(task.awareness_paths)
-    return _normalize_write_set(raw_paths) if raw_paths else []
+def _normalize_task_paths(paths: List[str]) -> List[str]:
+    return _normalize_write_set(paths) if paths else []
 
 
 def _goal_file_references(goal_behavior: str) -> List[str]:
     referenced: List[str] = []
-    for match in GOAL_FILE_REFERENCE_RE.finditer(goal_behavior or ""):
-        path = match.group(1).strip("\"'`()[]{}.,:;")
-        if not path:
-            continue
-        normalized = _normalize_write_set([path])[0]
-        if normalized not in referenced:
-            referenced.append(normalized)
+    for pattern in (GOAL_DIRECT_FILE_REFERENCE_RE, GOAL_TO_FILE_REFERENCE_RE):
+        for match in pattern.finditer(goal_behavior or ""):
+            _append_goal_file_reference(referenced, match.group(1))
     return referenced
 
 
-def _task_knows_path(referenced_path: str, known_paths: List[str]) -> bool:
-    return any(_paths_overlap(referenced_path, known_path) for known_path in known_paths)
+def _append_goal_file_reference(referenced: List[str], path: str) -> None:
+    clean_path = path.strip("\"'`()[]{}.,:;")
+    if not clean_path:
+        return
+    normalized = _normalize_write_set([clean_path])[0]
+    if normalized not in referenced:
+        referenced.append(normalized)
+
+
+def _task_claims_path(referenced_path: str, claimed_paths: List[str]) -> bool:
+    return any(_paths_overlap(referenced_path, claimed_path) for claimed_path in claimed_paths)
 
 
 # ---------------------------------------------------------------------------
@@ -349,11 +363,38 @@ def _describe_overlap_pairs(
     for left, right in overlap_pairs[:MAX_OVERLAP_DESCRIPTIONS]:
         display_left = _display_claimed_path(t1, left)
         display_right = _display_claimed_path(t2, right)
-        descriptions.append(
-            f'{t1.id} claims "{display_left}" which overlaps with '
-            f'{t2.id}\'s "{display_right}"'
-        )
+        left_claim = _OverlapClaim(t1.id, display_left, left)
+        right_claim = _OverlapClaim(t2.id, display_right, right)
+        descriptions.append(_describe_overlap_pair(left_claim, right_claim))
     return descriptions
+
+
+def _describe_overlap_pair(left: _OverlapClaim, right: _OverlapClaim) -> str:
+    if left.normalized_path == right.normalized_path:
+        return f"{left.task_id} and {right.task_id} both claim {left.display_path}"
+    if _path_contains(left.normalized_path, right.normalized_path):
+        return _containment_description(left, right)
+    if _path_contains(right.normalized_path, left.normalized_path):
+        return _containment_description(right, left)
+    return (
+        f"{left.task_id} claims {left.display_path} which overlaps with "
+        f"{right.task_id}'s {right.display_path}"
+    )
+
+
+def _containment_description(parent: _OverlapClaim, child: _OverlapClaim) -> str:
+    return (
+        f"{parent.task_id} claims {parent.display_path} which contains "
+        f"{child.task_id}'s {child.display_path}"
+    )
+
+
+def _path_contains(parent_path: str, child_path: str) -> bool:
+    if parent_path == child_path:
+        return False
+    if parent_path == "/":
+        return True
+    return child_path.startswith(f"{parent_path}/")
 
 
 def _display_claimed_path(task: TaskSpec, normalized_path: str) -> str:

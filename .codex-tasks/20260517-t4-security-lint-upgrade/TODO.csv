@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current verification gate and tests,DONE,"Relevant functions and expected tests are understood","rg -n '_check_security_lint|_check_input_robustness|record_verification' src/cccc/daemon/foreman/verification_gate.py tests/test_security_lint_blocking.py tests/test_security_lint_extended.py",2026-05-17 20:19 CST,0,
+2,Implement SL-1/SL-2/SL-3 changes,DONE,"Mode-aware blocking/warning behavior and requested patterns are implemented","python -m compileall -q src/cccc/daemon/foreman/verification_gate.py",2026-05-17 20:19 CST,0,
+3,Run requested pytest verification,DONE,"Requested test files pass within 60 seconds","python -m pytest tests/test_security_lint_blocking.py tests/test_security_lint_extended.py -v",2026-05-17 20:19 CST,0,

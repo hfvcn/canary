@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskEvent, TaskRef, VerificationSpec
@@ -79,7 +80,8 @@ def _advance_task_to_running(orch: WorkflowOrchestrator, workflow_id: str, task:
     orch.engine.report_worker_started(task.id, agent_id)
 
 
-def test_ralph_enhancement_surface_e2e(tmp_path: Path) -> None:
+def test_ralph_enhancement_surface_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CCCC_HOME", str(tmp_path / "cccc-home"))
     project_root = tmp_path / "project"
     project_root.mkdir()
     (project_root / "src").mkdir()

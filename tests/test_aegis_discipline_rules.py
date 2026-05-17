@@ -42,6 +42,28 @@ def test_unfilled_content_reports_error() -> None:
     assert issue.evidence == {"field": "title"}
 
 
+def test_placeholder_content_ignores_markers_inside_code_fences() -> None:
+    issues = _issues(_plan(_task(
+        goal_behavior=(
+            "Replace parser behavior with concrete output.\n"
+            "```python\n"
+            "# TODO placeholder implementation note\n"
+            "```\n"
+            "The runtime branch returns parsed records."
+        ),
+    )))
+
+    assert PLACEHOLDER_CODE not in _codes(issues)
+
+
+def test_placeholder_content_ignores_markers_inside_inline_code() -> None:
+    issues = _issues(_plan(_task(
+        goal_behavior="Use `TODO placeholder` as a literal marker in the parser.",
+    )))
+
+    assert PLACEHOLDER_CODE not in _codes(issues)
+
+
 def test_retirement_track_missing_for_refactor_provider_pattern() -> None:
     issues = _issues(_plan(_task(
         title="Refactor provider boundary",
@@ -52,6 +74,28 @@ def test_retirement_track_missing_for_refactor_provider_pattern() -> None:
     issue = _only_issue(issues, RETIREMENT_CODE)
     assert issue.severity == "error"
     assert issue.evidence == {"intent": "refactor"}
+
+
+def test_retirement_track_missing_for_migration_provider_pattern() -> None:
+    issues = _issues(_plan(_task(
+        title="Migrate provider boundary",
+        goal_behavior="Replace adapter route with concrete dispatch.",
+        aegis={"intent": "migration"},
+    )))
+
+    issue = _only_issue(issues, RETIREMENT_CODE)
+    assert issue.severity == "error"
+    assert issue.evidence == {"intent": "migration"}
+
+
+def test_retirement_track_ignores_refactor_without_target_shape() -> None:
+    issues = _issues(_plan(_task(
+        title="Refactor guard branch",
+        goal_behavior="Move condition into a clearer function.",
+        aegis={"intent": "refactor"},
+    )))
+
+    assert RETIREMENT_CODE not in _codes(issues)
 
 
 def test_fix_repair_track_requires_root_cause() -> None:

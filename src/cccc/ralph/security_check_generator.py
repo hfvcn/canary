@@ -5,24 +5,47 @@ from __future__ import annotations
 import re
 import shlex
 from pathlib import Path
-from typing import Dict, List
+from typing import Any
 
 from .models import CriticalFlow, Plan, TaskSpec
 from .plan_io import load_plan
-
+from .security_recipes import SECURITY_RECIPES
 
 DEFAULT_ENDPOINT = "/"
 DEFAULT_FORMAT = "json"
-ENCODED_IP_MATRIX = (
-    "0177.0.0.1",
-    "2130706433",
-    "0x7f000001",
-    "::ffff:127.0.0.1",
-    "::1",
-)
 FLOW_NAME_FIELDS = ("id", "description", "surface_type", "temporal_pattern")
 FORMAT_KEYWORDS = ("json", "yaml", "xml", "form", "multipart", "csv")
 HTTP_METHODS = "GET|POST|PUT|PATCH|DELETE"
+INPUT_VALIDATION_CATEGORY = "input_validation"
+URL_INPUT_RECIPE = "url_input"
+AUTH_TOKEN_RECIPE = "auth_token"
+TEMPORAL_RECIPE = "temporal:store_then_use"
+FLOW_CATEGORY_ORDER = (
+    INPUT_VALIDATION_CATEGORY,
+    URL_INPUT_RECIPE,
+    AUTH_TOKEN_RECIPE,
+    TEMPORAL_RECIPE,
+)
+INPUT_VALIDATION_TERMS = (
+    "input-validation",
+    "input validation",
+    "input_validation",
+    "fts",
+    "sql",
+    "search",
+    "xss",
+    "injection",
+)
+URL_CATEGORY_TERMS = ("url-input", "url input", "url_validation", "url-validation")
+AUTH_CATEGORY_TERMS = (
+    "auth-token",
+    "auth token",
+    "timing-safe",
+    "timing safe",
+    "credential",
+    "secret",
+    "password",
+)
 INPUT_VALIDATION_TESTS = (
     ("fts5-sql-injection", "test_fts5_sql_injection"),
     ("pagination-lower-bound", "test_pagination_lower_bound"),
@@ -30,33 +53,44 @@ INPUT_VALIDATION_TESTS = (
 )
 SSRF_TEST_TARGET = "tests/security/test_ssrf.py::test_encoded_ip_matrix"
 AUTH_TEST_TARGET = "tests/security/test_auth_timing.py::test_timing_safe_token_compare"
-ENDPOINT_RE = re.compile(rf"\b(?:{HTTP_METHODS})?\s*(/[A-Za-z0-9_./{{}}:-]+)")
+TOCTOU_TEST_TARGET = "tests/security/test_toctou.py::test_store_then_use_revalidation"
+ENDPOINT_RE = re.compile(rf"(?:^|\s)(?:{HTTP_METHODS})?\s*(/[A-Za-z0-9_./{{}}:-]+)", re.I)
 METHOD_ENDPOINT_RE = re.compile(rf"\b({HTTP_METHODS})\s+(/[A-Za-z0-9_./{{}}:-]+)", re.I)
 
 
-def generate_security_checks(plan_path: str) -> List[Dict]:
+def generate_security_checks(plan_path: str) -> list[dict[str, object]]:
     """Return deterministic behavioral security checks for a Ralph plan."""
     plan = load_plan(Path(plan_path))
     checks: list[dict[str, object]] = []
     for flow in plan.critical_flows:
-        flow_type = _flow_type(flow)
-        if flow_type == "":
+        categories = _flow_categories(flow)
+        if not categories:
             continue
         context = _context_for_flow(plan, flow)
-        checks.extend(_checks_for_flow(flow_type, context))
+        for category in categories:
+            checks.extend(_checks_for_category(category, context))
     return checks
 
 
-def _flow_type(flow: CriticalFlow) -> str:
+def _flow_categories(flow: CriticalFlow) -> list[str]:
     text = _flow_text(flow)
-    if _has_any(text, ("ssrf", "url-input", "url input", "url-validation")):
-        return "ssrf"
-    if _has_any(text, ("auth", "token", "key", "timing-safe", "timing safe")):
-        return "auth"
-    input_terms = ("input-validation", "input validation", "fts", "search", "xss", "injection")
-    if _has_any(text, input_terms):
-        return "input-validation"
-    return ""
+    return [
+        category
+        for category in FLOW_CATEGORY_ORDER
+        if _flow_matches_category(flow, text, category)
+    ]
+
+
+def _flow_matches_category(flow: CriticalFlow, text: str, category: str) -> bool:
+    if category == INPUT_VALIDATION_CATEGORY:
+        return _has_any(text, INPUT_VALIDATION_TERMS)
+    if category == URL_INPUT_RECIPE:
+        return _has_any(text, _recipe_terms(URL_INPUT_RECIPE, URL_CATEGORY_TERMS))
+    if category == AUTH_TOKEN_RECIPE:
+        return _has_any(text, _recipe_terms(AUTH_TOKEN_RECIPE, AUTH_CATEGORY_TERMS))
+    if category == TEMPORAL_RECIPE:
+        return bool(_temporal_pattern(flow))
+    return False
 
 
 def _context_for_flow(plan: Plan, flow: CriticalFlow) -> dict[str, str]:
@@ -67,12 +101,16 @@ def _context_for_flow(plan: Plan, flow: CriticalFlow) -> dict[str, str]:
         "flow_slug": _slug(flow.id),
         "endpoint": _extract_endpoint(text),
         "data_format": _extract_format(text),
+        "temporal_pattern": _temporal_pattern(flow),
+        "temporal_slug": _slug(_temporal_pattern(flow) or "temporal"),
     }
 
 
 def _tasks_for_flow(plan: Plan, flow: CriticalFlow) -> list[TaskSpec]:
     matched = [task for task in plan.tasks if _task_matches_flow(task, flow)]
-    return matched if matched else list(plan.tasks)
+    if matched:
+        return matched
+    return list(plan.tasks) if len(plan.tasks) == 1 else []
 
 
 def _task_matches_flow(task: TaskSpec, flow: CriticalFlow) -> bool:
@@ -85,14 +123,29 @@ def _task_matches_flow(task: TaskSpec, flow: CriticalFlow) -> bool:
     return any(_paths_overlap(entrypoint, path) for entrypoint in flow.entrypoints for path in paths)
 
 
-def _checks_for_flow(flow_type: str, context: dict[str, str]) -> list[dict[str, object]]:
-    if flow_type == "input-validation":
+def _checks_for_category(category: str, context: dict[str, str]) -> list[dict[str, object]]:
+    if category == INPUT_VALIDATION_CATEGORY:
         return _input_validation_checks(context)
-    if flow_type == "ssrf":
-        matrix = {"SECURITY_URL_MATRIX": ",".join(ENCODED_IP_MATRIX)}
+    if category == URL_INPUT_RECIPE:
+        matrix = {"SECURITY_URL_MATRIX": ",".join(_recipe_sequence(
+            URL_INPUT_RECIPE,
+            "hostname_encoding_matrix",
+        ))}
         return [_template_check(context, "ssrf-encoded-ip-matrix", SSRF_TEST_TARGET, extra_env=matrix)]
-    if flow_type == "auth":
-        return [_template_check(context, "auth-timing-safe-compare", AUTH_TEST_TARGET)]
+    if category == AUTH_TOKEN_RECIPE:
+        return [_template_check(
+            context,
+            "auth-timing-safe-compare",
+            AUTH_TEST_TARGET,
+            extra_env=_auth_recipe_env(),
+        )]
+    if category == TEMPORAL_RECIPE:
+        return [_template_check(
+            context,
+            f"toctou-{context['temporal_slug']}",
+            TOCTOU_TEST_TARGET,
+            extra_env=_temporal_recipe_env(context),
+        )]
     return []
 
 
@@ -111,6 +164,7 @@ def _template_check(
     extra_env: dict[str, str] | None = None,
 ) -> dict[str, object]:
     env = {
+        "SECURITY_FLOW_ID": context["flow_id"],
         "SECURITY_ENDPOINT": context["endpoint"],
         "SECURITY_FORMAT": context["data_format"],
         **(extra_env or {}),
@@ -148,8 +202,46 @@ def _schema_hint_text(task: TaskSpec) -> list[str]:
 
 def _hint_text(hint: object) -> str:
     if isinstance(hint, dict):
-        return " ".join(map(str, hint.values()))
+        return " ".join(_hint_text(hint[key]) for key in sorted(hint))
+    if isinstance(hint, (list, tuple)):
+        return " ".join(_hint_text(value) for value in hint)
+    if hint is None:
+        return ""
     return str(hint)
+
+
+def _auth_recipe_env() -> dict[str, str]:
+    patterns = SECURITY_RECIPES[AUTH_TOKEN_RECIPE]["timing_safe_compare_patterns"]
+    if not isinstance(patterns, dict):
+        raise TypeError("auth_token timing_safe_compare_patterns must be a dict")
+    return {"SECURITY_COMPARE_PATTERNS": ",".join(map(str, patterns.values()))}
+
+
+def _temporal_recipe_env(context: dict[str, str]) -> dict[str, str]:
+    templates = _recipe_sequence(TEMPORAL_RECIPE, "two_phase_test_template")
+    return {
+        "SECURITY_TEMPORAL_PATTERN": context["temporal_pattern"],
+        "SECURITY_TOCTOU_TEMPLATES": " | ".join(templates),
+    }
+
+
+def _recipe_terms(recipe_name: str, extra_terms: tuple[str, ...]) -> tuple[str, ...]:
+    keywords = SECURITY_RECIPES[recipe_name]["keywords"]
+    return (*_string_tuple(keywords), *extra_terms)
+
+
+def _recipe_sequence(recipe_name: str, key: str) -> tuple[str, ...]:
+    return _string_tuple(SECURITY_RECIPES[recipe_name][key])
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if isinstance(value, dict):
+        return tuple(str(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return tuple(str(item) for item in value)
+    if value:
+        return (str(value),)
+    return ()
 
 
 def _extract_endpoint(text: str) -> str:
@@ -188,4 +280,21 @@ def _slug(value: str) -> str:
 
 
 def _has_any(text: str, needles: tuple[str, ...]) -> bool:
-    return any(needle in text for needle in needles)
+    normalized = _normalized_text(text)
+    return any(_contains_term(normalized, needle) for needle in needles)
+
+
+def _contains_term(normalized_text: str, term: str) -> bool:
+    normalized_term = _normalized_text(term)
+    if not normalized_term:
+        return False
+    pattern = rf"(?<![a-z0-9]){re.escape(normalized_term)}(?![a-z0-9])"
+    return re.search(pattern, normalized_text) is not None
+
+
+def _normalized_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
+
+
+def _temporal_pattern(flow: CriticalFlow) -> str:
+    return str(getattr(flow, "temporal_pattern", "") or "")

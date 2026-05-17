@@ -35,7 +35,7 @@ from .agent import (
 )
 from .core import suggest, verify
 from .models import Plan, ValidationIssue, ValidationReport, compute_issue_instance_id
-from .plan_io import load_plan, save_plan_state
+from .plan_io import _read_plan_workflow_id, load_plan, save_plan_state
 from .report_diff import (
     diff_validation_reports,
     format_report_diff_json,
@@ -52,7 +52,7 @@ _EXIT_VALIDATION_FAILURE = 1  # Plan-level validation failures
 _EXIT_INTERNAL_ERROR = 2       # Internal errors (load failures, crashes, etc.)
 logger = logging.getLogger(__name__)
 _REPEATED_HINT_GROUP_THRESHOLD = 3
-_VALIDATE_DAEMON_EVENT_KIND = "workflow.plan_validated"
+_VALIDATE_DAEMON_EVENT_KIND = "ralph.validate_result"
 _VALIDATE_DAEMON_EVENT_OP = "ralph_validate_event"
 _VALIDATE_DAEMON_TIMEOUT_S = 1.0
 
@@ -215,6 +215,69 @@ def _resolve_group_ledger_path(group_id: str) -> Path | None:
     return group.ledger_path
 
 
+def _resolve_suggest_ledger_path(args: argparse.Namespace) -> Path | None:
+    explicit_ledger = getattr(args, "ledger", None)
+    if explicit_ledger is not None:
+        return explicit_ledger
+
+    explicit_group = str(getattr(args, "group", "") or "").strip()
+    if explicit_group:
+        ledger_path = _resolve_group_ledger_path(explicit_group)
+        if ledger_path is None:
+            raise ValueError(f"group ledger unavailable: {explicit_group}")
+        return ledger_path
+
+    plan_path = getattr(args, "plan", None)
+    if plan_path is None:
+        return None
+    return _auto_detect_suggest_ledger_path(Path(plan_path))
+
+
+def _auto_detect_suggest_ledger_path(plan_path: Path) -> Path | None:
+    project_root = _resolve_project_root(None, plan_path)
+    group_id = _active_group_for_project(project_root)
+    if not group_id:
+        group_id = _unique_group_for_project(project_root)
+    if group_id:
+        return _resolve_group_ledger_path(group_id)
+
+    local_ledger = plan_path.resolve().parent / "ledger.jsonl"
+    return local_ledger if local_ledger.exists() else None
+
+
+def _active_group_for_project(project_root: Path) -> str:
+    try:
+        from ..kernel.active import load_active
+        from ..kernel.group import load_group
+
+        group_id = str(load_active().get("active_group_id") or "").strip()
+        group = load_group(group_id) if group_id else None
+    except Exception:
+        return ""
+    if group is None:
+        return ""
+    return group_id if _group_matches_project_root(group, project_root) else ""
+
+
+def _unique_group_for_project(project_root: Path) -> str:
+    try:
+        from ..paths import ensure_home
+
+        groups_dir = ensure_home() / "groups"
+        group_dirs = [gp for gp in groups_dir.iterdir() if gp.is_dir()]
+    except Exception:
+        return ""
+    matches = _matching_group_ids(group_dirs, str(project_root.resolve()))
+    return matches[0] if len(matches) == 1 else ""
+
+
+def _group_matches_project_root(group: Any, project_root: Path) -> bool:
+    raw_project_root = str(group.doc.get("project_root") or "").strip()
+    if not raw_project_root:
+        return False
+    return str(Path(raw_project_root).resolve()) == str(project_root.resolve())
+
+
 def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ralph",
@@ -294,6 +357,8 @@ def main(argv: List[str] | None = None) -> int:
     p_sug = sub.add_parser("suggest", help="Show next ready batch")
     p_sug.add_argument("plan", type=Path, help="Path to plan.yaml or plan.json")
     p_sug.add_argument("--format", choices=["json", "text"], default="text")
+    p_sug.add_argument("--ledger", type=Path, default=None, help="Read workflow state from this ledger")
+    p_sug.add_argument("--group", type=str, default="", help="Group ID (resolves ledger path)")
 
     # --- verify ---
     p_ver = sub.add_parser("verify", help="Run verification for a task")
@@ -459,40 +524,60 @@ def main(argv: List[str] | None = None) -> int:
 
 def _cmd_show_schema() -> None:
     """Print the full plan schema with field names, types, and defaults."""
+    sections = [
+        "# Ralph Plan Schema Reference",
+        *_schema_model_sections(),
+        *_schema_example_sections(),
+    ]
+    print("\n".join(sections))
+
+
+def _schema_model_sections() -> list[str]:
     from .models import (
         CriticalFlow, ForbiddenFlow, Plan, TaskSpec, Verification,
         CheckSpec, Contract, SemanticBlock, SemanticTarget,
         VerificationCovers, RegistrationInvariant, FindingRef,
+        AegisDiscipline, RepairTrack, RetirementTrack,
     )
 
-    def _format_model(name: str, model_cls: type) -> str:
-        from pydantic.fields import PydanticUndefined
-        lines = [f"\n# {name}"]
-        for field_name, field_info in model_cls.model_fields.items():
-            annotation = field_info.annotation
-            type_str = getattr(annotation, "__name__", str(annotation))
-            default = field_info.default
-            if default is PydanticUndefined and field_info.default_factory is not None:
-                default = field_info.default_factory()
-            elif default is PydanticUndefined:
-                default = "(required)"
-            lines.append(f"  {field_name}: {type_str}  # default: {default!r}")
-        return "\n".join(lines)
+    schema_models = [
+        ("Plan (top level)", Plan),
+        ("TaskSpec (tasks[])", TaskSpec),
+        ("Verification (tasks[].verification)", Verification),
+        ("CheckSpec (tasks[].verification.checks[])", CheckSpec),
+        ("VerificationCovers (tasks[].verification.covers)", VerificationCovers),
+        ("Contract (tasks[].provides[] / consumes[])", Contract),
+        ("SemanticBlock (tasks[].semantic)", SemanticBlock),
+        ("SemanticTarget (tasks[].semantic.targets[])", SemanticTarget),
+        ("AegisDiscipline (tasks[].aegis)", AegisDiscipline),
+        ("RepairTrack (tasks[].aegis.repair_track)", RepairTrack),
+        ("RetirementTrack (tasks[].aegis.retirement_track)", RetirementTrack),
+        ("CriticalFlow (critical_flows[])", CriticalFlow),
+        ("ForbiddenFlow (forbidden_flows[])", ForbiddenFlow),
+        ("FindingRef (finding_refs[])", FindingRef),
+        ("RegistrationInvariant (registration_invariants[])", RegistrationInvariant),
+    ]
+    return [_format_schema_model(name, model_cls) for name, model_cls in schema_models]
 
-    sections = [
-        "# Ralph Plan Schema Reference",
-        _format_model("Plan (top level)", Plan),
-        _format_model("TaskSpec (tasks[])", TaskSpec),
-        _format_model("Verification (tasks[].verification)", Verification),
-        _format_model("CheckSpec (tasks[].verification.checks[])", CheckSpec),
-        _format_model("VerificationCovers (tasks[].verification.covers)", VerificationCovers),
-        _format_model("Contract (tasks[].provides[] / consumes[])", Contract),
-        _format_model("SemanticBlock (tasks[].semantic)", SemanticBlock),
-        _format_model("SemanticTarget (tasks[].semantic.targets[])", SemanticTarget),
-        _format_model("CriticalFlow (critical_flows[])", CriticalFlow),
-        _format_model("ForbiddenFlow (forbidden_flows[])", ForbiddenFlow),
-        _format_model("FindingRef (finding_refs[])", FindingRef),
-        _format_model("RegistrationInvariant (registration_invariants[])", RegistrationInvariant),
+
+def _format_schema_model(name: str, model_cls: type) -> str:
+    from pydantic.fields import PydanticUndefined
+
+    lines = [f"\n# {name}"]
+    for field_name, field_info in model_cls.model_fields.items():
+        annotation = field_info.annotation
+        type_str = getattr(annotation, "__name__", str(annotation))
+        default = field_info.default
+        if default is PydanticUndefined and field_info.default_factory is not None:
+            default = field_info.default_factory()
+        elif default is PydanticUndefined:
+            default = "(required)"
+        lines.append(f"  {field_name}: {type_str}  # default: {default!r}")
+    return "\n".join(lines)
+
+
+def _schema_example_sections() -> list[str]:
+    return [
         "\n# Example CriticalFlow:",
         '  - id: "user-login"',
         '    description: "End-to-end login flow"',
@@ -508,10 +593,13 @@ def _cmd_show_schema() -> None:
         '      level: "unit"',
         '      command: "pytest tests/test_login.py -x"',
     ]
-    print("\n".join(sections))
 
 
 def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
+    if getattr(args, "generate_security_checks", False):
+        _print_generated_security_checks(args.plan)
+        return _EXIT_OK
+
     project_root = _resolve_project_root(
         explicit_project_root=args.project_root,
         plan_path=args.plan,
@@ -549,18 +637,15 @@ def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
             report.warnings.append(issue)
         agent_suggestions = []
     compact = getattr(args, "compact", False)
-    if getattr(args, "generate_security_checks", False):
-        _print_generated_security_checks(args.plan)
-    else:
-        _print_validate_result(
-            report=report,
-            args=args,
-            project_root=project_root,
-            gate_name=gate_name,
-            show_semantic=show_semantic,
-            agent_suggestions=agent_suggestions,
-            compact=compact,
-        )
+    _print_validate_result(
+        report=report,
+        args=args,
+        project_root=project_root,
+        gate_name=gate_name,
+        show_semantic=show_semantic,
+        agent_suggestions=agent_suggestions,
+        compact=compact,
+    )
 
     group_id = _write_validate_ledger_event_if_requested(
         args=args,
@@ -637,10 +722,16 @@ def _validate_daemon_event_payload(
     plan_path: Path,
 ) -> Dict[str, object]:
     return {
-        "errors": len(report.errors),
-        "warnings": len(report.warnings),
-        "plan_digest": hashlib.sha256(plan_path.read_bytes()).hexdigest() if plan_path.exists() else "",
+        "error_count": len(report.errors),
+        "warning_count": len(report.warnings),
+        "hint_count": len(report.hints),
+        "plan_path_digest": _plan_path_digest(plan_path),
+        "outcome": "passed" if report.valid else "failed",
     }
+
+
+def _plan_path_digest(plan_path: Path) -> str:
+    return hashlib.sha256(str(plan_path.resolve()).encode("utf-8")).hexdigest()
 
 
 def _review_beyond_scope_with_agent(
@@ -872,7 +963,13 @@ def _cmd_validate_diff(args: argparse.Namespace) -> int:
 
 
 def _cmd_suggest(plan: Plan, args: argparse.Namespace) -> int:
-    result = suggest(plan)
+    plan_path = getattr(args, "plan", None)
+    workflow_id = _read_plan_workflow_id(Path(plan_path)) if plan_path else ""
+    result = suggest(
+        plan,
+        ledger_path=_resolve_suggest_ledger_path(args),
+        workflow_id=workflow_id,
+    )
 
     if args.format == "json":
         print(json.dumps(result.model_dump(), indent=2, ensure_ascii=False))

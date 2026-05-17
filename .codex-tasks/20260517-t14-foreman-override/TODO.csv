@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current override and dependency behavior,DONE,Relevant orchestrator IPC engine and tests are understood,rg -n "workflow_override|foreman_override_task|completed_by_override" src tests,2026-05-17T00:00:00+08:00,0,
+2,Implement WorkflowOrchestrator.override_task,DONE,Override status ledger agent release and downstream resuggest are driven by orchestrator,python -m pytest tests/test_workflow_override.py -v,2026-05-17T00:00:00+08:00,0,
+3,Update IPC workflow_override handler,DONE,IPC op calls orchestrator.override_task and preserves error handling,python -m pytest tests/test_workflow_override.py -v,2026-05-17T00:00:00+08:00,0,
+4,Run requested verification,DONE,Requested pytest command passes,python -m pytest tests/test_workflow_override.py -v,2026-05-17T00:00:00+08:00,1,First run exposed duplicate helper-name bug; fixed and reran successfully.

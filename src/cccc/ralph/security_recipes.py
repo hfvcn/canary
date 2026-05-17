@@ -2,38 +2,52 @@
 
 from __future__ import annotations
 
-from typing import Any, List
+import re
+from pathlib import Path
+from typing import Any, Iterable, List
 
 from .models import CriticalFlow, Plan, TaskSpec, ValidationIssue
+
+
+HOSTNAME_ENCODING_MATRIX = [
+    "0177.0.0.1",
+    "2130706433",
+    "0x7f000001",
+    "[::ffff:127.0.0.1]",
+    "[::1]",
+]
+TOCTOU_TEST_TEMPLATES = [
+    "phase 1: store accepted value; phase 2: mutate backing state before use",
+    "phase 1: store path or URL; phase 2: swap target and assert revalidation",
+]
+TIMING_SAFE_COMPARE = "secrets.compare_digest"
+TOKEN_NAME_PATTERN = (
+    r"\b(?=[A-Za-z_][A-Za-z0-9_]*\b)"
+    r"[A-Za-z0-9_]*(?:auth|token|key)[A-Za-z0-9_]*\b"
+)
+TOKEN_COMPARE_RE = re.compile(
+    rf"(?:{TOKEN_NAME_PATTERN})\s*(?:==|!=)|"
+    rf"(?:==|!=)\s*(?:{TOKEN_NAME_PATTERN})",
+    re.IGNORECASE,
+)
 
 
 SECURITY_RECIPES: dict[str, dict[str, Any]] = {
     "url_input": {
         "issue_code": "W_SSRF_ENCODING_UNCOVERED",
-        "keywords": ("ssrf", "url_validation", "url validation", "url input"),
-        "hostname_encoding_matrix": [
-            "0177.0.0.1",
-            "2130706433",
-            "0x7f000001",
-            "::ffff:127.0.0.1",
-            "::1",
-        ],
+        "keywords": ("ssrf", "url"),
+        "hostname_encoding_matrix": HOSTNAME_ENCODING_MATRIX,
         "coverage_terms": (
             "encoding matrix",
-            "encoded ip",
             "hostname matrix",
-            "0177.0.0.1",
-            "2130706433",
-            "0x7f000001",
-            "::ffff:127.0.0.1",
-            "::1",
+            *HOSTNAME_ENCODING_MATRIX,
         ),
     },
     "auth_token": {
         "issue_code": "W_AUTH_TIMING_UNSAFE",
-        "keywords": ("auth", "token"),
+        "keywords": ("auth", "token", "key"),
         "timing_safe_compare_patterns": {
-            "python": "secrets.compare_digest",
+            "python": TIMING_SAFE_COMPARE,
             "node": "crypto.timingSafeEqual",
             "go": "subtle.ConstantTimeCompare",
         },
@@ -51,10 +65,8 @@ SECURITY_RECIPES: dict[str, dict[str, Any]] = {
         "issue_code": "W_VERIFICATION_TOCTOU_GAP",
         "keywords": ("temporal", "toctou", "store_then_use"),
         "temporal_pattern": "store_then_use",
-        "toctou_test_templates": [
-            "store accepted value, mutate backing state, then use stored value",
-            "store path or URL, swap target before use, then assert revalidation",
-        ],
+        "toctou_test_templates": TOCTOU_TEST_TEMPLATES,
+        "two_phase_test_template": TOCTOU_TEST_TEMPLATES,
         "coverage_terms": (
             "toctou",
             "store_then_use",
@@ -69,10 +81,10 @@ def check_security_recipes(plan: Plan, task: TaskSpec) -> List[ValidationIssue]:
     """Return security-recipe hints for one task when all gates match."""
     issues: List[ValidationIssue] = []
     for flow in _relevant_flows(plan, task):
-        for surface_type, recipe in SECURITY_RECIPES.items():
-            if not _all_gates_match(flow, task, surface_type, recipe):
+        for recipe_name in SECURITY_RECIPES:
+            if not _recipe_matches(flow, task, recipe_name):
                 continue
-            issues.append(_build_issue(task, flow, surface_type, recipe))
+            issues.append(_build_issue(task, flow, recipe_name))
     return issues
 
 
@@ -95,34 +107,45 @@ def _task_relevant_to_flow(plan: Plan, task: TaskSpec, flow: CriticalFlow) -> bo
     return len(plan.tasks) == 1 and verification is not None
 
 
-def _all_gates_match(
+def _recipe_matches(flow: CriticalFlow, task: TaskSpec, recipe_name: str) -> bool:
+    recipe = SECURITY_RECIPES[recipe_name]
+    if recipe_name == "temporal:store_then_use":
+        return bool(_flow_temporal_pattern(flow))
+    if recipe_name == "url_input":
+        return _url_recipe_matches(flow, task, recipe)
+    if recipe_name == "auth_token":
+        return _auth_recipe_matches(flow, task, recipe)
+    return False
+
+
+def _url_recipe_matches(
     flow: CriticalFlow,
     task: TaskSpec,
-    surface_type: str,
     recipe: dict[str, Any],
 ) -> bool:
-    return (
-        _flow_has_security_keyword(flow, recipe)
-        and _flow_declares_recipe(flow, surface_type)
-        and not _task_has_recipe_coverage(task, recipe)
+    return _flow_has_security_keyword(flow, recipe) and not _task_has_recipe_coverage(
+        task,
+        recipe,
+    )
+
+
+def _auth_recipe_matches(
+    flow: CriticalFlow,
+    task: TaskSpec,
+    recipe: dict[str, Any],
+) -> bool:
+    return _flow_has_security_keyword(flow, recipe) and bool(
+        _unsafe_auth_compare_paths(task)
     )
 
 
 def _flow_has_security_keyword(flow: CriticalFlow, recipe: dict[str, Any]) -> bool:
-    if recipe.get("temporal_pattern") and _flow_temporal_pattern(flow):
-        return True
-    text = " ".join([flow.id, flow.description]).casefold()
+    text = _flow_security_text(flow)
     return any(str(keyword).casefold() in text for keyword in recipe["keywords"])
 
 
-def _flow_declares_recipe(flow: CriticalFlow, surface_type: str) -> bool:
-    declared_surface = _normalized(getattr(flow, "surface_type", None))
-    if declared_surface == _normalized(surface_type):
-        return True
-    if not surface_type.startswith("temporal:"):
-        return False
-    expected_temporal = surface_type.removeprefix("temporal:")
-    return _normalized(_flow_temporal_pattern(flow)) == _normalized(expected_temporal)
+def _flow_security_text(flow: CriticalFlow) -> str:
+    return " ".join([flow.id, flow.description]).casefold()
 
 
 def _task_has_recipe_coverage(task: TaskSpec, recipe: dict[str, Any]) -> bool:
@@ -143,34 +166,38 @@ def _coverage_terms(recipe: dict[str, Any]) -> List[str]:
 def _build_issue(
     task: TaskSpec,
     flow: CriticalFlow,
-    surface_type: str,
-    recipe: dict[str, Any],
+    recipe_name: str,
 ) -> ValidationIssue:
+    recipe = SECURITY_RECIPES[recipe_name]
     return ValidationIssue(
         code=str(recipe["issue_code"]),
         severity="hint",
         message=(
-            f"task '{task.id}' verification lacks {surface_type} security "
+            f"task '{task.id}' verification lacks {recipe_name} security "
             f"recipe coverage for critical flow '{flow.id}'"
         ),
         task_ids=[task.id],
-        evidence=_issue_evidence(task, flow, surface_type, recipe),
+        evidence=_issue_evidence(task, flow, recipe_name),
     )
 
 
 def _issue_evidence(
     task: TaskSpec,
     flow: CriticalFlow,
-    surface_type: str,
-    recipe: dict[str, Any],
+    recipe_name: str,
 ) -> dict[str, Any]:
+    recipe = SECURITY_RECIPES[recipe_name]
     verification = task.verification
     check_names = [check.name for check in verification.checks] if verification else []
     evidence = {
         "flow_id": flow.id,
-        "surface_type": surface_type,
+        "surface_type": recipe_name,
         "check_names": check_names,
     }
+    if recipe_name == "temporal:store_then_use":
+        evidence["temporal_pattern"] = _flow_temporal_pattern(flow)
+    if recipe_name == "auth_token":
+        evidence["unsafe_compare_paths"] = _unsafe_auth_compare_paths(task)
     for key in _recipe_evidence_keys(recipe):
         evidence[key] = recipe[key]
     return evidence
@@ -181,7 +208,7 @@ def _recipe_evidence_keys(recipe: dict[str, Any]) -> List[str]:
         "hostname_encoding_matrix",
         "timing_safe_compare_patterns",
         "toctou_test_templates",
-        "temporal_pattern",
+        "two_phase_test_template",
     ]
     return [key for key in keys if key in recipe]
 
@@ -210,9 +237,49 @@ def _paths_overlap(left: str, right: str) -> bool:
     )
 
 
-def _normalized(value: Any) -> str:
-    return str(value or "").strip().casefold()
-
-
 def _normalized_path(value: str) -> str:
     return value.strip().replace("\\", "/").strip("/")
+
+
+def _unsafe_auth_compare_paths(task: TaskSpec) -> List[str]:
+    return [
+        str(path)
+        for path in _claimed_source_files(task.claimed_paths)
+        if _path_has_unsafe_auth_compare(path)
+    ]
+
+
+def _claimed_source_files(paths: Iterable[str]) -> List[Path]:
+    source_paths: List[Path] = []
+    for raw_path in paths:
+        path = _resolve_source_path(raw_path)
+        if path.is_file():
+            source_paths.append(path)
+        elif path.is_dir():
+            source_paths.extend(
+                child for child in sorted(path.rglob("*.py")) if child.is_file()
+            )
+    return source_paths
+
+
+def _resolve_source_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path
+    return Path.cwd() / path
+
+
+def _path_has_unsafe_auth_compare(path: Path) -> bool:
+    return any(
+        _line_has_unsafe_auth_compare(line)
+        for line in path.read_text().splitlines()
+    )
+
+
+def _line_has_unsafe_auth_compare(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return False
+    if TIMING_SAFE_COMPARE in stripped:
+        return False
+    return bool(TOKEN_COMPARE_RE.search(stripped))

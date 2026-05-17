@@ -7,22 +7,24 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 _DEBUG_TRUE_RE = re.compile(r"\bdebug\s*=\s*True\b")
+_APP_RUN_DEBUG_RE = re.compile(r"app\.run\(.*debug\s*=\s*True")
 _MATCH_RAW_RE = re.compile(
     r"MATCH\s*\?\s*['\"]?\s*\+|MATCH\s*\(\s*['\"]?\s*[a-zA-Z_]+\s*\+"
 )
-_BARE_EXCEPT_RE = re.compile(r"except\s*:", re.MULTILINE)
-_EVAL_RE = re.compile(r"\beval\s*\(", re.MULTILINE)
-_EXEC_RE = re.compile(r"\bexec\s*\(", re.MULTILINE)
+_BARE_EXCEPT_RE = re.compile(r"except\s*:")
+_EVAL_CALL_RE = re.compile(r"\beval\s*\(")
+_EXEC_CALL_RE = re.compile(r"\bexec\s*\(")
 _HARDCODED_SECRET_RE = re.compile(
-    r"(password|secret|api_key)\s*=\s*[\"'][^\"'\s]{8,}",
+    r"(password|secret|api_key)\s*=\s*[\"'][^\"']+[\"']",
     re.IGNORECASE,
 )
 SECURITY_PATTERNS: Dict[str, re.Pattern[str]] = {
     "debug_true": _DEBUG_TRUE_RE,
+    "app_run_debug": _APP_RUN_DEBUG_RE,
     "fts_raw_input": _MATCH_RAW_RE,
     "bare_except": _BARE_EXCEPT_RE,
-    "eval": _EVAL_RE,
-    "exec": _EXEC_RE,
+    "eval_call": _EVAL_CALL_RE,
+    "exec_call": _EXEC_CALL_RE,
     "hardcoded_secret": _HARDCODED_SECRET_RE,
 }
 _INPUT_ROBUSTNESS_KEYWORDS = ("search", "query", "input", "fts", "match")
@@ -174,8 +176,18 @@ def _is_security_lint_target(path_text: str) -> bool:
     return bool(
         normalized
         and normalized.endswith(".py")
-        and "tests/" not in normalized
-        and not basename.startswith("test_")
+        and not _is_test_file_path(normalized, basename)
+    )
+
+
+def _is_test_file_path(normalized: str, basename: str) -> bool:
+    parts = [part for part in normalized.split("/") if part]
+    return (
+        "tests" in parts
+        or "test" in parts
+        or basename == "conftest.py"
+        or basename.startswith("test_")
+        or basename.endswith("_test.py")
     )
 
 

@@ -112,6 +112,27 @@ def test_critical_flow_task_keeps_explicit_challenge_mode(tmp_path: Path) -> Non
     worker.assert_not_called()
 
 
+def test_should_upgrade_ralph_task_touching_critical_flow(tmp_path: Path) -> None:
+    service = _service(tmp_path, "src/auth/login.py")
+    task_ref = _task_ref(claimed_paths=["src/auth/login.py"], mode="ralph")
+
+    assert service._should_upgrade_to_challenge(task_ref, "wf-1") is True
+
+
+def test_should_not_upgrade_ralph_task_outside_critical_flow(tmp_path: Path) -> None:
+    service = _service(tmp_path, "src/auth/login.py")
+    task_ref = _task_ref(claimed_paths=["src/profile/view.py"], mode="ralph")
+
+    assert service._should_upgrade_to_challenge(task_ref, "wf-1") is False
+
+
+def test_should_not_upgrade_explicit_challenge_task(tmp_path: Path) -> None:
+    service = _service(tmp_path, "src/auth/login.py")
+    task_ref = _task_ref(claimed_paths=["src/auth/login.py"], mode="challenge")
+
+    assert service._should_upgrade_to_challenge(task_ref, "wf-1") is False
+
+
 def test_validate_warns_when_critical_flow_task_uses_ralph_mode() -> None:
     plan = Plan(
         tasks=[

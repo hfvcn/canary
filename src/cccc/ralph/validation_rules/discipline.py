@@ -5,9 +5,9 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, List
 
-from ..aegis import effective_intent, has_patch_shape_risk
+from ..aegis import effective_intent
 from ..models import Plan, ValidationIssue
-from .discipline_security import _check_aegis_security_checks
+from .discipline_security import _check_aegis_security_chain
 from .discipline_second_wave import (
     check_decision_hygiene_missing,
     check_drift_check_missing,
@@ -30,6 +30,7 @@ PLACEHOLDER_PATTERN = re.compile(
     "|".join(rf"\b{re.escape(token)}\b(?![/\\.\-])" for token in PLACEHOLDER_TOKENS),
     re.IGNORECASE,
 )
+CODE_FENCE_PATTERN = re.compile(r"```.*?```|~~~.*?~~~|`[^`\n]*`", re.DOTALL)
 TEST_PATH_MARKERS = ("test_", "_test", "tests/")
 COMPLEX_DEPENDENCY_COUNT = 3
 RETIREMENT_INTENTS = ("refactor", "migration")
@@ -153,7 +154,7 @@ _DISCIPLINE_RULES: List[DisciplineRule] = [
     check_drift_check_missing,
     check_plan_compat_boundary_missing,
     check_ripple_verification_too_narrow,
-    _check_aegis_security_checks,
+    _check_aegis_security_chain,
 ]
 DISCIPLINE_CHECKS: tuple[DisciplineRule, ...] = tuple(_DISCIPLINE_RULES)
 
@@ -176,7 +177,11 @@ def _placeholder_field(task: Any) -> str:
 
 
 def _contains_placeholder(value: str) -> bool:
-    return PLACEHOLDER_PATTERN.search(value) is not None
+    return PLACEHOLDER_PATTERN.search(_without_code_fences(value)) is not None
+
+
+def _without_code_fences(value: str) -> str:
+    return CODE_FENCE_PATTERN.sub("", value)
 
 
 def _has_claimed_test_path(paths: List[str]) -> bool:
@@ -189,8 +194,6 @@ def _has_claimed_test_path(paths: List[str]) -> bool:
 
 
 def _has_retirement_shape(task: Any) -> bool:
-    if has_patch_shape_risk(task):
-        return True
     text = _task_text(task)
     return any(keyword in text for keyword in RETIREMENT_SHAPE_KEYWORDS)
 

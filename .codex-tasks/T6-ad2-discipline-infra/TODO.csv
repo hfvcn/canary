@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate relevant rule infrastructure,DONE,Existing structural and coverage patterns are understood,rg discipline src/cccc/ralph tests,2026-05-17,0,
+2,Implement aegis helpers,DONE,effective_intent and has_patch_shape_risk satisfy AD-2 behavior,python -m pytest tests/test_aegis_discipline_infra.py -v,2026-05-17,0,Existing implementation satisfied AD-2 behavior
+3,Wire discipline rules into exports validator and agent registry,DONE,discipline rules are collected and registered with docs/version metadata,python -m pytest tests/test_aegis_discipline_infra.py -v,2026-05-17,0,Added missing agent docs and rule versions for second-wave and security discipline codes
+4,Run targeted validation,DONE,Target test file passes,python -m pytest tests/test_aegis_discipline_infra.py -v,2026-05-17,0,12 passed
+5,Review final diff,DONE,Only scoped files changed intentionally,git diff -- src/cccc/ralph tests/test_aegis_discipline_infra.py,2026-05-17,0,Reviewed scoped diff; unrelated pre-existing worktree changes remain untouched

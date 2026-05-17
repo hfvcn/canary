@@ -13,7 +13,15 @@ from typing import Any, Dict
 import yaml
 from pydantic import ValidationError
 
-from .models import CriticalFlow, ForbiddenFlow, Plan, RegistrationInvariant
+from .models import (
+    AegisDiscipline,
+    CriticalFlow,
+    ForbiddenFlow,
+    Plan,
+    RegistrationInvariant,
+    RepairTrack,
+    RetirementTrack,
+)
 
 # ---------------------------------------------------------------------------
 # Legacy-schema stderr banner
@@ -150,6 +158,9 @@ def _known_fields(model_cls: type) -> set[str]:
 
 _PLAN_FIELDS: set[str] | None = None
 _TASK_FIELDS: set[str] | None = None
+_AEGIS_FIELDS: set[str] | None = None
+_REPAIR_TRACK_FIELDS: set[str] | None = None
+_RETIREMENT_TRACK_FIELDS: set[str] | None = None
 
 
 def _get_plan_fields() -> set[str]:
@@ -165,6 +176,27 @@ def _get_task_fields() -> set[str]:
         from .models import TaskSpec
         _TASK_FIELDS = _known_fields(TaskSpec)
     return _TASK_FIELDS
+
+
+def _get_aegis_fields() -> set[str]:
+    global _AEGIS_FIELDS
+    if _AEGIS_FIELDS is None:
+        _AEGIS_FIELDS = _known_fields(AegisDiscipline)
+    return _AEGIS_FIELDS
+
+
+def _get_repair_track_fields() -> set[str]:
+    global _REPAIR_TRACK_FIELDS
+    if _REPAIR_TRACK_FIELDS is None:
+        _REPAIR_TRACK_FIELDS = _known_fields(RepairTrack)
+    return _REPAIR_TRACK_FIELDS
+
+
+def _get_retirement_track_fields() -> set[str]:
+    global _RETIREMENT_TRACK_FIELDS
+    if _RETIREMENT_TRACK_FIELDS is None:
+        _RETIREMENT_TRACK_FIELDS = _known_fields(RetirementTrack)
+    return _RETIREMENT_TRACK_FIELDS
 
 
 def _format_allowed_fields(model_name: str, fields: set[str], *, sort_fields: bool = True) -> str:
@@ -196,7 +228,69 @@ def _check_strict_extra_fields(data: Dict[str, Any]) -> list[str]:
             if key not in task_fields:
                 suggestion = _suggest_field_by_name(key, "TaskSpec")
                 errors.append(f"tasks.{idx}.{key}: Extra inputs are not permitted.{suggestion} {task_guidance}")
+        errors.extend(_check_strict_aegis_extra_fields(idx, task_data.get("aegis")))
 
+    return errors
+
+
+def _check_strict_aegis_extra_fields(idx: int, aegis: Any) -> list[str]:
+    if not isinstance(aegis, dict):
+        return []
+    errors = _check_mapping_extra_fields(
+        prefix=f"tasks.{idx}.aegis",
+        data=aegis,
+        model_name="AegisDiscipline",
+        allowed_fields=_get_aegis_fields(),
+    )
+    errors.extend(_check_strict_nested_model_fields(
+        prefix=f"tasks.{idx}.aegis",
+        data=aegis,
+        field="repair_track",
+        model_name="RepairTrack",
+        allowed_fields=_get_repair_track_fields(),
+    ))
+    errors.extend(_check_strict_nested_model_fields(
+        prefix=f"tasks.{idx}.aegis",
+        data=aegis,
+        field="retirement_track",
+        model_name="RetirementTrack",
+        allowed_fields=_get_retirement_track_fields(),
+    ))
+    return errors
+
+
+def _check_strict_nested_model_fields(
+    *,
+    prefix: str,
+    data: Dict[str, Any],
+    field: str,
+    model_name: str,
+    allowed_fields: set[str],
+) -> list[str]:
+    nested = data.get(field)
+    if not isinstance(nested, dict):
+        return []
+    return _check_mapping_extra_fields(
+        prefix=f"{prefix}.{field}",
+        data=nested,
+        model_name=model_name,
+        allowed_fields=allowed_fields,
+    )
+
+
+def _check_mapping_extra_fields(
+    *,
+    prefix: str,
+    data: Dict[str, Any],
+    model_name: str,
+    allowed_fields: set[str],
+) -> list[str]:
+    guidance = _format_allowed_fields(model_name, allowed_fields)
+    errors = []
+    for key in data:
+        if key not in allowed_fields:
+            suggestion = _suggest_field_by_name(key, model_name)
+            errors.append(f"{prefix}.{key}: Extra inputs are not permitted.{suggestion} {guidance}")
     return errors
 
 

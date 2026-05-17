@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate existing Aegis discipline patterns,DONE,"Relevant implementation and tests identified","rg \"aegis|critical_flow|verification\\.checks|E_AEGIS_SECURITY_CHAIN_MISSING\" -n","2026-05-17",0,
+2,Implement or verify AD-9 rule,DONE,"Rule behavior matches requested predicates","python -m pytest tests/test_aegis_security_chain.py -v","2026-05-17",0,
+3,Run final validation,DONE,"Requested pytest command passes under timeout","python -m pytest tests/test_aegis_security_chain.py -v","2026-05-17",0,

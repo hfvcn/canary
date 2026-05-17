@@ -230,7 +230,18 @@ SOLVE_STEPS: list[StepSpec] = [
     _make_step(1, "understand", "Understand the problem", "Read code, docs, and issue context. Identify root cause and likely files.", None),
     _make_step(2, "plan", "Create and validate plan.yaml", "Create plan.yaml. Run ralph validate yourself to iterate, then ralph flow next to confirm.", _check_plan),
     _make_step(3, "review", "Collect Codex review output", "Save codex_bridge.py review JSON under .ralph-flow/step-3-review/.", _codex_step("step-3-review")),
-    _make_step(4, "gaps", "Record discovered gaps", "Update the tracker when --tracker is provided; it must have git diff additions.", _check_gap_record),
+    _make_step(
+        4,
+        "gaps",
+        "Record discovered gaps",
+        (
+            "Update the tracker when --tracker is provided:\n"
+            "1. Record discovered gaps and new findings.\n"
+            "2. Archive resolved items by moving them from the short tracker to the full version/archive.\n"
+            "3. Include a version marker line (for example v{N}) so git diff can detect current-session adds."
+        ),
+        _check_gap_record,
+    ),
     _make_step(5, "execute", "Execute and verify", "Dispatch plan tasks to codex_bridge.py (--sandbox workspace-write) in parallel.\nSave execution JSON under .ralph-flow/step-5-execute/.\nThen run ralph flow next — verification runs automatically after Codex output is confirmed.", _check_execute_and_verify),
     _make_step(6, "guide", "Generate capability guide", "Auto-generates schema/rules/CLI sections and incrementally updates runtime sections via git diff. Review any warnings for manual sections.", _check_guide),
 ]

@@ -40,12 +40,18 @@ AEGIS_EVIDENCE_NO_COVERAGE_CLAIM_WARNING = (
 )
 SECURITY_LINT_CHECK_NAME = "security_lint_debug_true"
 DEBUG_TRUE_TEXT = "debug" + "=True"
-SECURITY_LINT_DEBUG_FAILURE = (
-    f"security_lint failed: {DEBUG_TRUE_TEXT} found in non-test source files"
+SECURITY_LINT_FAILURE = (
+    "security_lint failed: unsafe pattern found in non-test source files"
+)
+SECURITY_LINT_WARNING = (
+    "security_lint warning: unsafe pattern found in non-test source files"
 )
 INPUT_ROBUSTNESS_CHECK_NAME = "input_robustness_smoke"
 INPUT_ROBUSTNESS_FAILURE = (
     "input_robustness failed: input/search/query critical_flow lacks malformed input coverage"
+)
+INPUT_ROBUSTNESS_WARNING = (
+    "input_robustness warning: input/search/query critical_flow lacks malformed input coverage"
 )
 SECURITY_LINT_HIT_LIMIT = 20
 ENTRYPOINT_DEBUG_HIT_LIMIT = 10
@@ -232,29 +238,38 @@ def process_completed_event(
             verification = verification.model_copy(
                 update={"warnings": [*verification.warnings, FORCE_COMPLETE_MISMATCH_WARNING]}
             )
-        verification = _apply_aegis_evidence_gate(
-            verification=verification,
-            evidence_text=evidence_summary,
-            task_ref=state.task,
-        )
+        if not _is_verifier_infra_failure(verification):
+            verification = _apply_aegis_evidence_gate(
+                verification=verification,
+                payload=payload,
+                task_ref=state.task,
+            )
 
     workspace_root = _workspace_root(engine)
-    verification = _apply_security_lint_gate(
-        verification=verification,
-        engine=engine,
-        task_id=task_id,
-        changed_files=list(changed_files),
-        workspace_root=workspace_root,
-    )
-    verification = _apply_input_robustness_gate(
-        verification=verification,
-        engine=engine,
-        task_id=task_id,
-        workspace_root=workspace_root,
+    gate_task_ref = _mode_gate_task_ref(
+        ralph_service=ralph_service,
         task_ref=state.task,
+        workflow_id=state.workflow_id,
     )
+    if not _is_verifier_infra_failure(verification):
+        verification = _apply_security_lint_gate(
+            verification=verification,
+            engine=engine,
+            task_id=task_id,
+            changed_files=list(changed_files),
+            workspace_root=workspace_root,
+            task_ref=gate_task_ref,
+        )
+        verification = _apply_input_robustness_gate(
+            verification=verification,
+            engine=engine,
+            task_id=task_id,
+            workspace_root=workspace_root,
+            task_ref=gate_task_ref,
+        )
     engine.record_verification_result(task_id, verification, hook_ctx=hook_ctx)
     result["verification_outcome"] = verification.overall_outcome
+    result["verification_failure_type"] = verification.failure_type
 
     if verification.overall_outcome == "agent_pending":
         # RA-3: agent verification — task stays in VERIFYING, just notify
@@ -294,6 +309,9 @@ def process_completed_event(
         )
         notification_outcome = "skipped_blocked"
         context_error = error_msg
+    elif _is_verifier_infra_failure(verification):
+        notification_outcome = "infra_error"
+        context_error = verification.summary or "Verification infrastructure error"
     else:
         on_task_failed_fn(
             task_id=task_id,
@@ -346,7 +364,7 @@ def _verify_completion_with_infra_retries(
             workflow_id=workflow_id,
             task_ref=task_ref,
         )
-        if verification.overall_outcome != "infra_error":
+        if not _is_verifier_infra_failure(verification):
             return verification, retries_used
         if retries_used >= MAX_VERIFICATION_INFRA_RETRIES:
             return _escalate_infra_error(verification), retries_used
@@ -385,12 +403,14 @@ def _verification_error_result(
     workflow_id: str,
     exc: Exception,
 ) -> VerificationResult:
+    outcome = _verification_error_outcome(exc)
     return VerificationResult(
         verification_id=f"ver-error-{task_id}",
         workflow_id=workflow_id,
         task_id=task_id,
-        overall_outcome=_verification_error_outcome(exc),
+        overall_outcome=outcome,
         checks=[],
+        failure_type=_verification_error_failure_type(exc),
         summary=f"verification_error: {exc}",
     )
 
@@ -401,15 +421,28 @@ def _verification_error_outcome(exc: Exception) -> str:
     return "failed"
 
 
+def _verification_error_failure_type(exc: Exception) -> str:
+    if isinstance(exc, VERIFICATION_INFRA_EXCEPTIONS):
+        return "infra_error"
+    return "task_quality"
+
+
 def _escalate_infra_error(verification: VerificationResult) -> VerificationResult:
     summary = verification.summary or "verification infrastructure error"
     return verification.model_copy(
         update={
-            "overall_outcome": "failed",
+            "overall_outcome": "infra_error",
+            "failure_type": "infra_error",
             "warnings": [*verification.warnings, VERIFICATION_INFRA_ESCALATED_WARNING],
             "summary": f"{VERIFICATION_INFRA_ESCALATED_WARNING}: {summary}",
         }
     )
+
+
+def _is_verifier_infra_failure(verification: VerificationResult) -> bool:
+    failure_type = str(getattr(verification, "failure_type", "") or "").strip()
+    outcome = str(getattr(verification, "overall_outcome", "") or "").strip()
+    return failure_type == "infra_error" or outcome == "infra_error"
 
 
 def process_failed_event(
@@ -453,73 +486,135 @@ def process_failed_event(
     return result
 
 
-def _check_aegis_evidence(evidence_text: str, task_ref: Any) -> Tuple[List[str], List[str]]:
-    """Return Aegis evidence gate (errors, warnings) for a completed task."""
+def _check_aegis_evidence(payload: Dict[str, Any], task_ref: Any) -> List[VerificationCheck]:
+    """Return Aegis evidence gate checks for a completed task."""
     aegis = getattr(task_ref, "aegis", None)
     if not aegis:
-        return [], []
+        return []
 
-    evidence = str(evidence_text or "").strip()
-    errors: List[str] = []
-    warnings: List[str] = []
-    has_missing_evidence = not evidence or evidence.casefold() in _TRIVIAL_EVIDENCE
-    if has_missing_evidence:
-        errors.append(AEGIS_EVIDENCE_MISSING_ERROR)
+    evidence = _aegis_evidence_text(payload)
+    mode = _verification_mode(task_ref)
+    checks: List[VerificationCheck] = []
+    has_trivial_evidence = _is_trivial_evidence(evidence)
 
     intent = effective_intent(task_ref)
     evidence_search = evidence.casefold()
     if intent == "fix" and not _has_any_keyword(evidence_search, _FIX_ROOT_CAUSE_KEYWORDS):
-        warnings.append(AEGIS_FIX_ROOT_CAUSE_WARNING)
+        checks.append(_aegis_evidence_check(
+            message=AEGIS_FIX_ROOT_CAUSE_WARNING,
+            severity="warning",
+            evidence_text=evidence,
+        ))
     if intent == "refactor" and not _has_any_keyword(evidence_search, _REFACTOR_RETIREMENT_KEYWORDS):
-        warnings.append(AEGIS_REFACTOR_RETIREMENT_WARNING)
-    if not has_missing_evidence and not _has_any_keyword(evidence_search, _COVERAGE_CLAIM_KEYWORDS):
-        warnings.append(AEGIS_EVIDENCE_NO_COVERAGE_CLAIM_WARNING)
-    return errors, warnings
+        checks.append(_aegis_evidence_check(
+            message=AEGIS_REFACTOR_RETIREMENT_WARNING,
+            severity="warning",
+            evidence_text=evidence,
+        ))
+    if has_trivial_evidence:
+        checks.append(_aegis_evidence_check(
+            message=AEGIS_EVIDENCE_MISSING_ERROR,
+            severity="error" if mode == "challenge" else "warning",
+            evidence_text=evidence,
+        ))
+    return checks
+
+
+def _check_aegis_coverage_warnings(evidence_text: str, task_ref: Any) -> List[str]:
+    aegis = getattr(task_ref, "aegis", None)
+    if not aegis:
+        return []
+    evidence = str(evidence_text or "").strip()
+    if _is_trivial_evidence(evidence):
+        return []
+    if not _has_any_keyword(evidence.casefold(), _COVERAGE_CLAIM_KEYWORDS):
+        return [AEGIS_EVIDENCE_NO_COVERAGE_CLAIM_WARNING]
+    return []
+
+
+def _aegis_evidence_text(payload: Dict[str, Any]) -> str:
+    summary = str(payload.get("evidence_summary") or "").strip()
+    if summary:
+        return summary
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, dict):
+        return ""
+    for key in ("summary", "text", "message"):
+        value = str(evidence.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _is_trivial_evidence(evidence_text: str) -> bool:
+    evidence = str(evidence_text or "").strip()
+    return not evidence or evidence.casefold() in _TRIVIAL_EVIDENCE
+
+
+def _aegis_evidence_check(
+    *,
+    message: str,
+    severity: str,
+    evidence_text: str,
+) -> VerificationCheck:
+    details_key = "errors" if severity == "error" else "warnings"
+    return VerificationCheck(
+        name=AEGIS_EVIDENCE_CHECK_NAME,
+        outcome="failed" if severity == "error" else "passed",
+        message=message,
+        details={
+            "severity": severity,
+            "errors": [message] if details_key == "errors" else [],
+            "warnings": [message] if details_key == "warnings" else [],
+            "evidence": str(evidence_text or "").strip(),
+        },
+    )
+
+
+def _aegis_warning_messages(checks: List[VerificationCheck]) -> List[str]:
+    messages: List[str] = []
+    for check in checks:
+        details = check.details or {}
+        if details.get("severity") == "warning" and check.message:
+            messages.append(check.message)
+    return messages
+
+
+def _aegis_failed_messages(checks: List[VerificationCheck]) -> List[str]:
+    return [check.message for check in checks if check.outcome == "failed" and check.message]
+
+
+def _aegis_checks_have_failure(checks: List[VerificationCheck]) -> bool:
+    return any(check.outcome == "failed" for check in checks)
 
 
 def _apply_aegis_evidence_gate(
     *,
     verification: VerificationResult,
-    evidence_text: str,
     task_ref: Any,
+    payload: Optional[Dict[str, Any]] = None,
+    evidence_text: str = "",
 ) -> VerificationResult:
-    errors, warnings = _check_aegis_evidence(evidence_text, task_ref)
-    if not errors and not warnings:
+    gate_payload = dict(payload or {"evidence_summary": evidence_text})
+    evidence = _aegis_evidence_text(gate_payload)
+    checks = _check_aegis_evidence(gate_payload, task_ref)
+    warnings = [
+        *_aegis_warning_messages(checks),
+        *_check_aegis_coverage_warnings(evidence, task_ref),
+    ]
+    if not checks and not warnings:
         return verification
 
-    mode = str(getattr(task_ref, "verification_mode", "ralph") or "ralph")
     updates: Dict[str, Any] = {}
-    gate_warnings = list(warnings)
-    if errors and mode == "challenge":
+    if checks:
+        updates["checks"] = [*verification.checks, *checks]
+    if _aegis_checks_have_failure(checks):
+        failed_messages = _aegis_failed_messages(checks)
         updates["overall_outcome"] = "failed"
-        updates["checks"] = [
-            *verification.checks,
-            _build_aegis_evidence_check(errors, warnings, evidence_text),
-        ]
-        updates["summary"] = _aegis_failure_summary(verification.summary, errors)
-    elif errors:
-        gate_warnings = [*errors, *gate_warnings]
-
-    if gate_warnings:
-        updates["warnings"] = [*verification.warnings, *gate_warnings]
+        updates["summary"] = _aegis_failure_summary(verification.summary, failed_messages)
+    if warnings:
+        updates["warnings"] = [*verification.warnings, *warnings]
     return verification.model_copy(update=updates)
-
-
-def _build_aegis_evidence_check(
-    errors: List[str],
-    warnings: List[str],
-    evidence_text: str,
-) -> VerificationCheck:
-    return VerificationCheck(
-        name=AEGIS_EVIDENCE_CHECK_NAME,
-        outcome="failed",
-        message="Aegis evidence quality gate failed",
-        details={
-            "errors": list(errors),
-            "warnings": list(warnings),
-            "evidence": str(evidence_text or "").strip(),
-        },
-    )
 
 
 def _aegis_failure_summary(summary: str, errors: List[str]) -> str:
@@ -538,6 +633,20 @@ def _workspace_root(engine: Any) -> Path:
     return Path(getattr(engine, "project_root", None) or Path.cwd())
 
 
+def _mode_gate_task_ref(*, ralph_service: Any, task_ref: Any, workflow_id: str) -> Any:
+    mode = _verification_mode(task_ref)
+    if mode != "ralph":
+        return task_ref
+    should_upgrade = getattr(ralph_service, "_should_upgrade_to_challenge", None)
+    if not callable(should_upgrade) or not should_upgrade(task_ref, workflow_id):
+        return task_ref
+    return task_ref.model_copy(update={"verification_mode": "challenge"})
+
+
+def _verification_mode(task_ref: Any) -> str:
+    return str(getattr(task_ref, "verification_mode", "ralph") or "ralph")
+
+
 def _apply_security_lint_gate(
     *,
     verification: VerificationResult,
@@ -545,12 +654,15 @@ def _apply_security_lint_gate(
     task_id: str,
     changed_files: List[str],
     workspace_root: Path,
+    task_ref: Any,
 ) -> VerificationResult:
-    _check_security_lint(
+    mode = _verification_mode(task_ref)
+    lint_hits = _check_security_lint(
         engine=engine,
         task_id=task_id,
         changed_files=changed_files,
         workspace_root=workspace_root,
+        task_ref=task_ref,
     )
     scanned_basenames = _changed_file_basenames(changed_files)
     entrypoint_hits = _check_entrypoint_debug(
@@ -558,14 +670,14 @@ def _apply_security_lint_gate(
         task_id=task_id,
         workspace_root=workspace_root,
         already_scanned=scanned_basenames,
+        task_ref=task_ref,
     )
-    debug_hits = [
-        *_scan_changed_file_debug_true(changed_files, workspace_root),
-        *entrypoint_hits,
-    ]
-    if not debug_hits:
+    security_hits = [*lint_hits, *entrypoint_hits]
+    if not security_hits:
         return verification
-    return _fail_verification_for_debug_true(verification, debug_hits)
+    if mode != "challenge":
+        return _warn_verification_for_security_lint(verification, security_hits)
+    return _fail_verification_for_security_lint(verification, security_hits)
 
 
 def _changed_file_basenames(changed_files: List[str]) -> List[str]:
@@ -576,39 +688,7 @@ def _changed_file_basenames(changed_files: List[str]) -> List[str]:
     ]
 
 
-def _scan_changed_file_debug_true(
-    changed_files: List[str],
-    workspace_root: Path,
-) -> List[Dict[str, Any]]:
-    from ...ralph.security_scan import _DEBUG_TRUE_RE, _is_security_lint_target
-
-    hits: List[Dict[str, Any]] = []
-    for raw_path in changed_files:
-        path_text = str(raw_path or "").strip()
-        if not _is_security_lint_target(path_text):
-            continue
-        file_path = Path(path_text)
-        if not file_path.is_absolute():
-            file_path = workspace_root / path_text
-        if not file_path.is_file():
-            continue
-        lines = file_path.read_text(encoding="utf-8").splitlines()
-        for lineno, line in enumerate(lines, start=1):
-            if _DEBUG_TRUE_RE.search(line):
-                hits.append(_debug_true_hit(path_text, lineno, line))
-    return hits
-
-
-def _debug_true_hit(path_text: str, lineno: int, line: str) -> Dict[str, Any]:
-    return {
-        "file": path_text,
-        "line": lineno,
-        "type": "debug_true",
-        "snippet": line.strip()[:120],
-    }
-
-
-def _fail_verification_for_debug_true(
+def _fail_verification_for_security_lint(
     verification: VerificationResult,
     hits: List[Dict[str, Any]],
 ) -> VerificationResult:
@@ -621,22 +701,42 @@ def _fail_verification_for_debug_true(
     )
 
 
+def _warn_verification_for_security_lint(
+    verification: VerificationResult,
+    hits: List[Dict[str, Any]],
+) -> VerificationResult:
+    return verification.model_copy(
+        update={
+            "warnings": [
+                *verification.warnings,
+                _security_lint_summary(SECURITY_LINT_WARNING, hits),
+            ],
+        }
+    )
+
+
 def _security_lint_failure_check(hits: List[Dict[str, Any]]) -> VerificationCheck:
     return VerificationCheck(
         name=SECURITY_LINT_CHECK_NAME,
         outcome="failed",
-        message=SECURITY_LINT_DEBUG_FAILURE,
+        message=SECURITY_LINT_FAILURE,
         details={"hits": hits[:SECURITY_LINT_HIT_LIMIT]},
     )
 
 
 def _security_lint_failure_summary(summary: str, hits: List[Dict[str, Any]]) -> str:
-    files = sorted({str(hit.get("file") or "") for hit in hits if hit.get("file")})
-    gate_summary = f"{SECURITY_LINT_DEBUG_FAILURE}: {', '.join(files)}"
+    gate_summary = _security_lint_summary(SECURITY_LINT_FAILURE, hits)
     current = str(summary or "").strip()
     if not current:
         return gate_summary
     return f"{current}; {gate_summary}"
+
+
+def _security_lint_summary(prefix: str, hits: List[Dict[str, Any]]) -> str:
+    files = sorted({str(hit.get("file") or "") for hit in hits if hit.get("file")})
+    if not files:
+        return prefix
+    return f"{prefix}: {', '.join(files)}"
 
 
 def _apply_input_robustness_gate(
@@ -653,6 +753,11 @@ def _apply_input_robustness_gate(
     if not _input_robustness_gap_blocks(plan_data):
         _record_input_robustness_warning(engine, task_id, gap)
         return verification
+    mode = _verification_mode(task_ref)
+    if mode != "challenge":
+        _record_input_robustness_warning(engine, task_id, gap)
+        return _warn_verification_for_input_robustness(verification, gap)
+    _record_input_robustness_failure(engine, task_id, gap)
     return _fail_verification_for_input_robustness(verification, gap)
 
 
@@ -695,6 +800,20 @@ def _fail_verification_for_input_robustness(
     )
 
 
+def _warn_verification_for_input_robustness(
+    verification: VerificationResult,
+    gap: Dict[str, Any],
+) -> VerificationResult:
+    return verification.model_copy(
+        update={
+            "warnings": [
+                *verification.warnings,
+                _input_robustness_summary(INPUT_ROBUSTNESS_WARNING, gap),
+            ],
+        }
+    )
+
+
 def _input_robustness_failure_check(gap: Dict[str, Any]) -> VerificationCheck:
     return VerificationCheck(
         name=INPUT_ROBUSTNESS_CHECK_NAME,
@@ -705,12 +824,18 @@ def _input_robustness_failure_check(gap: Dict[str, Any]) -> VerificationCheck:
 
 
 def _input_robustness_failure_summary(summary: str, gap: Dict[str, Any]) -> str:
-    flows = ", ".join(gap.get("critical_flows_with_input", []))
-    gate_summary = f"{INPUT_ROBUSTNESS_FAILURE}: {flows}" if flows else INPUT_ROBUSTNESS_FAILURE
+    gate_summary = _input_robustness_summary(INPUT_ROBUSTNESS_FAILURE, gap)
     current = str(summary or "").strip()
     if not current:
         return gate_summary
     return f"{current}; {gate_summary}"
+
+
+def _input_robustness_summary(prefix: str, gap: Dict[str, Any]) -> str:
+    flows = ", ".join(gap.get("critical_flows_with_input", []))
+    if not flows:
+        return prefix
+    return f"{prefix}: {flows}"
 
 
 def _check_output_contract(
@@ -761,6 +886,8 @@ def _check_security_lint(
     task_id: str,
     changed_files: List[str],
     workspace_root: Path,
+    *,
+    task_ref: Any = None,
 ) -> List[Dict[str, Any]]:
     from ...ralph.security_scan import scan_security_lint, format_security_summary
 
@@ -769,15 +896,14 @@ def _check_security_lint(
     hits = scan_security_lint(changed_files, workspace_root)
     if not hits:
         return []
-    try:
-        engine.record_verification_warning(
-            task_id,
-            warning_type="security_lint",
-            message=format_security_summary(hits),
-            evidence={"hits": hits[:SECURITY_LINT_HIT_LIMIT]},
-        )
-    except Exception:
-        logger.debug("Failed to record security lint warning", exc_info=True)
+    _record_security_lint_issue(
+        engine=engine,
+        task_id=task_id,
+        hits=hits,
+        blocking=_verification_mode(task_ref) == "challenge",
+        message=format_security_summary(hits),
+        hit_limit=SECURITY_LINT_HIT_LIMIT,
+    )
     return hits
 
 
@@ -786,25 +912,95 @@ def _check_entrypoint_debug(
     task_id: str,
     workspace_root: Path,
     already_scanned: Optional[List[str]] = None,
+    *,
+    task_ref: Any = None,
 ) -> List[Dict[str, Any]]:
     from ...ralph.security_scan import scan_entrypoint_debug
 
     hits = scan_entrypoint_debug(workspace_root, already_scanned=already_scanned)
     if not hits:
         return []
+    _record_security_lint_issue(
+        engine=engine,
+        task_id=task_id,
+        hits=hits,
+        blocking=_verification_mode(task_ref) == "challenge",
+        message=(
+            f"production entry point contains {DEBUG_TRUE_TEXT}: "
+            f"{', '.join(h['file'] for h in hits)}"
+        ),
+        hit_limit=ENTRYPOINT_DEBUG_HIT_LIMIT,
+    )
+    return hits
+
+
+def _record_security_lint_issue(
+    *,
+    engine: Any,
+    task_id: str,
+    hits: List[Dict[str, Any]],
+    blocking: bool,
+    message: str,
+    hit_limit: int,
+) -> None:
+    evidence = {"hits": hits[:hit_limit]}
+    if blocking:
+        _record_verification_failure(
+            engine=engine,
+            task_id=task_id,
+            failure_type="security_lint",
+            message=message,
+            evidence=evidence,
+        )
+        return
+    _record_verification_warning(
+        engine=engine,
+        task_id=task_id,
+        warning_type="security_lint",
+        message=message,
+        evidence=evidence,
+    )
+
+
+def _record_verification_failure(
+    *,
+    engine: Any,
+    task_id: str,
+    failure_type: str,
+    message: str,
+    evidence: Dict[str, Any],
+) -> None:
+    recorder = getattr(engine, "record_verification_failure", None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(
+            task_id,
+            failure_type=failure_type,
+            message=message,
+            evidence=dict(evidence),
+        )
+    except Exception:
+        logger.debug("Failed to record verification failure", exc_info=True)
+
+
+def _record_verification_warning(
+    *,
+    engine: Any,
+    task_id: str,
+    warning_type: str,
+    message: str,
+    evidence: Dict[str, Any],
+) -> None:
     try:
         engine.record_verification_warning(
             task_id,
-            warning_type="security_lint",
-            message=(
-                f"production entry point contains {DEBUG_TRUE_TEXT}: "
-                f"{', '.join(h['file'] for h in hits)}"
-            ),
-            evidence={"hits": hits[:ENTRYPOINT_DEBUG_HIT_LIMIT]},
+            warning_type=warning_type,
+            message=message,
+            evidence=dict(evidence),
         )
     except Exception:
-        logger.debug("Failed to record entrypoint debug warning", exc_info=True)
-    return hits
+        logger.debug("Failed to record verification warning", exc_info=True)
 
 
 def _check_input_robustness(
@@ -814,9 +1010,12 @@ def _check_input_robustness(
     *,
     task_ref: Any = None,
 ) -> Optional[Dict[str, Any]]:
-    gap, _plan_data = _input_robustness_gap_for_task(engine, task_id, workspace_root, task_ref)
+    gap, plan_data = _input_robustness_gap_for_task(engine, task_id, workspace_root, task_ref)
     if not gap:
         return None
+    if _verification_mode(task_ref) == "challenge" and _input_robustness_gap_blocks(plan_data):
+        _record_input_robustness_failure(engine, task_id, gap)
+        return gap
     _record_input_robustness_warning(engine, task_id, gap)
     return gap
 
@@ -983,15 +1182,23 @@ def _verification_text_has_input_robustness_marker(verification: Dict[str, Any])
 
 
 def _record_input_robustness_warning(engine: Any, task_id: str, gap: Dict[str, Any]) -> None:
-    try:
-        engine.record_verification_warning(
-            task_id,
-            warning_type="input_robustness_gap",
-            message=gap["message"],
-            evidence=_input_robustness_evidence(gap),
-        )
-    except Exception:
-        logger.debug("Failed to record input robustness warning", exc_info=True)
+    _record_verification_warning(
+        engine=engine,
+        task_id=task_id,
+        warning_type="input_robustness_gap",
+        message=gap["message"],
+        evidence=_input_robustness_evidence(gap),
+    )
+
+
+def _record_input_robustness_failure(engine: Any, task_id: str, gap: Dict[str, Any]) -> None:
+    _record_verification_failure(
+        engine=engine,
+        task_id=task_id,
+        failure_type="input_robustness_gap",
+        message=gap["message"],
+        evidence=_input_robustness_evidence(gap),
+    )
 
 
 def _input_robustness_evidence(gap: Dict[str, Any]) -> Dict[str, Any]:

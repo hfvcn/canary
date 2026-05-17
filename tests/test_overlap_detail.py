@@ -28,8 +28,8 @@ def _task(task_id: str, claimed_paths: list[str]) -> dict:
 def test_shared_path_message_names_task_pair_and_paths() -> None:
     plan = Plan.model_validate({
         "tasks": [
-            _task("T1", ["app/routes.py"]),
-            _task("T2", ["app/"]),
+            _task("T1", ["app/"]),
+            _task("T2", ["app/routes.py"]),
         ],
     })
 
@@ -37,4 +37,4 @@ def test_shared_path_message_names_task_pair_and_paths() -> None:
 
     issues = _issues(report, "W_SHARED_PATH_NO_DEPENDENCY")
     assert len(issues) == 1
-    assert 'T1 claims "app/routes.py" which overlaps with T2\'s "app/"' in issues[0].message
+    assert "T1 claims app/ which contains T2's app/routes.py" in issues[0].message

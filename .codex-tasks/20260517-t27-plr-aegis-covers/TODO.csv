@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate relevant rules and tests,DONE,Relevant files and expected behavior identified,rg/sed inspection,2026-05-17,0,"discipline.py handles fenced blocks; coverage.py already downgrades W_COVERS_NOT_EXERCISED with auto-expanded paths; covers_paths_validator needs plan context"
+2,Verify or update PLR-1 code fence exception,DONE,Placeholder checks ignore fenced and inline code sections,pytest targeted placeholder tests,2026-05-17,0,"2 placeholder tests passed"
+3,Implement PLR-2 covers.paths auto-fill and hint downgrade,DONE,covers.tasks with empty covers.paths uses claimed_paths and warning becomes hint,pytest covers auto-expand tests,2026-05-17,0,"6 covers tests passed, including covers_paths_unverified auto-expanded allowed paths"
+4,Run requested validation,DONE,Requested pytest command passes,python -m pytest tests/test_covers_auto_expand.py tests/test_aegis_discipline_rules.py -k placeholder -v,2026-05-17,0,"2 selected placeholder tests passed after final code change"

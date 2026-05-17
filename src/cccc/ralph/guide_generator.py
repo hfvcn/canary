@@ -8,7 +8,13 @@ from pathlib import Path
 
 from .guide_cli_reference import generate_cli_reference_section
 from .guide_rules import generate_rules_reference_section
-from .guide_schema import generate_schema_reference_section
+from .guide_schema import (
+    ModelReference,
+    _schema_model_references,
+    generate_schema_reference_section,
+)
+
+MODEL_REFERENCES: tuple[ModelReference, ...] = _schema_model_references()
 
 SECTION_HEADING_RE = re.compile(r"^## \d*\.?\s*(.+)$")
 

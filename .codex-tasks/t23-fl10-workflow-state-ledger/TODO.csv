@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate current status sources and ledger schema,DONE,Relevant code paths identified,rg/read target files,2026-05-17T00:00:00Z,0,"core suggest reads Plan.state; workflow engine ledger records verification_passed/completed statuses"
+2,Implement ledger-first status read for ralph suggest,DONE,ralph suggest uses ledger status by default,python -m pytest tests/test_plan_state_writeback.py -v,2026-05-17T00:00:00Z,0,"core suggest accepts ledger_path and CLI auto-detects workflow ledger"
+3,Update focused tests if needed,DONE,Regression captures completed workflow task without sync-state,python -m pytest tests/test_plan_state_writeback.py -v,2026-05-17T00:00:00Z,0,"added ledger-backed suggest regression"
+4,Run requested validation,DONE,Specified pytest command passes,python -m pytest tests/test_plan_state_writeback.py -v,2026-05-17T00:00:00Z,0,"3 passed in 0.93s"

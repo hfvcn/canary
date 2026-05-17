@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate validate and IPC flow,DONE,Relevant files and existing patterns identified,rg validate/daemon event code,2026-05-17T00:00:00+08:00,0,Found cli validate path plus ralph_validate_event daemon handler
+2,Implement compact validate_result event,DONE,ralph.validate_result emitted after validate returns and daemon failures are skipped,pytest target tests,2026-05-17T00:00:00+08:00,0,Updated CLI payload daemon handler validation and event contract mapping
+3,Run requested validation,DONE,Requested pytest command passes,python -m pytest tests/test_ralph_validate_ledger.py tests/test_validate_ledger_event.py -v,2026-05-17T00:00:00+08:00,0,Requested tests passed; parity add-on run also passed 8 total in 1.10s with timeout=60

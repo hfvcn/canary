@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate current ready-batch and Aegis rule structure,DONE,Relevant files and call paths identified,rg/read target files,2026-05-17T00:00:00+08:00,0,Found daemon/core suggest Aegis helpers and second-wave rule registration.
+2,Implement AD-7 quick-check in ralph_service.py,DONE,E_AEGIS task-local issues block ready batch and W_AEGIS only affect rationale,python -m pytest tests/test_suggest_aegis_filter.py -v,2026-05-17T00:00:00+08:00,0,Passed 4 tests.
+3,Verify or add AD-8 second-wave rules and tests,DONE,Requested rule IDs exist and each has coverage,python -m pytest tests/test_aegis_second_wave.py -v,2026-05-17T00:00:00+08:00,0,Passed 7 tests.
+4,Run requested combined validation,DONE,Requested pytest command passes,python -m pytest tests/test_suggest_aegis_filter.py tests/test_aegis_second_wave.py -v,2026-05-17T00:00:00+08:00,0,Passed 11 tests.

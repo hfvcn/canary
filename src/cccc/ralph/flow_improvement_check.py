@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import datetime
+import dataclasses
 import pathlib
 import re
 import subprocess
@@ -20,16 +20,32 @@ _TRACKER_ID_RE = re.compile(r"[A-Z]{1,3}-\d+")
 _TRACKER_ID_SPLIT_RE = re.compile(r"[/,、\s]+")
 _TRACKER_HEADER_END = "---"
 _TRACKER_SECTION_PREFIX = "#### "
+_PRE_FLOW_SNAPSHOT_PARAM = "tracker_pre_flow_snapshot"
+_PRE_FLOW_SNAPSHOT_TRACKERS = "trackers"
+_PRE_FLOW_SNAPSHOT_STARTED_AT = "started_at"
+
+
+@dataclasses.dataclass(frozen=True)
+class _TrackerCheckContext:
+    cwd: str
+    version: str
+    started_at: str
+    pre_flow_snapshots: dict[str, str]
 
 
 def _check_improvement_register(state: FlowState) -> CheckResult:
     cwd, tracker_short, tracker_full = _tracker_paths(state)
-    markers = _current_flow_markers(state)
+    context = _TrackerCheckContext(
+        cwd=cwd,
+        version=_state_version(state),
+        started_at=str(state.started_at).strip(),
+        pre_flow_snapshots=_pre_flow_snapshots(state),
+    )
     details: list[dict] = []
     short_diff = ""
 
     for label, tracker_path in [("short", tracker_short), ("full", tracker_full)]:
-        tracker_details, diff_text = _check_tracker_diff(cwd, label, tracker_path, markers)
+        tracker_details, diff_text = _check_tracker_diff(label, tracker_path, context)
         details.extend(tracker_details)
         if label == "short":
             short_diff = diff_text
@@ -48,13 +64,8 @@ def _tracker_paths(state: FlowState) -> tuple[str, str, str]:
     return cwd, tracker_short, tracker_full
 
 
-def _check_tracker_diff(
-    cwd: str,
-    label: str,
-    tracker_path: str,
-    markers: tuple[str, ...],
-) -> tuple[list[dict], str]:
-    result = _git_diff(cwd, tracker_path)
+def _check_tracker_diff(label: str, tracker_path: str, context: _TrackerCheckContext) -> tuple[list[dict], str]:
+    result = _git_diff(context.cwd, tracker_path)
     if isinstance(result, OSError):
         return [_detail(f"{label} tracker diff", False, str(result))], ""
     if result.returncode != SUCCESS_EXIT_CODE:
@@ -66,7 +77,7 @@ def _check_tracker_diff(
             has_changes,
             f"{label} tracker has additions" if has_changes else f"{label} tracker has no additions",
         ),
-        _tracker_marker_detail(label, result.stdout, markers),
+        _tracker_current_session_detail(label, tracker_path, result.stdout, context),
     ]
     return details, result.stdout
 
@@ -83,46 +94,84 @@ def _git_diff(cwd: str, tracker_path: str) -> subprocess.CompletedProcess | OSEr
         return exc
 
 
-def _tracker_marker_detail(label: str, diff_text: str, markers: tuple[str, ...]) -> dict:
-    has_marker = _diff_additions_contain_any(diff_text, markers)
-    marker_text = ", ".join(markers)
+def _state_version(state: FlowState) -> str:
+    values = [getattr(state, "version", None), state.params.get("version")]
+    return next((str(value).strip() for value in values if str(value or "").strip()), "")
+
+
+def _pre_flow_snapshots(state: FlowState) -> dict[str, str]:
+    raw_snapshot = state.params.get(_PRE_FLOW_SNAPSHOT_PARAM)
+    if not isinstance(raw_snapshot, dict):
+        return {}
+    if raw_snapshot.get(_PRE_FLOW_SNAPSHOT_STARTED_AT) != state.started_at:
+        return {}
+    trackers = raw_snapshot.get(_PRE_FLOW_SNAPSHOT_TRACKERS)
+    if not isinstance(trackers, dict):
+        return {}
+    return {
+        str(path): content
+        for path, content in trackers.items()
+        if isinstance(content, str)
+    }
+
+
+def _tracker_current_session_detail(label: str, tracker_path: str, diff_text: str, context: _TrackerCheckContext) -> dict:
+    if context.version:
+        return _tracker_version_marker_detail(label, diff_text, context.version)
+    return _tracker_pre_flow_detail(label, tracker_path, diff_text, context)
+
+
+def _tracker_version_marker_detail(label: str, diff_text: str, version: str) -> dict:
+    has_marker = _diff_additions_contain(diff_text, version)
     message = (
-        f"{label} tracker additions include current marker: {marker_text}"
+        f"{label} tracker additions include current marker: {version}"
         if has_marker
-        else f"{label} tracker additions do not include current marker: {marker_text}"
+        else f"{label} tracker additions do not include current marker: {version}"
     )
     return _detail(f"{label} tracker current marker", has_marker, message)
 
 
-def _current_flow_markers(state: FlowState) -> tuple[str, ...]:
-    values = [
-        getattr(state, "version", None),
-        state.params.get("version"),
-        state.started_at,
-        _canonical_started_at(state.started_at),
-    ]
-    return tuple(
-        dict.fromkeys(str(value).strip() for value in values if str(value or "").strip())
+def _tracker_pre_flow_detail(label: str, tracker_path: str, diff_text: str, context: _TrackerCheckContext) -> dict:
+    snapshot_text = _tracker_snapshot_text(tracker_path, context)
+    if snapshot_text is None:
+        message = f"{label} tracker pre-flow snapshot missing for {context.started_at}"
+        return _detail(f"{label} tracker current addition", False, message)
+    has_current_addition = _diff_has_added_content_not_in_snapshot(diff_text, snapshot_text)
+    message = (
+        f"{label} tracker has additions absent from pre-flow snapshot"
+        if has_current_addition
+        else f"{label} tracker additions already existed in pre-flow snapshot"
     )
+    return _detail(f"{label} tracker current addition", has_current_addition, message)
 
 
-def _canonical_started_at(started_at: str) -> str:
-    try:
-        parsed = datetime.datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-    except ValueError:
-        return ""
-    utc_value = parsed.astimezone(datetime.timezone.utc) if parsed.tzinfo else parsed
-    return utc_value.isoformat().replace("+00:00", "Z")
+def _tracker_snapshot_text(tracker_path: str, context: _TrackerCheckContext) -> str | None:
+    for key in _tracker_snapshot_keys(tracker_path, context.cwd):
+        if key in context.pre_flow_snapshots:
+            return context.pre_flow_snapshots[key]
+    return None
 
 
-def _diff_additions_contain_any(diff_text: str, values: tuple[str, ...]) -> bool:
-    return any(_diff_additions_contain(diff_text, value) for value in values)
+def _tracker_snapshot_keys(tracker_path: str, cwd: str) -> tuple[str, str]:
+    path = pathlib.Path(tracker_path)
+    absolute = path if path.is_absolute() else pathlib.Path(cwd) / path
+    return str(path), str(absolute)
 
 
 def _diff_additions_contain(diff_text: str, value: str) -> bool:
-    return any(
-        line.startswith("+") and not line.startswith("+++") and value in line
+    return any(value in content for content in _diff_added_contents(diff_text))
+
+
+def _diff_has_added_content_not_in_snapshot(diff_text: str, snapshot_text: str) -> bool:
+    snapshot_lines = set(snapshot_text.splitlines())
+    return any(content not in snapshot_lines for content in _diff_added_contents(diff_text))
+
+
+def _diff_added_contents(diff_text: str) -> tuple[str, ...]:
+    return tuple(
+        line[1:]
         for line in diff_text.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
     )
 
 

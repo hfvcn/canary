@@ -47,6 +47,7 @@ EventKind = Literal[
     "workflow.plan_digest_divergence_post_hoc",
     "workflow.plan_validated",
     "workflow.plan_validation_failed",
+    "ralph.validate_result",
     "ralph.schema_stats",
 ]
 
@@ -286,6 +287,7 @@ VALIDATION_REPORT_SCHEMA_VERSION = 1
 
 KIND_PLAN_VALIDATED = "workflow.plan_validated"
 KIND_PLAN_VALIDATION_FAILED = "workflow.plan_validation_failed"
+KIND_RALPH_VALIDATE_RESULT = "ralph.validate_result"
 KIND_SCHEMA_STATS = "ralph.schema_stats"
 
 
@@ -332,6 +334,18 @@ class PlanValidationFailedData(BaseModel):
     counts: Dict[str, int] = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="allow")
+
+
+class RalphValidateResultData(BaseModel):
+    """Compact event payload for ralph.validate_result."""
+
+    error_count: int = 0
+    warning_count: int = 0
+    hint_count: int = 0
+    plan_path_digest: str = ""
+    outcome: Literal["passed", "failed"] = "passed"
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class SchemaStatsData(BaseModel):
@@ -394,6 +408,7 @@ _KIND_TO_MODEL = {
     "workflow.plan_digest_divergence_post_hoc": PlanDigestDivergenceData,
     KIND_PLAN_VALIDATED: PlanValidatedData,
     KIND_PLAN_VALIDATION_FAILED: PlanValidationFailedData,
+    KIND_RALPH_VALIDATE_RESULT: RalphValidateResultData,
     KIND_SCHEMA_STATS: SchemaStatsData,
 }
 

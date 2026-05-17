@@ -298,9 +298,9 @@ def test_covered_flow_summary() -> None:
     ])
     summary = _covered_flow_summary(plan)
     assert summary["covered_flow_ids"] == {"flow-a", "flow-b"}
-    # integration (2) > unit (1) for flow-a
-    assert summary["best_level_by_flow"]["flow-a"] == 2
-    assert summary["best_level_by_flow"]["flow-b"] == 2
+    # integration (3) > unit (1) for flow-a
+    assert summary["best_level_by_flow"]["flow-a"] == 3
+    assert summary["best_level_by_flow"]["flow-b"] == 3
 
 
 # ---------------------------------------------------------------------------

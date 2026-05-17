@@ -64,6 +64,86 @@ def test_input_validation_flow_generates_at_least_three_checks(tmp_path: Path) -
     assert all("/api/search" in str(check["command"]) for check in checks)
 
 
+def test_url_input_flow_uses_security_recipe_matrix(tmp_path: Path) -> None:
+    payload = _input_validation_plan()
+    payload["critical_flows"] = [
+        {
+            "id": "ssrf-protection",
+            "description": "URL input must block SSRF encoded hosts.",
+            "surface_type": "url_input",
+            "entrypoints": ["src/search.py"],
+            "required_verification_level": "unit",
+        }
+    ]
+    payload["tasks"][0]["goal_behavior"] = "POST /api/redirect accepts JSON URL input."
+    payload["tasks"][0]["verification"]["covers"]["flows"] = ["ssrf-protection"]
+    plan_path = _write_plan(tmp_path, payload)
+
+    checks = generate_security_checks(str(plan_path))
+
+    assert [check["name"] for check in checks] == [
+        "ssrf-protection-ssrf-encoded-ip-matrix",
+    ]
+    command = checks[0]["command"]
+    assert "SECURITY_URL_MATRIX=" in command
+    assert "0177.0.0.1" in command
+    assert "[::1]" in command
+    assert "/api/redirect" in command
+
+
+def test_auth_flow_generates_timing_safe_behavior_check(tmp_path: Path) -> None:
+    payload = _input_validation_plan()
+    payload["critical_flows"] = [
+        {
+            "id": "admin-auth-token",
+            "description": "Admin token verification is timing-safe.",
+            "surface_type": "auth_token",
+            "entrypoints": ["src/search.py"],
+            "required_verification_level": "unit",
+        }
+    ]
+    payload["tasks"][0]["goal_behavior"] = "Deletes admin session after token validation."
+    payload["tasks"][0]["provides"][0]["schema_hint"] = {
+        "method": "POST",
+        "path": "/admin/delete",
+        "content_type": "application/json",
+    }
+    payload["tasks"][0]["verification"]["covers"]["flows"] = ["admin-auth-token"]
+    plan_path = _write_plan(tmp_path, payload)
+
+    checks = generate_security_checks(str(plan_path))
+
+    assert [check["name"] for check in checks] == [
+        "admin-auth-token-auth-timing-safe-compare",
+    ]
+    assert "SECURITY_COMPARE_PATTERNS=" in checks[0]["command"]
+    assert "secrets.compare_digest" in checks[0]["command"]
+    assert "/admin/delete" in checks[0]["command"]
+
+
+def test_temporal_flow_generates_toctou_behavior_check(tmp_path: Path) -> None:
+    payload = _input_validation_plan()
+    payload["critical_flows"] = [
+        {
+            "id": "stored-redirect",
+            "description": "Redirect target is stored then used after validation.",
+            "temporal_pattern": "store_then_use",
+            "entrypoints": ["src/search.py"],
+            "required_verification_level": "unit",
+        }
+    ]
+    payload["tasks"][0]["verification"]["covers"]["flows"] = ["stored-redirect"]
+    plan_path = _write_plan(tmp_path, payload)
+
+    checks = generate_security_checks(str(plan_path))
+
+    assert [check["name"] for check in checks] == [
+        "stored-redirect-toctou-store-then-use",
+    ]
+    assert "SECURITY_TEMPORAL_PATTERN=store_then_use" in checks[0]["command"]
+    assert "test_store_then_use_revalidation" in checks[0]["command"]
+
+
 def test_plan_without_security_flow_generates_empty_list(tmp_path: Path) -> None:
     plan_path = _write_plan(
         tmp_path,
@@ -95,10 +175,10 @@ def test_cli_flag_prints_generated_checks_json(tmp_path: Path, capsys) -> None:
         str(plan_path),
         "--project-root",
         str(tmp_path),
-        "--no-agent",
     ])
 
     captured = capsys.readouterr()
     checks = json.loads(captured.out)
     assert exit_code == 0
     assert checks[0]["auto_generated"] is True
+    assert captured.err == ""

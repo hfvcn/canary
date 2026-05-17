@@ -15,8 +15,8 @@
 #     schema_version    "1.0.0"（启用严格模式）
 #     tasks             TaskSpec[]
 #     required_issues   string[]  — 必须被 task.addresses 覆盖
-#     suppress_codes    string[]  — 降级为 hint 的规则 code
-#     suppress_instances SuppressInstance[]  — 带 lease 的精细抑制
+#     suppress_codes    string[]  — bare suppress，最后手段；优先使用 suppress_instances
+#     suppress_instances SuppressInstance[]  — 带 owner/expiry lease 的精细抑制
 #     semantic_mode     "off" | "advisory" | "strict"
 #     auto_infer        bool
 #     plan_scope        string[]  — 计划涉及的顶层目录
@@ -115,6 +115,9 @@
 #     review_after      string  — ISO 日期
 #
 # 常见 suppress_codes（按需添加，只抑制确实不适用的）：
+#   首选 suppress_instances：记录 owner/expiry/review_after，便于到期清理。
+#   bare suppress_codes 是最后手段：只在无法使用 managed suppress、
+#   或需要兼容只读取 suppress_codes 的旧流程时使用。
 #   E_CRITICAL_ENTRYPOINT_UNOWNED    — 关键入口文件未被任何 task claim
 #   E_CRITICAL_FLOW_UNCOVERED        — 关键流未被任何 task 验证覆盖
 #   E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED — 关键流入口未被 claim
@@ -152,8 +155,21 @@ semantic_mode: "off"
 auto_infer: false
 
 # --- 抑制不适用的规则（按需添加，保持最小集）---
-# Best practice: prefer suppress_instances (with owner/expiry) over bare suppress_codes.
-# Bare suppress is a last resort — managed suppress with owner/expiry is preferred.
+# Decision order:
+#   1. Fix the plan or verification if the warning exposes a real gap.
+#   2. Prefer managed suppress via suppress_instances with owner/expiry.
+#   3. Use bare suppress_codes only as a last resort.
+#
+# Preferred managed suppress example:
+# suppress_instances:
+#   - code: W_VERIFICATION_BEHAVIOR_MISMATCH
+#     owner: "team-or-person"
+#     expiry: "2026-12-31"
+#     review_after: "2026-06-30"
+#
+# Last-resort bare suppress example:
+# suppress_codes:
+#   - W_AGENT_REVIEW_SKIPPED
 suppress_codes:
   - E_CRITICAL_ENTRYPOINT_UNOWNED
   - E_CRITICAL_FLOW_UNCOVERED
@@ -462,9 +478,13 @@ tasks:
 batch_e2e_command: "python -m pytest tests/e2e/test_workflow.py -v"
 batch_e2e_timeout: 300
 
-# --- 带 lease 的精细抑制；优先用于需要 owner/expiry/review_after 的抑制 ---
+# --- 带 lease 的精细抑制；优先用于需要 owner/expiry/review_after 的 managed suppress ---
 suppress_instances:
   - code: W_AGENT_REVIEW_SKIPPED
     owner: "foreman-docs"
+    expiry: "2026-12-31"
+    review_after: "2026-06-30"
+  - code: W_VERIFICATION_BEHAVIOR_MISMATCH
+    owner: "verification-owner"
     expiry: "2026-12-31"
     review_after: "2026-06-30"

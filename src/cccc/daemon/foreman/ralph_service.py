@@ -64,6 +64,9 @@ DEFAULT_VERIFICATION_CLEANUP_PATTERNS = [
 SUSPICIOUS_DURATION_THRESHOLD_MS = 50
 _SHELL_OPERATOR_TOKENS = {"&&", "||", "|", ";"}
 _TRIVIAL_VERIFY_COMMANDS = {"true", ":", "echo", "printf"}
+_SUSPICIOUS_DURATION_EXEMPT_COMMANDS = frozenset(
+    {"grep", "test", "[", "true", "false"}
+)
 WORKER_SCOPE_WARNING_CODE = "W_WORKER_EXCEEDED_SCOPE"
 CHALLENGE_DEGRADED_WARNING_CODE = "W_CHALLENGE_DEGRADED"
 CHALLENGE_DEGRADED_WARNING = (
@@ -156,16 +159,27 @@ def _has_shell_operators(command: str) -> bool:
     return in_single or in_double
 
 
-def _is_trivial_command(command: str) -> bool:
-    """Check if command is trivial (echo, true, etc.) for RV-25 threshold."""
+def _first_command_base(command: str) -> str | None:
     try:
         tokens = shlex.split(command)
     except ValueError:
-        return False
+        return None
     if not tokens:
-        return False
-    base = tokens[0].rsplit("/", 1)[-1]
-    return base in _TRIVIAL_VERIFY_COMMANDS
+        return None
+    return tokens[0].rsplit("/", 1)[-1]
+
+
+def _is_trivial_command(command: str) -> bool:
+    """Check if command is trivial (echo, true, etc.) for RV-25 threshold."""
+    return _first_command_base(command) in _TRIVIAL_VERIFY_COMMANDS
+
+
+def _is_suspicious_duration_exempt_command(command: str) -> bool:
+    base = _first_command_base(command)
+    return (
+        base in _TRIVIAL_VERIFY_COMMANDS
+        or base in _SUSPICIOUS_DURATION_EXEMPT_COMMANDS
+    )
 
 
 def _agent_checks(raw_checks: Any) -> List[VerificationCheck]:
@@ -776,6 +790,9 @@ class RalphService:
 
     def _should_upgrade_to_challenge(self, task_ref: "TaskRef", workflow_id: str) -> bool:
         """Upgrade ralph→challenge if task touches critical flow entrypoints."""
+        mode = getattr(task_ref, "verification_mode", None) or "ralph"
+        if mode != "ralph":
+            return False
         try:
             critical_flows = self._verification_critical_flows(workflow_id, task_ref)
         except Exception:
@@ -784,7 +801,10 @@ class RalphService:
             return False
         claimed = set(getattr(task_ref, "claimed_paths", None) or [])
         for flow in critical_flows:
-            entrypoints = getattr(flow, "entrypoints", None) or flow.get("entrypoints", []) if isinstance(flow, dict) else getattr(flow, "entrypoints", [])
+            if isinstance(flow, dict):
+                entrypoints = flow.get("entrypoints", [])
+            else:
+                entrypoints = getattr(flow, "entrypoints", [])
             for ep in entrypoints:
                 ep_path = ep.split("::")[0] if "::" in ep else ep
                 if ep_path in claimed:
@@ -1669,7 +1689,7 @@ class RalphService:
                 command=command,
                 expected_exit_code=expected_exit_code,
                 duration_ms=duration_ms,
-                outcome="failed",
+                outcome="infra_error",
                 exc=exc,
             )
         except ValueError as exc:
@@ -1696,7 +1716,7 @@ class RalphService:
 
         # RV-25: flag suspiciously fast completions
         if outcome == "passed" and duration_ms < SUSPICIOUS_DURATION_THRESHOLD_MS:
-            if not _is_trivial_command(command):
+            if not _is_suspicious_duration_exempt_command(command):
                 message = f"[SUSPICIOUS: completed in {duration_ms}ms] {message}"
                 details["suspicious_duration"] = True
 

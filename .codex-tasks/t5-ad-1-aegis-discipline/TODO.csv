@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current model and schema flow,DONE,Relevant files and tests are understood,rg/read relevant files,2026-05-17,0,
+2,Implement AegisDiscipline wiring,DONE,Requested files contain scoped changes,python -m pytest tests/test_aegis_discipline_infra.py -v,2026-05-17,0,
+3,Run targeted verification,DONE,Targeted pytest passes within 60s,python -m pytest tests/test_aegis_discipline_infra.py -v,2026-05-17,0,12 passed in 0.91s
+4,Review diff and close task,DONE,Diff is scoped and task artifacts updated,git diff --stat && git diff --check,2026-05-17,0,git diff --check passed

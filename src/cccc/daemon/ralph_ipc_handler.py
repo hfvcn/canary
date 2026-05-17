@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from ..contracts.v1 import DaemonError, DaemonResponse
-from ..contracts.v1.event import KIND_PLAN_VALIDATED
+from ..contracts.v1.event import KIND_RALPH_VALIDATE_RESULT
 from ..contracts.v1.ralph_ipc import (
     ActorStatus,
     BatchDecision,
@@ -36,6 +36,9 @@ from ..util.time import parse_utc_iso
 logger = logging.getLogger("cccc.daemon.ralph_ipc")
 RALPH_STATE_TTL_SECONDS = 300
 RALPH_STATE_BUCKETS = ("pending_suggestions", "pending_restarts")
+_VALIDATE_RESULT_PAYLOAD_KEYS = frozenset(
+    ("error_count", "warning_count", "hint_count", "plan_path_digest", "outcome"),
+)
 
 # Transient IPC state. Only pre-engine messages live here; authoritative
 # workflow decisions and verification results are written through the engine.
@@ -1034,9 +1037,9 @@ def handle_ralph_validate_event(args: Dict[str, Any]) -> DaemonResponse:
 
     if not group_id:
         return _error("missing_group_id", "Missing group_id")
-    if kind != KIND_PLAN_VALIDATED:
+    if kind != KIND_RALPH_VALIDATE_RESULT:
         return _error("invalid_event_kind", f"Unsupported validate event kind: {kind}")
-    payload_error = _validate_plan_validated_payload(payload)
+    payload_error = _validate_result_payload_error(payload)
     if payload_error:
         return payload_error
 
@@ -1045,7 +1048,7 @@ def handle_ralph_validate_event(args: Dict[str, Any]) -> DaemonResponse:
         return _error("group_not_found", f"group not found: {group_id}")
     event = append_event(
         group.ledger_path,
-        kind=KIND_PLAN_VALIDATED,
+        kind=KIND_RALPH_VALIDATE_RESULT,
         group_id=group.group_id,
         scope_key="",
         by=by,
@@ -1054,16 +1057,22 @@ def handle_ralph_validate_event(args: Dict[str, Any]) -> DaemonResponse:
     return _success({"event": event})
 
 
-def _validate_plan_validated_payload(payload: Any) -> Optional[DaemonResponse]:
+def _validate_result_payload_error(payload: Any) -> Optional[DaemonResponse]:
     if not isinstance(payload, dict):
         return _error("invalid_payload", "payload must be an object")
-    for key in ("errors", "warnings"):
+    extra_keys = sorted(set(payload) - _VALIDATE_RESULT_PAYLOAD_KEYS)
+    if extra_keys:
+        return _error("invalid_payload", f"unsupported payload keys: {extra_keys}")
+    for key in ("error_count", "warning_count", "hint_count"):
         value = payload.get(key)
         if type(value) is not int or value < 0:
             return _error("invalid_payload", f"payload.{key} must be a non-negative integer")
-    digest = payload.get("plan_digest")
+    digest = payload.get("plan_path_digest")
     if not isinstance(digest, str) or not digest.strip():
-        return _error("invalid_payload", "payload.plan_digest must be a non-empty string")
+        return _error("invalid_payload", "payload.plan_path_digest must be a non-empty string")
+    outcome = payload.get("outcome")
+    if outcome not in {"passed", "failed"}:
+        return _error("invalid_payload", "payload.outcome must be passed or failed")
     return None
 
 
@@ -1101,7 +1110,7 @@ def handle_workflow_override(args: Dict[str, Any]) -> DaemonResponse:
     task_id = str(args.get("task_id") or args.get("task") or "").strip()
     workflow_id = str(args.get("workflow_id") or "").strip()
     reason = str(args.get("reason") or "").strip()
-    evidence = str(args.get("evidence") or "").strip()
+    evidence = args.get("evidence")
 
     if not group_id:
         return _error("missing_group_id", "Missing group_id")
@@ -1109,7 +1118,7 @@ def handle_workflow_override(args: Dict[str, Any]) -> DaemonResponse:
         return _error("missing_task_id", "Missing task_id")
     if not reason:
         return _error("missing_reason", "Missing reason")
-    if not evidence:
+    if evidence is None or (isinstance(evidence, str) and not evidence.strip()):
         return _error("missing_evidence", "Missing evidence")
 
     try:
@@ -1125,20 +1134,7 @@ def handle_workflow_override(args: Dict[str, Any]) -> DaemonResponse:
         if workflow_id and actual_workflow_id != workflow_id:
             message = f"workflow_id mismatch for task {task_id}: expected {workflow_id}, got {actual_workflow_id}"
             return _error("workflow_id_mismatch", message)
-        orchestrator.engine.foreman_override_task(task_id, reason, evidence)
-        workflow_data = orchestrator._active_workflows.get(actual_workflow_id, {})
-        tracked = workflow_data.get("tasks", {}).get(task_id) if isinstance(workflow_data, dict) else None
-        if isinstance(tracked, dict):
-            tracked["status"] = "completed_by_override"
-        orchestrator._resuggest_ready_tasks(actual_workflow_id)
-        return _success(
-            {
-                "accepted": True,
-                "task_id": task_id,
-                "workflow_id": actual_workflow_id,
-                "status": "completed_by_override",
-            }
-        )
+        return _success(orchestrator.override_task(task_id, reason, evidence))
     except ValueError as exc:
         return _error("workflow_override_error", str(exc))
 

@@ -5,36 +5,42 @@ from __future__ import annotations
 import re
 from typing import Any, List
 
-from ..aegis import effective_intent
 from ..models import Plan, ValidationIssue
 
-SECURITY_INTENTS = ("feature", "fix")
+FEATURE_INTENT = "feature"
+SECURITY_CHAIN_MISSING_CODE = "E_AEGIS_SECURITY_CHAIN_MISSING"
 SECURITY_FLOW_KEYWORDS = (
     "ssrf",
     "auth",
     "input-validation",
+    "security",
     "xss",
     "injection",
     "token",
+    "secret",
+    "credential",
+    "password",
+    "permission",
+    "csrf",
 )
-SECURITY_CHECK_KEYWORDS = (*SECURITY_FLOW_KEYWORDS, "security")
+SECURITY_CHECK_KEYWORDS = SECURITY_FLOW_KEYWORDS
 SECURITY_FLOW_FIELDS = ("id", "description", "surface_type", "temporal_pattern")
 
 
-def _check_aegis_security_checks(plan: Plan) -> List[ValidationIssue]:
-    """Require security-related checks when security critical flows are declared."""
+def _check_aegis_security_chain(plan: Plan) -> List[ValidationIssue]:
+    """Require feature Aegis tasks to test declared security critical flows."""
     issues: List[ValidationIssue] = []
     for task in plan.tasks:
-        issues.extend(_check_aegis_security_checks_for_task(plan, task))
+        issues.extend(_check_aegis_security_chain_for_task(plan, task))
     return issues
 
 
-def _check_aegis_security_checks_for_task(
+def _check_aegis_security_chain_for_task(
     plan: Plan,
     task: Any,
 ) -> List[ValidationIssue]:
-    intent = effective_intent(task)
-    if intent not in SECURITY_INTENTS:
+    intent = _aegis_intent(task)
+    if intent != FEATURE_INTENT:
         return []
     flow_ids = _security_critical_flow_ids(plan)
     if not flow_ids:
@@ -50,7 +56,7 @@ def _security_issue(
     flow_ids: List[str],
 ) -> ValidationIssue:
     return ValidationIssue(
-        code="E_AEGIS_SECURITY_CHECKS_MISSING",
+        code=SECURITY_CHAIN_MISSING_CODE,
         severity="error",
         message=(
             f"{intent} task '{task.id}' has security critical_flow declarations "
@@ -63,6 +69,15 @@ def _security_issue(
             "check_names": _verification_check_names(task),
         },
     )
+
+
+def _aegis_intent(task: Any) -> str:
+    aegis = getattr(task, "aegis", None)
+    if isinstance(aegis, dict):
+        return str(aegis.get("intent") or "")
+    if aegis is None:
+        return ""
+    return str(getattr(aegis, "intent", "") or "")
 
 
 def _security_critical_flow_ids(plan: Plan) -> List[str]:
