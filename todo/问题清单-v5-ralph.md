@@ -520,13 +520,14 @@ plan 声明了 `flask`/`fastapi`/`requests` 相关依赖但 critical_flows 无�
 
 ### v38 E2E 新发现（Flask FTS5 复验，2026-05-17）
 
-#### FL-14 flow step-4 未引导使用 collaborating-with-codex skill（P2）
+#### FL-14 flow Codex 步骤未引导使用 skill 且未提示并行执行（P2）
 
-> **来源**：2026-05-17 E2E v38 流程体验
+> **来源**：2026-05-17 E2E v38 + solve flow 流程体验
 - **严重度**：P2 — flow 引导缺失导致用户/agent 直接调用 codex CLI 而非使用 `collaborating-with-codex` skill
-- **现象**：flow step-4 instruction 说 "Use codex_bridge.py with dedicated review prompts"，但未说明应使用 Claude Code 的 `collaborating-with-codex` skill 来调度 Codex；实际操作者直接用 `codex exec` CLI，绕过了 skill 提供的 session 管理和格式化
-- **改进方案**：flow step-4 instruction 应明确引导："使用 /collaborating-with-codex skill 进行 review（或手动使用 codex_bridge.py）"；同时 `codex_bridge.py` 本身应存在于项目中或 flow 应检测到 skill 可用性。此外应提示 Codex review 任务放到后台执行（`run_in_background`），两个 review（results + process）可并行，避免串行等待浪费时间
-- **验收标准**：下一轮 E2E agent 使用 skill 且两个 review 并行执行
+- **现象**：E2E flow step-4 和 solve flow step-3/step-5 的 instruction 都只说 "Save codex_bridge.py review JSON"，但未说明：(1) 应使用 `collaborating-with-codex` skill 来调度 Codex (2) 多个 Codex 任务应放后台并行执行（`run_in_background`）而非串行等待
+- **影响范围**：E2E flow step-4（results + process review）、solve flow step-3（plan review）、solve flow step-5（execute 多 task）
+- **改进方案**：所有涉及 Codex 的 flow step instruction 统一补充："使用 /collaborating-with-codex skill（或 codex_bridge.py）；多个 review/execute 任务应并行放后台执行"
+- **验收标准**：agent 在 Codex 步骤时自动选择 skill 且多任务并行执行
 
 #### FL-15 flow step-6 未引导写入新发现和归档已修复（P2）
 
