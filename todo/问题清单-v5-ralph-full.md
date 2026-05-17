@@ -223,3 +223,94 @@ CLI：`ralph flow start {solve|e2e}` / `ralph flow next` / `ralph flow status`
 | v36 | 05-16 | 4 | 4 | 4 | 4.0 | FastAPI SSRF，次高 |
 | v37 | 05-17 | 3 | 3 | 4 | 3.3 | Flask FTS5，challenge gate 误判 |
 | **v38** | **05-17** | **4** | **4** | **5** | **4.2** | **Flask FTS5 复验，input_robustness 修复验证通过，0 manual interventions** |
+| **v39** | **05-17** | **4.5** | **4.5** | **4** | **4.3** | **FastAPI Bookmark Service，历史并列最高；86 tests, 93% cov, SSRF 20 cases, Aegis discipline 首次实战验证** |
+
+## v39 代码修复归档（2026-05-17，全量 42 项 + REG-1/REG-2）
+
+以下条目在 v39 solve flow 中完成代码修复，全量 pytest 2913 passed / 0 failed / 120 skipped 验证通过。
+
+### RO 系列
+- **RO-84**（P2）：validate ledger 事件 — `ralph.validate_result` 事件发送到 daemon。v39 E2E 确认生效。
+- **RO-89**（P1）：verify gate 检测 FTS5 malformed input — input_robustness_smoke 检查已实现。
+- **RO-90**（P2）：verify gate 检测 debug=True — security_lint grep 检查已实现。
+- **RO-91**（P3）：claimed_paths 遗漏写入文件 — W_CLAIMED_PATH_INCOMPLETE 规则已实现。
+- **RO-92**（P1）：TOCTOU 审查 — temporal_pattern 字段 + W_VERIFICATION_TOCTOU_GAP recipe 已实现。
+- **RO-93**（P1）：hostname 编码规范化 — url_input security recipe 含编码矩阵已实现。
+- **RO-94**（P2）：auth timing-safe compare — auth_token security recipe grep 检查已实现。
+- **RO-95**（P1）：deferred recovery 死循环 — on_task_failed 和 deferred 转移时 release_agent 已修复。
+- **RO-97**（P1）：verification_mode=ralph 语义 — ralph mode 不触发 challenge review 已实现。
+- **RO-98**（P2）：task failure vs infra failure — verification_infra_error 状态已实现。
+- **RO-99**（P1）：challenge prompt 安全 checklist — critical_flows 驱动的 checklist 注入已实现。
+- **RO-100**（P2）：discipline rule 输出排序 — sorted(dependencies) 已修复。
+- **RO-101**（P2）：challenge upgrade 独立测试 — _should_upgrade_to_challenge 已提取为独立方法。
+- **RO-102**（P3）：validate ledger event plan 不存在时 crash — plan_path.exists() 防御已修复。
+
+### FL 系列
+- **FL-4**（P2）：guide --output 覆盖 Description — models.py Field(description=) 已添加。
+- **FL-5**（P2）：guide --update dev 分支 warning — advisory 降级已实现。
+- **FL-6**（P2）：_check_improvement_register 不区分新旧 — version marker 检查已实现。
+- **FL-7**（P2）：step-6 归档迁移提示 — archive advisory 已实现。
+- **FL-8**（P2）：e2e 强制 compile step — W_E2E_MISSING_COMPILE_CHECK 已实现。
+- **FL-9**（P1）：compact 盲点 — managed suppress 在 compact 模式显示已修复。
+- **FL-10**（P3）：plan.yaml 持久化 workflow 态 — suggest 从 ledger 读已实现。
+- **FL-11**（P2）：foreman override 路径 — cccc workflow override 命令已实现。
+- **FL-12**（P2）：deferred 可恢复状态 — deferred 出边（retry/accept/cancel）已实现。
+- **FL-13**（P3）：e2e enhancement test xdist flaky — 已标记 serial。
+- **FL-15**（P2）：step-6 引导写入新发现 — instruction 已更新。
+
+### UX 系列
+- **UX-5**（P2）：ralph guide 自动生成 — 已实现。
+- **UX-8**（P3）：claimed_paths 冲突提示 — overlap 输出含任务对已实现。
+- **UX-11**（P2）：deferred re-verify — verify --refresh-spec 已实现。
+- **UX-12**（P3）：SUSPICIOUS 标记误报 — grep/test 快速命令豁免已实现。
+
+### AD 系列
+- **AD-1**（P1）：AegisDiscipline 子模型 + aegis 字段 — schema 已实现。v39 E2E 确认 foreman 正确使用。
+- **AD-2**（P1）：intent 推断 + discipline.py 基础设施 — effective_intent() 已实现。
+- **AD-3**（P1）：首期 5 条高信号规则 — E_AEGIS_PLACEHOLDER_CONTENT / E_AEGIS_RETIREMENT_TRACK_MISSING / W_AEGIS_FIX_NO_REPAIR_TRACK / W_AEGIS_TDD_NO_TEST_PATH / W_AEGIS_COMPLEX_MISSING_BASELINE 已实现。v39 E2E 确认实战生效。
+- **AD-4**（P1）：verification_gate Evidence 质量门 — _check_aegis_evidence 已实现。
+- **AD-7**（P3）：suggest 阶段 Aegis 快检 — E_ 规则 task 不进 ready batch 已实现。
+- **AD-8**（P3）：二期规则扩展 — 7 条候选规则已实现。
+- **AD-9**（P2）：aegis intent→verification 强制链 — _check_aegis_discipline 已实现。
+- **AD-11**（P1）：validate LLM 生成 behavioral security checks — security_check_generator 已实现。
+
+### SL 系列
+- **SL-1**（P3）：security_lint 升级 blocking — record_verification_failure 已修复。
+- **SL-2**（P3）：扩展 pattern 矩阵 — bare_except/eval/exec 等已添加。
+- **SL-3**（P3）：input_robustness 升级 blocking — 已修复。
+
+### RL 系列
+- **RL-22**（P3）：goal_behavior 与源码语义不一致 — agent 可覆盖。
+- **RL-25**（P3）：实现方案与数据结构不兼容 — agent 可覆盖。
+
+### 其他
+- **PLR-1**（P2）：code fence 内术语触发 aegis — 引用例外已实现。
+- **PLR-2**（P2）：covers.paths 自动补齐 — covers.tasks 展开已实现。
+- **DOC-1**（P3）：capability guide verify gate warning 清单 — 已补充。
+- **DOC-2**（P3）：suppress 文档 — managed suppress 说明已补充。
+- **REG-1**（P3）：test_command_not_found_fails 断言 — 已更新为 infra_error。
+- **REG-2**（P3）：test_covered_flow_summary level 编号 — 已更新。
+
+---
+
+## v39 E2E 验证归档（2026-05-17，FastAPI Bookmark Service）
+
+### 已验证修复
+
+- **AD-1~3**（Aegis discipline 规则）：E_AEGIS_SECURITY_CHAIN_MISSING 在 validate 中触发并强制 foreman 添加 managed suppress；W_AEGIS_COMPLEX_MISSING_BASELINE 和 W_AEGIS_TDD_NO_TEST_PATH 正确报告。规则有效，foreman 能正确响应。
+- **RO-84**（validate ledger 事件）：ralph.validate_result 事件在 ledger 中确认（4 次 failed + 1 次 passed）。
+
+### 未触发（执行太干净）
+
+- RO-95（deferred recovery）：0 deferred tasks
+- RO-96（attach 路径解析）：使用绝对路径，未触发相对路径 bug
+- RO-97（verification_mode 语义）：全部 ralph mode，无 challenge
+- RO-98（infra vs task failure）：0 failures
+- SL-1/2/3（security_lint）：Worker 未犯低级错误
+- RO-92/93/94（security recipes）：recipes 未被 runtime 触发（Worker 自行实现了正确安全逻辑）
+
+### v39 新发现
+
+- FL-17b（P2）：solve flow state.json 清除仍未生效——cwd 下残留旧状态阻塞新 flow
+- UX-13（P3）：foreman 未在 workflow.completed 后自动生成 WORKFLOW_EVALUATION.md
+- UX-14（P3）：Worker 首任务冷启动 stall 阈值过低（300s 触发，实际 ~400s 完成）
