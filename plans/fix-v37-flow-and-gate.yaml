@@ -1,0 +1,319 @@
+schema_version: "1.0.0"
+
+required_issues:
+  - "FL-6"
+  - "RO-89"
+  - "RO-90"
+  - "UX-11"
+  - "FL-5"
+  - "FL-7"
+  - "RO-84"
+  - "RO-87"
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - W_AGENT_REVIEW_SKIPPED
+  - W_UNCLAIMED_TEST_FOR_SOURCE
+  - W_VERIFICATION_CROSS_SCOPE
+  - W_VERIFICATION_TARGET_MISSING
+  - W_AEGIS_FIX_NO_REPAIR_TRACK
+  - W_AEGIS_COMPLEX_MISSING_BASELINE
+  - W_TEST_COVERAGE_GAP
+  - W_CROSS_BOUNDARY_WITHOUT_GLUE
+  - W_NO_EARLY_INTEGRATION_CHECKPOINT
+  - W_NO_FAILURE_PATH
+  - W_TASK_ADDRESSES_DISJOINT
+  - W_PLAN_SCOPE_UNUSED
+
+semantic_mode: "off"
+auto_infer: false
+
+tasks:
+  - id: T1
+    title: "FL-6: _check_verify 移除强制 xdist 要求"
+    addresses:
+      - "FL-6"
+    goal_behavior: |
+      修改 src/cccc/ralph/flow_engine.py 的 _check_verify() 函数（line 124-137）：
+
+      移除对 parallel execution 的强制要求。当前逻辑在 output 中未检测到
+      "workers" 或 "gw" 时直接返回 False，这对不需要 xdist 的小项目不适用。
+
+      改为：仍然检测并记录是否使用了并行执行（作为 advisory detail），
+      但不将其作为通过条件。通过条件仅为 returncode == 0。
+    acceptance_criteria: |
+      1. _check_verify 不再因缺少 xdist 而失败
+      2. 仍然记录是否使用了并行执行（advisory）
+      3. 通过条件仅为 test command exit code == 0
+      4. 现有测试不受影响
+    claimed_paths:
+      - src/cccc/ralph/flow_engine.py
+      - tests/test_flow_verify_xdist.py
+    verification:
+      level: unit
+      checks:
+        - name: flow-verify-test
+          command: "python -m pytest tests/test_flow_verify_xdist.py -v"
+
+  - id: T2
+    title: "RO-89: verify gate 静态预检 — input robustness gap warning"
+    addresses:
+      - "RO-89"
+    goal_behavior: |
+      修改 src/cccc/daemon/foreman/verification_gate.py：
+
+      扩展现有 _check_security_lint() 或添加新函数
+      _check_input_robustness(changed_files, workspace_root, plan_critical_flows)：
+
+      1. 从 plan-level critical_flows（通过 task_ref 或 workspace plan.yaml 获取）
+         检查是否含 search/query/input 关键词
+      2. 若无相关 critical_flow 声明，静默跳过（零噪音）
+      3. ��有，grep verification test 文件中是否含异常输入模式
+         （NUL byte: \\x00、control chars、极长字符串测试）
+      4. 未覆盖时通过 engine.record_verification_warning 报
+         warning_type="input_robustness_gap"
+
+      注意：critical_flows 是 plan-level 字段，需从 workspace 的 plan.yaml
+      读取，或通过 daemon 上下文获取。TaskRef 本身无 critical_flows。
+
+      这是静态预检层，不执行 fuzz，只检查测试覆盖声明。
+    acceptance_criteria: |
+      1. plan critical_flow 含 search/query/input 关键词且 test 文件无异常输入模式时报 warning
+      2. 无相关 critical_flow 时零输出
+      3. test 文件已有异常输入模式时零输出
+      4. 不影响现有 verification 流程
+    claimed_paths:
+      - src/cccc/daemon/foreman/verification_gate.py
+      - tests/test_verification_input_precheck.py
+    verification:
+      level: unit
+      checks:
+        - name: input-precheck-test
+          command: "python -m pytest tests/test_verification_input_precheck.py -v"
+
+  - id: T3
+    title: "RO-90: verify gate debug=True 检查扩展入口文件白名单"
+    depends_on:
+      - T2
+    addresses:
+      - "RO-90"
+    goal_behavior: |
+      修改 src/cccc/daemon/foreman/verification_gate.py：
+
+      现有 _check_security_lint() 已使用 _DEBUG_TRUE_RE 扫描 changed_files。
+      但只对 changed_files 扫描，不检查 claimed_paths 中的入口文件。
+
+      扩展检查逻辑：
+      1. 在 verification passed 后，额外扫描 workspace 中的入口文件
+         （app.py/main.py/server.py/wsgi.py/run.py）中的 debug=True
+      2. 复用现有 _DEBUG_TRUE_RE 和 _scan_security_lint_file() 基础设施
+      3. 检测到时使用统一的 warning_type="security_lint"（与现有一致）
+      4. 仅在文件实际存在于 workspace 时检查
+
+      现有测试在 tests/test_verification_gate_security_lint.py。
+    acceptance_criteria: |
+      1. workspace 入口文件含 debug=True 时报 security_lint warning
+      2. 入口文件不存在或无 debug=True 时零输出
+      3. 不阻塞 verification outcome
+      4. 与现有 changed_files 扫描共存不重复
+    claimed_paths:
+      - src/cccc/daemon/foreman/verification_gate.py
+      - tests/test_verification_gate_security_lint.py
+    verification:
+      level: unit
+      checks:
+        - name: debug-check-test
+          command: "python -m pytest tests/test_verification_gate_security_lint.py -v"
+
+  - id: T4
+    title: "UX-11: 确认 workflow verify --refresh-spec 已实现 + 补充测试"
+    addresses:
+      - "UX-11"
+    goal_behavior: |
+      确认已有实现：
+      - CLI: main.py 已注册 --refresh-spec 参数
+      - workflow_cmds.py:203 已传递 refresh_spec 到 daemon op
+      - ralph_ipc_handler.py:1112 handle_ralph_task_verify() 已在
+        refresh_spec=True 时重读 plan 并传 fresh TaskRef
+
+      当前行为：plan.yaml 不存在时返回 plan_refresh_failed（非静默降级）。
+      这是正确的 debug-first 行为，保持不变。
+
+      本 task 只需确认现有逻辑正确并补充测试覆盖。
+      现有测试在 tests/test_workflow_verify_refresh_spec.py。
+    acceptance_criteria: |
+      1. verify --refresh-spec 使用最新 plan.yaml 的检查命令（已实现）
+      2. 无 --refresh-spec 时行为不变（已实现）
+      3. plan.yaml 不存在时返回 plan_refresh_failed（已实现）
+      4. 测试覆盖三种场景
+    claimed_paths:
+      - tests/test_workflow_verify_refresh_spec.py
+    verification:
+      level: unit
+      checks:
+        - name: refresh-spec-test
+          command: "python -m pytest tests/test_workflow_verify_refresh_spec.py -v"
+
+  - id: T5
+    title: "FL-5: 确认 guide advisory 不阻塞 flow + 补测试"
+    depends_on:
+      - T1
+    addresses:
+      - "FL-5"
+    goal_behavior: |
+      确认已有实现：
+      - flow_engine.py:139 _check_guide() 的 passed = large_enough
+      - warnings 只追加 advisory detail（"guide section advisory (non-blocking)"）
+      - FlowEngine.next() 只看 result.passed，不看 advisory details
+
+      现有测试在 tests/ralph/test_flow_engine_guide.py。
+
+      本 task 确认逻辑正确，如现有测试已覆盖 advisory 场景则标记完成。
+      如缺少"有 warnings 但仍 passed"的测试，补充该场景。
+    acceptance_criteria: |
+      1. guide --update 有 warnings 时 flow step 仍通过（已实现）
+      2. guide 文件 size 不足时 flow step 失败（已实现）
+      3. 测试覆盖"有 warnings 但 passed"场景
+    claimed_paths:
+      - tests/ralph/test_flow_engine_guide.py
+    verification:
+      level: unit
+      checks:
+        - name: guide-advisory-test
+          command: "python -m pytest tests/ralph/test_flow_engine_guide.py -v"
+
+  - id: T6
+    title: "FL-7: 确认 flow step-6 归档 advisory 已实现 + 补测试"
+    addresses:
+      - "FL-7"
+    goal_behavior: |
+      确认已有实现：
+      - flow_steps_e2e.py:171 _check_improvement_register() 调用
+        _check_short_tracker_archive_advisory()
+      - flow_steps_e2e.py:175 _check_short_tracker_archive_advisory() 对比
+        baseline 和 current，输出 completed-but-not-archived advisory
+
+      现有测试在 tests/ralph/test_flow_e2e.py:184。
+
+      本 task 确认功能已实现。如现有测试已覆盖 archive advisory 逻辑
+      则标记完成。如缺少独立测试，补充覆盖。
+    acceptance_criteria: |
+      1. 短版有已完成但未归档的条目时输出 advisory（已实现）
+      2. advisory 不阻塞 flow step 通过（已实现）
+      3. 测试覆盖 archive advisory 场景
+    claimed_paths:
+      - tests/ralph/test_flow_e2e.py
+    verification:
+      level: unit
+      checks:
+        - name: archive-advisory-test
+          command: "python -m pytest tests/ralph/test_flow_e2e.py -v"
+
+  - id: T7
+    title: "RO-84: 确��� ralph validate ledger 事件已实现 + 补测试"
+    addresses:
+      - "RO-84"
+    goal_behavior: |
+      确认已有实现：
+      - cli.py:559 _write_validate_ledger_event_if_requested() 在 validate 完成后调用
+      - cli.py:762 _write_validation_event() 序列化事件并 append 到 ledger
+      - 事件 kind 使用 ralph_ipc.py 中的 validation_event_kind()
+        （canonical kind: workflow.plan_validated / workflow.plan_validation_failed）
+
+      现有行为：无 --ledger 且无法自动检测 group 时向 stderr 输出 warning
+      （不是静默跳过）。这是正确的 debug-first 行为。
+
+      本 task 确认功能已实现。如现有测试已覆盖 ledger 写入
+      则标记完成。如缺少，补充覆盖。
+      现有相关测试搜索：tests/test_ralph_validate_ledger*.py
+    acceptance_criteria: |
+      1. ralph validate 成功时写入 workflow.plan_validated 事件（已实现）
+      2. ralph validate 失败时写入 workflow.plan_validation_failed 事件（已实现）
+      3. 事件包含 error/warning 计数 + plan digest（已实现）
+      4. 测���覆盖两种 outcome 的 ledger 写入
+    claimed_paths:
+      - src/cccc/ralph/cli.py
+      - tests/test_ralph_validate_ledger.py
+    verification:
+      level: unit
+      checks:
+        - name: validate-ledger-test
+          command: "python -m pytest tests/test_ralph_validate_ledger.py -v"
+
+  - id: T8
+    title: "RO-87: 确认 plan digest divergence 防护已实现 + 补测试"
+    addresses:
+      - "RO-87"
+    goal_behavior: |
+      确认已有实现：
+      - assignment_batches.py:411 注册时记录 structural plan digest
+      - workflow_orchestrator.py:268 状态转移前用 PreTransitionVetoed 硬拦截
+      - plan_io.py:67 structural digest 排除 verification/goal_behavior/title
+        （只跟踪结构变化，不跟踪文字变化���
+
+      设计语义：digest divergence 是 PreTransitionVetoed（硬拦截），
+      不是 warning。这是 tracker 顶部明确的纠正点：
+      "T5 RO-87 保留 PreTransitionVetoed，仅去重事件层"
+
+      现有测试：test_ralph_plan_digest_guard.py / test_plan_digest_divergence_once.py
+
+      本 task 确认功能已实现。确认去重事件层（digest divergence
+      只报一次事件，不重复报）。如缺少去重测试则补充。
+    acceptance_criteria: |
+      1. plan 注册时记录 structural digest（已实现）
+      2. 状态转移时 digest 不匹配则 PreTransitionVetoed（已实现）
+      3. 去重：同一 divergence 只产生一次事件
+      4. 测试覆盖 veto 和去重场景
+    claimed_paths:
+      - src/cccc/daemon/foreman/assignment_batches.py
+      - tests/test_ralph_plan_digest_guard.py
+    verification:
+      level: unit
+      checks:
+        - name: digest-check-test
+          command: "python -m pytest tests/test_ralph_plan_digest_guard.py -v"
+
+  - id: T-int
+    title: "集成验证：全量 regression + 新测试"
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T4
+      - T5
+      - T6
+      - T7
+      - T8
+    role: integration
+    addresses:
+      - "FL-6"
+      - "RO-89"
+    goal_behavior: |
+      运行全量 pytest 确认所有修改无回归。
+    acceptance_criteria: |
+      1. 全量 pytest 0 failure
+      2. 所有新增测试 pass
+    claimed_paths:
+      - tests/test_v37_integration.py
+    verification:
+      level: integration
+      checks:
+        - name: new-tests
+          command: "python -m pytest tests/test_flow_verify_xdist.py tests/test_verification_input_precheck.py tests/test_verification_gate_security_lint.py tests/test_workflow_verify_refresh_spec.py tests/ralph/test_flow_engine_guide.py tests/ralph/test_flow_e2e.py tests/test_ralph_validate_ledger.py tests/test_ralph_plan_digest_guard.py -v"
+        - name: full-regression
+          command: "python -m pytest -q --tb=short"
+      covers:
+        tasks:
+          - T1
+          - T2
+          - T3
+          - T4
+          - T5
+          - T6
+          - T7
+          - T8
+
+batch_e2e_command: "python -m pytest -q --tb=short"
+batch_e2e_timeout: 300

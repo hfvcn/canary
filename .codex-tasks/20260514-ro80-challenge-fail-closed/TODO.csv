@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm T1 plan and current code,DONE,T1 plan and target files read,test -f plans/v33-ux-and-ro-fixes.yaml,,0,
+2,Implement fail-closed challenge dependency handling,DONE,Dependency errors return failed VerificationResult,python -m pytest tests/test_challenge_degradation.py -v,,0,
+3,Update challenge degradation tests,DONE,Existing assertions reflect failed outcome and new infrastructure failure test exists,python -m pytest tests/test_challenge_degradation.py -v,,0,
+4,Run verification,DONE,Targeted pytest passes,python -m pytest tests/test_challenge_degradation.py -v,2026-05-14,0,"Specified command blocked by missing xdist for configured -n auto; explicit addopts override passed 7 tests"

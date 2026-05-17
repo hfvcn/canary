@@ -24,6 +24,10 @@ this file as permission to add size or branching to these modules.
 | `src/cccc/ralph/validation_rules/coverage.py` | file size and several rule functions | Coverage rules were split from the validator but still contain multiple rule families. | Split critical-entrypoint, verification, and forbidden-flow rules into separate files. |
 | `src/cccc/ralph/validation_rules/structural.py` | file size and structural rule function length | Structural rules still combine graph, role, and integration-spine checks. | Split graph, role, and integration-spine checks into focused modules. |
 | `src/cccc/ralph/validation_rules/contracts.py` | contract rule function length | Contract checks still validate multiple contract surfaces in one function. | Split contract rule families into separate helpers under the function limit. |
+| `src/cccc/ralph/guide_generator.py` | file size | Guide generator combines template rendering, capability extraction, and markdown assembly. | Split template sections into per-section generators. |
+| `src/cccc/ralph/flow_engine.py` | file size | Flow engine combines state management, step orchestration, and check functions for solve/e2e flows. | Split check functions into per-flow modules (already started with flow_steps_e2e.py). |
+| `src/cccc/ralph/flow_steps_e2e.py` | file size | E2E flow step checks combine env preparation, tracker scanning, version-marker enforcement, and archive advisory in one module. | Extract tracker-diff helpers (HEAD baseline, header parsing, body remnant scan) into a dedicated submodule once the per-step ownership stabilizes. |
+| `src/cccc/ralph/validation_rules/__init__.py` | `get_all_rules` function length | Registry function lists all validation rule references in a single return statement for discoverability. | Not planned — a flat list is the simplest correct form for a registry. |
 
 ## Rules
 

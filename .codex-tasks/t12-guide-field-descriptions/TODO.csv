@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Verify T12 scope and model Field descriptions,DONE,Relevant TaskSpec fields have Field descriptions,rg/inspection,2026-05-17,0,"verified verification_mode aegis provides consumes mock_tests descriptions"
+2,Locate guide table generation logic,DONE,Exact code path for Description column identified,rg/inspection,2026-05-17,0,"_format_schema_section -> _format_field_row"
+3,Implement Field description extraction,DONE,Generated guide uses non-empty Pydantic field descriptions where present,focused test,2026-05-17,0,"added _field_description helper"
+4,Add and run regression tests,DONE,New test passes and relevant existing tests pass,pytest focused,2026-05-17,0,"9 passed in 0.89s"

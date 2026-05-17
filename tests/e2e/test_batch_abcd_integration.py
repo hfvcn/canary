@@ -31,7 +31,7 @@ from unittest.mock import patch
 
 import pytest
 
-from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef
+from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef, VerificationSpec
 from cccc.daemon.foreman.workflow import BatchEvaluationResult
 from cccc.kernel.workflow_state_types import WorkflowTaskStatus
 
@@ -117,11 +117,11 @@ def _make_verification(task_id: str, wf_id: str, outcome: str = "passed"):
 #
 
 TASKS = [
-    TaskRef(id="T1", title="backend-scaffold", type="backend", claimed_paths=["src/app.py"], depends_on=[]),
-    TaskRef(id="T2", title="api-routes", type="backend", claimed_paths=["src/routes.py"], depends_on=["T1"]),
-    TaskRef(id="T3", title="models", type="backend", claimed_paths=["src/models.py"], depends_on=["T1"]),
-    TaskRef(id="T4", title="integration-tests", type="general", claimed_paths=["tests/test_api.py"], depends_on=["T2", "T3"]),
-    TaskRef(id="T5", title="docs", type="general", claimed_paths=["docs/README.md"], depends_on=[]),
+    TaskRef(id="T1", title="backend-scaffold", type="backend", claimed_paths=["src/app.py"], depends_on=[], verification=VerificationSpec(command="echo ok")),
+    TaskRef(id="T2", title="api-routes", type="backend", claimed_paths=["src/routes.py"], depends_on=["T1"], verification=VerificationSpec(command="echo ok")),
+    TaskRef(id="T3", title="models", type="backend", claimed_paths=["src/models.py"], depends_on=["T1"], verification=VerificationSpec(command="echo ok")),
+    TaskRef(id="T4", title="integration-tests", type="general", claimed_paths=["tests/test_api.py"], depends_on=["T2", "T3"], verification=VerificationSpec(command="echo ok")),
+    TaskRef(id="T5", title="docs", type="general", claimed_paths=["docs/README.md"], depends_on=[], verification=VerificationSpec(command="echo ok")),
 ]
 
 WORKFLOW_ID = "wf-integration-test"
@@ -359,7 +359,7 @@ class TestBatchABCDIntegration:
         batch = ReadyBatchSuggestion(
             suggestion_id="batch-reject",
             workflow_id="wf-reject",
-            tasks=[TaskRef(id="TX", title="reject-test", type="backend", claimed_paths=["x.py"])],
+            tasks=[TaskRef(id="TX", title="reject-test", type="backend", claimed_paths=["x.py"], verification=VerificationSpec(command="echo ok"))],
         )
 
         def fake_reject(_suggestion, *, auto_approve=True, notify_feishu=False):
@@ -453,7 +453,7 @@ class TestBatchABCDIntegration:
         """ARCH-7: DEFERRED state persists, transitions, and replays correctly."""
         orch, group = setup
 
-        task = TaskRef(id="TD1", title="deferred-task", type="backend", claimed_paths=["d.py"])
+        task = TaskRef(id="TD1", title="deferred-task", type="backend", claimed_paths=["d.py"], verification=VerificationSpec(command="echo ok"))
         orch.engine.register_task(task, "wf-defer")
 
         # Defer
@@ -476,7 +476,7 @@ class TestBatchABCDIntegration:
         """ARCH-6: assignment_id/attempt_id present in ledger batch_approved events."""
         orch, group = setup
 
-        task = TaskRef(id="TA1", title="audit-task", type="backend", claimed_paths=["a.py"])
+        task = TaskRef(id="TA1", title="audit-task", type="backend", claimed_paths=["a.py"], verification=VerificationSpec(command="echo ok"))
         batch = ReadyBatchSuggestion(
             suggestion_id="batch-audit",
             workflow_id="wf-audit",

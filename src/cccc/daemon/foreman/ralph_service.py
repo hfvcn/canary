@@ -36,9 +36,9 @@ from ...ralph.agent import (
     RalphAgent,
     build_error_envelope,
 )
+from ...ralph.aegis import effective_intent, suggest_aegis_issues
 from ...ralph.plan_io import compute_structural_plan_digest, load_plan
 from ...kernel.claimed_paths import (
-    GLOBAL_WRITE_CLAIM,
     conflicts_with_any as _conflicts_with_any_fn,
     normalize_path as _normalize_path_fn,
     normalize_write_set as _normalize_write_set_fn,
@@ -47,6 +47,8 @@ from ...kernel.claimed_paths import (
 )
 READY_BATCH_ID_HEX_LEN = 12
 TASK_STATUS_COMPLETED = "completed"
+TASK_STATUS_COMPLETED_BY_OVERRIDE = "completed_by_override"
+COMPLETED_TASK_STATUSES = frozenset({TASK_STATUS_COMPLETED, TASK_STATUS_COMPLETED_BY_OVERRIDE})
 TASK_STATUS_RUNNING = "running"
 GIT_COMMAND_TIMEOUT_SECONDS = 10
 STUCK_LOOP_LOOKBACK = 6
@@ -69,11 +71,19 @@ CHALLENGE_DEGRADED_WARNING = (
     "Gemini unavailability"
 )
 AGENT_VERIFICATION_FAILED_PREFIX = "agent verification failed:"
+AGENT_VERIFICATION_INFRA_ERROR_PREFIX = "agent verification infrastructure error:"
 AGENT_REVIEW_SKIPPED_WARNING_CODE = "W_AGENT_REVIEW_SKIPPED"
 MAX_SCOPE_WARNING_FILES = 5
 SOURCE_CONTEXT_MAX_BYTES = 50_000
 SOURCE_FILE_MAX_BYTES = 16_000
 _SOURCE_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx"}
+VERIFICATION_INFRA_EXCEPTIONS = (
+    FileNotFoundError,
+    ConnectionError,
+    TimeoutError,
+    OSError,
+    subprocess.TimeoutExpired,
+)
 AGENT_VERIFICATION_EXCEPTIONS = (
     OSError,
     subprocess.CalledProcessError,
@@ -224,13 +234,31 @@ def _mock_command_start_failure(
 ) -> Dict[str, Any]:
     return {
         "command": command,
-        "outcome": "failed",
+        "outcome": "infra_error",
         "returncode": None,
         "stdout": "",
         "stderr": "",
         "duration_ms": duration_ms,
         "error": str(exc),
     }
+
+
+def _is_verification_infra_exception(exc: Exception) -> bool:
+    return isinstance(exc, VERIFICATION_INFRA_EXCEPTIONS)
+
+
+def _verification_exception_outcome(exc: Exception) -> str:
+    if _is_verification_infra_exception(exc):
+        return "infra_error"
+    return "failed"
+
+
+def _mock_tests_outcome(checks: List[VerificationCheck]) -> str:
+    if all(check.outcome == "passed" for check in checks):
+        return "passed"
+    if any(check.outcome == "infra_error" for check in checks):
+        return "infra_error"
+    return "failed"
 
 
 def _mock_test_details(
@@ -266,18 +294,40 @@ def _agent_verification_warnings(
     return _dedupe_warnings(merged)
 
 
-def _task_covers_critical_flow(task_ref: TaskRef, critical_flows: List[Any]) -> bool:
-    claimed_paths = [
-        path for path in _normalize_write_set_fn(task_ref.claimed_paths)
-        if path != GLOBAL_WRITE_CLAIM
+def _suggest_aegis_errors(task: TaskRef) -> List[str]:
+    return [
+        issue.reason
+        for issue in suggest_aegis_issues(task)
+        if issue.severity == "error"
     ]
-    if not claimed_paths or not critical_flows:
-        return False
-    for flow in critical_flows:
-        for entrypoint in getattr(flow, "entrypoints", []):
-            if any(_paths_overlap(claimed_path, entrypoint) for claimed_path in claimed_paths):
-                return True
-    return False
+
+
+def _suggest_aegis_warning_notes(task: TaskRef) -> List[str]:
+    return [
+        f"Aegis warning {task.id}: {issue.reason}"
+        for issue in suggest_aegis_issues(task)
+        if issue.severity == "warning"
+    ]
+
+
+def _suggest_aegis_exclusion_notes(task: TaskRef, errors: List[str]) -> List[str]:
+    return [f"Aegis excluded {task.id}: {reason}" for reason in errors]
+
+
+def _log_suggest_aegis_exclusion(task: TaskRef, errors: List[str]) -> None:
+    _logger.warning(
+        "Ralph suggest excluded task %s (intent=%s): %s",
+        task.id,
+        effective_intent(task),
+        "; ".join(errors),
+    )
+
+
+def _ready_batch_rationale(ready_count: int, notes: List[str]) -> str:
+    rationale = f"Ralph: {ready_count} tasks passed dependency and claimed_paths gating"
+    if not notes:
+        return rationale
+    return f"{rationale}; " + "; ".join(notes)
 
 
 class RalphService:
@@ -304,7 +354,6 @@ class RalphService:
         # engine delegation (see _get_task_status_from_engine).
         self._processed_keys: set[str] = set()
         self._semantic_gate_cache: Dict[tuple, str] = {}
-        self._workflow_plan_cache: Dict[str, tuple[int, Any]] = {}
 
     def get_changed_files(self, since_ref: str = "HEAD~1") -> List[str]:
         """Get list of files changed since a git ref."""
@@ -402,10 +451,17 @@ class RalphService:
         active_write_sets = self._prepare_running_write_sets(running_write_sets)
         ready: List[TaskRef] = []
         batch_claims: List[List[str]] = []
+        aegis_notes: List[str] = []
 
         for task in tasks:
             dep_status = self.check_dependencies(task.id)
             if not dep_status["satisfied"]:
+                continue
+
+            aegis_errors = _suggest_aegis_errors(task)
+            if aegis_errors:
+                _log_suggest_aegis_exclusion(task, aegis_errors)
+                aegis_notes.extend(_suggest_aegis_exclusion_notes(task, aegis_errors))
                 continue
 
             task_write_set = self._normalize_write_set(getattr(task, "claimed_paths", []) or [])
@@ -416,6 +472,7 @@ class RalphService:
 
             ready.append(task)
             batch_claims.append(task_write_set)
+            aegis_notes.extend(_suggest_aegis_warning_notes(task))
 
         if not ready:
             return None
@@ -424,7 +481,7 @@ class RalphService:
             suggestion_id=f"ralph-{uuid.uuid4().hex[:READY_BATCH_ID_HEX_LEN]}",
             workflow_id=workflow_id,
             tasks=ready,
-            rationale=f"Ralph: {len(ready)} tasks passed dependency and claimed_paths gating",
+            rationale=_ready_batch_rationale(len(ready), aegis_notes),
             estimated_parallelism=len(ready),
         )
 
@@ -523,7 +580,7 @@ class RalphService:
             tasks = engine.list_tasks()
             if tasks:
                 total = len(tasks)
-                completed = sum(1 for t in tasks if t.status.value == TASK_STATUS_COMPLETED)
+                completed = sum(1 for t in tasks if t.status.value in COMPLETED_TASK_STATUSES)
                 running = sum(1 for t in tasks if t.status.value == TASK_STATUS_RUNNING)
                 failed = sum(1 for t in tasks if t.status.value == "failed")
                 pending = total - completed - running - failed
@@ -532,7 +589,7 @@ class RalphService:
         statuses = self._build_task_status_index()
         running_statuses = {TASK_STATUS_RUNNING, "started", "heartbeat"}
         total = len(statuses)
-        completed = sum(1 for s in statuses.values() if s == TASK_STATUS_COMPLETED)
+        completed = sum(1 for s in statuses.values() if s in COMPLETED_TASK_STATUSES)
         running = sum(1 for s in statuses.values() if s in running_statuses)
         failed = sum(1 for s in statuses.values() if s == "failed")
         pending = total - completed - running - failed
@@ -653,35 +710,102 @@ class RalphService:
                 summary=f"verification failed: task '{task_id}' not found",
             )
 
-        mode = getattr(resolved_task, "verification_mode", "ralph") or "ralph"
-        critical_flows = self._load_workflow_critical_flows(workflow_id)
-        if mode == "ralph" and _task_covers_critical_flow(resolved_task, critical_flows):
-            _logger.info(
-                "verification mode upgrade: task_id=%s workflow_id=%s from=ralph to=challenge",
-                task_id,
-                workflow_id,
-            )
+        return self._verify_completion_for_mode(
+            task_id=task_id,
+            changed_files=changed_files,
+            workflow_id=workflow_id,
+            task_ref=resolved_task,
+        )
+
+    def _verify_completion_for_mode(
+        self,
+        *,
+        task_id: str,
+        changed_files: List[str],
+        workflow_id: str,
+        task_ref: TaskRef,
+    ) -> VerificationResult:
+        mode = getattr(task_ref, "verification_mode", "ralph") or "ralph"
+        if mode == "ralph" and self._should_upgrade_to_challenge(task_ref, workflow_id):
             mode = "challenge"
+        if mode == "ralph":
+            return self._verify_completion_with_worker(
+                task_id=task_id,
+                workflow_id=workflow_id,
+                changed_files=changed_files,
+                task_ref=task_ref,
+            )
+
+        worker_result = self._run_worker_verification_before_review(
+            task_id=task_id,
+            workflow_id=workflow_id,
+            changed_files=changed_files,
+            task_ref=task_ref,
+        )
+        if worker_result is not None and worker_result.overall_outcome != "passed":
+            return worker_result
+
+        verification_output = (
+            self._verification_output_from_result(worker_result)
+            if worker_result is not None
+            else None
+        )
         if mode == "agent":
             return self._verify_completion_with_agent(
                 task_id=task_id,
                 changed_files=changed_files,
                 workflow_id=workflow_id,
-                task_ref=resolved_task,
+                task_ref=task_ref,
+                verification_output=verification_output,
             )
         if mode == "challenge":
             return self._verify_completion_with_challenge(
                 task_id=task_id,
                 changed_files=changed_files,
                 workflow_id=workflow_id,
-                task_ref=resolved_task,
+                task_ref=task_ref,
+                worker_result=worker_result,
             )
 
         return self._verify_completion_with_worker(
             task_id=task_id,
             workflow_id=workflow_id,
             changed_files=changed_files,
-            task_ref=resolved_task,
+            task_ref=task_ref,
+        )
+
+    def _should_upgrade_to_challenge(self, task_ref: "TaskRef", workflow_id: str) -> bool:
+        """Upgrade ralph→challenge if task touches critical flow entrypoints."""
+        try:
+            critical_flows = self._verification_critical_flows(workflow_id, task_ref)
+        except Exception:
+            return False
+        if not critical_flows:
+            return False
+        claimed = set(getattr(task_ref, "claimed_paths", None) or [])
+        for flow in critical_flows:
+            entrypoints = getattr(flow, "entrypoints", None) or flow.get("entrypoints", []) if isinstance(flow, dict) else getattr(flow, "entrypoints", [])
+            for ep in entrypoints:
+                ep_path = ep.split("::")[0] if "::" in ep else ep
+                if ep_path in claimed:
+                    return True
+        return False
+
+    def _run_worker_verification_before_review(
+        self,
+        *,
+        task_id: str,
+        workflow_id: str,
+        changed_files: List[str],
+        task_ref: TaskRef,
+    ) -> Optional[VerificationResult]:
+        if not self._resolve_verification_specs(task_ref):
+            return None
+        return self._verify_completion_with_worker(
+            task_id=task_id,
+            workflow_id=workflow_id,
+            changed_files=changed_files,
+            task_ref=task_ref,
         )
 
     def _verify_completion_with_worker(
@@ -801,13 +925,15 @@ class RalphService:
         changed_files: List[str],
         workflow_id: str,
         task_ref: TaskRef,
+        worker_result: Optional[VerificationResult] = None,
     ) -> VerificationResult:
-        worker_result = self._verify_completion_with_worker(
-            task_id=task_id,
-            changed_files=changed_files,
-            workflow_id=workflow_id,
-            task_ref=task_ref,
-        )
+        if worker_result is None:
+            worker_result = self._verify_completion_with_worker(
+                task_id=task_id,
+                changed_files=changed_files,
+                workflow_id=workflow_id,
+                task_ref=task_ref,
+            )
         if worker_result.overall_outcome != "passed":
             return worker_result
 
@@ -825,7 +951,19 @@ class RalphService:
                 worker_result.warnings
                 + [_challenge_degraded_warning(dependency_error)]
             )
-            return worker_result.model_copy(update={"warnings": warnings})
+            return VerificationResult(
+                verification_id=worker_result.verification_id,
+                workflow_id=worker_result.workflow_id,
+                task_id=worker_result.task_id,
+                overall_outcome="failed",
+                checks=worker_result.checks,
+                warnings=warnings,
+                summary=(
+                    "challenge verification failed: agent infrastructure "
+                    f"unavailable ({dependency_error})"
+                ),
+                challenge_outcome="",
+            )
         return self._challenge_verification_result(worker_result, agent_result)
 
     def _challenge_verification_result(
@@ -834,7 +972,7 @@ class RalphService:
         agent_result: VerificationResult,
     ) -> VerificationResult:
         challenge_outcome = str(agent_result.overall_outcome)
-        outcome = "passed" if challenge_outcome == "passed" else "failed"
+        outcome = self._challenge_outcome(challenge_outcome)
         summary = (
             "worker verification passed; "
             f"challenge verification {challenge_outcome}: {agent_result.summary}"
@@ -849,6 +987,13 @@ class RalphService:
             summary=summary,
             challenge_outcome=challenge_outcome,
         )
+
+    def _challenge_outcome(self, challenge_outcome: str) -> str:
+        if challenge_outcome == "passed":
+            return "passed"
+        if challenge_outcome == "infra_error":
+            return "infra_error"
+        return "failed"
 
     def _verification_result(
         self,
@@ -890,6 +1035,7 @@ class RalphService:
                     warnings=warnings,
                     checks=checks,
                     total=len(mock_tests),
+                    outcome=outcome,
                 )
             return self._verify_agent_after_mock_tests(
                 task_id=task_id,
@@ -934,6 +1080,7 @@ class RalphService:
             workflow_id=workflow_id,
             config=AgentConfig(provider=GEMINI_PROVIDER),
         )
+        critical_flows = self._verification_critical_flows(workflow_id, task_ref)
         payload = agent.verify_task_completion(
             task_ref,
             changed_files=changed_files,
@@ -941,8 +1088,58 @@ class RalphService:
             source_context=source_context,
             git_diff=git_diff,
             verification_output=agent_verification_output,
+            critical_flows=critical_flows,
         )
         return self._agent_verification_result(task_id, workflow_id, warnings, payload)
+
+    def _verification_critical_flows(
+        self,
+        workflow_id: str,
+        task_ref: TaskRef,
+    ) -> List[Any]:
+        task_flows = self._critical_flows_from_task_ref(task_ref)
+        if task_flows:
+            return task_flows
+
+        plan_path = self._workflow_plan_path(workflow_id)
+        if plan_path:
+            return self._critical_flows_from_plan_file(plan_path)
+
+        root_plan = self.project_root / "plan.yaml"
+        if root_plan.is_file():
+            return self._critical_flows_from_plan_file(root_plan)
+        return []
+
+    def _critical_flows_from_task_ref(self, task_ref: TaskRef) -> List[Any]:
+        plan_context = getattr(task_ref, "plan", None)
+        if isinstance(plan_context, dict):
+            flows = plan_context.get("critical_flows")
+            if isinstance(flows, list):
+                return list(flows)
+
+        plan_flows = getattr(plan_context, "critical_flows", None)
+        if isinstance(plan_flows, (list, tuple)):
+            return list(plan_flows)
+
+        flows = getattr(task_ref, "critical_flows", None)
+        if isinstance(flows, (list, tuple)):
+            return list(flows)
+        return []
+
+    def _workflow_plan_path(self, workflow_id: str) -> str:
+        get_meta = getattr(self.workflow_engine, "get_workflow_meta", None)
+        if not workflow_id or not callable(get_meta):
+            return ""
+        meta = get_meta(workflow_id)
+        return str(getattr(meta, "plan_path", "") or "").strip()
+
+    def _critical_flows_from_plan_file(self, plan_path: Any) -> List[Any]:
+        path = Path(plan_path)
+        if not path.is_absolute():
+            path = self.project_root / path
+        if not path.is_file():
+            raise RuntimeError(f"verification plan_path missing: {path}")
+        return [flow.model_dump() for flow in load_plan(path).critical_flows]
 
     def _verify_agent_after_mock_tests(
         self,
@@ -966,6 +1163,14 @@ class RalphService:
                 warnings=warnings,
             )
         except AGENT_VERIFICATION_EXCEPTIONS as exc:
+            if _is_verification_infra_exception(exc):
+                return self._agent_infra_after_mock_tests(
+                    task_id=task_id,
+                    workflow_id=workflow_id,
+                    warnings=warnings,
+                    checks=mock_checks,
+                    exc=exc,
+                )
             return self._mock_tests_passed_without_agent(
                 task_id=task_id,
                 workflow_id=workflow_id,
@@ -990,8 +1195,7 @@ class RalphService:
             self._run_mock_test(index=index, mock_test=mock_test)
             for index, mock_test in enumerate(mock_tests, start=1)
         ]
-        outcome = "passed" if all(check.outcome == "passed" for check in checks) else "failed"
-        return checks, outcome
+        return checks, _mock_tests_outcome(checks)
 
     def _run_mock_test(self, *, index: int, mock_test: Any) -> VerificationCheck:
         timeout = VERIFICATION_COMMAND_TIMEOUT_SECONDS
@@ -1089,11 +1293,12 @@ class RalphService:
         warnings: List[str],
         checks: List[VerificationCheck],
         total: int,
+        outcome: str = "failed",
     ) -> VerificationResult:
         return self._verification_result(
             task_id=task_id,
             workflow_id=workflow_id,
-            outcome="failed",
+            outcome=outcome,
             checks=checks,
             warnings=warnings,
             summary=self._mock_tests_failure_summary(checks, total),
@@ -1120,6 +1325,18 @@ class RalphService:
             warnings=_dedupe_warnings(warnings + [skipped]),
             summary=f"verification passed: {len(checks)} mock tests passed",
         )
+
+    def _agent_infra_after_mock_tests(
+        self,
+        *,
+        task_id: str,
+        workflow_id: str,
+        warnings: List[str],
+        checks: List[VerificationCheck],
+        exc: Exception,
+    ) -> VerificationResult:
+        result = self._failed_agent_verification(task_id, workflow_id, warnings, exc)
+        return result.model_copy(update={"checks": checks + result.checks})
 
     def _mock_tests_verification_output(
         self,
@@ -1151,14 +1368,20 @@ class RalphService:
         warnings: List[str],
         exc: Exception,
     ) -> VerificationResult:
+        outcome = _verification_exception_outcome(exc)
+        prefix = (
+            AGENT_VERIFICATION_INFRA_ERROR_PREFIX
+            if outcome == "infra_error"
+            else AGENT_VERIFICATION_FAILED_PREFIX
+        )
         return VerificationResult(
             verification_id=f"ver-{uuid.uuid4().hex[:READY_BATCH_ID_HEX_LEN]}",
             workflow_id=workflow_id,
             task_id=task_id,
-            overall_outcome="failed",
+            overall_outcome=outcome,
             checks=[],
             warnings=warnings,
-            summary=f"agent verification failed: {_agent_error_detail(exc)}",
+            summary=f"{prefix} {_agent_error_detail(exc)}",
         )
 
     def _agent_verification_result(
@@ -1439,14 +1662,25 @@ class RalphService:
                 duration_ms=duration_ms,
                 details={"command": command, "expected_exit_code": expected_exit_code},
             )
-        except (FileNotFoundError, ValueError) as exc:
+        except OSError as exc:
             duration_ms = int((time.perf_counter() - started_at) * 1000)
-            return VerificationCheck(
+            return self._verification_start_failure_check(
                 name=name,
-                outcome="failed",
-                message=f"{name} failed to start: {exc}",
+                command=command,
+                expected_exit_code=expected_exit_code,
                 duration_ms=duration_ms,
-                details={"command": command, "expected_exit_code": expected_exit_code},
+                outcome="failed",
+                exc=exc,
+            )
+        except ValueError as exc:
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
+            return self._verification_start_failure_check(
+                name=name,
+                command=command,
+                expected_exit_code=expected_exit_code,
+                duration_ms=duration_ms,
+                outcome="failed",
+                exc=exc,
             )
 
         duration_ms = int((time.perf_counter() - started_at) * 1000)
@@ -1472,6 +1706,24 @@ class RalphService:
             message=message,
             duration_ms=duration_ms,
             details=details,
+        )
+
+    def _verification_start_failure_check(
+        self,
+        *,
+        name: str,
+        command: str,
+        expected_exit_code: int,
+        duration_ms: int,
+        outcome: str,
+        exc: Exception,
+    ) -> VerificationCheck:
+        return VerificationCheck(
+            name=name,
+            outcome=outcome,
+            message=f"{name} failed to start: {exc}",
+            duration_ms=duration_ms,
+            details={"command": command, "expected_exit_code": expected_exit_code},
         )
 
     def _remember_tasks(self, tasks: List[TaskRef]) -> None:
@@ -1518,7 +1770,7 @@ class RalphService:
 
     def _is_task_completed(self, task_id: str) -> bool:
         """Check if a task is completed."""
-        return self._build_task_status_index().get(task_id) == TASK_STATUS_COMPLETED
+        return self._build_task_status_index().get(task_id) in COMPLETED_TASK_STATUSES
 
     def _prepare_running_write_sets(
         self,
@@ -1573,28 +1825,6 @@ class RalphService:
                 registered_digest[:12],
                 plan_path,
             )
-
-    def _load_workflow_critical_flows(self, workflow_id: str) -> List[Any]:
-        if self.workflow_engine is None:
-            return []
-        meta = self.workflow_engine.get_workflow_meta(workflow_id)
-        plan_path = str(getattr(meta, "plan_path", "") or "").strip()
-        if not plan_path:
-            return []
-        return list(getattr(self._load_cached_workflow_plan(plan_path), "critical_flows", []))
-
-    def _load_cached_workflow_plan(self, plan_path: str) -> Any:
-        path = Path(plan_path)
-        if not path.is_absolute():
-            path = self.project_root / path
-        cache_key = str(path.resolve())
-        mtime_ns = path.stat().st_mtime_ns
-        cached = self._workflow_plan_cache.get(cache_key)
-        if cached is not None and cached[0] == mtime_ns:
-            return cached[1]
-        plan = load_plan(path)
-        self._workflow_plan_cache[cache_key] = (mtime_ns, plan)
-        return plan
 
     def _get_metrics_mtime_ns(self) -> int:
         """Return mtime_ns of the metrics file, or 0 if missing/unreadable."""

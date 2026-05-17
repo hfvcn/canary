@@ -35,7 +35,7 @@ class TestPromptDefaults(unittest.TestCase):
         self.assertNotIn("cccc_runtime_list", body)
         self.assertNotIn("cccc_model", body)
         self.assertNotIn("cccc_capability_use", body)
-        self.assertLessEqual(len(body.split()), 400)
+        self.assertLessEqual(len(body.split()), 500)
 
     def test_default_preamble_avoids_long_rule_duplication(self) -> None:
         from cccc.kernel.prompt_files import DEFAULT_PREAMBLE_BODY

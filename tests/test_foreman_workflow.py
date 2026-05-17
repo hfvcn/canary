@@ -11,7 +11,7 @@ from typing import List
 import pytest
 
 from cccc.contracts.v1.agent import Agent, ModelCapability, ModelRegistry
-from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, RestartSuggestion, TaskRef
+from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, RestartSuggestion, TaskRef, VerificationSpec
 from cccc.daemon.foreman.agent_pool import (
     AgentPoolManager,
     AgentEvaluation,
@@ -85,9 +85,9 @@ def pool_manager(temp_project_dir):
 def sample_tasks() -> List[TaskRef]:
     """Create sample tasks for testing."""
     return [
-        TaskRef(id="T1", title="Implement API endpoint", type="backend", claimed_paths=["src/api"]),
-        TaskRef(id="T2", title="Create React component", type="frontend", claimed_paths=["src/ui"]),
-        TaskRef(id="T3", title="Write documentation", type="general", claimed_paths=["docs"]),
+        TaskRef(id="T1", title="Implement API endpoint", type="backend", claimed_paths=["src/api"], verification=VerificationSpec(command="echo ok")),
+        TaskRef(id="T2", title="Create React component", type="frontend", claimed_paths=["src/ui"], verification=VerificationSpec(command="echo ok")),
+        TaskRef(id="T3", title="Write documentation", type="general", claimed_paths=["docs"], verification=VerificationSpec(command="echo ok")),
     ]
 
 

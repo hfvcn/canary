@@ -17,11 +17,13 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from ..contracts.v1 import DaemonError, DaemonResponse
+from ..contracts.v1.event import KIND_PLAN_VALIDATED
 from ..contracts.v1.ralph_ipc import (
     ActorStatus,
     BatchDecision,
@@ -168,6 +170,20 @@ def _normalize_assignment_map(value: Any) -> Dict[str, str]:
     }
 
 
+def _check_task_completeness(tasks: list) -> List[str]:
+    """Return error strings for tasks missing claimed_paths or verification."""
+    errors: List[str] = []
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        task_id = t.get("id", "<unknown>")
+        if not t.get("claimed_paths"):
+            errors.append(f"task '{task_id}' has no claimed_paths")
+        if t.get("verification") is None and not t.get("verification_command"):
+            errors.append(f"task '{task_id}' has no verification defined")
+    return errors
+
+
 def handle_ralph_batch_suggest(args: Dict[str, Any], *, daemon_request_fn: Any = None) -> DaemonResponse:
     """
     Handle ralph_batch_suggest operation.
@@ -258,6 +274,13 @@ def handle_ralph_register_and_suggest(
             return _error("orchestrator_not_available", "orchestrator not available")
         if daemon_request_fn and not orchestrator._daemon_request_fn:
             orchestrator._daemon_request_fn = daemon_request_fn
+
+        task_errors = _check_task_completeness(tasks)
+        if task_errors:
+            return _error(
+                "incomplete_tasks",
+                f"Workflow submit rejected — {len(task_errors)} issue(s): " + "; ".join(task_errors),
+            )
 
         result = orchestrator.register_and_suggest(
             tasks,
@@ -998,6 +1021,52 @@ def handle_ralph_task_event(args: Dict[str, Any]) -> DaemonResponse:
         )
     return _error("invalid_task_event", f"Unsupported task event: {event_type}")
 
+
+def handle_ralph_validate_event(args: Dict[str, Any]) -> DaemonResponse:
+    """Append the non-blocking ralph validate ledger event."""
+    from ..kernel.group import load_group
+    from ..kernel.ledger import append_event
+
+    group_id = str(args.get("group_id") or "").strip()
+    by = str(args.get("by") or "ralph").strip() or "ralph"
+    kind = str(args.get("kind") or "").strip()
+    payload = args.get("payload")
+
+    if not group_id:
+        return _error("missing_group_id", "Missing group_id")
+    if kind != KIND_PLAN_VALIDATED:
+        return _error("invalid_event_kind", f"Unsupported validate event kind: {kind}")
+    payload_error = _validate_plan_validated_payload(payload)
+    if payload_error:
+        return payload_error
+
+    group = load_group(group_id)
+    if group is None:
+        return _error("group_not_found", f"group not found: {group_id}")
+    event = append_event(
+        group.ledger_path,
+        kind=KIND_PLAN_VALIDATED,
+        group_id=group.group_id,
+        scope_key="",
+        by=by,
+        data=dict(payload),
+    )
+    return _success({"event": event})
+
+
+def _validate_plan_validated_payload(payload: Any) -> Optional[DaemonResponse]:
+    if not isinstance(payload, dict):
+        return _error("invalid_payload", "payload must be an object")
+    for key in ("errors", "warnings"):
+        value = payload.get(key)
+        if type(value) is not int or value < 0:
+            return _error("invalid_payload", f"payload.{key} must be a non-negative integer")
+    digest = payload.get("plan_digest")
+    if not isinstance(digest, str) or not digest.strip():
+        return _error("invalid_payload", "payload.plan_digest must be a non-empty string")
+    return None
+
+
 def handle_ralph_task_retry(args: Dict[str, Any]) -> DaemonResponse:
     """Handle ralph_task_retry operation — Foreman decision entrypoint."""
     from .ops.workflow_task_ops import retry_task
@@ -1023,6 +1092,55 @@ def handle_ralph_task_retry(args: Dict[str, Any]) -> DaemonResponse:
             assign_agent_id=assign_agent_id,
         )
     )
+
+
+def handle_workflow_override(args: Dict[str, Any]) -> DaemonResponse:
+    """Handle workflow_override operation — Foreman marks a task completed by override."""
+    group_id = str(args.get("group_id") or "").strip()
+    project_root = _resolve_group_project_root(group_id, args.get("project_root")) or None
+    task_id = str(args.get("task_id") or args.get("task") or "").strip()
+    workflow_id = str(args.get("workflow_id") or "").strip()
+    reason = str(args.get("reason") or "").strip()
+    evidence = str(args.get("evidence") or "").strip()
+
+    if not group_id:
+        return _error("missing_group_id", "Missing group_id")
+    if not task_id:
+        return _error("missing_task_id", "Missing task_id")
+    if not reason:
+        return _error("missing_reason", "Missing reason")
+    if not evidence:
+        return _error("missing_evidence", "Missing evidence")
+
+    try:
+        from .foreman.workflow_orchestrator import get_orchestrator
+
+        orchestrator = get_orchestrator(group_id, project_root=Path(project_root) if project_root else None)
+        if orchestrator is None:
+            return _error("orchestrator_not_found", "No active orchestrator for group")
+        state = orchestrator.engine.get_task(task_id)
+        if state is None:
+            return _error("task_not_found", f"task not found: {task_id}")
+        actual_workflow_id = str(getattr(state, "workflow_id", "") or "").strip()
+        if workflow_id and actual_workflow_id != workflow_id:
+            message = f"workflow_id mismatch for task {task_id}: expected {workflow_id}, got {actual_workflow_id}"
+            return _error("workflow_id_mismatch", message)
+        orchestrator.engine.foreman_override_task(task_id, reason, evidence)
+        workflow_data = orchestrator._active_workflows.get(actual_workflow_id, {})
+        tracked = workflow_data.get("tasks", {}).get(task_id) if isinstance(workflow_data, dict) else None
+        if isinstance(tracked, dict):
+            tracked["status"] = "completed_by_override"
+        orchestrator._resuggest_ready_tasks(actual_workflow_id)
+        return _success(
+            {
+                "accepted": True,
+                "task_id": task_id,
+                "workflow_id": actual_workflow_id,
+                "status": "completed_by_override",
+            }
+        )
+    except ValueError as exc:
+        return _error("workflow_override_error", str(exc))
 
 
 def handle_ralph_task_block(args: Dict[str, Any]) -> DaemonResponse:
@@ -1094,6 +1212,7 @@ def handle_ralph_task_verify(args: Dict[str, Any]) -> DaemonResponse:
     project_root = _resolve_group_project_root(group_id, args.get("project_root")) or None
     task_id = str(args.get("task_id") or "").strip()
     changed_files = args.get("changed_files") if isinstance(args.get("changed_files"), list) else []
+    refresh_spec = bool(args.get("refresh_spec"))
 
     if not group_id:
         return _error("missing_group_id", "Missing group_id")
@@ -1111,12 +1230,15 @@ def handle_ralph_task_verify(args: Dict[str, Any]) -> DaemonResponse:
         if state is None:
             return _error("task_not_found", f"task not found: {task_id}")
 
+        fresh_task_ref, refresh_error = _verify_task_ref(orchestrator, state, task_id, refresh_spec)
+        if refresh_error is not None:
+            return refresh_error
         files = [str(p or "").strip() for p in changed_files if str(p or "").strip()]
         verification = orchestrator.ralph.verify_completion(
             task_id,
             files,
             workflow_id=state.workflow_id,
-            task_ref=state.task,
+            task_ref=fresh_task_ref,
         )
         return _success(
             {
@@ -1128,6 +1250,59 @@ def handle_ralph_task_verify(args: Dict[str, Any]) -> DaemonResponse:
     except Exception as e:
         logger.warning(f"Failed to verify task completion: {e}")
         return _error("task_verify_error", f"Failed to verify task completion: {e}")
+
+
+def _verify_task_ref(orchestrator: Any, state: Any, task_id: str, refresh_spec: bool) -> tuple[Any, Optional[DaemonResponse]]:
+    if not refresh_spec:
+        return state.task, None
+    fresh_task_ref, refresh_error = _load_task_ref_from_plan(orchestrator, state, task_id)
+    if refresh_error is not None:
+        return None, refresh_error
+    return _refresh_cached_task_verification(orchestrator, state, task_id, fresh_task_ref), None
+
+
+def _load_task_ref_from_plan(
+    orchestrator: Any,
+    state: Any,
+    task_id: str,
+) -> tuple[Any, Optional[DaemonResponse]]:
+    meta = orchestrator.engine.get_workflow_meta(state.workflow_id)
+    if meta is None or not meta.plan_path:
+        return None, _error("plan_refresh_failed", "workflow has no registered plan")
+    plan_path = Path(meta.plan_path)
+    if not plan_path.exists():
+        return None, _error("plan_refresh_failed", f"plan_path missing: {plan_path}")
+    try:
+        from cccc.ralph.plan_io import load_plan
+
+        plan = load_plan(plan_path)
+    except Exception as e:
+        return None, _error("plan_refresh_failed", f"plan parse error: {e}")
+    matching = next((t for t in plan.tasks if t.id == task_id), None)
+    if matching is None:
+        return None, _error("plan_refresh_failed", f"task_not_in_plan: {task_id}")
+    return matching.to_task_ref(), None
+
+
+def _refresh_cached_task_verification(
+    orchestrator: Any,
+    state: Any,
+    task_id: str,
+    fresh_task_ref: Any,
+) -> Any:
+    updated_task = state.task.model_copy(
+        update={
+            "verification": fresh_task_ref.verification,
+            "verification_command": fresh_task_ref.verification_command,
+        }
+    )
+    cached_tasks = getattr(orchestrator.engine, "_tasks", None)
+    if isinstance(cached_tasks, dict) and task_id in cached_tasks:
+        cached_tasks[task_id] = replace(state, task=updated_task)
+        return updated_task
+    if hasattr(state, "__dict__"):
+        state.task = updated_task
+    return updated_task
 
 
 # Operation dispatcher
@@ -1146,7 +1321,9 @@ _RALPH_OPS = {
     "ralph_workflow_health": handle_ralph_workflow_health,
     "ralph_task_heartbeat": handle_ralph_task_heartbeat,
     "ralph_task_event": handle_ralph_task_event,
+    "ralph_validate_event": handle_ralph_validate_event,
     "ralph_task_retry": handle_ralph_task_retry,
+    "workflow_override": handle_workflow_override,
     "ralph_task_block": handle_ralph_task_block,
     "ralph_task_verify": handle_ralph_task_verify,
     "ralph_check_stalled": handle_ralph_check_stalled,

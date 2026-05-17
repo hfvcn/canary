@@ -8,6 +8,10 @@ def _warnings_by_code(report, code: str) -> list:
     return [issue for issue in report.warnings if issue.code == code]
 
 
+def _hints_by_code(report, code: str) -> list:
+    return [issue for issue in report.hints if issue.code == code]
+
+
 def _checks(commands: list[str]) -> list[dict[str, str]]:
     return [
         {"name": f"check-{index}", "command": command}
@@ -52,7 +56,7 @@ def test_covers_no_reference_flagged() -> None:
     plan = _plan("pytest tests/ralph/test_validator_flow.py -q")
 
     report = validate(plan)
-    issues = _warnings_by_code(report, "W_COVERS_NOT_EXERCISED")
+    issues = _hints_by_code(report, "W_COVERS_NOT_EXERCISED")
 
     assert len(issues) == 1
     assert issues[0].task_ids == ["T2", "T1"]

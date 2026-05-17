@@ -125,7 +125,7 @@ class TestMonitorViolationLedger:
                     json={
                         "workflow_id": "wf-post-violation",
                         "tasks": [
-                            {"id": "T1", "title": "test", "type": "backend", "depends_on": [], "claimed_paths": ["src/a.py"]},
+                            {"id": "T1", "title": "test", "type": "backend", "depends_on": [], "claimed_paths": ["src/a.py"], "verification": {"command": "echo ok"}},
                         ],
                         "auto_process": True,
                         "auto_start_agents": False,

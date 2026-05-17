@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from cccc.contracts.v1.ralph_ipc import TaskRef
+from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationSpec
 from cccc.kernel.workflow_state import WorkflowMeta, WorkflowTaskStatus
 
 
@@ -75,6 +75,7 @@ def _task() -> TaskRef:
         type="backend",
         depends_on=[],
         claimed_paths=["src/stalled.py"],
+        verification=VerificationSpec(command="echo ok"),
     )
 
 

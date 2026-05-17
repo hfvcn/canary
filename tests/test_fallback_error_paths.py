@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
-from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef
+from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef, VerificationSpec
 from cccc.daemon.foreman.agent_pool import TaskAssignment
 from cccc.daemon.foreman.workflow import BatchEvaluationResult
 
@@ -27,7 +27,7 @@ def _make_suggestion(**overrides) -> ReadyBatchSuggestion:
     defaults = dict(
         suggestion_id="s-1",
         workflow_id="wf-1",
-        tasks=[TaskRef(id="t1", title="Task 1", type="backend")],
+        tasks=[TaskRef(id="t1", title="Task 1", type="backend", claimed_paths=["src/placeholder.py"], verification=VerificationSpec(command="echo ok"))],
         rationale="test",
         estimated_parallelism=1,
     )

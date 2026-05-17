@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef
+from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef, VerificationSpec
 from cccc.daemon.foreman.workflow import BatchEvaluationResult
 from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
 
@@ -23,7 +23,7 @@ def _suggestion(*, fallback_allowed: bool = False) -> ReadyBatchSuggestion:
     return ReadyBatchSuggestion(
         suggestion_id="s-fallback",
         workflow_id=WORKFLOW_ID,
-        tasks=[TaskRef(id="task-1", title="Task 1", type="backend")],
+        tasks=[TaskRef(id="task-1", title="Task 1", type="backend", claimed_paths=["src/placeholder.py"], verification=VerificationSpec(command="echo ok"))],
         rationale="test",
         estimated_parallelism=1,
         fallback_allowed=fallback_allowed,

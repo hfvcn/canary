@@ -91,6 +91,7 @@ def test_smoke_task_event_reaches_orchestrator(client: TestClient, temp_group) -
                     "type": "backend",
                     "depends_on": [],
                     "claimed_paths": ["src/a.py"],
+                    "verification": {"command": "echo ok"},
                 },
                 {
                     "id": "T2",
@@ -98,6 +99,7 @@ def test_smoke_task_event_reaches_orchestrator(client: TestClient, temp_group) -
                     "type": "frontend",
                     "depends_on": ["T1"],
                     "claimed_paths": ["web/a.tsx"],
+                    "verification": {"command": "echo ok"},
                 },
             ],
             "auto_process": True,

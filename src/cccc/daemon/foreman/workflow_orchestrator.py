@@ -50,6 +50,7 @@ from ...contracts.v1.ralph_ipc import (
     VerificationResult,
 )
 from ...ralph.agent import build_error_envelope
+from ...ralph import plan_io
 from ...ralph.plan_io import compute_structural_plan_digest
 from .context_store import ContextStore, TaskContext
 from .workflow import ForemanWorkflow, BatchEvaluationResult
@@ -76,8 +77,10 @@ logger = logging.getLogger("cccc.daemon.foreman.orchestrator")
 TASK_STATUS_PENDING = "pending"
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_COMPLETED = "completed"
+TASK_STATUS_COMPLETED_BY_OVERRIDE = _WTS.COMPLETED_BY_OVERRIDE.value
 TASK_STATUS_FAILED = "failed"
-_TERMINAL_STATUSES = {"completed", "archived"}
+_COMPLETED_STATUSES = {TASK_STATUS_COMPLETED, TASK_STATUS_COMPLETED_BY_OVERRIDE}
+_TERMINAL_STATUSES = {TASK_STATUS_COMPLETED, TASK_STATUS_COMPLETED_BY_OVERRIDE, _WTS.CANCELLED.value, "archived"}
 TASK_STATUS_DEFERRED = _WTS.DEFERRED.value
 SINGLE_WRITER_REASON = "single_writer_active"
 EXTERNAL_PRESSURE_REASON = "external_workflow_pressure"
@@ -431,6 +434,34 @@ class WorkflowOrchestrator:
             if str(task_id or "").strip() and str(agent_id or "").strip()
         }
 
+    def _release_agent_for_task(
+        self,
+        task_id: str,
+        tracked_task: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        agent_id = self._agent_id_for_task_release(task_id, tracked_task)
+        if not agent_id:
+            return False
+        return self.foreman.pool_manager.release_agent(agent_id)
+
+    def _agent_id_for_task_release(
+        self,
+        task_id: str,
+        tracked_task: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        if tracked_task:
+            agent_id = str(tracked_task.get("agent_id") or "").strip()
+            if agent_id:
+                return agent_id
+        state = self.engine.get_task(task_id) if task_id else None
+        if state and state.agent_id:
+            return str(state.agent_id).strip()
+        active = self.foreman.pool_manager.get_active_assignments()
+        for agent_id, assigned_task_id in active.items():
+            if assigned_task_id == task_id:
+                return agent_id
+        return ""
+
     def _track_task_ref(
         self,
         workflow_id: str,
@@ -690,7 +721,7 @@ class WorkflowOrchestrator:
         workflow_id: Optional[str] = None,
         verification: Optional[VerificationResult] = None,
     ) -> bool:
-        return self._assignment_controller.on_task_completed_inner(
+        success = self._assignment_controller.on_task_completed_inner(
             task_id,
             agent_id,
             duration_seconds,
@@ -698,6 +729,46 @@ class WorkflowOrchestrator:
             workflow_id=workflow_id,
             verification=verification,
         )
+        self._write_completed_plan_state(task_id, workflow_id)
+        return success
+
+    def _write_completed_plan_state(
+        self,
+        task_id: str,
+        workflow_id: Optional[str],
+    ) -> None:
+        try:
+            plan_path = self._completion_plan_path(task_id, workflow_id)
+            if plan_path is None:
+                return
+            plan_io.update_plan_task_state(plan_path, task_id, TASK_STATUS_COMPLETED)
+        except Exception:
+            logger.warning(
+                "Failed to update plan task state for task %s",
+                task_id,
+                exc_info=True,
+            )
+
+    def _completion_plan_path(
+        self,
+        task_id: str,
+        workflow_id: Optional[str],
+    ) -> Optional[Path]:
+        resolved_workflow_id = workflow_id or self._workflow_id_for_task(task_id)
+        if not resolved_workflow_id:
+            return None
+        meta = self.engine.get_workflow_meta(resolved_workflow_id)
+        raw_plan_path = str(getattr(meta, "plan_path", "") or "").strip() if meta else ""
+        return Path(raw_plan_path) if raw_plan_path else None
+
+    def _workflow_id_for_task(self, task_id: str) -> str:
+        state = self.engine.get_task(task_id)
+        if state:
+            return str(state.workflow_id or "")
+        for workflow_id, workflow_data in self._active_workflows.items():
+            if task_id in workflow_data.get("tasks", {}):
+                return str(workflow_id or "")
+        return ""
 
     def _resuggest_ready_tasks(self, workflow_id: Optional[str]) -> None:
         """WF-3: After a task completes, check if downstream tasks are now ready.
@@ -713,11 +784,12 @@ class WorkflowOrchestrator:
             return
 
         skip_statuses = {
-            TASK_STATUS_COMPLETED,
+            *_COMPLETED_STATUSES,
             TASK_STATUS_RUNNING,
             "assigned",
             _WTS.BLOCKED.value,
             _WTS.DEFERRED.value,
+            _WTS.CANCELLED.value,
         }
         remaining_refs: List[TaskRef] = []
         running_write_sets: List[List[str]] = []
@@ -905,12 +977,15 @@ class WorkflowOrchestrator:
                 return False
 
         # Update assignment status
+        failed_task: Optional[Dict[str, Any]] = None
         for wdata in self._active_workflows.values():
             td = wdata.get("tasks", {}).get(task_id)
             if td:
                 td["status"] = TASK_STATUS_FAILED
                 td["error_message"] = error_message
+                failed_task = td
                 break
+        self._release_agent_for_task(task_id, failed_task)
 
         success = self.reporter.on_task_failed(
             task_id,
@@ -940,11 +1015,11 @@ class WorkflowOrchestrator:
             tasks = wdata.get("tasks", {})
             if not tasks:
                 return
-            terminal = {"completed", "failed", "archived"}
+            terminal = {*_COMPLETED_STATUSES, "failed", "cancelled", "archived"}
             if all(t.get("status") in terminal for t in tasks.values()):
-                completed = sum(1 for t in tasks.values() if t.get("status") == "completed")
+                completed = sum(1 for t in tasks.values() if t.get("status") in _COMPLETED_STATUSES)
                 total = len(tasks)
-                summary = f"All {total} tasks finished ({completed} completed, {total - completed} failed/archived)"
+                summary = f"All {total} tasks finished ({completed} completed, {total - completed} failed/cancelled/archived)"
                 self._log(f"[orchestrator] Workflow {workflow_id} auto-completing: {summary}")
                 try:
                     self.complete_workflow(workflow_id, summary=summary)
@@ -1665,7 +1740,7 @@ class WorkflowOrchestrator:
             downstream = self.engine.get_task(tid)
             if downstream is None:
                 continue
-            if downstream.status in {_WTS.COMPLETED, _WTS.ARCHIVED, _WTS.BLOCKED}:
+            if downstream.status in {_WTS.COMPLETED, _WTS.COMPLETED_BY_OVERRIDE, _WTS.CANCELLED, _WTS.ARCHIVED, _WTS.BLOCKED}:
                 continue
             was_running = downstream.status == _WTS.RUNNING
             cascade_reason = f"upstream {blocked_task_id} blocked: {reason}"
@@ -1816,8 +1891,8 @@ class WorkflowOrchestrator:
         # Collect counts BEFORE cleanup (Codex review: pop destroys the data)
         wdata = self._active_workflows.get(workflow_id, {})
         tasks = wdata.get("tasks", {})
-        completed_count = sum(1 for t in tasks.values() if t.get("status") == "completed")
-        failed_count = sum(1 for t in tasks.values() if t.get("status") in {"failed", "archived"})
+        completed_count = sum(1 for t in tasks.values() if t.get("status") in _COMPLETED_STATUSES)
+        failed_count = sum(1 for t in tasks.values() if t.get("status") in {"failed", "cancelled", "archived"})
         total = len(tasks)
 
         # Emit ledger event (RO-77)

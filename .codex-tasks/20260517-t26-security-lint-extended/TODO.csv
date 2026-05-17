@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current security lint and T26 plan,DONE,Existing implementation and expected task details are understood,rg and file reads complete,2026-05-17,0,
+2,Implement extended security patterns and gate behavior,DONE,Pattern exports and warning/blocking behavior match T26,pytest target tests pass,2026-05-17,0,
+3,Add focused regression tests,DONE,Tests cover eval warning bare except warning and robustness blocking,pytest tests/test_security_lint_extended.py,2026-05-17,0,
+4,Run verification and record outcome,DONE,Targeted automated verification completes,pytest tests/test_security_lint_extended.py,2026-05-17,0,

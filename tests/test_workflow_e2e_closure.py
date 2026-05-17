@@ -136,10 +136,10 @@ class TestPhasedSubmission(unittest.TestCase):
             return True
 
         tasks = [
-            {"id": "T1", "title": "Task 1", "type": "backend", "claimed_paths": ["src/a.py"]},
-            {"id": "T2", "title": "Task 2", "type": "backend", "depends_on": ["T1"], "claimed_paths": ["src/b.py"]},
-            {"id": "T3", "title": "Task 3", "type": "backend", "claimed_paths": ["src/c.py"]},
-            {"id": "T4", "title": "Task 4", "type": "backend", "depends_on": ["T2", "T3"], "claimed_paths": ["src/d.py"]},
+            {"id": "T1", "title": "Task 1", "type": "backend", "claimed_paths": ["src/a.py"], "verification": {"command": "echo ok"}},
+            {"id": "T2", "title": "Task 2", "type": "backend", "depends_on": ["T1"], "claimed_paths": ["src/b.py"], "verification": {"command": "echo ok"}},
+            {"id": "T3", "title": "Task 3", "type": "backend", "claimed_paths": ["src/c.py"], "verification": {"command": "echo ok"}},
+            {"id": "T4", "title": "Task 4", "type": "backend", "depends_on": ["T2", "T3"], "claimed_paths": ["src/d.py"], "verification": {"command": "echo ok"}},
         ]
 
         orchestrator_module._ORCHESTRATORS["test-group"] = orchestrator
@@ -264,12 +264,12 @@ class TestDurationTracking(unittest.TestCase):
     def test_engine_computes_duration(self):
         """report_worker_completion includes duration from engine timestamps."""
         from cccc.kernel.workflow_state_types import KIND_TASK_REPORTED_COMPLETED
-        from cccc.contracts.v1.ralph_ipc import TaskRef
+        from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationSpec
 
         engine, tmpdir = _make_engine_with_tmpdir()
 
         # Register a task
-        task = TaskRef(id="T1", title="Test")
+        task = TaskRef(id="T1", title="Test", claimed_paths=["src/placeholder.py"], verification=VerificationSpec(command="echo ok"))
         engine.register_task(task, "wf-1")
 
         # Approve batch
@@ -310,10 +310,10 @@ class TestVerificationWarning(unittest.TestCase):
     def test_verification_warning_event(self):
         """record_verification_warning writes to ledger."""
         from cccc.kernel.workflow_state_types import KIND_VERIFICATION_WARNING
-        from cccc.contracts.v1.ralph_ipc import TaskRef
+        from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationSpec
 
         engine, tmpdir = _make_engine_with_tmpdir()
-        task = TaskRef(id="T1", title="Test")
+        task = TaskRef(id="T1", title="Test", claimed_paths=["src/placeholder.py"], verification=VerificationSpec(command="echo ok"))
         engine.register_task(task, "wf-1")
 
         events = []

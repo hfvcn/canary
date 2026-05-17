@@ -6,13 +6,16 @@ No daemon, no engine, no MCP — just pure computation on the plan file data.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from .agent import AgentConfig, GEMINI_PROVIDER, GeminiResponseError, RalphAgent
+from .aegis import suggest_aegis_issues
 from .models import (
     BatchResult,
     BlockedTask,
@@ -33,9 +36,21 @@ from cccc.kernel.claimed_paths import (
 )
 
 
+_logger = logging.getLogger("cccc.ralph.core")
+
+
 # ---------------------------------------------------------------------------
 # Suggest ready batch
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _SuggestContext:
+    state: PlanState
+    done: set[str]
+    running_write_sets: List[List[str]]
+    task_map: Dict[str, TaskSpec]
+
 
 def _unlock_score(task_id: str, task_map: Dict[str, TaskSpec], state: PlanState) -> int:
     done = set(state.completed_task_ids)
@@ -76,13 +91,151 @@ def _dependency_block_reasons(
     return reasons
 
 
-def _suggest_rationale(ready_count: int, blocked_count: int) -> str:
+def _suggest_rationale(
+    ready_count: int,
+    blocked_count: int,
+    notes: Optional[List[str]] = None,
+) -> str:
     ready_text = (
         f"{ready_count} task{'s' if ready_count != 1 else ''} ready after ordering by unlock score"
     )
+    rationale = ready_text
     if blocked_count:
-        return f"{ready_text}, {blocked_count} blocked"
-    return ready_text
+        rationale = f"{ready_text}, {blocked_count} blocked"
+    if notes:
+        return f"{rationale}; " + "; ".join(notes)
+    return rationale
+
+
+def _suggest_context(plan: Plan) -> _SuggestContext:
+    state = plan.state
+    running_write_sets = [
+        _normalize_write_set(rt.claimed_paths) for rt in state.running_tasks
+    ]
+    return _SuggestContext(
+        state=state,
+        done=set(state.completed_task_ids),
+        running_write_sets=running_write_sets,
+        task_map={task.id: task for task in plan.tasks},
+    )
+
+
+def _eligible_tasks(
+    plan: Plan,
+    context: _SuggestContext,
+) -> tuple[List[tuple[TaskSpec, List[str]]], List[BlockedTask]]:
+    running_ids = {rt.task_id for rt in context.state.running_tasks}
+    skip = context.done | running_ids | set(context.state.failed_task_ids)
+    eligible: List[tuple[TaskSpec, List[str]]] = []
+    blocked: List[BlockedTask] = []
+    for task in plan.tasks:
+        if task.id in skip:
+            continue
+        reasons = _dependency_block_reasons(
+            task,
+            done=context.done,
+            failed=set(context.state.failed_task_ids),
+            task_map=context.task_map,
+        )
+        if reasons:
+            blocked.append(BlockedTask(task_id=task.id, kind="waiting", reasons=reasons))
+            continue
+        eligible.append((task, reasons))
+    return eligible, blocked
+
+
+def _ordered_eligible(
+    eligible: List[tuple[TaskSpec, List[str]]],
+    context: _SuggestContext,
+) -> List[tuple[TaskSpec, List[str]]]:
+    return sorted(
+        eligible,
+        key=lambda item: _unlock_score(item[0].id, context.task_map, context.state),
+        reverse=True,
+    )
+
+
+def _ready_from_eligible(
+    eligible: List[tuple[TaskSpec, List[str]]],
+    context: _SuggestContext,
+) -> tuple[List[str], List[BlockedTask], List[str]]:
+    ready: List[str] = []
+    blocked: List[BlockedTask] = []
+    notes: List[str] = []
+    batch_claims: List[List[str]] = []
+    for task, _ in _ordered_eligible(eligible, context):
+        result = _accept_suggest_candidate(task, context, batch_claims)
+        if result is None:
+            ready.append(task.id)
+            batch_claims.append(_normalize_write_set(task.claimed_paths))
+            notes.extend(_aegis_warning_notes(task))
+            continue
+        blocked.append(result)
+        if _is_aegis_block(result):
+            notes.extend(f"Aegis excluded {task.id}: {reason}" for reason in result.reasons)
+    return ready, blocked, notes
+
+
+def _accept_suggest_candidate(
+    task: TaskSpec,
+    context: _SuggestContext,
+    batch_claims: List[List[str]],
+) -> Optional[BlockedTask]:
+    aegis_errors = _aegis_errors(task)
+    if aegis_errors:
+        _logger.warning("Ralph suggest excluded task %s: %s", task.id, "; ".join(aegis_errors))
+        return BlockedTask(task_id=task.id, kind="deferred", reasons=aegis_errors)
+    task_ws = _normalize_write_set(task.claimed_paths)
+    if _conflicts_with_any(task_ws, context.running_write_sets):
+        return BlockedTask(
+            task_id=task.id,
+            kind="deferred",
+            reasons=["claimed_paths_conflict:running"],
+        )
+    if _conflicts_with_any(task_ws, batch_claims):
+        return BlockedTask(
+            task_id=task.id,
+            kind="deferred",
+            reasons=["claimed_paths_conflict:batch"],
+        )
+    return None
+
+
+def _aegis_errors(task: TaskSpec) -> List[str]:
+    return [
+        issue.reason
+        for issue in suggest_aegis_issues(task)
+        if issue.severity == "error"
+    ]
+
+
+def _aegis_warning_notes(task: TaskSpec) -> List[str]:
+    return [
+        f"Aegis warning {task.id}: {issue.reason}"
+        for issue in suggest_aegis_issues(task)
+        if issue.severity == "warning"
+    ]
+
+
+def _is_aegis_block(blocked: BlockedTask) -> bool:
+    return any(reason.startswith("E_AEGIS_") for reason in blocked.reasons)
+
+
+def _task_descriptions(ready: List[str], task_map: Dict[str, TaskSpec]) -> Dict[str, str]:
+    descriptions: Dict[str, str] = {}
+    for tid in ready:
+        task = task_map.get(tid)
+        if task and task.goal_behavior:
+            descriptions[tid] = task.goal_behavior
+    return descriptions
+
+
+def _task_summaries(ready: List[str], task_map: Dict[str, TaskSpec]) -> Dict[str, str]:
+    return {
+        tid: task_map[tid].title
+        for tid in ready
+        if tid in task_map and task_map[tid].title
+    }
 
 
 def suggest(plan: Plan) -> BatchResult:
@@ -94,89 +247,23 @@ def suggest(plan: Plan) -> BatchResult:
     3. Its claimed_paths don't conflict with running tasks' claimed_paths
     4. Its claimed_paths don't conflict with other ready tasks in this batch
     """
-    state = plan.state
-    done = set(state.completed_task_ids)
-    running_ids = {rt.task_id for rt in state.running_tasks}
-    failed = set(state.failed_task_ids)
-    skip = done | running_ids | failed
-
-    running_write_sets = [
-        _normalize_write_set(rt.claimed_paths) for rt in state.running_tasks
-    ]
-    task_map = {t.id: t for t in plan.tasks}
-    ready: List[str] = []
-    blocked: List[BlockedTask] = []
-    batch_claims: List[List[str]] = []
-    eligible: List[tuple[TaskSpec, List[str]]] = []
-
-    for task in plan.tasks:
-        if task.id in skip:
-            continue
-
-        reasons = _dependency_block_reasons(
-            task,
-            done=done,
-            failed=failed,
-            task_map=task_map,
-        )
-        if reasons:
-            blocked.append(BlockedTask(task_id=task.id, kind="waiting", reasons=reasons))
-            continue
-        eligible.append((task, reasons))
-
-    ordered_eligible = sorted(
-        eligible,
-        key=lambda item: _unlock_score(item[0].id, task_map, state),
-        reverse=True,
-    )
-    for task, _ in ordered_eligible:
-        task_ws = _normalize_write_set(task.claimed_paths)
-        conflict_running = _conflicts_with_any(task_ws, running_write_sets)
-        if conflict_running:
-            blocked.append(BlockedTask(
-                task_id=task.id,
-                kind="deferred",
-                reasons=[f"claimed_paths_conflict:running"],
-            ))
-            continue
-
-        # Check write-set conflicts with already-selected batch
-        conflict_batch = _conflicts_with_any(task_ws, batch_claims)
-        if conflict_batch:
-            blocked.append(BlockedTask(
-                task_id=task.id,
-                kind="deferred",
-                reasons=[f"claimed_paths_conflict:batch"],
-            ))
-            continue
-
-        ready.append(task.id)
-        batch_claims.append(task_ws)
-
-    n = len(ready)
-    ready_set = set(ready)
-    task_descriptions = {}
-    for tid in ready:
-        task = task_map.get(tid)
-        if task and task.goal_behavior:
-            task_descriptions[tid] = task.goal_behavior
+    context = _suggest_context(plan)
+    eligible, blocked = _eligible_tasks(plan, context)
+    ready, deferred, aegis_notes = _ready_from_eligible(eligible, context)
+    blocked.extend(deferred)
 
     return BatchResult(
         ready=ready,
         blocked=blocked,
-        rationale=_suggest_rationale(n, len(blocked)),
+        rationale=_suggest_rationale(len(ready), len(blocked), aegis_notes),
         task_metadata={
             task.id: {"verification_mode": task.verification_mode}
             for task in plan.tasks
         },
-        batch_sequence=len(done),
+        batch_sequence=len(context.done),
         batch_boundary=True,
-        task_summaries={
-            tid: task_map[tid].title
-            for tid in ready
-            if tid in task_map and task_map[tid].title
-        },
-        task_descriptions=task_descriptions,
+        task_summaries=_task_summaries(ready, context.task_map),
+        task_descriptions=_task_descriptions(ready, context.task_map),
     )
 
 
@@ -194,8 +281,6 @@ def verify(
     if task.verification_mode == "agent":
         return _verify_with_agent(task, changed_files, project_root=project_root)
 
-    del changed_files
-
     specs, reason = _resolve_verification_specs(task)
     if reason is not None:
         return {
@@ -203,6 +288,7 @@ def verify(
             "outcome": "skipped",
             "reason": reason,
             "checks": [],
+            "security_warnings": [],
         }
 
     checks: List[Dict[str, Any]] = []
@@ -222,11 +308,60 @@ def verify(
             outcome = check["outcome"]
             break
 
+    security_warnings = _run_security_scan(
+        changed_files=changed_files,
+        project_root=project_root,
+        task=task,
+    )
+
     return {
         "task_id": task.id,
         "outcome": outcome,
         "checks": checks,
+        "security_warnings": security_warnings,
     }
+
+
+def _run_security_scan(
+    changed_files: List[str],
+    project_root: Path,
+    task: Any,
+) -> List[Dict[str, Any]]:
+    """Run shared security scanning (same logic as daemon verification gate)."""
+    from .security_scan import (
+        scan_security_lint,
+        scan_entrypoint_debug,
+        check_input_robustness,
+        format_security_summary,
+    )
+
+    warnings: List[Dict[str, Any]] = []
+
+    lint_hits = scan_security_lint(changed_files, project_root)
+    if lint_hits:
+        warnings.append({
+            "type": "security_lint",
+            "message": format_security_summary(lint_hits),
+            "hits": lint_hits[:20],
+        })
+
+    scanned_basenames = [
+        str(p).replace("\\", "/").rsplit("/", 1)[-1]
+        for p in changed_files if p
+    ]
+    debug_hits = scan_entrypoint_debug(project_root, already_scanned=scanned_basenames)
+    if debug_hits:
+        warnings.append({
+            "type": "entrypoint_debug",
+            "message": f"production entry point contains debug=True: {', '.join(h['file'] for h in debug_hits)}",
+            "hits": debug_hits[:10],
+        })
+
+    robustness_gap = check_input_robustness(project_root)
+    if robustness_gap:
+        warnings.append(robustness_gap)
+
+    return warnings
 
 
 def _verify_with_agent(

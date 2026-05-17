@@ -178,13 +178,13 @@ def test_ralph_enhancement_surface_e2e(tmp_path: Path) -> None:
     assert allowed["accepted"] is True
     assert allowed["verification_outcome"] == "passed"
 
-    running_task = TaskRef(id="TA", title="active", type="backend", claimed_paths=["src/shared.py"])
+    running_task = TaskRef(id="TA", title="active", type="backend", claimed_paths=["src/shared.py"], verification=VerificationSpec(command="echo ok"))
     _advance_task_to_running(orch, "wf-pressure-a", running_task, agent_id="worker-a")
     deferred = orch.process_batch_suggestion(
         ReadyBatchSuggestion(
             suggestion_id="batch-pressure",
             workflow_id="wf-pressure-b",
-            tasks=[TaskRef(id="TB", title="contender", type="backend", claimed_paths=["src/shared.py"])],
+            tasks=[TaskRef(id="TB", title="contender", type="backend", claimed_paths=["src/shared.py"], verification=VerificationSpec(command="echo ok"))],
         ),
         auto_start_agents=False,
     )

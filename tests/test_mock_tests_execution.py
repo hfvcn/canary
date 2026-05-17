@@ -110,7 +110,7 @@ def _register_running_task(
     orchestrator.engine.report_worker_started(task.id, agent_id)
 
 
-def test_mock_tests_all_pass_without_gemini_returns_passed(
+def test_mock_tests_all_pass_without_gemini_returns_infra_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -124,10 +124,10 @@ def test_mock_tests_all_pass_without_gemini_returns_passed(
         task_ref=task,
     )
 
-    assert result.overall_outcome == "passed"
-    assert result.summary == "verification passed: 1 mock tests passed"
+    assert result.overall_outcome == "infra_error"
+    assert result.summary == "agent verification infrastructure error: gemini unavailable"
     assert [check.outcome for check in result.checks] == ["passed"]
-    assert any("W_AGENT_REVIEW_SKIPPED" in warning for warning in result.warnings)
+    assert result.warnings == []
     assert (tmp_path / "mock-fixture.txt").read_text(encoding="utf-8") == "ok"
 
 

@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read T3 context and existing interfaces,DONE,T3 behavior and local APIs are understood,python -m pytest tests/ralph/test_aegis_intent.py -q,2026-05-15,0,
+2,Implement discipline checks,DONE,Five checks emit required codes and severities,python -m pytest tests/ralph/test_aegis_rules.py -v,2026-05-15,0,
+3,Register rule docs and versions,DONE,ralph explain exposes new codes,python -m pytest tests/ralph/test_aegis_rules.py -v,2026-05-15,0,
+4,Run requested verification,DONE,Both requested pytest commands pass,python -m pytest tests/ralph/test_aegis_rules.py -v && python -m pytest tests/ralph/test_ralph_standalone.py -v,2026-05-15,0,

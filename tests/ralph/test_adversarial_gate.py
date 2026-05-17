@@ -127,7 +127,7 @@ def test_challenge_mode_agent_unavailable(
         task_ref=_task_ref(),
     )
 
-    assert result.overall_outcome == "passed"
+    assert result.overall_outcome == "failed"
     assert result.challenge_outcome == ""
     assert result.warnings
     assert result.warnings[0].startswith(f"{CHALLENGE_DEGRADED_WARNING_CODE}:")

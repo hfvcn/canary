@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect T8 context,DONE,T8 scope and existing Ralph validation structure are understood,test -f plans/fix-v38-all-issues.yaml,2026-05-17,0,
+2,Implement AD-2 infrastructure,DONE,effective_intent and discipline collector satisfy T8 requirements,python -m pytest tests/test_aegis_discipline_infra.py -v,2026-05-17,0,
+3,Run focused validation,DONE,Requested discipline infra test passes,python -m pytest tests/test_aegis_discipline_infra.py -v,2026-05-17,0,12 passed

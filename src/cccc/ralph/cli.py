@@ -17,10 +17,13 @@ import json
 import logging
 import subprocess
 import sys
+from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List
 
+from ..daemon.server import call_daemon
 from .agent import (
     AgentConfig,
     AgentSuggestion,
@@ -39,6 +42,7 @@ from .report_diff import (
     format_report_diff_text,
     load_validation_report,
 )
+from .security_check_generator import generate_security_checks
 from .validator import _sort_issues, validate, validate_with_project
 
 
@@ -47,6 +51,10 @@ _EXIT_OK = 0
 _EXIT_VALIDATION_FAILURE = 1  # Plan-level validation failures
 _EXIT_INTERNAL_ERROR = 2       # Internal errors (load failures, crashes, etc.)
 logger = logging.getLogger(__name__)
+_REPEATED_HINT_GROUP_THRESHOLD = 3
+_VALIDATE_DAEMON_EVENT_KIND = "workflow.plan_validated"
+_VALIDATE_DAEMON_EVENT_OP = "ralph_validate_event"
+_VALIDATE_DAEMON_TIMEOUT_S = 1.0
 
 
 def _warning_exc_info(exc_info: object | None) -> object | None:
@@ -275,6 +283,12 @@ def main(argv: List[str] | None = None) -> int:
         default=None,
         help="Group ID (resolves ledger path)",
     )
+    p_val.add_argument(
+        "--generate-security-checks",
+        action="store_true",
+        default=False,
+        help="Generate behavioral security check commands from critical flows",
+    )
 
     # --- suggest ---
     p_sug = sub.add_parser("suggest", help="Show next ready batch")
@@ -314,11 +328,57 @@ def main(argv: List[str] | None = None) -> int:
     p_sync.add_argument("--ledger", type=Path, help="Path to ledger.jsonl")
     p_sync.add_argument("--group", type=str, help="Group ID (resolves ledger path)")
 
+    # --- guide ---
+    p_guide = sub.add_parser(
+        "guide",
+        help="Auto-generate capability guide from plan schema and validation rules",
+    )
+    p_guide.add_argument("--output", type=Path, default=None, help="Output file (default: stdout)")
+    p_guide.add_argument(
+        "--update", type=Path, default=None, metavar="EXISTING",
+        help="Incrementally update an existing guide: only regenerate sections affected by git changes",
+    )
+    p_guide.add_argument(
+        "--since", type=str, default=None,
+        help="Git ref for diff base (default: last commit that touched the guide file)",
+    )
+
+    # --- flow ---
+    p_flow = sub.add_parser("flow", help="Progressive workflow guidance")
+    flow_sub = p_flow.add_subparsers(dest="flow_command")
+    p_flow_start = flow_sub.add_parser("start", help="Start a new workflow")
+    p_flow_start.add_argument("flow_type", choices=["solve", "e2e"], help="Flow type")
+    p_flow_start.add_argument("--workspace", type=Path, required=True, help="Workspace directory")
+    p_flow_start.add_argument("--test-cmd", default="pytest", help="Test command for verification step")
+    p_flow_start.add_argument("--tracker", type=Path, default=None, help="Issue tracker file")
+    p_flow_start.add_argument("--guide-output", type=Path, default=None, help="Capability guide output path")
+    p_flow_start.add_argument("--cccc-root", type=Path, default=None, help="CCCC project root (e2e)")
+    p_flow_start.add_argument("--version", type=str, default=None, help="Version tag (e2e)")
+    p_flow_start.add_argument("--report-path", type=Path, default=None, help="E2E report output path")
+    p_flow_next = flow_sub.add_parser("next", help="Advance to next step")
+    p_flow_next.add_argument("--workspace", type=Path, default=Path("."), help="Workspace directory")
+    p_flow_status = flow_sub.add_parser("status", help="Show current flow status")
+    p_flow_status.add_argument("--workspace", type=Path, default=Path("."), help="Workspace directory")
+
     args = parser.parse_args(argv)
 
     if args.command is None:
         parser.print_help()
         return 1
+
+    if args.command == "guide":
+        try:
+            return _cmd_guide(args)
+        except Exception as exc:
+            _emit_error_envelope("guide", exc)
+            return _EXIT_INTERNAL_ERROR
+
+    if args.command == "flow":
+        try:
+            return _cmd_flow(args)
+        except Exception as exc:
+            _emit_error_envelope("flow", exc)
+            return _EXIT_INTERNAL_ERROR
 
     # ``audit`` does not require a plan file
     if args.command == "audit":
@@ -489,23 +549,37 @@ def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
             report.warnings.append(issue)
         agent_suggestions = []
     compact = getattr(args, "compact", False)
-    _print_validate_result(
-        report=report,
-        args=args,
-        project_root=project_root,
-        gate_name=gate_name,
-        show_semantic=show_semantic,
-        agent_suggestions=agent_suggestions,
-        compact=compact,
-    )
+    if getattr(args, "generate_security_checks", False):
+        _print_generated_security_checks(args.plan)
+    else:
+        _print_validate_result(
+            report=report,
+            args=args,
+            project_root=project_root,
+            gate_name=gate_name,
+            show_semantic=show_semantic,
+            agent_suggestions=agent_suggestions,
+            compact=compact,
+        )
 
-    _write_validate_ledger_event_if_requested(
+    group_id = _write_validate_ledger_event_if_requested(
         args=args,
         report=report,
         project_root=project_root,
+    )
+    _emit_validate_daemon_ledger_event(
+        args=args,
+        report=report,
+        project_root=project_root,
+        group_id=group_id,
     )
 
     return _EXIT_OK if report.valid else _EXIT_VALIDATION_FAILURE
+
+
+def _print_generated_security_checks(plan_path: Path) -> None:
+    checks = generate_security_checks(str(plan_path))
+    print(json.dumps(checks, indent=2, ensure_ascii=False))
 
 
 def _write_validate_ledger_event_if_requested(
@@ -513,7 +587,7 @@ def _write_validate_ledger_event_if_requested(
     args: argparse.Namespace,
     report: ValidationReport,
     project_root: Path,
-) -> None:
+) -> str:
     ledger_path = getattr(args, "ledger", None)
     group_id = getattr(args, "group", None)
     if not group_id and not ledger_path:
@@ -521,7 +595,7 @@ def _write_validate_ledger_event_if_requested(
     if not ledger_path and group_id:
         ledger_path = _resolve_group_ledger_path(group_id)
     if not ledger_path:
-        return
+        return group_id or ""
     try:
         _write_validation_event(
             ledger_path=ledger_path,
@@ -531,6 +605,42 @@ def _write_validate_ledger_event_if_requested(
         )
     except Exception as exc:
         _warn_visible("Failed to write validation event to ledger: %s", exc, exc_info=True)
+    return group_id or ""
+
+
+def _emit_validate_daemon_ledger_event(
+    *,
+    args: argparse.Namespace,
+    report: ValidationReport,
+    project_root: Path,
+    group_id: str,
+) -> None:
+    request = {
+        "op": _VALIDATE_DAEMON_EVENT_OP,
+        "args": {
+            "group_id": group_id,
+            "project_root": str(project_root),
+            "kind": _VALIDATE_DAEMON_EVENT_KIND,
+            "payload": _validate_daemon_event_payload(report=report, plan_path=args.plan),
+            "by": "ralph",
+        },
+    }
+    try:
+        call_daemon(request, timeout_s=_VALIDATE_DAEMON_TIMEOUT_S)
+    except Exception:
+        logger.debug("Daemon unavailable while sending validate ledger event", exc_info=True)
+
+
+def _validate_daemon_event_payload(
+    *,
+    report: ValidationReport,
+    plan_path: Path,
+) -> Dict[str, object]:
+    return {
+        "errors": len(report.errors),
+        "warnings": len(report.warnings),
+        "plan_digest": hashlib.sha256(plan_path.read_bytes()).hexdigest() if plan_path.exists() else "",
+    }
 
 
 def _review_beyond_scope_with_agent(
@@ -835,6 +945,13 @@ def _cmd_verify(plan: Plan, args: argparse.Namespace) -> int:
     )
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
+    security_warnings = result.get("security_warnings") or []
+    if security_warnings:
+        print(f"\n⚠ security scan: {len(security_warnings)} warning(s)", file=sys.stderr)
+        for w in security_warnings:
+            print(f"  [{w.get('type', '?')}] {w.get('message', '')}", file=sys.stderr)
+
     return 0 if result.get("outcome") in {"passed", "agent_pending"} else 1
 
 
@@ -1143,6 +1260,69 @@ def _cmd_sync_state(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _cmd_guide(args: argparse.Namespace) -> int:
+    from .guide_generator import generate_guide, update_guide
+
+    if args.update is not None:
+        content, warnings = update_guide(args.update, since=args.since)
+        for w in warnings:
+            print(f"⚠  {w}", file=sys.stderr)
+        dest = args.output or args.update
+        dest.write_text(content, encoding="utf-8")
+        if warnings:
+            print(f"\n{len(warnings)} section(s) may need manual review (see warnings above)", file=sys.stderr)
+        return _EXIT_OK
+
+    content = generate_guide()
+    if args.output is None:
+        print(content, end="")
+        return _EXIT_OK
+    args.output.write_text(content, encoding="utf-8")
+    return _EXIT_OK
+
+
+def _cmd_flow(args: argparse.Namespace) -> int:
+    from .flow_engine import FlowEngine
+
+    workspace = args.workspace.resolve()
+    engine = FlowEngine(workspace)
+    if args.flow_command == "start":
+        params: dict[str, Any] = {}
+        if args.test_cmd:
+            params["test_cmd"] = args.test_cmd
+        if args.tracker:
+            params["tracker"] = str(args.tracker)
+        if args.guide_output:
+            params["guide_output"] = str(args.guide_output)
+        if getattr(args, "cccc_root", None):
+            params["cccc_root"] = str(args.cccc_root)
+        if getattr(args, "version", None):
+            params["version"] = args.version
+        if getattr(args, "report_path", None):
+            params["report_path"] = str(args.report_path)
+        output = engine.start(args.flow_type, **params)
+        print(output)
+        return _EXIT_OK
+    if args.flow_command == "next":
+        output = engine.next()
+        print(output)
+        state = engine.state
+        if state and state.current_step > len(engine._get_steps(state.flow_type)):
+            return _EXIT_OK
+        return _EXIT_OK
+    if args.flow_command == "status":
+        state = engine.state
+        if state is None:
+            print("No active flow. Run: ralph flow start <solve|e2e> --workspace <path>")
+            return _EXIT_VALIDATION_FAILURE
+        steps = engine._get_steps(state.flow_type)
+        total = len(steps)
+        print(f"Flow: {state.flow_type}  Step: {state.current_step}/{total}  Completed: {state.steps_completed}")
+        return _EXIT_OK
+    print("error: flow requires a subcommand (start/next/status)", file=sys.stderr)
+    return _EXIT_VALIDATION_FAILURE
+
+
 # ---------------------------------------------------------------------------
 # Text formatters
 # ---------------------------------------------------------------------------
@@ -1170,6 +1350,62 @@ def _format_summary_banner(report: ValidationReport) -> str:
     )
 
 
+@dataclass
+class _GroupedIssue:
+    is_group: bool
+    issue: ValidationIssue | None = None
+    code: str = ""
+    count: int = 0
+    task_ids: list[str] | None = None
+    message_sample: str = ""
+
+
+def _group_repeated_issues(
+    issues: list[ValidationIssue],
+    threshold: int = _REPEATED_HINT_GROUP_THRESHOLD,
+) -> list[_GroupedIssue]:
+    code_counts = Counter(issue.code for issue in issues)
+    grouped_codes = {code for code, count in code_counts.items() if count > threshold}
+    result: list[_GroupedIssue] = []
+    grouped_bucket: dict[str, list[ValidationIssue]] = {}
+    for issue in issues:
+        if issue.code in grouped_codes:
+            grouped_bucket.setdefault(issue.code, []).append(issue)
+            continue
+        result.append(_GroupedIssue(is_group=False, issue=issue))
+
+    for code, group in grouped_bucket.items():
+        task_ids: list[str] = []
+        for grouped_issue in group:
+            for task_id in grouped_issue.task_ids:
+                if task_id not in task_ids:
+                    task_ids.append(task_id)
+        result.append(_GroupedIssue(
+            is_group=True,
+            code=code,
+            count=len(group),
+            task_ids=task_ids,
+            message_sample=group[0].message if group else "",
+        ))
+    return result
+
+
+def _print_grouped_issue(entry: _GroupedIssue) -> None:
+    task_str = ", ".join(entry.task_ids or [])
+    task_suffix = f" [{task_str}]" if task_str else ""
+    message = f": {entry.message_sample}" if entry.message_sample else ":"
+    print(f"  {entry.code} (x{entry.count}){message}{task_suffix}")
+
+
+def _print_grouped_issue_entry(entry: _GroupedIssue) -> None:
+    if entry.is_group:
+        _print_grouped_issue(entry)
+        return
+    if entry.issue is None:
+        raise ValueError("ungrouped validation issue entry is missing issue")
+    _print_issue(entry.issue)
+
+
 def _print_validation_text(
     report: ValidationReport,
     *,
@@ -1177,30 +1413,38 @@ def _print_validation_text(
     compact: bool = False,
 ) -> None:
     if compact:
-        errors = _compact_filter_issues(report.errors, "error")
-        warnings = _compact_filter_issues(report.warnings, "warning")
-        total = len(errors) + len(warnings)
-
-        print(_format_compact_banner(report, len(errors), len(warnings)))
-
-        if total == 0:
-            print("Plan is valid. No actionable issues in compact view.")
-            return
-
-        print()
-        if errors:
-            print(f"Errors ({len(errors)}):")
-            for issue in errors:
-                _print_issue(issue)
-        if warnings:
-            print(f"\nWarnings ({len(warnings)}, exact-confidence only):")
-            for issue in warnings:
-                _print_issue(issue)
-
-        print(f"\ncompact: {len(errors)} error(s), {len(warnings)} warning(s) shown"
-              f" (full: {len(report.errors)} errors, {len(report.warnings)} warnings, {len(report.hints)} hints)")
+        _print_compact_validation_text(report)
         return
 
+    _print_full_validation_text(report, show_semantic=show_semantic)
+
+
+def _print_compact_validation_text(report: ValidationReport) -> None:
+    errors = _compact_filter_issues(report.errors, "error")
+    warnings = _compact_filter_issues(report.warnings, "warning")
+    total = len(errors) + len(warnings)
+
+    print(_format_compact_banner(report, len(errors), len(warnings)))
+
+    if total == 0:
+        print("Plan is valid. No actionable issues in compact view.")
+        return
+
+    print()
+    if errors:
+        print(f"Errors ({len(errors)}):")
+        for issue in errors:
+            _print_issue(issue)
+    if warnings:
+        print(f"\nWarnings ({len(warnings)}, exact-confidence only):")
+        for issue in warnings:
+            _print_issue(issue)
+
+    print(f"\ncompact: {len(errors)} error(s), {len(warnings)} warning(s) shown"
+          f" (full: {len(report.errors)} errors, {len(report.warnings)} warnings, {len(report.hints)} hints)")
+
+
+def _print_full_validation_text(report: ValidationReport, *, show_semantic: bool) -> None:
     print(_format_summary_banner(report))
 
     total = len(report.errors) + len(report.warnings) + len(report.hints)
@@ -1223,8 +1467,9 @@ def _print_validation_text(
 
     if report.hints:
         print(f"\nHints ({len(report.hints)}):")
-        for issue in report.hints:
-            _print_issue(issue)
+        grouped = _group_repeated_issues(report.hints, threshold=_REPEATED_HINT_GROUP_THRESHOLD)
+        for entry in grouped:
+            _print_grouped_issue_entry(entry)
 
     if show_semantic:
         _print_semantic_findings(report)

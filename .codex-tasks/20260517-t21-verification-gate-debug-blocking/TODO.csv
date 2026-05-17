@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect verification gate and existing security scan behavior,DONE,Relevant control flow and tests understood,rg verification_gate/security_scan/tests,2026-05-17T00:00:00+08:00,0,
+2,Implement pre-completion blocking security lint,DONE,debug=True in non-test changed source changes outcome to failed,pytest tests/test_security_lint_blocking.py,2026-05-17T00:00:00+08:00,0,
+3,Add focused regression tests,DONE,Three requested cases covered in tests/test_security_lint_blocking.py,pytest tests/test_security_lint_blocking.py,2026-05-17T00:00:00+08:00,0,
+4,Run validation and summarize,DONE,Focused tests pass or failure is recorded,pytest tests/test_security_lint_blocking.py,2026-05-17T00:00:00+08:00,1,`timeout` unavailable on macOS; reran with Python subprocess timeout.

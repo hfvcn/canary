@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationResult
+from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationResult, VerificationSpec
 from cccc.kernel.workflow_state import WorkflowTaskStatus
 
 
@@ -62,9 +62,9 @@ def orchestrator(temp_home, temp_project_dir):  # noqa: ARG001
 
 def _linear_tasks() -> list[TaskRef]:
     return [
-        TaskRef(id="T1", title="task-1", type="backend", depends_on=[], claimed_paths=["src/a.py"]),
-        TaskRef(id="T2", title="task-2", type="backend", depends_on=["T1"], claimed_paths=["src/b.py"]),
-        TaskRef(id="T3", title="task-3", type="backend", depends_on=["T2"], claimed_paths=["src/c.py"]),
+        TaskRef(id="T1", title="task-1", type="backend", depends_on=[], claimed_paths=["src/a.py"], verification=VerificationSpec(command="echo ok")),
+        TaskRef(id="T2", title="task-2", type="backend", depends_on=["T1"], claimed_paths=["src/b.py"], verification=VerificationSpec(command="echo ok")),
+        TaskRef(id="T3", title="task-3", type="backend", depends_on=["T2"], claimed_paths=["src/c.py"], verification=VerificationSpec(command="echo ok")),
     ]
 
 

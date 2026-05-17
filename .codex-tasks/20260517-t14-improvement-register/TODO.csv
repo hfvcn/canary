@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm implementation location,DONE,Active check function and call path identified,rg "_check_improvement_register" src tests,2026-05-17T00:00:00+08:00,0,Active code is in flow_steps_e2e.py and imported by FlowEngine for e2e flow.
+2,Implement current marker check,DONE,Pre-existing additions without current marker fail,python -m pytest tests/test_flow_improvement_check.py -v,2026-05-17T00:00:00+08:00,0,Implemented in flow_improvement_check.py with FlowState.version support.
+3,Add focused tests,DONE,Three requested cases are covered,python -m pytest tests/test_flow_improvement_check.py -v,2026-05-17T00:00:00+08:00,0,Added tests/test_flow_improvement_check.py with pass old-addition fail and no-diff fail cases.
+4,Run target verification,DONE,Target pytest passes within 60 seconds,timeout 60 python -m pytest tests/test_flow_improvement_check.py -v,2026-05-17T00:00:00+08:00,0,3 passed in 0.98s; related flow_e2e suite also passed.

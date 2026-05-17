@@ -95,7 +95,13 @@ class AssignmentDeferralMixin:
         workflow_id: str,
         tasks: List[TaskRef],
     ) -> List[TaskAssignment]:
-        return record_deferred_tasks(self._owner.engine, tasks, SINGLE_WRITER_REASON)
+        deferred_assignments = record_deferred_tasks(self._owner.engine, tasks, SINGLE_WRITER_REASON)
+        self._release_deferred_task_agents(tasks)
+        return deferred_assignments
+
+    def _release_deferred_task_agents(self, tasks: List[TaskRef]) -> None:
+        for task in tasks:
+            self._owner._release_agent_for_task(task.id)
 
     def get_active_external_tasks(
         self,
@@ -165,6 +171,7 @@ class AssignmentDeferralMixin:
                 self._owner.engine.defer_task(task.id, EXTERNAL_PRESSURE_REASON)
             except ValueError:
                 pass
+            self._owner._release_agent_for_task(task.id)
             deferred_assignments.append(self._deferred_assignment(task))
         return deferred_assignments
 

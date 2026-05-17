@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm current routing and task scope,DONE,Current verify_completion behavior and T2 scope are understood,test -f plans/fix-v38-all-issues.yaml,2026-05-17,0,
+2,Implement verification_mode routing,DONE,ralph skips review and agent/challenge keep review routing,python -m py_compile src/cccc/daemon/foreman/ralph_service.py,2026-05-17,0,
+3,Add routing tests,DONE,tests cover ralph agent challenge review calls,python -m pytest tests/test_verification_mode_routing.py -v,2026-05-17,0,
+4,Run T2 verification,DONE,T2 unit check passes,python -m pytest tests/test_verification_mode_routing.py -v,2026-05-17,0,

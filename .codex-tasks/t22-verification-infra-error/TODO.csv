@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm T22 scope,DONE,T22 YAML and verification flow inspected,rg -n "id: T22|RO-98" plans/fix-v38-all-issues.yaml,2026-05-17T00:00:00+08:00,0,
+2,Implement contract state and gate retry,DONE,infra_error is a non-terminal verification outcome with 2 verifier retries,python -m pytest tests/test_verification_infra_error.py -v,2026-05-17T00:00:00+08:00,0,
+3,Classify RalphService infra failures,DONE,RalphService returns infra_error for infrastructure exceptions,python -m pytest tests/test_verification_infra_error.py -v,2026-05-17T00:00:00+08:00,0,
+4,Add regression tests,DONE,New test file covers transient infra normal failure and retry exhaustion,python -m pytest tests/test_verification_infra_error.py -v,2026-05-17T00:00:00+08:00,0,
+5,Run target validation,DONE,Target pytest passes within 60s,python -m pytest tests/test_verification_infra_error.py -v,2026-05-17T00:00:00+08:00,0,

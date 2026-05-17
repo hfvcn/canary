@@ -10,6 +10,7 @@ import pytest
 from cccc.contracts.v1.ralph_ipc import (
     ReadyBatchSuggestion,
     TaskRef,
+    VerificationSpec,
 )
 from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
 from cccc.ralph.models import ValidationIssue
@@ -68,8 +69,8 @@ def test_register_hard_fails_on_fatal_structural_error(tmp_path, monkeypatch):
 
     result = orchestrator.register_and_suggest(
         [
-            {"id": "T1", "title": "Task 1", "type": "backend", "depends_on": ["T2"]},
-            {"id": "T2", "title": "Task 2", "type": "backend", "depends_on": ["T1"]},
+            {"id": "T1", "title": "Task 1", "type": "backend", "depends_on": ["T2"], "claimed_paths": ["src/t1.py"], "verification": {"command": "echo ok"}},
+            {"id": "T2", "title": "Task 2", "type": "backend", "depends_on": ["T1"], "claimed_paths": ["src/t2.py"], "verification": {"command": "echo ok"}},
         ],
         "wf-cycle",
         plan_path=plan_path,
@@ -94,7 +95,7 @@ def test_register_submits_ready_suggestion_to_batch_processor(tmp_path, monkeypa
           completed_task_ids: []
         """,
     )
-    task_ref = TaskRef(id="T1", title="Task 1", type="backend")
+    task_ref = TaskRef(id="T1", title="Task 1", type="backend", claimed_paths=["src/placeholder.py"], verification=VerificationSpec(command="echo ok"))
     suggestion = ReadyBatchSuggestion(
         suggestion_id="s-1",
         workflow_id="wf-warn",
@@ -115,7 +116,7 @@ def test_register_submits_ready_suggestion_to_batch_processor(tmp_path, monkeypa
     )
 
     result = orchestrator.register_and_suggest(
-        [{"id": "T1", "title": "Task 1", "type": "backend"}],
+        [{"id": "T1", "title": "Task 1", "type": "backend", "claimed_paths": ["src/placeholder.py"], "verification": {"command": "echo ok"}}],
         "wf-warn",
         plan_path=plan_path,
         auto_start_agents=False,
@@ -142,7 +143,7 @@ def test_register_persists_workflow_meta_from_plan_path(tmp_path, monkeypatch):
     )
 
     result = orchestrator.register_and_suggest(
-        [{"id": "T1", "title": "Task 1", "type": "backend"}],
+        [{"id": "T1", "title": "Task 1", "type": "backend", "claimed_paths": ["src/placeholder.py"], "verification": {"command": "echo ok"}}],
         "wf-err",
         plan_path=plan_path,
         auto_start_agents=False,
@@ -167,7 +168,7 @@ def test_build_task_prompt_includes_issue_digest_and_claimed_paths(tmp_path, mon
         worker_relevance="blocking",
     )
     prompt = orchestrator._build_task_prompt(
-        TaskRef(id="T1", title="Task 1", type="backend", claimed_paths=["src/foo.py"]),
+        TaskRef(id="T1", title="Task 1", type="backend", claimed_paths=["src/foo.py"], verification=VerificationSpec(command="echo ok")),
         issues=[issue],
     )
 

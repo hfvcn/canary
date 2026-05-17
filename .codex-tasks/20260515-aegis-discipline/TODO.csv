@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read plan and local schema context,DONE,T1 scope and existing patterns understood,test -f plan.yaml,,0,
+2,Add Aegis models and TaskSpec field,DONE,TaskSpec accepts optional aegis with ignored extras,python -m pytest tests/ralph/test_aegis_discipline.py -v,,0,passed
+3,Pass aegis through to TaskRef,DONE,TaskRef contains serialized aegis dict from TaskSpec.to_task_ref(),python -m pytest tests/ralph/test_aegis_discipline.py -v,,0,passed
+4,Add focused Aegis discipline tests,DONE,Required parsing/backcompat/transparency tests exist,python -m pytest tests/ralph/test_aegis_discipline.py -v,,0,passed
+5,Run requested regression tests,DONE,Both requested pytest commands pass,python -m pytest tests/ralph/test_aegis_discipline.py -v && python -m pytest tests/ralph/test_contract_schema_validation.py -v,2026-05-15,0,passed

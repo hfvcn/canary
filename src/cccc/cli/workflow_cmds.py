@@ -9,6 +9,7 @@ __all__ = [
     "cmd_workflow_status",
     "cmd_workflow_verify",
     "cmd_workflow_retry",
+    "cmd_workflow_override",
     "cmd_workflow_fail",
     "cmd_task_complete",
     "cmd_task_heartbeat",
@@ -201,8 +202,9 @@ def cmd_workflow_verify(args: argparse.Namespace) -> int:
         _print_json({"ok": False, "error": {"code": "missing_task_id", "message": "Missing task_id"}})
         return 2
     changed_files = list(getattr(args, "changed_file", []) or [])
+    refresh_spec = bool(getattr(args, "refresh_spec", False))
     workflow_id = _resolve_task_workflow_id(group_id, project_root, task_id)
-    resp = call_daemon(_build_task_request("ralph_task_verify", group_id=group_id, project_root=project_root, task_id=task_id, workflow_id=workflow_id, changed_files=changed_files))
+    resp = call_daemon(_build_task_request("ralph_task_verify", group_id=group_id, project_root=project_root, task_id=task_id, workflow_id=workflow_id, changed_files=changed_files, refresh_spec=refresh_spec))
     _print_json(resp)
     return 0 if resp.get("ok") else 1
 def cmd_workflow_retry(args: argparse.Namespace) -> int:
@@ -230,6 +232,43 @@ def cmd_workflow_retry(args: argparse.Namespace) -> int:
     )
     _print_json(resp)
     return 0 if resp.get("ok") else 1
+
+
+def cmd_workflow_override(args: argparse.Namespace) -> int:
+    if not _ensure_daemon_or_exit():
+        return 1
+    group_id, project_root = _task_request_context(args)
+    task_id = str(getattr(args, "task_id", "") or getattr(args, "task", "") or "").strip()
+    reason = str(getattr(args, "reason", "") or "").strip()
+    evidence = str(getattr(args, "evidence", "") or "").strip()
+    if not group_id:
+        _print_json({"ok": False, "error": {"code": "missing_group_id", "message": "Missing --group or active group"}})
+        return 2
+    if not task_id:
+        _print_json({"ok": False, "error": {"code": "missing_task_id", "message": "Missing --task"}})
+        return 2
+    if not reason:
+        _print_json({"ok": False, "error": {"code": "missing_reason", "message": "Missing --reason"}})
+        return 2
+    if not evidence:
+        _print_json({"ok": False, "error": {"code": "missing_evidence", "message": "Missing --evidence"}})
+        return 2
+    workflow_id = _resolve_task_workflow_id(group_id, project_root, task_id, str(getattr(args, "workflow_id", "") or "").strip())
+    resp = call_daemon(
+        _build_task_request(
+            "workflow_override",
+            group_id=group_id,
+            project_root=project_root,
+            task_id=task_id,
+            workflow_id=workflow_id,
+            reason=reason,
+            evidence=evidence,
+        )
+    )
+    _print_json(resp)
+    return 0 if resp.get("ok") else 1
+
+
 def cmd_workflow_fail(args: argparse.Namespace) -> int:
     if not _ensure_daemon_or_exit():
         return 1

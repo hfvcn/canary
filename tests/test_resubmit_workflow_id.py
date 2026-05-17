@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef
+from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef, VerificationSpec
 from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
 from cccc.kernel.group import Group
 from cccc.kernel.workflow_state_engine import WorkflowEngine
@@ -63,7 +63,7 @@ AGENT_PREFIX = "agent"
 
 
 def _task(task_id: str) -> TaskRef:
-    return TaskRef(id=task_id, title=task_id, type="backend", claimed_paths=[f"src/{task_id}.py"])
+    return TaskRef(id=task_id, title=task_id, type="backend", claimed_paths=[f"src/{task_id}.py"], verification=VerificationSpec(command="echo ok"))
 
 
 def _suggestion(*, workflow_id: str, task_ids: list[str], suggestion_id: str) -> ReadyBatchSuggestion:

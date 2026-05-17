@@ -7,6 +7,7 @@ from cccc.ralph.models import Plan, PlanState, RunningTask
 
 _STATUS_BUCKETS = {
     WorkflowTaskStatus.COMPLETED: "completed",
+    WorkflowTaskStatus.COMPLETED_BY_OVERRIDE: "completed",
     WorkflowTaskStatus.ARCHIVED: "completed",
     WorkflowTaskStatus.RUNNING: "running",
     WorkflowTaskStatus.VERIFYING: "running",
@@ -14,6 +15,7 @@ _STATUS_BUCKETS = {
     WorkflowTaskStatus.FAILED: "failed",
     WorkflowTaskStatus.BLOCKED: "failed",
     WorkflowTaskStatus.DEFERRED: "failed",
+    WorkflowTaskStatus.CANCELLED: "failed",
     WorkflowTaskStatus.PLANNED: "candidate",
     WorkflowTaskStatus.READY: "candidate",
 }

@@ -526,6 +526,47 @@ def test_gate_default_no_flag():
     assert "W_VERIFICATION_SHALLOW_CHECKS" not in [issue.code for issue in report.hints]
 
 
+def test_group_hint_deduplication_in_validation_text(capsys):
+    """UX-2: repeated same-code hints are grouped in output."""
+    from cccc.ralph.cli import _GroupedIssue, _group_repeated_issues, _print_validation_text
+
+    hints = [
+        ValidationIssue(
+            code="W_VERIFICATION_SHAPE_UNKNOWN",
+            severity="hint",
+            message=f"task 'T{i}' verification shape not recognized",
+            task_ids=[f"T{i}"],
+        )
+        for i in range(10)
+    ]
+
+    grouped = _group_repeated_issues(hints, threshold=3)
+
+    assert len(grouped) == 1
+    assert isinstance(grouped[0], _GroupedIssue)
+    assert grouped[0].is_group is True
+    assert grouped[0].count == 10
+    assert grouped[0].code == "W_VERIFICATION_SHAPE_UNKNOWN"
+    assert _group_repeated_issues(hints[:3], threshold=3) == [
+        _GroupedIssue(is_group=False, issue=hint)
+        for hint in hints[:3]
+    ]
+
+    _print_validation_text(
+        ValidationReport(valid=True, hints=hints),
+        show_semantic=False,
+    )
+    output = capsys.readouterr().out
+    code_lines = [
+        line for line in output.splitlines()
+        if "W_VERIFICATION_SHAPE_UNKNOWN" in line
+    ]
+
+    assert len(code_lines) == 1
+    assert "(x10)" in code_lines[0]
+    assert "[T0, T1, T2, T3, T4, T5, T6, T7, T8, T9]" in code_lines[0]
+
+
 # ---------------------------------------------------------------------------
 # Validator tests
 # ---------------------------------------------------------------------------
@@ -881,6 +922,42 @@ class TestValidator:
         assert len(hints) == 1
         assert hints[0].task_ids == ["T1"]
 
+    def test_leaf_exemption_when_covered_by_flow_covering_task(self):
+        plan = self._make_plan(
+            [
+                {
+                    "id": "T1",
+                    "role": "leaf",
+                    "claimed_paths": ["src/server.py"],
+                    "verification": {
+                        "level": "unit",
+                        "command": "true",
+                        "covers": {"tasks": ["T1"]},
+                    },
+                },
+                {
+                    "id": "T2",
+                    "role": "leaf",
+                    "claimed_paths": ["src/integration.py"],
+                    "depends_on": ["T1"],
+                    "verification": {
+                        "level": "unit",
+                        "command": "true",
+                        "covers": {"tasks": ["T1", "T2"], "flows": ["startup_flow"]},
+                    },
+                },
+            ],
+            critical_flows=[CriticalFlow(id="startup_flow", entrypoints=["src/server.py"])],
+        )
+
+        report = validate(plan)
+
+        warnings = [issue for issue in report.warnings if issue.code == "W_FLOW_OWNER_NO_VERIFICATION"]
+        hints = [issue for issue in report.hints if issue.code == "W_FLOW_OWNER_NO_VERIFICATION"]
+        assert warnings == []
+        assert len(hints) == 1
+        assert hints[0].task_ids == ["T1"]
+
     def test_leaf_no_exemption_leaf_only(self):
         plan = self._make_plan(
             [
@@ -902,7 +979,7 @@ class TestValidator:
                     "verification": {
                         "level": "integration",
                         "command": "true",
-                        "covers": {"tasks": ["T1", "T2"], "flows": ["startup_flow"]},
+                        "covers": {"tasks": ["T2"], "flows": ["startup_flow"]},
                     },
                 },
             ],
@@ -1080,6 +1157,23 @@ class TestValidator:
         report = validate(plan)
 
         assert "W_SHARED_FILE_PARTIAL_VERIFICATION" not in [issue.code for issue in report.hints]
+
+    def test_shared_path_warning_describes_containment(self):
+        plan = self._make_plan([
+            {"id": "T1", "claimed_paths": ["src/app/"],
+             "verification": {"level": "unit", "command": "true",
+                              "covers": {"tasks": ["T1"]}}},
+            {"id": "T2", "claimed_paths": ["src/app/routes.py"],
+             "verification": {"level": "unit", "command": "true",
+                              "covers": {"tasks": ["T2"]}}},
+        ])
+
+        report = validate(plan)
+        issues = [issue for issue in report.warnings if issue.code == "W_SHARED_PATH_NO_DEPENDENCY"]
+
+        assert len(issues) == 1
+        assert "overlaps" in issues[0].message or "contains" in issues[0].message
+        assert "T1" in issues[0].message and "T2" in issues[0].message
 
     def test_validate_with_project_short_circuits_on_fatal(self, monkeypatch, tmp_path):
         plan = self._make_plan([

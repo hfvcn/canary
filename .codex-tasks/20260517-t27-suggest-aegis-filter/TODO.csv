@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current suggest and Aegis behavior,DONE,Implementation points and data models are understood,rg -n "suggest_ready_batch|def suggest|effective_intent|retirement_track" src tests,2026-05-17T00:00:00+08:00,0,
+2,Implement shared Aegis suggest quick filter,DONE,Daemon and core suggest use the same E/W quick-check semantics,python -m pytest tests/test_suggest_aegis_filter.py -v,2026-05-17T00:00:00+08:00,0,
+3,Add focused suggest filter tests,DONE,Tests cover E placeholder E retirement normal include and W include rationale,python -m pytest tests/test_suggest_aegis_filter.py -v,2026-05-17T00:00:00+08:00,0,
+4,Run validation and record outcome,DONE,Focused pytest passes within 60 seconds,python -m pytest tests/test_suggest_aegis_filter.py -v,2026-05-17T00:00:00+08:00,0,

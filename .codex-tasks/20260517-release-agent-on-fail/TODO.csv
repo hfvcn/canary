@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm T3 requirements and current release paths,DONE,Relevant workflow and deferral paths identified,rg -n "release_agent|on_task_failed|defer" src/cccc/daemon/foreman tests,2026-05-17T00:00:00+08:00,0,
+2,Implement release on failed and deferred transitions,DONE,Assigned agents are released when task fails or defers,python -m pytest tests/test_release_on_fail.py -v,2026-05-17T00:00:00+08:00,0,
+3,Add regression tests,DONE,New tests cover failed deferred and completed release paths,python -m pytest tests/test_release_on_fail.py -v,2026-05-17T00:00:00+08:00,0,
+4,Run focused validation,DONE,Focused tests pass within timeout,python -m pytest tests/test_release_on_fail.py -v,2026-05-17T00:00:00+08:00,0,

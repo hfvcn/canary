@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect plan implementation and test patterns,DONE,Relevant code paths and existing test conventions identified,rg and sed reads complete,2026-05-17,0,Implementation already contains required rule shape; top-level tests missing.
+2,Patch Aegis evidence gate logic,DONE,Required checks implemented with existing constants,pytest targeted file can execute,2026-05-17,0,No source patch needed; existing function already uses required constants and mode split.
+3,Add focused pytest coverage,DONE,New test file covers five requested scenarios,pytest tests/test_aegis_evidence_gate.py,2026-05-17,0,Added top-level tests/test_aegis_evidence_gate.py with empty/trivial evidence cases.
+4,Run verification and update task state,DONE,Targeted tests pass within 60 seconds,timeout 60 pytest tests/test_aegis_evidence_gate.py,2026-05-17,0,Targeted test file passed; related ralph test file also passed.

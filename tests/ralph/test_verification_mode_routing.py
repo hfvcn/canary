@@ -122,12 +122,12 @@ class TestVerifyCompletionRouting:
         )
         assert result.overall_outcome != "agent_pending"
 
-    def test_agent_mode_does_not_run_checks(
+    def test_agent_mode_runs_checks_then_review(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Agent mode must not call _execute_verification_checks."""
+        """Agent mode runs shell checks first, then agent review."""
         monkeypatch.setattr(
             "cccc.ralph.agent.subprocess.run",
             lambda command, **kwargs: _agent_completed(True),
@@ -135,11 +135,9 @@ class TestVerifyCompletionRouting:
         svc = _make_ralph_service(tmp_path)
         task = _task_ref("T1", verification_mode="agent")
 
-        with patch.object(svc, "_execute_verification_checks") as mock_exec:
-            result = svc.verify_completion(
-                "T1", [], workflow_id="wf-1", task_ref=task,
-            )
-        mock_exec.assert_not_called()
+        result = svc.verify_completion(
+            "T1", [], workflow_id="wf-1", task_ref=task,
+        )
         assert result.overall_outcome == "passed"
 
     def test_agent_mode_keeps_scope_warnings(

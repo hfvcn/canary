@@ -79,6 +79,11 @@ def _role_policy_lines(role: str) -> List[str]:
             "- Treat `done`, `idle`, and silence as signals to evaluate, not closure truth.",
             "- [See workflow guidance for details] Use workflow CLI + visible delivery as the control plane, including verify-gate decisions and task handoff.",
             "- If criteria are unmet, choose one clear next control action: continue, request evidence, hand off, or block.",
+            "Plan Discipline (Aegis):",
+            "- fix/debug task: fill failure_path + aegis.repair_track (root_cause, canonical_owner)",
+            "- refactor/replace task: fill aegis.retirement_track (old_owner, deletion_trigger)",
+            "- each task claimed_paths should include relevant test files",
+            "- ralph validate W_AEGIS_ warnings should be resolved before workflow execution",
         ]
     if role_norm == "peer":
         return [

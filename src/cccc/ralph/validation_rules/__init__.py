@@ -8,11 +8,13 @@ from .structural import (
     _check_graph_structure,
     _check_covers_graph,
     _check_field_completeness,
+    _check_claimed_path_incomplete,
     _check_implicit_serialization,
     _check_shared_file_verification,
     _check_integration_spine,
     _check_role_constraints,
     _check_early_integration_checkpoint,
+    _check_e2e_compile_check,
     _is_cross_task_verifier,
     _check_module_consistency,
 )
@@ -56,6 +58,10 @@ from .contracts import (
     _check_cross_task_io_contracts,
 )
 
+from . import discipline
+from .discipline import _check_aegis_discipline, collect_discipline_issues
+from .security import _check_security_recipes
+
 
 def get_all_rules():
     """Return all rule functions for discovery/testing."""
@@ -64,11 +70,13 @@ def get_all_rules():
         _check_graph_structure,
         _check_covers_graph,
         _check_field_completeness,
+        _check_claimed_path_incomplete,
         _check_implicit_serialization,
         _check_shared_file_verification,
         _check_integration_spine,
         _check_role_constraints,
         _check_early_integration_checkpoint,
+        _check_e2e_compile_check,
         # coverage
         _check_verification_strength,
         _check_verification_no_checks,
@@ -101,19 +109,27 @@ def get_all_rules():
         _check_contracts,
         _check_contract_verification_coverage,
         _check_contract_dep_alignment,
+        # discipline
+        collect_discipline_issues,
+        # security
+        _check_security_recipes,
     ]
 
 
 __all__ = [
     "get_all_rules",
+    "discipline",
+    "collect_discipline_issues",
     "_check_graph_structure",
     "_check_covers_graph",
     "_check_field_completeness",
+    "_check_claimed_path_incomplete",
     "_check_implicit_serialization",
     "_check_shared_file_verification",
     "_check_integration_spine",
     "_check_role_constraints",
     "_check_early_integration_checkpoint",
+    "_check_e2e_compile_check",
     "_is_cross_task_verifier",
     "_check_verification_strength",
     "_check_verification_no_checks",
@@ -146,4 +162,6 @@ __all__ = [
     "_check_contracts",
     "_check_contract_verification_coverage",
     "_check_contract_dep_alignment",
+    "_check_aegis_discipline",
+    "_check_security_recipes",
 ]

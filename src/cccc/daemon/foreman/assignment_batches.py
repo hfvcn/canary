@@ -16,6 +16,10 @@ from .assignment_constants import (
     RECOMMENDED_TESTS_KEY,
     TASK_STATUS_PENDING,
 )
+from .contract_signature_advisory import (
+    SignatureAdvisoryContext,
+    warn_on_contract_signature_source_mismatches,
+)
 from .workflow import BatchEvaluationResult
 from .workflow_id_resolution import (
     ensure_tasks_are_new,
@@ -31,6 +35,21 @@ _BATCHABLE_TASK_STATUSES = {
     WorkflowTaskStatus.READY,
     WorkflowTaskStatus.DEFERRED,
 }
+
+
+def _reject_incomplete_tasks(task_refs: List[TaskRef]) -> None:
+    """Reject tasks missing claimed_paths or verification before they enter the engine."""
+    errors: List[str] = []
+    for task in task_refs:
+        if not task.claimed_paths:
+            errors.append(f"task '{task.id}' has no claimed_paths")
+        if task.verification is None and not task.verification_command:
+            errors.append(f"task '{task.id}' has no verification defined")
+    if errors:
+        raise ValueError(
+            f"Workflow submit rejected — {len(errors)} task(s) incomplete: "
+            + "; ".join(errors)
+        )
 
 
 class AssignmentBatchMixin:
@@ -97,6 +116,7 @@ class AssignmentBatchMixin:
         self.sync_batch_to_control_plane(result)
         self._report_batch_started(batch_id, workflow_id, result)
         if auto_start_agents and result.approved_tasks:
+            self._warn_on_contract_signature_sources(result)
             self._owner._start_assigned_agents(result)
         return result
 
@@ -118,6 +138,7 @@ class AssignmentBatchMixin:
     ) -> tuple[ReadyBatchSuggestion | None, Dict[str, Any], List[str]]:
         workflow_id = suggestion.workflow_id
         batch_id = suggestion.suggestion_id
+        _reject_incomplete_tasks(suggestion.tasks)
         for task in suggestion.tasks:
             self._owner.engine.register_task(task, workflow_id)
             self._owner._track_task_ref(workflow_id, task)
@@ -317,6 +338,34 @@ class AssignmentBatchMixin:
         ]
         self._owner.reporter.on_batch_started(batch_id, task_infos, workflow_id=workflow_id)
 
+    def _warn_on_contract_signature_sources(self, result: BatchEvaluationResult) -> None:
+        context = SignatureAdvisoryContext(
+            project_root=self._owner.project_root,
+            all_tasks=self._known_signature_check_tasks(result),
+            consumer_tasks=list(result.approved_tasks),
+            log_fn=self._owner._log,
+        )
+        warn_on_contract_signature_source_mismatches(context)
+
+    def _known_signature_check_tasks(self, result: BatchEvaluationResult) -> List[TaskRef]:
+        tasks = {task.id: task for task in result.suggestion.tasks}
+        workflow_id = result.suggestion.workflow_id
+        for task in self._tracked_workflow_task_refs(workflow_id):
+            tasks[task.id] = task
+        for state in self._owner._list_engine_tasks(workflow_id):
+            if state.task is not None:
+                tasks[state.task.id] = state.task
+        return list(tasks.values())
+
+    def _tracked_workflow_task_refs(self, workflow_id: str) -> List[TaskRef]:
+        workflow = self._owner._active_workflows.get(workflow_id, {})
+        task_refs: List[TaskRef] = []
+        for tracked in workflow.get("tasks", {}).values():
+            task_ref = tracked.get("task_ref")
+            if isinstance(task_ref, TaskRef):
+                task_refs.append(task_ref)
+        return task_refs
+
     def register_and_suggest_inner(
         self,
         task_dicts: List[Dict[str, Any]],
@@ -324,6 +373,7 @@ class AssignmentBatchMixin:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         task_refs = [TaskRef.model_validate(task) for task in task_dicts]
+        _reject_incomplete_tasks(task_refs)
         ensure_tasks_are_new(
             task_refs,
             self._owner.engine.get_task,

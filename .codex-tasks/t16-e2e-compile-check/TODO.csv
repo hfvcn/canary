@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing structural validation wiring,DONE,Rule style and call chain identified,rg structural validation wiring,2026-05-17T00:00:00+08:00,0,
+2,Implement W_E2E_MISSING_COMPILE_CHECK,DONE,Rule detects missing compile/import checks for e2e integration api tasks,python -m pytest tests/test_e2e_compile_check.py -v,2026-05-17T00:00:00+08:00,0,
+3,Add focused tests,DONE,Three requested cases are covered,python -m pytest tests/test_e2e_compile_check.py -v,2026-05-17T00:00:00+08:00,0,
+4,Run verification,DONE,Focused pytest passes,python -m pytest tests/test_e2e_compile_check.py -v,2026-05-17T00:00:00+08:00,0,3 passed in 0.84s

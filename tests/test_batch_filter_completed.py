@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef, VerificationResult
+from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef, VerificationResult, VerificationSpec
 from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
 from cccc.kernel.workflow_state_types import WorkflowTaskStatus
 
@@ -46,6 +46,7 @@ def _task(task_id: str) -> TaskRef:
         title=task_id,
         type="backend",
         claimed_paths=[f"src/{task_id.lower()}.py"],
+        verification=VerificationSpec(command="echo ok"),
     )
 
 

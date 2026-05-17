@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef
+from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef, VerificationSpec
 
 
 @pytest.fixture()
@@ -65,6 +65,7 @@ def _task(task_id: str) -> TaskRef:
         title=f"task-{task_id}",
         type="backend",
         claimed_paths=[f"src/{task_id.lower()}.py"],
+        verification=VerificationSpec(command="echo ok"),
     )
 
 

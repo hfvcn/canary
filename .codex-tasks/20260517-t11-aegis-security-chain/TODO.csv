@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing discipline and validation model,DONE,Existing rule/test structure is understood,rg -n "DISCIPLINE_RULES|critical_flows" src tests,,0,
+2,Implement security checks missing rule,DONE,New rule is registered in _DISCIPLINE_RULES and uses plan critical_flows,python -m pytest tests/test_aegis_security_chain.py -v,,0,
+3,Add focused regression tests,DONE,Four requested cases are covered,python -m pytest tests/test_aegis_security_chain.py -v,,0,
+4,Run validation,DONE,Focused tests pass within 60 seconds,python -m pytest tests/test_aegis_security_chain.py -v,,0,

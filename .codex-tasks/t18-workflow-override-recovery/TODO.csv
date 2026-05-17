@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect T18 plan and existing workflow implementation,DONE,Relevant CLI daemon engine orchestrator and tests are understood,rg workflow_override src tests,2026-05-17,0,fast-context call was cancelled by tool
+2,Implement workflow override CLI and daemon path,DONE,CLI sends workflow_override and daemon records completed_by_override plus ledger event,pytest tests/test_workflow_override.py -q,2026-05-17,0,
+3,Implement deferred recovery transitions and dependency completion handling,DONE,Deferred can transition to running completed_by_override and cancelled; dependencies accept override completion,pytest tests/test_deferred_recovery.py -q,2026-05-17,0,
+4,Add focused tests,DONE,New tests cover override command and deferred recovery behavior,pytest tests/test_workflow_override.py tests/test_deferred_recovery.py -q,2026-05-17,0,
+5,Run validation and finalize,DONE,Relevant automated checks pass within 60s,python -c subprocess.run pytest timeout=60,2026-05-17,0,GNU timeout unavailable on macOS; used Python subprocess timeout

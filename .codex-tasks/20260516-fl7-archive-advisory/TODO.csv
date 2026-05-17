@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate step-6 implementation,DONE,Implementation path confirmed,test -f src/cccc/ralph/flow_improvement_check.py,2026-05-17T00:00:00Z,0,"E2E step 6 delegates to _check_improvement_register"
+2,Implement stdout archive advisory,DONE,Advisory prints only for newly completed header entries,python -m pytest tests/test_flow_archive_prompt.py -v,2026-05-17T00:00:00Z,0,
+3,Run verification,DONE,Target test passes,python -m pytest tests/test_flow_archive_prompt.py -v,2026-05-17T00:00:00Z,0,"Also ran tests/test_flow_improvement_check.py and tests/ralph/test_flow_e2e.py"

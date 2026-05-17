@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read plan and inspect existing formatter,DONE,T3 requirements and existing formatter are understood,test -f plans/v33-ux-and-ro-fixes.yaml,2026-05-14T00:00:00+08:00,0,
+2,Implement hint grouping helper,DONE,Repeated same-code hints above threshold collapse into grouped display entries,python -m pytest tests/ralph/test_ralph_standalone.py -v -k 'group_hint_deduplication',2026-05-14T00:00:00+08:00,0,
+3,Add focused regression test,DONE,Test asserts repeated hint code is grouped once,python -m pytest tests/ralph/test_ralph_standalone.py -v -k 'group_hint_deduplication',2026-05-14T00:00:00+08:00,0,
+4,Run verification,FAILED,Requested pytest command fails before collection because pyproject addopts requires missing pytest-xdist; target test passes with explicit addopts override,python -m pytest tests/ralph/test_ralph_standalone.py -v -k 'group_hint_deduplication',2026-05-14T00:00:00+08:00,0,"exact command exit 4; override command passed"

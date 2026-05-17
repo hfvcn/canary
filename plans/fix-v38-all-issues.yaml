@@ -1,0 +1,1023 @@
+schema_version: "1.0.0"
+
+required_issues:
+  - "RO-96"
+  - "RO-97"
+  - "RO-95"
+  - "RO-89"
+  - "RO-92"
+  - "RO-93"
+  - "RO-94"
+  - "RO-98"
+  - "RO-99"
+  - "AD-11"
+  - "SL-1"
+  - "SL-2"
+  - "SL-3"
+  - "FL-4"
+  - "FL-5"
+  - "FL-6"
+  - "FL-7"
+  - "FL-8"
+  - "FL-9"
+  - "FL-10"
+  - "FL-11"
+  - "FL-12"
+  - "RO-84"
+  - "RO-90"
+  - "RO-91"
+  - "UX-5"
+  - "UX-8"
+  - "UX-11"
+  - "AD-1"
+  - "AD-2"
+  - "AD-3"
+  - "AD-4"
+  - "AD-9"
+  - "AD-10"
+  - "AD-7"
+  - "AD-8"
+  - "RL-22"
+  - "RL-25"
+  - "RL-27"
+  - "PLR-2"
+  - "DOC-2"
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - W_AGENT_REVIEW_SKIPPED
+  - W_UNCLAIMED_TEST_FOR_SOURCE
+  - W_VERIFICATION_CROSS_SCOPE
+  - W_VERIFICATION_TARGET_MISSING
+  - W_AEGIS_FIX_NO_REPAIR_TRACK
+  - W_AEGIS_COMPLEX_MISSING_BASELINE
+  - W_TEST_COVERAGE_GAP
+  - W_CROSS_BOUNDARY_WITHOUT_GLUE
+  - W_NO_EARLY_INTEGRATION_CHECKPOINT
+  - W_NO_FAILURE_PATH
+  - W_TASK_ADDRESSES_DISJOINT
+  - W_PLAN_SCOPE_UNUSED
+  - W_SHARED_PATH_NO_DEPENDENCY
+  - W_VERIFICATION_BEHAVIOR_MISMATCH
+  - W_COVERS_NOT_EXERCISED
+
+semantic_mode: "off"
+auto_infer: false
+
+tasks:
+  # ===========================================================================
+  # Batch 1: P0 — 一行修复解锁 challenge reviewer
+  # ===========================================================================
+  - id: T1
+    title: "RO-96: attach 路径 resolve 修复"
+    addresses:
+      - "RO-96"
+    goal_behavior: |
+      修改 src/cccc/cli/group_cmds.py 的 cmd_attach() 函数（line 26）：
+
+      将 args.path 传给 daemon 之前先 resolve 为绝对路径。
+      当前代码直接传 args.path（可能是相对路径如 "."），daemon 在自己 cwd 解析
+      导致 scope url 指向错误目录。
+
+      修改：
+      {"op": "attach", "args": {"path": str(Path(args.path).resolve()), ...}}
+    acceptance_criteria: |
+      1. cmd_attach 传给 daemon 的 path 总是绝对路径
+      2. cccc attach . 在任意目录执行后 scope.url 指向该目录
+      3. 现有测试不受影响
+    claimed_paths:
+      - src/cccc/cli/group_cmds.py
+      - tests/test_attach_resolve.py
+    verification:
+      level: unit
+      checks:
+        - name: attach-resolve-test
+          command: "python -m pytest tests/test_attach_resolve.py -v"
+
+  # ===========================================================================
+  # Batch 2: P1 — verification gate 逻辑修复
+  # ===========================================================================
+  - id: T2
+    title: "RO-97: verification_mode=ralph 时跳过 challenge review"
+    depends_on:
+      - T1
+    addresses:
+      - "RO-97"
+    goal_behavior: |
+      修改 src/cccc/daemon/foreman/ralph_service.py 的 verify_completion() 方法：
+
+      当 task_ref.verification_mode == "ralph" 时，只运行 shell checks，
+      不触发 agent/challenge review。当前代码在所有 mode 下都运行 challenge review。
+
+      逻辑：
+      - verification_mode=ralph: 只执行 checks[]，不调用 Gemini
+      - verification_mode=agent: shell checks + agent review
+      - verification_mode=challenge: shell checks + adversarial review
+    acceptance_criteria: |
+      1. verification_mode=ralph 的 task shell checks 通过即 passed
+      2. 不触发 Gemini/challenge review API 调用
+      3. verification_mode=agent/challenge 行为不变
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - tests/test_verification_mode_routing.py
+    verification:
+      level: unit
+      checks:
+        - name: mode-routing-test
+          command: "python -m pytest tests/test_verification_mode_routing.py -v"
+
+  - id: T3
+    title: "RO-95: on_task_failed 释放 agent + deferred 释放"
+    addresses:
+      - "RO-95"
+    goal_behavior: |
+      修改 src/cccc/daemon/foreman/workflow_orchestrator.py 的 on_task_failed()（line 891）：
+
+      在 task 进入 failed 状态时调用 release_agent(agent_id)。当前只有
+      on_task_completed_inner (assignment_completion.py:32) 调用 release_agent，
+      failed/deferred 路径不释放导致 _active_assignments 永久污染。
+
+      同时在 assignment_deferrals.py 的 deferred 状态转移时也释放 agent。
+
+      修改点：
+      1. on_task_failed() 中通过 self.foreman（ForemanWorkflow）调用
+         pool_manager.release_agent(agent_id)。agent_id 从 engine task state 获取
+      2. deferred 状态转移处同样释放 agent
+    acceptance_criteria: |
+      1. task 进入 failed 后 _active_assignments 清除该 agent
+      2. task 进入 deferred 后 _active_assignments 清除该 agent
+      3. 后续 batch 不再因旧 assignment 被 defer
+      4. 现有 on_task_completed 路径不受影响
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/workflow.py
+      - src/cccc/daemon/foreman/assignment_deferrals.py
+      - tests/test_release_on_fail.py
+    verification:
+      level: unit
+      checks:
+        - name: release-on-fail-test
+          command: "python -m pytest tests/test_release_on_fail.py -v"
+
+  - id: T4
+    title: "RO-89: verify gate 注入 input robustness smoke（NUL/control 检查）"
+    addresses:
+      - "RO-89"
+    goal_behavior: |
+      修改 src/cccc/daemon/foreman/verification_gate.py 的 _check_input_robustness()：
+
+      当 critical_flow 名称含 search/query/input/fts 关键词时，在 verification 后
+      自动注入异常输入 smoke check（NUL 字节、极长输入）。如果 verify checks 中已含
+      对应 pattern 则跳过（避免重复）。
+
+      命中时记录 verification warning（不阻塞，但可见于 ledger）。
+    acceptance_criteria: |
+      1. critical_flow 含 search/input 时注入 NUL/control 检查
+      2. 已有对应测试时跳过（不重复）
+      3. 无安全 critical_flow 的项目零输出
+      4. 命中时记录 warning 而非 error
+    claimed_paths:
+      - src/cccc/daemon/foreman/verification_gate.py
+      - tests/test_input_robustness_gate.py
+    verification:
+      level: unit
+      checks:
+        - name: robustness-gate-test
+          command: "python -m pytest tests/test_input_robustness_gate.py -v"
+
+  - id: T5
+    title: "RO-92/93/94: Security Recipe Library（surface_type 驱动）"
+    addresses:
+      - "RO-92"
+      - "RO-93"
+      - "RO-94"
+    goal_behavior: |
+      新增 src/cccc/ralph/security_recipes.py：
+
+      按 surface_type 组织安全检查 recipe：
+      - temporal:store_then_use → TOCTOU 类检查（RO-92）
+      - url_input → hostname 编码规范化矩阵（RO-93）
+      - auth_token → timing-safe compare grep（RO-94）
+
+      三重门控逻辑：
+      1. critical_flow 含安全关键词
+      2. plan 声明对应 surface_type 或 temporal_pattern
+      3. verification.checks 缺少该 surface 的测试
+      三者同时成立才报 warning。
+
+      无安全 critical_flow 的项目零检查零噪音。
+    acceptance_criteria: |
+      1. critical_flow 含 ssrf + 无编码矩阵测试 → hint
+      2. critical_flow 含 auth + 源码无 timing-safe → hint
+      3. 声明 temporal_pattern 但无覆盖 → hint
+      4. 无安全 flow 的项目 → 零输出
+      5. 已覆盖测试 → 跳过
+    claimed_paths:
+      - src/cccc/ralph/security_recipes.py
+      - src/cccc/ralph/validation_rules/security.py
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/validation_rules/__init__.py
+      - src/cccc/ralph/validator.py
+      - tests/test_security_recipes.py
+    verification:
+      level: unit
+      checks:
+        - name: security-recipes-test
+          command: "python -m pytest tests/test_security_recipes.py -v"
+
+  - id: T6
+    title: "RO-99: challenge reviewer prompt 注入安全 checklist"
+    depends_on:
+      - T1
+      - T5
+    addresses:
+      - "RO-99"
+    goal_behavior: |
+      修改 src/cccc/ralph/agent.py 的 _build_verification_prompt()：
+
+      从 plan.critical_flows 提取安全关键词，将对应的安全 checklist 注入
+      Gemini verification prompt。
+
+      Checklist 由 critical_flow 类型驱动：
+      - input-validation → FTS5/SQL injection, resource limits
+      - ssrf → encoded IPs, DNS rebinding, redirect chains
+      - *-auth → timing-safe comparison, hardcoded secrets
+
+      无安全 critical_flow → 不注入 → Gemini 仅做功能审查。
+    acceptance_criteria: |
+      1. plan 含 input-validation critical_flow → prompt 含安全 checklist
+      2. 无安全 flow → prompt 无安全 checklist
+      3. checklist 内容匹配 critical_flow 类型
+    claimed_paths:
+      - src/cccc/ralph/agent.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - tests/test_challenge_security_checklist.py
+    verification:
+      level: unit
+      checks:
+        - name: security-checklist-test
+          command: "python -m pytest tests/test_challenge_security_checklist.py -v"
+
+  - id: T7
+    title: "AD-11: ralph validate --generate-security-checks"
+    depends_on:
+      - T5
+    addresses:
+      - "AD-11"
+      - "AD-10"
+    goal_behavior: |
+      新增 src/cccc/ralph/security_check_generator.py + CLI 子命令：
+
+      ralph validate --generate-security-checks plan.yaml：
+      - 从 plan metadata（goal_behavior, acceptance_criteria, critical_flows, provides）
+        提取安全上下文
+      - 调用 LLM（可配置 provider）生成 behavioral test 命令
+      - 输出结构化 JSON：[{name, command, auto_generated: true}]
+      - 无安全 critical_flow → 不生成 → 零噪音
+
+      这取代了 AD-10 的 grep-based recipe 注入（behavioral test > grep）。
+    acceptance_criteria: |
+      1. 对含安全 critical_flow 的 plan 生成 >=3 个 behavioral check
+      2. 无安全 flow 的 plan → 不生成
+      3. 生成的 checks 标记 auto_generated: true
+      4. CLI 子命令正常工作
+    claimed_paths:
+      - src/cccc/ralph/security_check_generator.py
+      - src/cccc/ralph/cli.py
+      - tests/test_security_check_generator.py
+    verification:
+      level: unit
+      checks:
+        - name: generator-test
+          command: "python -m pytest tests/test_security_check_generator.py -v"
+
+  # ===========================================================================
+  # Batch 3: P1 — Aegis 纪律整合基础
+  # ===========================================================================
+  - id: T8
+    title: "AD-1/2: AegisDiscipline 子模型 + discipline.py 规则基础设施"
+    addresses:
+      - "AD-1"
+      - "AD-2"
+    goal_behavior: |
+      AD-1 已完成（AegisDiscipline 子模型 + TaskSpec.aegis 字段已存在）。
+      AD-2 需要：
+
+      1. 确认 src/cccc/ralph/aegis.py 的 effective_intent() helper 正常工作
+      2. 新增 src/cccc/ralph/validation_rules/discipline.py 规则文件骨架
+      3. 在 validation_rules/__init__.py re-export discipline 模块
+      4. 在 validator.py 的 _collect_structural_issues() 调用 discipline 规则
+
+      注意：AD-1 的 schema 基础已在之前版本完成（models.py 已有 AegisDiscipline），
+      本 task 只完成 AD-2 的规则基础设施部分。
+    acceptance_criteria: |
+      1. effective_intent() 对 TaskSpec 和 TaskRef 均可工作
+      2. discipline.py 规则格式与 structural/coverage/contracts 一致
+      3. validator.py 调用 discipline 规则
+      4. 现有 validate 行为不受影响（discipline 规则暂为空）
+    claimed_paths:
+      - src/cccc/ralph/aegis.py
+      - src/cccc/ralph/validation_rules/discipline.py
+      - src/cccc/ralph/validation_rules/__init__.py
+      - src/cccc/ralph/validator.py
+      - tests/test_aegis_discipline_infra.py
+    verification:
+      level: unit
+      checks:
+        - name: discipline-infra-test
+          command: "python -m pytest tests/test_aegis_discipline_infra.py -v"
+
+  - id: T9
+    title: "AD-3: 首期 5 条高信号 Aegis 规则"
+    depends_on:
+      - T8
+    addresses:
+      - "AD-3"
+    goal_behavior: |
+      在 src/cccc/ralph/validation_rules/discipline.py 实现 5 条规则：
+
+      1. E_AEGIS_*_CONTENT: title/goal/acceptance 含未填充标记词
+      2. E_AEGIS_RETIREMENT_TRACK_MISSING: intent=refactor 无 retirement_track
+      3. W_AEGIS_FIX_NO_REPAIR_TRACK: intent=fix 无 repair_track
+      4. W_AEGIS_TDD_NO_TEST_PATH: fix/feature 的 claimed_paths 无测试文件
+      5. W_AEGIS_COMPLEX_MISSING_BASELINE: 复杂 task 无 baseline_refs
+
+      注意：规则 3 和 5 已在 suppress_codes 中可选抑制。
+    acceptance_criteria: |
+      1. 含未填充标记的 plan 触发 E_AEGIS 未填充规则
+      2. refactor 无 retirement_track → E_AEGIS_RETIREMENT_TRACK_MISSING
+      3. fix 无 repair_track → W_AEGIS_FIX_NO_REPAIR_TRACK
+      4. feature 无测试 → W_AEGIS_TDD_NO_TEST_PATH
+      5. 现有全量 pytest 零 regression
+    claimed_paths:
+      - src/cccc/ralph/validation_rules/discipline.py
+      - tests/test_aegis_discipline_rules.py
+    verification:
+      level: unit
+      checks:
+        - name: discipline-rules-test
+          command: "python -m pytest tests/test_aegis_discipline_rules.py -v"
+
+  - id: T10
+    title: "AD-4: verification gate Evidence 质量门"
+    depends_on:
+      - T8
+    addresses:
+      - "AD-4"
+    goal_behavior: |
+      修改 src/cccc/daemon/foreman/verification_gate.py：
+
+      在 _apply_aegis_evidence_gate() 中增强检查逻辑：
+      - evidence 为空或仅含 "done"/"completed" → fail（challenge 模式）/ warning（ralph 模式）
+      - intent=fix 且 evidence 无根因关键词 → warning
+      - intent=refactor 且 evidence 无退役关键词 → warning
+
+      注意：当前已有 _apply_aegis_evidence_gate 函数和相关常量（line 28-39），
+      需要确认逻辑完整性并补充测试。
+    acceptance_criteria: |
+      1. 空 evidence + challenge mode → verification failed
+      2. 空 evidence + ralph mode → warning 但不阻止
+      3. fix evidence 无根因 → warning
+      4. 有实质 evidence → 正常通过
+      5. 无 aegis task → 跳过检查
+    claimed_paths:
+      - src/cccc/daemon/foreman/verification_gate.py
+      - tests/test_aegis_evidence_gate.py
+    verification:
+      level: unit
+      checks:
+        - name: evidence-gate-test
+          command: "python -m pytest tests/test_aegis_evidence_gate.py -v"
+
+  - id: T11
+    title: "AD-9: aegis intent→verification 强制链"
+    depends_on:
+      - T8
+      - T9
+    addresses:
+      - "AD-9"
+    goal_behavior: |
+      在 src/cccc/ralph/validation_rules/discipline.py 新增规则：
+
+      E_AEGIS_SECURITY_CHECKS_MISSING：
+      - intent=feature + 有安全 critical_flow + checks 无安全测试 → error
+      - 无安全 flow → 不触发
+
+      这确保"声明了安全关注但 checks 为空"的 plan 无法通过 validate。
+    acceptance_criteria: |
+      1. feature + security flow + 空 checks → error
+      2. feature + security flow + 有 checks → pass
+      3. 无 security flow → 不触发
+    claimed_paths:
+      - src/cccc/ralph/validation_rules/discipline.py
+      - tests/test_aegis_security_chain.py
+    verification:
+      level: unit
+      checks:
+        - name: security-chain-test
+          command: "python -m pytest tests/test_aegis_security_chain.py -v"
+
+  # ===========================================================================
+  # Batch 4: P2 — Flow 改进
+  # ===========================================================================
+  - id: T12
+    title: "FL-4: guide --output 从 Field(description=) 提取描述"
+    addresses:
+      - "FL-4"
+    goal_behavior: |
+      修改 src/cccc/ralph/models.py：
+
+      在 TaskSpec 的关键字段 Field() 中添加 description= 参数：
+      - verification_mode: 已有 description（确认 guide_generator 读取）
+      - aegis: 已有 description
+      - provides: 已有 description
+      - consumes: 已有 description
+      - mock_tests (Verification): 已有 description
+
+      修改 src/cccc/ralph/guide_generator.py：确保从 model_fields 的 description
+      属性提取文本填入 guide Description 列。
+    acceptance_criteria: |
+      1. ralph guide --output 生成的 guide 中关键字段 Description 非空
+      2. 手动编辑的描述不被覆盖（guide_generator 优先保留已有内容）
+    claimed_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/guide_generator.py
+      - tests/test_guide_description.py
+    verification:
+      level: unit
+      checks:
+        - name: guide-desc-test
+          command: "python -m pytest tests/test_guide_description.py -v"
+
+  - id: T13
+    title: "FL-5: guide --update dev 分支 warning 不阻塞 flow"
+    addresses:
+      - "FL-5"
+    goal_behavior: |
+      修改 src/cccc/ralph/flow_engine.py：
+
+      flow step-7 检查 guide update 结果时，将 "affected by changes — review manually"
+      类 warnings 降级为 advisory（不阻塞 flow）。
+
+      改为只在 guide 生成失败（非零退出码且非 warning）时才阻塞。
+    acceptance_criteria: |
+      1. dev 分支有未提交变更时 flow step-7 不被 advisory warnings 阻塞
+      2. guide 生成真正失败时仍然阻塞
+    claimed_paths:
+      - src/cccc/ralph/flow_engine.py
+      - tests/test_flow_guide_advisory.py
+    verification:
+      level: unit
+      checks:
+        - name: flow-guide-test
+          command: "python -m pytest tests/test_flow_guide_advisory.py -v"
+
+  - id: T14
+    title: "FL-6: flow step-4 _check_improvement_register 区分新旧变更"
+    addresses:
+      - "FL-6"
+    goal_behavior: |
+      修改 src/cccc/ralph/flow_engine.py 的 _check_improvement_register()：
+
+      不再仅检查 git diff 有 additions。改为检查 diff 中是否包含
+      当前版本标识（从 flow state 或 tracker header 提取），
+      或 diff 行的时间戳 > flow 启动时间。
+
+      这防止 pre-existing 未提交变更让检查假通过。
+    acceptance_criteria: |
+      1. tracker 有 pre-existing additions 但无本轮标识时 step-4 不通过
+      2. 本轮新增内容时 step-4 通过
+      3. 正常流程不受影响
+    claimed_paths:
+      - src/cccc/ralph/flow_engine.py
+      - tests/test_flow_improvement_check.py
+    verification:
+      level: unit
+      checks:
+        - name: improvement-check-test
+          command: "python -m pytest tests/test_flow_improvement_check.py -v"
+
+  - id: T15
+    title: "FL-7: flow step-6 归档已修复条目提示"
+    addresses:
+      - "FL-7"
+    goal_behavior: |
+      修改 src/cccc/ralph/flow_engine.py 的 flow step-6 逻辑：
+
+      检测 tracker header 中新增"已完成"条目后，输出提示
+      "请移除短版中对应详细描述（或运行 ralph tracker archive）"。
+
+      不需要自动迁移，只需 advisory 提示。
+    acceptance_criteria: |
+      1. header 新增已完成条目时输出归档提示
+      2. 无新增时不输出
+    claimed_paths:
+      - src/cccc/ralph/flow_engine.py
+      - tests/test_flow_archive_prompt.py
+    verification:
+      level: unit
+      checks:
+        - name: archive-prompt-test
+          command: "python -m pytest tests/test_flow_archive_prompt.py -v"
+
+  - id: T16
+    title: "FL-8: e2e task 强制 compile check"
+    addresses:
+      - "FL-8"
+    goal_behavior: |
+      修改 src/cccc/ralph/validation_rules/structural.py 或新增规则：
+
+      对 verification.level in (api, e2e, integration) 的 task，
+      若 checks[] 不含 import/compile 项（即无命令包含 "import" 或
+      "from ... import" 或 "python -c"），报 W_E2E_MISSING_COMPILE_CHECK。
+    acceptance_criteria: |
+      1. e2e task 无 compile check → warning
+      2. e2e task 有 compile check → pass
+      3. unit task → 不检查
+    claimed_paths:
+      - src/cccc/ralph/validation_rules/structural.py
+      - tests/test_e2e_compile_check.py
+    verification:
+      level: unit
+      checks:
+        - name: e2e-compile-test
+          command: "python -m pytest tests/test_e2e_compile_check.py -v"
+
+  - id: T17
+    title: "FL-9: provides/consumes signature 声明 + ast.parse 校验"
+    addresses:
+      - "FL-9"
+    goal_behavior: |
+      扩展 src/cccc/ralph/models.py 的 Contract 模型：
+
+      新增可选字段 signatures: Optional[Dict[str, str]]（格式 {fn_name: "(args) -> ret"}）。
+
+      在 validation_rules/contracts.py 新增规则：
+      1. consumes 含 signatures 时，检查对应 provides 也有 signatures 声明
+      2. 当 provides 含 signatures 且对应源文件存在时，用 ast.parse + type hint
+         校验源文件确实导出了对应函数签名
+
+      在 assignment_batches.py（dispatcher）中：consumer task 启动前
+      用 ast.parse 检查上游模块是否导出对应 signature，不符合时拒绝启动。
+    acceptance_criteria: |
+      1. Contract 支持 signatures 字段
+      2. consumer 声明 signatures 但 provider 未声明 → warning
+      3. 上游模块未导出对应 signature → dispatcher 拒绝启动
+      4. 无 signatures → 不触发
+    claimed_paths:
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/validation_rules/contracts.py
+      - src/cccc/daemon/foreman/assignment_batches.py
+      - tests/test_contract_signatures.py
+    verification:
+      level: unit
+      checks:
+        - name: signatures-test
+          command: "python -m pytest tests/test_contract_signatures.py -v"
+
+  - id: T18
+    title: "FL-11/12: foreman override 路径 + deferred 可恢复"
+    addresses:
+      - "FL-11"
+      - "FL-12"
+    goal_behavior: |
+      1. FL-11: 在 src/cccc/cli/workflow_cmds.py 新增
+         cccc workflow override --task TASK_ID --reason "..." 命令。
+         产生 workflow.foreman_override ledger 事件，task 状态变为 completed_by_override。
+
+      2. FL-12: 在 src/cccc/kernel/workflow_state_engine.py 为 deferred 状态
+         增加出边：retry_worker, foreman_accept, cancel。
+         Foreman 可通过 cccc workflow retry 或 override 从 deferred 恢复。
+    acceptance_criteria: |
+      1. cccc workflow override 改变 task 状态为 completed_by_override
+      2. ledger 含 workflow.foreman_override 事件
+      3. deferred task 可被 retry 或 override 恢复
+      4. downstream tasks 识别 completed_by_override
+    claimed_paths:
+      - src/cccc/cli/workflow_cmds.py
+      - src/cccc/cli/main.py
+      - src/cccc/daemon/ralph_ipc_handler.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/kernel/workflow_state_engine.py
+      - src/cccc/kernel/workflow_state_types.py
+      - tests/test_workflow_override.py
+      - tests/test_deferred_recovery.py
+    verification:
+      level: unit
+      checks:
+        - name: override-test
+          command: "python -m pytest tests/test_workflow_override.py tests/test_deferred_recovery.py -v"
+
+  - id: T19
+    title: "FL-10: workflow 完成态自动回写 plan.yaml state"
+    addresses:
+      - "FL-10"
+    goal_behavior: |
+      修改 src/cccc/daemon/foreman/workflow_orchestrator.py：
+
+      workflow state transition 完成 task 后，自动回写 plan.yaml 的 state 字段。
+      通过 on_task_completed 末尾调用 plan_io 的写入函数更新 plan state。
+
+      这样 ralph suggest（纯函数从 plan 读取）不需要改动，
+      plan.yaml 始终反映最新 workflow 状态。
+    acceptance_criteria: |
+      1. workflow 完成 task 后 plan.yaml state 自动更新
+      2. ralph suggest 立即显示新批次（无需 sync-state）
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/ralph/plan_io.py
+      - tests/test_plan_state_writeback.py
+    verification:
+      level: unit
+      checks:
+        - name: plan-state-writeback-test
+          command: "python -m pytest tests/test_plan_state_writeback.py -v"
+
+  # ===========================================================================
+  # Batch 5: P2 — 其他改进
+  # ===========================================================================
+  - id: T20
+    title: "RO-84: ralph validate 产生 ledger 事件"
+    addresses:
+      - "RO-84"
+    goal_behavior: |
+      修改 src/cccc/ralph/cli.py 的 validate 子命令：
+
+      validate 成功/失败时向 daemon 发送 workflow.plan_validated 事件
+      （含 error/warning 计数 + plan digest）。
+
+      使用现有 IPC 机制（call_daemon 或直接写 ledger）。
+    acceptance_criteria: |
+      1. validate 成功 → ledger 有 workflow.plan_validated 事件
+      2. validate 失败 → ledger 有 workflow.plan_validated 事件（含 error count）
+      3. daemon 未运行时静默跳过（不阻塞 validate）
+    claimed_paths:
+      - src/cccc/ralph/cli.py
+      - tests/test_validate_ledger_event.py
+    verification:
+      level: unit
+      checks:
+        - name: validate-event-test
+          command: "python -m pytest tests/test_validate_ledger_event.py -v"
+
+  - id: T21
+    title: "RO-90: verify gate grep debug=True blocking"
+    addresses:
+      - "RO-90"
+    goal_behavior: |
+      修改 src/cccc/daemon/foreman/verification_gate.py 的 process_completed_event()：
+
+      将 _check_security_lint / _check_entrypoint_debug 调用从 on_task_completed 之后
+      移到 verify_completion 之前（或集成进 verify_completion 结果中）。
+      这样 debug=True 命中时可以让 verification outcome = failed，
+      从而阻断 task 进入 completed。
+
+      当前 security lint 在 task 已 completed 后才执行（line 232-251），
+      只能记 warning 无法阻断。需要重构执行顺序。
+
+      复用现有 _DEBUG_TRUE_RE pattern（定义在 security_scan.py），
+      在 verification 阶段作为 pre-check 执行。
+    acceptance_criteria: |
+      1. 源文件含 debug=True → verify gate fail task（不进 completed）
+      2. 无 debug=True → 正常通过
+      3. 测试文件中的 debug=True 不触发（只检查 claimed_paths 非 test 文件）
+    claimed_paths:
+      - src/cccc/daemon/foreman/verification_gate.py
+      - src/cccc/ralph/security_scan.py
+      - tests/test_security_lint_blocking.py
+    verification:
+      level: unit
+      checks:
+        - name: lint-blocking-test
+          command: "python -m pytest tests/test_security_lint_blocking.py -v"
+
+  - id: T22
+    title: "RO-98: verification_infra_error 状态区分"
+    addresses:
+      - "RO-98"
+    goal_behavior: |
+      修改 src/cccc/daemon/foreman/verification_gate.py：
+
+      当 ralph_service.verify_completion() 异常且异常类型为 infra 相关
+      （FileNotFoundError, ConnectionError, TimeoutError）时：
+      - verification outcome 设为 "infra_error" 而非 "failed"
+      - 不计入 retry count
+      - 自动 retry verifier（最多 2 次），超限后 fail
+
+      修改 src/cccc/contracts/v1/ralph_ipc.py VerificationResult：
+      overall_outcome 的 Literal 类型添加 "infra_error"。
+    acceptance_criteria: |
+      1. verifier 因文件不可读失败 → outcome=infra_error
+      2. infra_error 不扣减 worker retry 次数
+      3. 正常 verification failure → 行为不变
+    claimed_paths:
+      - src/cccc/daemon/foreman/verification_gate.py
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - src/cccc/kernel/workflow_state_engine.py
+      - src/cccc/kernel/workflow_state_types.py
+      - tests/test_verification_infra_error.py
+    verification:
+      level: unit
+      checks:
+        - name: infra-error-test
+          command: "python -m pytest tests/test_verification_infra_error.py -v"
+
+  - id: T23
+    title: "UX-5: ralph guide 自动生成能力指南"
+    addresses:
+      - "UX-5"
+    goal_behavior: |
+      确认 src/cccc/ralph/guide_generator.py 已实现 ralph guide 功能。
+
+      确保输出包含：
+      1. 所有 Plan schema 字段（从 Pydantic model_fields 提取）
+      2. 所有验证规则代码（从 validation_rules/ 目录提取）
+      3. 所有 CLI 命令（从 argparse 提取）
+
+      如果已实现则补充测试覆盖。
+    acceptance_criteria: |
+      1. ralph guide 输出包含 schema 字段
+      2. 输出包含验证规则
+      3. 输出包含 CLI 命令
+    claimed_paths:
+      - src/cccc/ralph/guide_generator.py
+      - tests/test_guide_generator_coverage.py
+    verification:
+      level: unit
+      checks:
+        - name: guide-coverage-test
+          command: "python -m pytest tests/test_guide_generator_coverage.py -v"
+
+  - id: T24
+    title: "UX-11: workflow verify --refresh-spec"
+    depends_on:
+      - T18
+    addresses:
+      - "UX-11"
+    goal_behavior: |
+      修改 src/cccc/cli/workflow_cmds.py：
+
+      cccc workflow verify --task TASK_ID --refresh-spec：
+      从 plan.yaml 重新加载 verification commands 而非使用缓存的 task spec。
+
+      修改 src/cccc/daemon/ralph_ipc_handler.py 的 handle_ralph_task_verify：
+      当 refresh_spec=True 时重读 plan.yaml。
+    acceptance_criteria: |
+      1. --refresh-spec 使用最新 plan.yaml 的检查命令
+      2. 不带 --refresh-spec 时行为不变
+    claimed_paths:
+      - src/cccc/cli/workflow_cmds.py
+      - src/cccc/daemon/ralph_ipc_handler.py
+      - tests/test_verify_refresh_spec.py
+    verification:
+      level: unit
+      checks:
+        - name: refresh-spec-test
+          command: "python -m pytest tests/test_verify_refresh_spec.py -v"
+
+  - id: T25
+    title: "RL-27: W_SHARED_PATH_NO_DEPENDENCY 写冲突升级"
+    addresses:
+      - "RL-27"
+    goal_behavior: |
+      修改 src/cccc/ralph/validation_rules/structural.py：
+
+      当两个 task 的 claimed_paths 有重叠（同一源文件被两个 task claim）
+      且两者都非 integration role 时，升级为 error（E_WRITE_CONFLICT）
+      而非 warning（W_SHARED_PATH_NO_DEPENDENCY）。
+
+      仅当 explicit suppress_instance 才可降级。
+    acceptance_criteria: |
+      1. 两个 leaf task claim 同一文件 → error
+      2. integration task 覆盖多文件 → 不触发
+      3. suppress_instance 可降级
+    claimed_paths:
+      - src/cccc/ralph/validation_rules/structural.py
+      - tests/test_write_conflict_upgrade.py
+    verification:
+      level: unit
+      checks:
+        - name: write-conflict-test
+          command: "python -m pytest tests/test_write_conflict_upgrade.py -v"
+
+  # ===========================================================================
+  # Batch 6: P3 — 保险网/体验优化
+  # ===========================================================================
+  - id: T26
+    title: "SL-1/2/3: security_lint blocking + pattern 扩展 + robustness blocking"
+    depends_on:
+      - T21
+    addresses:
+      - "SL-1"
+      - "SL-2"
+      - "SL-3"
+    goal_behavior: |
+      修改 src/cccc/ralph/security_scan.py 和 verification_gate.py：
+
+      1. SL-1: 基于 T21 的重构，security_lint 命中 → verification failed
+      2. SL-2: 在 security_scan.py 扩展 pattern 矩阵增加
+         bare_except/eval/exec/hardcoded_secret regex
+      3. SL-3: _check_input_robustness 命中升级为 conditional blocking
+         （仅当 critical_flow 含 input/search 关键词时 blocking）
+
+      注意：对 Claude worker 几乎无效，仅防退化/非 Claude runtime。
+    acceptance_criteria: |
+      1. debug=True → blocking（由 T21 保证）
+      2. eval() in source → warning
+      3. bare except → warning
+      4. critical_flow + input robustness 未通过 → blocking
+    claimed_paths:
+      - src/cccc/daemon/foreman/verification_gate.py
+      - src/cccc/ralph/security_scan.py
+      - tests/test_security_lint_extended.py
+    verification:
+      level: unit
+      checks:
+        - name: lint-extended-test
+          command: "python -m pytest tests/test_security_lint_extended.py -v"
+
+  - id: T27
+    title: "AD-7: suggest 阶段 Aegis E_ 快检"
+    depends_on:
+      - T9
+    addresses:
+      - "AD-7"
+    goal_behavior: |
+      修改 src/cccc/daemon/foreman/ralph_service.py 的 suggest_ready_batch()：
+
+      对每个 candidate task 执行 Aegis E_ 级别快检：
+      - E_AEGIS 级别 error（如未填充标记、缺失退役轨迹） → 不进 ready batch
+      - W_ 规则只追加 rationale 不阻止
+
+      被拦截的 task 写 logger + rationale。
+    acceptance_criteria: |
+      1. 含 E_AEGIS error 的 task 不出现在 suggest 结果
+      2. blocked reason 在 log/rationale 可见
+      3. W_ 规则不阻止
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - src/cccc/ralph/core.py
+      - tests/test_suggest_aegis_filter.py
+    verification:
+      level: unit
+      checks:
+        - name: suggest-filter-test
+          command: "python -m pytest tests/test_suggest_aegis_filter.py -v"
+
+  - id: T28
+    title: "AD-8: 二期规则扩展（7 条候选）"
+    depends_on:
+      - T9
+    addresses:
+      - "AD-8"
+    goal_behavior: |
+      在 src/cccc/ralph/validation_rules/discipline.py 新增 7 条规则：
+
+      1. W_AEGIS_PATCH_SHAPE_TRIAGE_MISSING
+      2. W_AEGIS_RIPPLE_TRIAGE_MISSING
+      3. W_AEGIS_DECISION_HYGIENE_MISSING
+      4. W_AEGIS_DRIFT_CHECK_MISSING
+      5. W_AEGIS_PLAN_NO_COMPAT_BOUNDARY
+      6. E_AEGIS_RIPPLE_VERIFICATION_TOO_NARROW
+      7. W_AEGIS_EVIDENCE_NO_COVERAGE_CLAIM
+
+      每条规则有对应测试，误报率目标 < 10%。
+    acceptance_criteria: |
+      1. 7 条规则各有测试覆盖
+      2. 现有 plan validate 零 regression
+      3. 每条规则在对应场景正确触发
+    claimed_paths:
+      - src/cccc/ralph/validation_rules/discipline.py
+      - tests/test_aegis_second_wave.py
+    verification:
+      level: unit
+      checks:
+        - name: second-wave-test
+          command: "python -m pytest tests/test_aegis_second_wave.py -v"
+
+  - id: T29
+    title: "UX-8/RO-91/RL-22/RL-25/PLR-2/DOC-2: 体验+规则盲区+文档改善"
+    addresses:
+      - "UX-8"
+      - "RO-91"
+      - "RL-22"
+      - "RL-25"
+      - "PLR-2"
+      - "DOC-2"
+    goal_behavior: |
+      1. UX-8: 修改 structural.py overlap 规则输出含冲突的任务 ID + 具体路径
+      2. RO-91: 在 agent rules 中新增检查：goal_behavior 提及写入文件但不在 claimed_paths
+         → W_CLAIMED_PATH_INCOMPLETE
+      3. RL-22/25: Agent 可覆盖。在 validation_rules/discipline.py 记录为 known limitation，
+         添加注释说明 Codex 审查步骤可系统性拦截此类问题。不做代码修改，只补测试确认现状。
+      4. PLR-2: 在 core.py 的 suggest() 中，从 covers.tasks 自动展开 task 的
+         claimed_paths 补到 covers.paths，并把 W_COVERS_NOT_EXERCISED 改为 hint
+      5. DOC-2: 在 plans/_template.yaml suppress_codes 段落添加说明
+         "裸 suppress 应为 last resort，managed suppress（带 owner/expiry）是首选"
+    acceptance_criteria: |
+      1. overlap 错误信息含任务对和路径
+      2. goal 提及写入但不在 claimed_paths → warning
+      3. RL-22/25 有测试确认行为
+      4. covers.tasks 自动展开 paths
+      5. template 含 suppress 最佳实践说明
+    claimed_paths:
+      - src/cccc/ralph/validation_rules/structural.py
+      - src/cccc/ralph/validation_rules/coverage.py
+      - src/cccc/ralph/validation_rules/discipline.py
+      - plans/_template.yaml
+      - tests/test_overlap_detail.py
+      - tests/test_claimed_path_incomplete.py
+      - tests/test_covers_auto_expand.py
+    verification:
+      level: unit
+      checks:
+        - name: overlap-detail-test
+          command: "python -m pytest tests/test_overlap_detail.py tests/test_claimed_path_incomplete.py tests/test_covers_auto_expand.py -v"
+        - name: template-suppress-docs
+          command: "grep -q 'managed suppress' plans/_template.yaml"
+
+  # ===========================================================================
+  # Integration: 全量回归
+  # ===========================================================================
+  - id: T-int
+    title: "集成验证：全量 pytest regression"
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T4
+      - T5
+      - T6
+      - T7
+      - T8
+      - T9
+      - T10
+      - T11
+      - T12
+      - T13
+      - T14
+      - T15
+      - T16
+      - T17
+      - T18
+      - T19
+      - T20
+      - T21
+      - T22
+      - T23
+      - T24
+      - T25
+      - T26
+      - T27
+      - T28
+      - T29
+    role: integration
+    goal_behavior: |
+      运行全量 pytest 确认所有修改无回归。
+    acceptance_criteria: |
+      1. 全量 pytest 0 failure
+      2. 新增测试全部 pass
+    claimed_paths:
+      - tests/
+    verification:
+      level: integration
+      checks:
+        - name: full-regression
+          command: "python -m pytest -q"
+      covers:
+        tasks:
+          - T1
+          - T2
+          - T3
+          - T4
+          - T5
+          - T6
+          - T7
+          - T8
+          - T9
+          - T10
+          - T11
+          - T12
+          - T13
+          - T14
+          - T15
+          - T16
+          - T17
+          - T18
+          - T19
+          - T20
+          - T21
+          - T22
+          - T23
+          - T24
+          - T25
+          - T26
+          - T27
+          - T28
+          - T29
+
+batch_e2e_command: "python -m pytest -q"
+batch_e2e_timeout: 600

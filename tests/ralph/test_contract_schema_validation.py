@@ -6,7 +6,7 @@ from typing import Any
 
 import yaml
 
-from cccc.ralph.models import Plan
+from cccc.ralph.models import Plan, TaskSpec
 from cccc.ralph.validator import validate
 
 
@@ -64,6 +64,48 @@ class TestContractSchemaValidation:
     @staticmethod
     def _warning_codes(report) -> list[str]:
         return [warning.code for warning in report.warnings]
+
+    def _cross_task_io_warnings(
+        self,
+        dependency_outputs: dict[str, dict[str, str]],
+        expected_input: dict[str, str],
+    ):
+        tasks = [
+            {"id": task_id, "expected_output": expected_output}
+            for task_id, expected_output in dependency_outputs.items()
+        ]
+        tasks.append(
+            {"id": "C", "depends_on": list(dependency_outputs), "expected_input": expected_input}
+        )
+        report = validate(Plan.model_validate({"tasks": tasks}))
+        return [w for w in report.warnings if w.code == "W_CROSS_TASK_IO_MISMATCH"]
+
+    def test_cross_task_io_multi_upstream_collective(self):
+        warnings = self._cross_task_io_warnings(
+            {"A": {"key_a": "val"}, "B": {"key_b": "val"}}, {"key_a": "x", "key_b": "y"}
+        )
+        assert warnings == []
+
+    def test_cross_task_io_multi_upstream_missing(self):
+        warnings = self._cross_task_io_warnings(
+            {"A": {"key_a": "val"}, "B": {"key_b": "val"}}, dict(key_a="x", key_b="y", key_c="z")
+        )
+        assert len(warnings) == 1
+        assert warnings[0].evidence["missing_keys"] == ["key_c"]
+
+    def test_cross_task_io_single_upstream(self):
+        warnings = self._cross_task_io_warnings({"A": {"key_a": "val"}}, {"key_a": "x"})
+        assert warnings == []
+
+    def test_task_ref_preserves_awareness_and_failure_fields(self):
+        task_ref = TaskSpec(
+            id="T1",
+            awareness_paths=["docs/readme.md"],
+            failure_path="rollback instructions",
+        ).to_task_ref()
+
+        assert task_ref.awareness_paths == ["docs/readme.md"]
+        assert task_ref.failure_path == "rollback instructions"
 
     def test_matching_schema_no_warning(self):
         report = self._validate_contract_plan(

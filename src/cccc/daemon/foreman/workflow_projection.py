@@ -11,6 +11,7 @@ from ...kernel.workflow_state_types import WorkflowTaskStatus as _WTS
 TASK_STATUS_PENDING = "pending"
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_COMPLETED = "completed"
+TASK_STATUS_COMPLETED_BY_OVERRIDE = _WTS.COMPLETED_BY_OVERRIDE.value
 TASK_STATUS_FAILED = "failed"
 TASK_STATUS_DEFERRED = _WTS.DEFERRED.value
 
@@ -93,9 +94,9 @@ class WorkflowProjection:
     @staticmethod
     def snapshot_bucket_for_status(status: str) -> Optional[str]:
         normalized = str(status or TASK_STATUS_PENDING)
-        if normalized in {TASK_STATUS_COMPLETED, _WTS.ARCHIVED.value}:
+        if normalized in {TASK_STATUS_COMPLETED, TASK_STATUS_COMPLETED_BY_OVERRIDE, _WTS.ARCHIVED.value}:
             return "completed"
-        if normalized in {TASK_STATUS_FAILED, _WTS.BLOCKED.value}:
+        if normalized in {TASK_STATUS_FAILED, _WTS.BLOCKED.value, _WTS.CANCELLED.value}:
             return "failed"
         if normalized in {TASK_STATUS_RUNNING, _WTS.ASSIGNED.value, _WTS.VERIFYING.value}:
             return "running"

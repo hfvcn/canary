@@ -201,20 +201,53 @@ def _check_covers_not_exercised(plan: Plan) -> List[ValidationIssue]:
         if verification is None:
             continue
         commands = [verification.command] + [check.command for check in verification.checks]
+        covered_paths, auto_expanded = _coverage_paths(verification, task_map)
+        if not covered_paths or _commands_reference_paths(commands, covered_paths):
+            continue
         for covered_id in verification.covers.tasks:
             if covered_id == task.id or covered_id not in task_map:
                 continue
-            claimed_paths = task_map[covered_id].claimed_paths
-            if _commands_reference_paths(commands, claimed_paths):
-                continue
             issues.append(ValidationIssue(
                 code="W_COVERS_NOT_EXERCISED",
-                severity="warning",
+                severity="hint" if auto_expanded else "warning",
                 message=f"task '{task.id}' covers '{covered_id}' but its verification does not reference the covered paths",
                 task_ids=[task.id, covered_id],
-                evidence={"covered_task_id": covered_id, "covered_paths": list(claimed_paths)},
+                evidence={
+                    "covered_task_id": covered_id,
+                    "covered_paths": covered_paths,
+                    "auto_expanded_from_covers_tasks": auto_expanded,
+                },
             ))
     return issues
+
+
+def _coverage_paths(
+    verification: Verification,
+    task_map: Dict[str, TaskSpec],
+) -> tuple[List[str], bool]:
+    if verification.covers.paths:
+        return _dedupe_paths(verification.covers.paths), False
+    if not verification.covers.tasks:
+        return [], False
+    claimed_paths = [
+        path
+        for task_id in verification.covers.tasks
+        for path in _claimed_paths_for(task_id, task_map)
+    ]
+    return _dedupe_paths(claimed_paths), True
+
+
+def _claimed_paths_for(task_id: str, task_map: Dict[str, TaskSpec]) -> List[str]:
+    task = task_map.get(task_id)
+    return list(task.claimed_paths) if task is not None else []
+
+
+def _dedupe_paths(paths: List[str]) -> List[str]:
+    deduped: List[str] = []
+    for path in paths:
+        if path not in deduped:
+            deduped.append(path)
+    return deduped
 
 
 def _check_failure_path(plan: Plan) -> List[ValidationIssue]:
@@ -605,6 +638,21 @@ def _check_flow_segment_ownership(plan: Plan) -> List[ValidationIssue]:
             task.id for task in covering_tasks
             if task.role in ("integration", "verification")
         }
+        covered_by_flow_verifiers = {
+            tid
+            for ct in covering_tasks
+            if ct.verification and ct.verification.covers
+            for tid in ct.verification.covers.tasks
+            if tid != ct.id
+        }
+        covered_by_any_verifier = {
+            tid
+            for t in plan.tasks
+            if t.role in ("integration", "verification") and t.verification and t.verification.covers
+            for tid in t.verification.covers.tasks
+            if tid != t.id
+        }
+        covered_by_flow_verifiers |= covered_by_any_verifier
 
         for task in covering_tasks:
             if _claimed_flow_entrypoints(task, entrypoints):
@@ -623,6 +671,8 @@ def _check_flow_segment_ownership(plan: Plan) -> List[ValidationIssue]:
             for entrypoint in _claimed_flow_entrypoints(task, entrypoints):
                 severity = "warning"
                 if task.role == "leaf" and integration_or_verification_covering:
+                    severity = "hint"
+                if task.id in covered_by_flow_verifiers:
                     severity = "hint"
                 issues.append(ValidationIssue(
                     code="W_FLOW_OWNER_NO_VERIFICATION",

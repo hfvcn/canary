@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import pytest
 
-from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef
+from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef, VerificationSpec
 from cccc.daemon.foreman.agent_pool import TaskAssignment
 from cccc.daemon.foreman.workflow import BatchEvaluationResult
 
@@ -74,7 +74,7 @@ class TestForemanExplicitAssignment:
         orch, group = orchestrator
 
         tasks = [
-            TaskRef(id="T1", title="test-1", type="backend", claimed_paths=["src/a.py"]),
+            TaskRef(id="T1", title="test-1", type="backend", claimed_paths=["src/a.py"], verification=VerificationSpec(command="echo ok")),
         ]
         suggestion = ReadyBatchSuggestion(
             suggestion_id="batch-1",
@@ -105,7 +105,7 @@ class TestRejectedBatchStaysRejected:
         orch, group = orchestrator
 
         tasks = [
-            TaskRef(id="T1", title="test-1", type="backend", claimed_paths=["src/a.py"]),
+            TaskRef(id="T1", title="test-1", type="backend", claimed_paths=["src/a.py"], verification=VerificationSpec(command="echo ok")),
         ]
         suggestion = ReadyBatchSuggestion(
             suggestion_id="batch-rejected",
@@ -136,8 +136,8 @@ class TestResuggestNotifiesForeman:
 
         # Set up a workflow with T1 completed and T2 depending on T1
         tasks = [
-            TaskRef(id="T1", title="task-1", type="backend", claimed_paths=["src/a.py"]),
-            TaskRef(id="T2", title="task-2", type="backend", depends_on=["T1"], claimed_paths=["src/b.py"]),
+            TaskRef(id="T1", title="task-1", type="backend", claimed_paths=["src/a.py"], verification=VerificationSpec(command="echo ok")),
+            TaskRef(id="T2", title="task-2", type="backend", depends_on=["T1"], claimed_paths=["src/b.py"], verification=VerificationSpec(command="echo ok")),
         ]
         orch._ensure_active_workflow("wf-dag")
         for t in tasks:
@@ -182,7 +182,7 @@ class TestAssignmentIdPassthrough:
         orch, group = orchestrator
 
         # Register a task first
-        task = TaskRef(id="T1", title="test", type="backend", claimed_paths=["src/a.py"])
+        task = TaskRef(id="T1", title="test", type="backend", claimed_paths=["src/a.py"], verification=VerificationSpec(command="echo ok"))
         suggestion = ReadyBatchSuggestion(
             suggestion_id="batch-aid",
             workflow_id="wf-aid",
@@ -206,7 +206,7 @@ class TestBackwardCompatible:
         orch, group = orchestrator
 
         tasks = [
-            TaskRef(id="T1", title="test-1", type="backend", claimed_paths=["src/a.py"]),
+            TaskRef(id="T1", title="test-1", type="backend", claimed_paths=["src/a.py"], verification=VerificationSpec(command="echo ok")),
         ]
         suggestion = ReadyBatchSuggestion(
             suggestion_id="batch-compat",

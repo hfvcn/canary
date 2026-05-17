@@ -528,6 +528,61 @@ def _syncable_task_id_from_ledger_line(line: str, plan_workflow_id: str) -> str:
     return str(data.get("task_id") or "").strip()
 
 
+def update_plan_task_state(plan_path: Path, task_id: str, new_status: str) -> None:
+    """Set ``state.tasks[task_id]`` in the raw plan file."""
+    normalized_task_id = str(task_id or "").strip()
+    normalized_status = str(new_status or "").strip()
+    if not normalized_task_id:
+        raise ValueError("task_id is required")
+    if not normalized_status:
+        raise ValueError("new_status is required")
+
+    data = _parse_raw_data(plan_path)
+    state = _ensure_mapping_field(data, "state", owner="plan")
+    tasks = _ensure_mapping_field(state, "tasks", owner="plan.state")
+    tasks[normalized_task_id] = normalized_status
+    _sync_existing_status_lists(state, normalized_task_id, normalized_status)
+    _write_raw_plan_data(plan_path, data)
+
+
+def _ensure_mapping_field(data: Dict[str, Any], field: str, *, owner: str) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError(f"{owner} must be a mapping")
+    value = data.get(field)
+    if value is None:
+        value = {}
+        data[field] = value
+    if not isinstance(value, dict):
+        raise ValueError(f"{owner}.{field} must be a mapping")
+    return value
+
+
+def _sync_existing_status_lists(state: Dict[str, Any], task_id: str, status: str) -> None:
+    if status == "completed" and "completed_task_ids" in state:
+        _append_unique_state_id(state, "completed_task_ids", task_id)
+    if status == "failed" and "failed_task_ids" in state:
+        _append_unique_state_id(state, "failed_task_ids", task_id)
+
+
+def _append_unique_state_id(state: Dict[str, Any], field: str, task_id: str) -> None:
+    values = state.get(field)
+    if not isinstance(values, list):
+        raise ValueError(f"plan.state.{field} must be a list")
+    if task_id not in values:
+        values.append(task_id)
+
+
+def _write_raw_plan_data(plan_path: Path, data: Dict[str, Any]) -> None:
+    if plan_path.suffix.lower() == ".json":
+        plan_path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return
+    plan_path.write_text(
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
 
 
 def save_plan_state(path: Path, completed_task_id: str) -> None:

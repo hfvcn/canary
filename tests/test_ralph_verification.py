@@ -32,7 +32,7 @@ def _warning_codes_for_task(task: dict[str, object]) -> list[str]:
 def _make_validation_task(**overrides: object) -> dict[str, object]:
     task: dict[str, object] = {
         "id": "T1",
-        "claimed_paths": ["src/feature.py"],
+        "claimed_paths": ["src/feature.py", "tests/test_feature.py"],
         "goal_behavior": "implement feature",
         "acceptance_criteria": "feature works",
         "verification": {
@@ -817,6 +817,7 @@ def test_validate_with_project_suppress_instances_normal_path(
     plan = Plan.model_validate({
         "tasks": [_make_validation_task(claimed_paths=[])],
         "suppress_instances": [{"code": "E_MISSING_CLAIMED_PATHS"}],
+        "suppress_codes": ["W_AEGIS_TDD_NO_TEST_PATH"],
     })
 
     with (
@@ -832,8 +833,9 @@ def test_validate_with_project_suppress_instances_normal_path(
     assert report.valid is True
     assert [issue.code for issue in report.errors] == []
     assert [issue.code for issue in report.warnings] == []
-    assert [issue.code for issue in report.hints] == ["E_MISSING_CLAIMED_PATHS"]
-    assert report.hints[0].message.startswith("[suppressed] ")
+    assert "E_MISSING_CLAIMED_PATHS" in [issue.code for issue in report.hints]
+    suppressed_hints = [h for h in report.hints if h.code == "E_MISSING_CLAIMED_PATHS"]
+    assert suppressed_hints[0].message.startswith("[suppressed] ")
 
 
 def test_validate_and_validate_with_project_suppress_consistent(

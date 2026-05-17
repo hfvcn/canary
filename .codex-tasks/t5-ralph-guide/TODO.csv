@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read plan and existing Ralph CLI/model/rule context,DONE,Relevant specifications and code structure are understood,test -f plans/v33-ux-and-ro-fixes.yaml,2026-05-14,0,
+2,Implement guide generator and CLI wiring,DONE,guide subcommand emits schema fields validation codes and command reference,python -m compileall src/cccc/ralph,2026-05-14,0,
+3,Add guide generator tests,DONE,Tests cover plan fields validation codes and CLI commands,test -f tests/ralph/test_guide_generator.py,2026-05-14,0,
+4,Run requested pytest verification,DONE,Requested guide generator tests pass,python -m pytest -o addopts= tests/ralph/test_guide_generator.py -v,2026-05-14,0,
+5,Run requested ralph guide smoke verification,DONE,CLI prints Markdown guide first lines,ralph guide 2>&1 | head -5,2026-05-14,0,

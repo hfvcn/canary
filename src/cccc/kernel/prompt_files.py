@@ -32,7 +32,14 @@ def _load_builtin_workflow_guidance_markdown() -> str:
 
 def _workflow_guidance_excerpt(markdown: str) -> str:
     wanted_fragments = (
+        "Foreman Responsibilities",
+        "Stay on orchestration only",
         "Reuse workers first.",
+        "Slice work into independently verifiable functional slices",
+        "define the full execution contract",
+        "claimed_paths",
+        "verification_command",
+        "Apply the verify gate strictly",
     )
     selected = [
         "Canonical detail from `workflow_guidance.md`:",

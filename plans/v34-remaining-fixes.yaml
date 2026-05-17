@@ -1,0 +1,226 @@
+# Plan: v34 — remaining open issues after v33
+# Source: todo/问题清单-v5-ralph.md
+# Date: 2026-05-15
+# Scope: RO-82, UX-7, UX-8, FL-1, FL-3
+# Note: RO-80/RO-81/UX-2 verified as already fixed during plan analysis
+
+schema_version: "1.0.0"
+
+required_issues:
+  - "RO-82"
+  - "UX-7"
+  - "UX-8"
+  - "FL-1"
+  - "FL-3"
+
+semantic_mode: "off"
+auto_infer: false
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - W_AGENT_REVIEW_SKIPPED
+  - W_UNCLAIMED_TEST_FOR_SOURCE
+  - W_TEST_COVERAGE_GAP
+  - W_COVERS_NOT_EXERCISED
+  - W_PLAN_SCOPE_UNUSED
+  - W_NO_EARLY_INTEGRATION_CHECKPOINT
+
+tasks:
+  - id: T1
+    title: "RO-82: TaskRef 透传 awareness_paths 和 failure_path"
+    addresses:
+      - "RO-82"
+    goal_behavior: |
+      1. 在 src/cccc/contracts/v1/ralph_ipc.py 的 TaskRef 类中添加两个字段：
+         - awareness_paths: List[str] = Field(default_factory=list)
+         - failure_path: str = ""
+      2. 在 src/cccc/ralph/models.py 的 TaskSpec.to_task_ref()（line 186-203）中添加透传：
+         - awareness_paths=self.awareness_paths
+         - failure_path=self.failure_path
+      3. 在 tests/ralph/test_contract_schema_validation.py 中添加测试验证透传
+    acceptance_criteria: |
+      1. TaskRef 有 awareness_paths 和 failure_path 字段
+      2. to_task_ref() 将这两个字段从 TaskSpec 传递到 TaskRef
+      3. task_registered 事件包含这两个字段
+      4. 单测覆盖透传场景
+    claimed_paths:
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - src/cccc/ralph/models.py
+      - tests/ralph/test_contract_schema_validation.py
+    verification:
+      level: unit
+      checks:
+        - name: contract-schema-test
+          command: "python -m pytest tests/ralph/test_contract_schema_validation.py -v"
+    provides:
+      - name: task_ref_field_transparency
+        kind: runtime_capability
+
+  - id: T2
+    title: "UX-7: W_FLOW_OWNER_NO_VERIFICATION 对被 covers.tasks 包含的任务降级为 hint"
+    addresses:
+      - "UX-7"
+    goal_behavior: |
+      修改 src/cccc/ralph/validation_rules/coverage.py 的 _check_flow_segment_ownership()
+      （line 620-633）：
+
+      在 line 620 的 for task 循环中，当 task.id 不在 covering_ids 时，额外检查：
+      当前 flow 的 covering_tasks 中是否有其他 task 的 verification.covers.tasks 包含当前 task.id。
+      如果是，则将 severity 降级为 "hint"。
+
+      具体做法：在 line 620 循环前，基于当前 flow 的 covering_tasks（line 598-602）
+      构建 covered_by_flow_verifiers 集合：
+      covered_by_flow_verifiers = {tid for ct in covering_tasks
+                                    if ct.verification and ct.verification.covers
+                                    for tid in ct.verification.covers.tasks
+                                    if tid != ct.id}
+      当 task.id in covered_by_flow_verifiers 时 severity = "hint"
+
+      注意：1) 必须排除 self（ct.id != tid），避免自测降级
+      2) 必须限定在当前 flow 的 covering_tasks 内，避免不相关 flow 误影响
+    acceptance_criteria: |
+      1. leaf task 被其他 integration task 的 covers.tasks 包含时，W_FLOW_OWNER_NO_VERIFICATION 降级为 hint
+      2. 未被 covers.tasks 包含的 task 仍报 warning
+      3. 单测覆盖两种场景
+    claimed_paths:
+      - src/cccc/ralph/validation_rules/coverage.py
+      - tests/ralph/test_ralph_standalone.py
+    verification:
+      level: unit
+      checks:
+        - name: coverage-test
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -v -k flow_owner"
+
+  - id: T3
+    title: "UX-8: W_SHARED_PATH_NO_DEPENDENCY 含 containment 时消息指出 contains 关系"
+    depends_on:
+      - T2
+    addresses:
+      - "UX-8"
+    goal_behavior: |
+      修改 src/cccc/ralph/validation_rules/structural.py 的 _check_implicit_serialization()
+      （line 217-230）：
+
+      当 overlap 由 containment（如 T1 claims 'app/'，T2 claims 'app/routes.py'）产生时，
+      在 message 中改为 "T1 claims 'app/' which contains T2's 'app/routes.py'" 格式。
+
+      具体做法：将 line 221 的 overlap 计算改为保留 (a, b) 配对：
+      overlap_pairs = [(a, b) for a in ws1 for b in ws2 if _paths_overlap(a, b)]
+      然后根据 pair 关系生成消息：
+      - 如果 a == b：精确匹配，保持原消息
+      - 如果 _paths_overlap(a, b) 且 a != b：containment，用
+        "{t1.id} claims '{a}' which contains {t2.id}'s '{b}'" 或反向
+
+      注意：1) 必须保留 (a, b) 配对而非只保留 a 侧
+      2) 方向判断应复用 _paths_overlap 的 slash-aware 语义
+      3) "/" 全局 claim 是特殊值，containment 消息应适当处理
+    acceptance_criteria: |
+      1. containment 场景的 message 包含 "contains" 和两个具体路径
+      2. 非 containment（精确匹配）场景保持原有消息格式
+      3. 单测覆盖两种场景
+    claimed_paths:
+      - src/cccc/ralph/validation_rules/structural.py
+      - tests/ralph/test_ralph_standalone.py
+    verification:
+      level: unit
+      checks:
+        - name: structural-test
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -v -k shared_path"
+
+  - id: T4
+    title: "FL-1: e2e flow step-1 自动准备 workspace 和基础环境"
+    addresses:
+      - "FL-1"
+    goal_behavior: |
+      修改 src/cccc/ralph/flow_steps_e2e.py 的 _check_env_prepare()（line 33-36）：
+
+      FlowEngine.start() 已自动创建 workspace/.ralph-flow（含 parents=True），
+      所以 workspace 目录本身不需要 step-1 创建。
+
+      将检查逻辑从"仅验证 workspace 存在"改为"检查 docs 文档 + 自动复制"：
+      1. 检查 workspace/docs/ 下是否存在必需的文档文件
+         （如 foreman-capability-guide.md、工作流蓝图.md 等）
+      2. 如果 state.params['cccc_root'] 存在且文档缺失，从 cccc_root/docs/ 复制
+      3. 如果 cccc_root 不存在（可选参数），仅检查 docs/ 存在即可
+      4. 返回 CheckResult 包含每个检查项的 detail
+
+      不执行 git init（避免嵌套仓库风险），不含 daemon start。
+      更新 instruction_text 说明 step-1 检查并复制文档。
+    acceptance_criteria: |
+      1. workspace/docs/ 缺失时，如有 cccc_root 则自动复制文档
+      2. cccc_root 不存在时，仅检查 docs/ 目录存在
+      3. CheckResult 包含每个准备步骤的 passed/failed detail
+      4. 单测覆盖有/无 cccc_root 两种场景
+    claimed_paths:
+      - src/cccc/ralph/flow_steps_e2e.py
+      - tests/ralph/test_flow_e2e.py
+    verification:
+      level: unit
+      checks:
+        - name: flow-e2e-test
+          command: "python -m pytest tests/ralph/test_flow_e2e.py -v -k env_prepare"
+
+  - id: T5
+    title: "FL-3: e2e flow step-6 自动化改进登记检查"
+    addresses:
+      - "FL-3"
+    depends_on:
+      - T4
+    goal_behavior: |
+      修改 src/cccc/ralph/flow_steps_e2e.py 的 step-6 定义（line 145-151）：
+
+      将 lambda _state: _manual_check("improvement-register") 替换为新函数
+      _check_improvement_register(state)：
+      1. 使用 state.params.get('cccc_root', state.workspace) 作为 cwd
+         （与 step-0 的 _check_code_verify 一致）
+      2. 默认 tracker = state.params.get('tracker', 'todo/问题清单-v5-ralph.md')（短版）
+      3. 复用 flow_engine.py 中 _check_gap_record 的模式：
+         运行 git diff -- {tracker}，用 _diff_has_additions() 判断是否有新增行
+      4. 返回 CheckResult 包含 "tracker has additions" detail
+
+      注意：git diff 只能看到已跟踪文件的变更，不会看到 untracked 新文件。
+      如果 tracker 是新文件，需要先 git add 后才能被检测到。
+    acceptance_criteria: |
+      1. step-6 不再是 manual_check，而是自动检查 git diff
+      2. 检查目标是短版问题清单（问题清单-v5-ralph.md）
+      3. 有新增行时通过，无变更时失败
+      4. 单测覆盖有变更和无变更两种场景
+    claimed_paths:
+      - src/cccc/ralph/flow_steps_e2e.py
+      - tests/ralph/test_flow_e2e.py
+    verification:
+      level: unit
+      checks:
+        - name: flow-e2e-test
+          command: "python -m pytest tests/ralph/test_flow_e2e.py -v -k improvement"
+
+  - id: T-int
+    title: "集成验证：全量 pytest regression"
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T4
+      - T5
+    role: integration
+    goal_behavior: |
+      运行全量 pytest 套件确认所有改动没有引入回归。
+    acceptance_criteria: |
+      1. 新增测试全部 pass
+      2. 全量 pytest 0 failure
+    claimed_paths:
+      - tests/
+    verification:
+      level: integration
+      checks:
+        - name: full-regression
+          command: "python -m pytest -q"
+      covers:
+        tasks:
+          - T1
+          - T2
+          - T3
+          - T4
+          - T5

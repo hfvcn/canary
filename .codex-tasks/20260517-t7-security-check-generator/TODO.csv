@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm validate CLI and plan model shape,DONE,"Existing CLI and plan models understood","rg -n \"validate|critical_flows\" src/cccc/ralph tests",2026-05-17T02:34:00+08:00,0,
+2,Implement security check generator,DONE,"Generator returns deterministic checks for security flows","python -m pytest tests/test_security_check_generator.py -v",2026-05-17T02:40:42+08:00,0,
+3,Wire validate CLI flag,DONE,"validate accepts --generate-security-checks and prints generated JSON","python -m pytest tests/test_security_check_generator.py -v",2026-05-17T02:40:42+08:00,0,
+4,Add and run focused tests,DONE,"Requested generator tests pass","python -m pytest tests/test_security_check_generator.py -v",2026-05-17T02:40:42+08:00,0,

@@ -1,0 +1,7 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect relevant Ralph code,DONE,Relevant functions and tests are located,rg/sed reads complete,2026-05-16T00:00:00Z,0,
+2,Fix RL-26 placeholder token matching,DONE,Paths like todo/issues.md do not match placeholder token but standalone TODO still does,"python -m pytest tests/ralph/ -k 'discipline or placeholder or aegis' -v -o addopts=",2026-05-16T00:00:00Z,0,
+3,Fix FL-4 guide Description generation,DONE,Target Pydantic fields expose descriptions and guide output uses them,python -m pytest tests/ralph/test_guide_generator.py -v -o addopts=,2026-05-16T00:00:00Z,0,
+4,Fix FL-5 guide warnings as advisory,DONE,Guide warnings are visible but do not fail step-7 checks,"python -m pytest tests/ralph/test_flow_e2e.py tests/ -k flow -v -o addopts=",2026-05-16T00:00:00Z,0,
+5,Fix FL-6 register check for current version additions,DONE,Step-4 requires added diff lines to include current version when version is set,python -m pytest tests/ralph/test_flow_e2e.py -v -o addopts=,2026-05-16T00:00:00Z,0,
+6,Run full regression check,FAILED,Full test suite passes,python -m pytest tests/ -x -q -o addopts=,2026-05-16T00:00:00Z,1,timed out after 60s; tests/ralph passed separately

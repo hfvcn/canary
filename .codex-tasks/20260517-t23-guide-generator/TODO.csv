@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Audit current generator coverage,DONE,Missing schema/rule/CLI coverage identified or ruled out,python -m pytest tests/ralph/test_guide_generator.py tests/test_guide_description.py -q,2026-05-17T02:37:01+0800,0,Found missing nested Plan models and AST-derived rule tokens.
+2,Enhance guide generator if needed,DONE,Guide generation derives comprehensive schema/rule/CLI reference from live code,python -m pytest tests/test_guide_generator_coverage.py -v,2026-05-17T02:38:32+0800,0,Schema traversal and source-token rule collection added.
+3,Add coverage tests,DONE,Tests assert TaskSpec fields validation rule codes and CLI command names appear,python -m pytest tests/test_guide_generator_coverage.py -v,2026-05-17T02:39:20+0800,0,Passed in 0.89s under 60s timeout.
+4,Run focused verification,DONE,Focused guide tests pass within 60 seconds,python -m pytest tests/test_guide_generator_coverage.py tests/ralph/test_guide_generator.py tests/test_guide_description.py -q,2026-05-17T02:42:03+0800,0,12 passed in 1.19s under 60s timeout.

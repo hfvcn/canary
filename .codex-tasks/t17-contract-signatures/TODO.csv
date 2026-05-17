@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate existing contract and dispatch code,DONE,"Relevant files and insertion points identified","rg -n \"Contract|provides|consumes|_start_assigned_agents\" src tests",2026-05-17T02:40:00+08:00,0,
+2,Implement model and validation rule,DONE,"Contract signatures field and static warning rule exist","python -m pytest tests/test_contract_signatures.py -q",2026-05-17T02:47:00+08:00,0,
+3,Implement dispatch advisory ast.parse check,DONE,"Approved consumer tasks log advisory warnings on source mismatch","python -m pytest tests/test_contract_signatures.py -q",2026-05-17T02:47:00+08:00,0,
+4,Run focused validation,DONE,"Focused tests pass within 60s","python subprocess timeout=60: python -m pytest tests/test_contract_signatures.py -v",2026-05-17T02:48:00+08:00,1,"system timeout command missing; Python subprocess timeout used"

@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect T7 plan and current flow/CLI implementation,DONE,Plan and existing flow/CLI/test structure understood,,2026-05-14T00:00:00Z,0,
+2,Implement E2E flow steps and FlowEngine e2e lookup,DONE,E2E_STEPS has seven numbered steps and FlowEngine resolves e2e,,2026-05-14T00:00:00Z,0,
+3,Wire ralph flow CLI commands,DONE,flow start next status parse and dispatch through FlowEngine,,2026-05-14T00:00:00Z,0,
+4,Add tests for E2E flow and CLI help,DONE,tests/ralph/test_flow_e2e.py covers requested cases,,2026-05-14T00:00:00Z,0,
+5,Run requested verification,DONE,pytest target and ralph flow help complete successfully,"python -m pytest -o addopts= tests/ralph/test_flow_e2e.py -v; ralph flow --help",2026-05-14T00:00:00Z,0,"4 passed; ralph flow --help exited 0; flow_engine+flow_e2e combo 10 passed"

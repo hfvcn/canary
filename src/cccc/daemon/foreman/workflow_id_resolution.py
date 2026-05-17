@@ -27,7 +27,7 @@ class TasksAlreadyExistError(ValueError):
 
 
 _BATCHABLE_STATUSES: frozenset[str] = frozenset({"planned", "ready", "failed", "deferred"})
-_TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "archived"})
+_TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "completed_by_override", "cancelled", "archived"})
 
 
 def find_existing_task_ids(

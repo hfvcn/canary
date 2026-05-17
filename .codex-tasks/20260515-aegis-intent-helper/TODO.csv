@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read T2 plan and current Ralph structure,DONE,T2 goal and existing import patterns understood,test -f plan.yaml,2026-05-15,0,
+2,Implement aegis helper module,DONE,effective_intent and has_patch_shape_risk support TaskSpec and TaskRef,python -m pytest tests/ralph/test_aegis_intent.py -v,2026-05-15,0,13 passed
+3,Register discipline skeleton,DONE,discipline skeleton callable from validator without new issues,python -m pytest tests/ralph/test_ralph_standalone.py -v,2026-05-15,0,176 passed
+4,Add focused Aegis intent tests,DONE,TaskSpec and TaskRef helper behavior covered,python -m pytest tests/ralph/test_aegis_intent.py -v,2026-05-15,0,13 passed
+5,Run requested verification,DONE,Both requested pytest commands pass,python -m pytest tests/ralph/test_aegis_intent.py -v && python -m pytest tests/ralph/test_ralph_standalone.py -v,2026-05-15,0,passed with 60s hard timeout wrappers

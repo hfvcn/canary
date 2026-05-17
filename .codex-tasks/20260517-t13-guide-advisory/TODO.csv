@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read T13 and locate step-7 guide check,DONE,Relevant functions and expected behavior identified,test -f plans/fix-v38-all-issues.yaml,2026-05-17T00:00:00Z,0,_check_guide located in src/cccc/ralph/flow_engine.py
+2,Implement advisory warning handling,DONE,Only real guide generation errors block while affected-by-changes warnings are advisory,python -m py_compile src/cccc/ralph/flow_engine.py,2026-05-17T00:00:00Z,0,py_compile passed
+3,Add guide advisory tests,DONE,Tests cover advisory warning and command failure paths,test -f tests/test_flow_guide_advisory.py,2026-05-17T00:00:00Z,0,tests/test_flow_guide_advisory.py added
+4,Run focused verification,DONE,Focused tests pass within 60 seconds,timeout 60s pytest tests/test_flow_guide_advisory.py,2026-05-17T00:00:00Z,0,5 focused tests passed in 0.83s

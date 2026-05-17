@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate completion and plan IO paths,DONE,Relevant call chain and plan IO patterns identified,rg -n "on_task_completed|plan_io" src/cccc tests,2026-05-17T02:41:25+08:00,0,
+2,Implement plan state writeback,DONE,Completion success path writes state.tasks[task_id]=completed,python -m pytest tests/test_plan_state_writeback.py -v,2026-05-17T02:41:25+08:00,0,
+3,Add regression tests,DONE,Success and write-failure behavior covered,python -m pytest tests/test_plan_state_writeback.py -v,2026-05-17T02:41:25+08:00,0,
+4,Run verification,DONE,Target tests pass,python -m pytest tests/test_plan_state_writeback.py -v,2026-05-17T02:41:25+08:00,0,

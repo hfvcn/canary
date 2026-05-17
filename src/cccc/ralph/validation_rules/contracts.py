@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Set, Tuple
 
+from ..contract_signatures import signature_mismatches
 from ..models import (
     Contract,
     Plan,
@@ -75,6 +76,9 @@ def _check_contracts(plan: Plan) -> List[ValidationIssue]:
                         },
                     },
                 ))
+            signature_issue = _contract_signature_issue(t.id, c, provider_matches)
+            if signature_issue is not None:
+                issues.append(signature_issue)
 
     # Unused providers (hint, not error)
     consumed_names = set()
@@ -209,6 +213,48 @@ def _should_warn_on_contract_schema_mismatch(
     return checked_provider
 
 
+def _contract_signature_issue(
+    consumer_task_id: str,
+    consumer: Contract,
+    provider_matches: List[Tuple[str, Contract]],
+) -> ValidationIssue | None:
+    if not consumer.signatures:
+        return None
+
+    mismatches = _contract_signature_mismatches(consumer, provider_matches)
+    if not mismatches:
+        return None
+
+    provider_task_ids = [task_id for task_id, _ in provider_matches]
+    return ValidationIssue(
+        code="W_CONTRACT_SIGNATURE_MISMATCH",
+        severity="warning",
+        message=f"task '{consumer_task_id}' consumes '{consumer.name}' with signature mismatch",
+        task_ids=[consumer_task_id, *provider_task_ids],
+        evidence={
+            "contract_name": consumer.name,
+            "consumer_signatures": consumer.signatures,
+            "provider_mismatches": mismatches,
+        },
+    )
+
+
+def _contract_signature_mismatches(
+    consumer: Contract,
+    provider_matches: List[Tuple[str, Contract]],
+) -> Dict[str, Dict[str, Dict[str, str | None]]]:
+    return {
+        task_id: mismatch
+        for task_id, provider in provider_matches
+        if (
+            mismatch := signature_mismatches(
+                provider.signatures,
+                consumer.signatures,
+            )
+        )
+    }
+
+
 def _contract_schema_hints_compatible(
     provider_schema: Dict[str, Any],
     consumer_schema: Dict[str, Any],
@@ -307,25 +353,31 @@ def _check_cross_task_io_contracts(plan: Plan) -> List[ValidationIssue]:
         if not task.expected_input:
             continue
         input_keys = set(task.expected_input.keys())
+        upstream_keys = set()
+        has_any_upstream_output = False
+
         for dep_id in task.depends_on:
             dep = task_map.get(dep_id)
-            if dep is None or not dep.expected_output:
-                continue
-            output_keys = set(dep.expected_output.keys())
-            missing = input_keys - output_keys
-            if missing:
-                issues.append(ValidationIssue(
-                    code="W_CROSS_TASK_IO_MISMATCH",
-                    severity="warning",
-                    message=(
-                        f"task '{task.id}' expects input keys {sorted(missing)} "
-                        f"not in dependency '{dep_id}' expected_output"
-                    ),
-                    task_ids=[task.id, dep_id],
-                    evidence={
-                        "missing_keys": sorted(missing),
-                        "consumer_task": task.id,
-                        "provider_task": dep_id,
-                    },
-                ))
+            if dep is not None and dep.expected_output:
+                has_any_upstream_output = True
+                upstream_keys.update(dep.expected_output.keys())
+
+        if not has_any_upstream_output:
+            continue
+
+        missing = input_keys - upstream_keys
+        if missing:
+            issues.append(ValidationIssue(
+                code="W_CROSS_TASK_IO_MISMATCH",
+                severity="warning",
+                message=(
+                    f"task '{task.id}' expects input keys {sorted(missing)} "
+                    f"not provided by any upstream dependency's expected_output"
+                ),
+                task_ids=[task.id],
+                evidence={
+                    "missing_keys": sorted(missing),
+                    "consumer_task": task.id,
+                },
+            ))
     return issues

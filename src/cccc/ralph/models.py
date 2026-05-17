@@ -53,7 +53,14 @@ class Verification(BaseModel):
     covers: VerificationCovers = Field(default_factory=VerificationCovers)
     expected_exit_code: int = 0
     cleanup_patterns: Optional[List[str]] = None
-    mock_tests: Optional[List[MockTestCase]] = None
+    mock_tests: Optional[List[MockTestCase]] = Field(
+        default=None,
+        description=(
+            "Adversarial test cases for agent/challenge mode. Each MockTestCase "
+            "has: name, input, expected_output, setup_command, verify_command, "
+            "description."
+        ),
+    )
 
     model_config = ConfigDict(extra="ignore")
 
@@ -71,6 +78,10 @@ class Contract(BaseModel):
     schema_hint: Union[str, Dict[str, Any], None] = ""
     # Supports legacy free-text hints and structured descriptors like
     # {"type": "string", "format": "uuid"}.
+    signatures: Optional[Dict[str, str]] = Field(
+        default=None,
+        description='Function signatures {fn_name: "(args) -> ret"}',
+    )
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
@@ -119,6 +130,45 @@ class ModuleSpec(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+class RepairTrack(BaseModel):
+    """Aegis repair discipline metadata for fix-oriented tasks."""
+
+    root_cause: Optional[str] = ""
+    canonical_owner: Optional[str] = ""
+    minimal_change: Optional[str] = ""
+    verification_method: Optional[str] = ""
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class RetirementTrack(BaseModel):
+    """Aegis retirement discipline metadata for replacement/refactor tasks."""
+
+    old_owner: Optional[str] = ""
+    deletion_trigger: Optional[str] = ""
+    retained: Optional[bool] = False
+    retention_reason: Optional[str] = ""
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class AegisDiscipline(BaseModel):
+    """Aegis execution discipline metadata attached to a task."""
+
+    intent: Optional[
+        Literal["fix", "feature", "refactor", "test", "docs", "infra", "chore"]
+    ] = None
+    baseline_refs: Optional[List[str]] = Field(default_factory=list)
+    compat_boundary: Optional[str] = ""
+    patch_shape_triage: Optional[Union[str, Dict[str, Any], List[str]]] = None
+    decision_review: Optional[Union[str, Dict[str, Any], List[str]]] = None
+    drift_check: Optional[Union[str, Dict[str, Any], List[str]]] = None
+    repair_track: Optional[RepairTrack] = None
+    retirement_track: Optional[RetirementTrack] = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class TaskSpec(BaseModel):
     """A single task in a plan — the unit of work assignment."""
 
@@ -132,17 +182,37 @@ class TaskSpec(BaseModel):
 
     goal_behavior: str = ""
     acceptance_criteria: str = ""
-    verification_mode: Literal["ralph", "agent", "challenge"] = "ralph"
+    verification_mode: Literal["ralph", "agent", "challenge"] = Field(
+        default="ralph",
+        description=(
+            "ralph: shell command exit code. agent: Gemini reviews code + runs "
+            "mock_tests. challenge: adversarial mode with attack payloads."
+        ),
+    )
 
     verification: Optional[Verification] = None
 
-    provides: List[Contract] = Field(default_factory=list)
-    consumes: List[Contract] = Field(default_factory=list)
+    provides: List[Contract] = Field(
+        default_factory=list,
+        description="Task outputs as Contract objects ({name, kind, schema_hint}).",
+    )
+    consumes: List[Contract] = Field(
+        default_factory=list,
+        description="Task inputs from upstream as Contract objects ({name, from, kind}).",
+    )
 
     addresses: List[str] = Field(default_factory=list)  # issue IDs this task fixes
     failure_path: str = ""
 
     semantic: Optional[SemanticBlock] = None
+    aegis: Optional[AegisDiscipline] = Field(
+        default=None,
+        description=(
+            "Aegis execution discipline: intent, repair_track, retirement_track, "
+            "baseline_refs, compat_boundary, patch_shape_triage, decision_review, "
+            "drift_check."
+        ),
+    )
 
     # BP-3: Structured I/O contract for black-box worker model
     expected_input: Dict[str, Any] = Field(default_factory=dict)
@@ -190,6 +260,7 @@ class TaskSpec(BaseModel):
             role=self.role,
             depends_on=self.depends_on,
             claimed_paths=self.claimed_paths,
+            awareness_paths=self.awareness_paths,
             goal_behavior=self.goal_behavior,
             acceptance_criteria=self.acceptance_criteria,
             verification=verification_spec,
@@ -197,6 +268,8 @@ class TaskSpec(BaseModel):
             provides=[c.model_dump() for c in self.provides],
             consumes=[c.model_dump() for c in self.consumes],
             addresses=self.addresses,
+            failure_path=self.failure_path,
+            aegis=self.aegis.model_dump(exclude_none=True) if self.aegis else None,
             expected_input=self.expected_input,
             expected_output=self.expected_output,
             modules=[m.model_dump() for m in self.modules] if self.modules else None,
@@ -212,6 +285,8 @@ class CriticalFlow(BaseModel):
 
     id: str
     description: str = ""
+    surface_type: Optional[str] = None
+    temporal_pattern: Optional[str] = None
     entrypoints: List[str] = Field(default_factory=list)
     test_created_by: List[str] = Field(default_factory=list)
     required_verification_level: VerificationLevel = "integration"

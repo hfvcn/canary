@@ -46,6 +46,7 @@ VerificationOutcome = Literal[
     "skipped",        # Verification was skipped
     "skipped_blocked",  # Verification was skipped and completion is blocked
     "timeout",        # Verification timed out
+    "infra_error",    # Verification infrastructure failed
     "agent_pending",  # Awaiting external agent verification (RA-3)
     "force_passed",   # Force-complete override — verification skipped, task completed
 ]
@@ -95,6 +96,7 @@ class TaskRef(BaseModel):
     type: Literal["frontend", "backend", "general"] = "general"
     depends_on: List[str] = Field(default_factory=list)
     claimed_paths: List[str] = Field(default_factory=list)
+    awareness_paths: List[str] = Field(default_factory=list)
 
     # New (D-10): goal + acceptance
     goal_behavior: str = ""
@@ -114,6 +116,8 @@ class TaskRef(BaseModel):
     provides: List[Dict[str, Any]] = Field(default_factory=list)
     consumes: List[Dict[str, Any]] = Field(default_factory=list)
     addresses: List[str] = Field(default_factory=list)
+    failure_path: str = ""
+    aegis: Optional[Dict[str, Any]] = None
 
     # BP-2: module decomposition (advisory, rendered in worker prompt)
     modules: Optional[List[Dict[str, Any]]] = None

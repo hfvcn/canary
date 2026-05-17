@@ -1,0 +1,597 @@
+# Plan: v33 — RO-80/81 fixes + UX-1/2/4/5/6 improvements
+# Source: todo/问题清单-v5-ralph.md (open items after v32)
+# Date: 2026-05-14
+# Scope: RO-80, RO-81, UX-1, UX-2, UX-4, UX-5, UX-6
+# Codex review: UX-3 removed — existing code already handles upstream claimed_paths
+#   via covered_by_upstream + _path_looks_related_to_projected(projected).
+#   The projected set includes self + all deps. Real v32 trigger was likely
+#   stem mismatch (e.g., "test_integration" vs "api"), which is a plan
+#   authoring issue, not a validator bug.
+
+schema_version: "1.0.0"
+
+required_issues:
+  - "RO-80"
+  - "RO-81"
+  - "UX-1"
+  - "UX-2"
+  - "UX-4"
+  - "UX-5"
+  - "UX-6"
+
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - W_UNCLAIMED_TEST_FOR_SOURCE
+  - W_COVERS_PATHS_UNVERIFIED
+  - W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION
+  - W_FLOW_OWNER_NO_VERIFICATION
+  - W_COVERS_NOT_EXERCISED
+  - W_AGENT_REVIEW_SKIPPED
+  - W_SHARED_PATH_NO_DEPENDENCY
+  - W_PLAN_SCOPE_UNUSED
+  - W_NO_FAILURE_PATH
+  - W_NO_EARLY_INTEGRATION_CHECKPOINT
+  - W_TASK_ADDRESSES_DISJOINT
+
+tasks:
+  # ══════════════════════════════════════════════════════════════════════
+  # Batch 1 — independent leaf fixes (all parallelizable)
+  # ══════════════════════════════════════════════════════════════════════
+
+  # ── T1: RO-80 — challenge verification fail-closed ────────────────
+  - id: T1
+    title: "RO-80: Challenge mode returns failed when agent infrastructure is unavailable"
+    role: leaf
+    addresses: ["RO-80"]
+    claimed_paths:
+      - src/cccc/daemon/foreman/ralph_service.py
+      - tests/test_challenge_degradation.py
+    depends_on: []
+    goal_behavior: |
+      In ralph_service.py _verify_completion_with_challenge() (line 797),
+      when _agent_dependency_error_detail(agent_result) returns non-None
+      (lines 822-828), the code currently returns worker_result (passed)
+      with a W_CHALLENGE_DEGRADED warning appended. This is fail-open.
+
+      Fix: change lines 822-828 so that instead of returning
+      worker_result.model_copy(update={"warnings": warnings}), it returns
+      a new VerificationResult with overall_outcome="failed" and a summary
+      indicating infrastructure failure. Keep the W_CHALLENGE_DEGRADED
+      warning in the warnings list. Also preserve challenge_outcome="" to
+      indicate the agent didn't produce a judgment.
+
+      The existing _failed_agent_verification() method (line 1147) already
+      returns outcome="failed" for agent mode exceptions — challenge mode
+      should have consistent behavior.
+
+      Update test_challenge_degradation.py:
+      - test_challenge_degrades_on_gemini_network_error (line 48):
+        change assert from overall_outcome == "passed" to "failed".
+        Also assert challenge_outcome="" and checks still contain
+        worker-check only (agent checks not available).
+      - test_challenge_degradation_warning_is_in_verification_result (line 97):
+        verify warning is still present when outcome is "failed"
+      - Add test_challenge_infrastructure_failure_is_fail_closed: verify
+        RuntimeError, OSError, TimeoutExpired all produce "failed"
+    acceptance_criteria: |
+      1. Challenge mode returns overall_outcome="failed" when Gemini is unavailable
+      2. W_CHALLENGE_DEGRADED warning is still present in result.warnings
+      3. challenge_outcome="" when agent didn't produce a judgment
+      4. Agent mode behavior unchanged (already fails correctly)
+      5. Genuine agent judgment failures still produce "failed" (unchanged)
+      6. Worker-only verification still works when verification_mode="ralph"
+    verification:
+      level: unit
+      checks:
+        - name: test_challenge_degradation
+          command: "python -m pytest tests/test_challenge_degradation.py -v"
+          required: true
+      covers:
+        tasks: ["T1"]
+        paths:
+          - src/cccc/daemon/foreman/ralph_service.py
+
+  # ── T2: RO-81 — cross-task IO contracts multi-upstream fix ────────
+  - id: T2
+    title: "RO-81: Collect union of upstream expected_output keys before comparison"
+    role: leaf
+    addresses: ["RO-81"]
+    claimed_paths:
+      - src/cccc/ralph/validation_rules/contracts.py
+      - tests/ralph/test_contract_schema_validation.py
+    depends_on: []
+    goal_behavior: |
+      In contracts.py _check_cross_task_io_contracts() (lines 301-331),
+      the current logic iterates over each dep_id and individually compares
+      input_keys - output_keys. When task C depends on both A and B, and
+      C's expected_input requires keys from both A and B, the function
+      falsely reports W_CROSS_TASK_IO_MISMATCH for each dep that doesn't
+      provide ALL keys.
+
+      Fix: restructure the loop to first collect the union of all upstream
+      expected_output keys, then compare once:
+
+        upstream_keys = set()
+        has_any_upstream_output = False
+        for dep_id in task.depends_on:
+            dep = task_map.get(dep_id)
+            if dep and dep.expected_output:
+                has_any_upstream_output = True
+                upstream_keys.update(dep.expected_output.keys())
+        if not has_any_upstream_output:
+            continue
+        missing = input_keys - upstream_keys
+        if missing:
+            issues.append(...)  # single warning with all missing keys
+
+      Add tests in test_contract_schema_validation.py:
+      - test_cross_task_io_multi_upstream_collective: C depends on A+B,
+        A provides key_a, B provides key_b, C expects both → no warning
+      - test_cross_task_io_multi_upstream_missing: C expects key_c not in
+        A or B → warning with missing key_c
+      - test_cross_task_io_single_upstream: existing 1:1 behavior preserved
+    acceptance_criteria: |
+      1. No W_CROSS_TASK_IO_MISMATCH when multiple upstreams collectively
+         provide all expected_input keys
+      2. W_CROSS_TASK_IO_MISMATCH still emitted when keys are genuinely missing
+         across all upstreams
+      3. Single-dependency behavior unchanged
+      4. Warning message includes all missing keys and the consumer task ID
+    verification:
+      level: unit
+      checks:
+        - name: test_cross_task_io
+          command: "python -m pytest tests/ralph/test_contract_schema_validation.py -v -k 'cross_task_io'"
+          required: true
+      covers:
+        tasks: ["T2"]
+        paths:
+          - src/cccc/ralph/validation_rules/contracts.py
+
+  # ── T3: UX-2 — hint deduplication in validation output ────────────
+  - id: T3
+    title: "UX-2: Group repeated same-code hints in validation output"
+    role: leaf
+    addresses: ["UX-2"]
+    claimed_paths:
+      - src/cccc/ralph/cli.py
+      - tests/ralph/test_ralph_standalone.py
+    depends_on: []
+    goal_behavior: |
+      In cli.py _print_validation_text() (lines 1173-1233), the non-compact
+      mode prints every hint individually (lines 1224-1227). When a plan has
+      many tasks with unrecognized verification shapes, W_VERIFICATION_SHAPE_UNKNOWN
+      appears 12+ times, drowning out actionable items.
+
+      Fix: add a _group_repeated_issues() helper that groups issues sharing
+      the same code when count > 3. For grouped issues, print one summary
+      line: "  W_VERIFICATION_SHAPE_UNKNOWN (×12): verification shape not
+      recognized for static precheck [T1, T2, T3, ...]" instead of 12
+      individual lines.
+
+      Apply this grouping to the hints section in _print_validation_text().
+      Do NOT apply to errors (always show individually). Optionally apply
+      to warnings if count > 5.
+
+      Implementation in _print_validation_text() around line 1224:
+        grouped_hints = _group_repeated_issues(report.hints, threshold=3)
+        print(f"\nHints ({len(report.hints)}):")
+        for entry in grouped_hints:
+            if entry.is_group:
+                _print_grouped_issue(entry)
+            else:
+                _print_issue(entry.issue)
+
+      Add test named test_group_hint_deduplication_in_validation_text:
+      create a ValidationReport with 10 hints all having code
+      W_VERIFICATION_SHAPE_UNKNOWN, call _print_validation_text, capture
+      stdout and verify ≤2 W_VERIFICATION_SHAPE_UNKNOWN lines appear
+      (1 grouped line + possibly 1 count line).
+    acceptance_criteria: |
+      1. Hints with same code appearing >3 times are grouped into one summary line
+      2. Summary line shows count and affected task IDs
+      3. Hints appearing ≤3 times still show individually
+      4. Errors always show individually (never grouped)
+      5. JSON format output unchanged (grouping is display-only)
+      6. --compact mode unchanged
+    verification:
+      level: unit
+      checks:
+        - name: test_hint_grouping
+          command: "python -m pytest tests/ralph/test_ralph_standalone.py -v -k 'group_hint_deduplication'"
+          required: true
+      covers:
+        tasks: ["T3"]
+        paths:
+          - src/cccc/ralph/cli.py
+
+  # ── T4: UX-1+UX-4 — template + capability guide documentation ────
+  - id: T4
+    title: "UX-1+UX-4: Full-field plan template + capability guide alignment"
+    role: leaf
+    addresses: ["UX-1", "UX-4"]
+    claimed_paths:
+      - plans/_template.yaml
+      - docs/foreman-capability-guide.md
+    depends_on: []
+    goal_behavior: |
+      Two documentation improvements (zero code risk):
+
+      1. Update plans/_template.yaml:
+         The template already has good field documentation in comments.
+         Add UNCOMMENTED examples for:
+         - batch_e2e_command (top-level, string, shell command)
+         - batch_e2e_timeout (top-level, int, default 300)
+         - provides with full {name, kind, schema_hint} format (not string)
+         - consumes with {name, from, kind} format
+         - module_spec (modules field on TaskSpec with id, description,
+           input_spec, output_spec, internal_depends_on)
+         - expected_input / expected_output (Dict[str, Any])
+         - suppress_instances with code/owner/expiry/review_after
+         - verification.checks with multiple CheckSpec entries
+         Make it clear which format is required vs optional.
+
+      2. Update docs/foreman-capability-guide.md:
+         - Add "Plan Schema Quick Reference" section pointing to template
+         - Add provides/consumes complete examples matching the schema
+           (must use {name, kind} object format, NOT string format)
+         - Add batch_e2e_command explanation and example
+         - Add module_spec explanation
+         - Fix any references to "mode" that should be "level" in
+           verification context
+         - Add suppress_codes common list with one-line explanations
+    acceptance_criteria: |
+      1. plans/_template.yaml includes all Plan schema fields with examples
+      2. docs/foreman-capability-guide.md provides/consumes examples match schema
+      3. batch_e2e_command documented in both template and guide
+      4. No "mode" vs "level" inconsistency in verification context
+      5. Template is valid YAML parseable by PyYAML
+    verification:
+      level: compile
+      checks:
+        - name: template-parseable
+          command: "python -c \"from pathlib import Path; import yaml; yaml.safe_load(Path('plans/_template.yaml').read_text(encoding='utf-8')); print('parse ok')\""
+          required: true
+        - name: guide-exists
+          command: "test -s docs/foreman-capability-guide.md"
+          required: true
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Batch 2 — depends on batch 1 (cli.py additive changes)
+  # ══════════════════════════════════════════════════════════════════════
+
+  # ── T5: UX-5 — ralph guide auto-generation ────────────────────────
+  - id: T5
+    title: "UX-5: Add ralph guide subcommand for auto-generating capability guide"
+    role: leaf
+    addresses: ["UX-5"]
+    claimed_paths:
+      - src/cccc/ralph/guide_generator.py
+      - src/cccc/ralph/cli.py
+      - tests/ralph/test_guide_generator.py
+    depends_on: ["T3"]
+    goal_behavior: |
+      Create src/cccc/ralph/guide_generator.py with a generate_guide()
+      function that:
+      1. Extracts all fields from Plan, TaskSpec, Verification, ModuleSpec,
+         CheckSpec, Contract, CriticalFlow, ForbiddenFlow Pydantic models
+         using model_fields (field name, type, default, description)
+      2. Collects all validation rule codes (W_*, E_*, H_*) from
+         validation_rules/*.py and filesystem_validator.py by scanning
+         for code= string literals in ValidationIssue constructions
+      3. Extracts CLI subcommands and flags from cli.py main() by
+         inspecting the argparse parser
+      4. Formats all of this into a structured Markdown document with
+         sections: "Plan Schema Fields", "Validation Rules Reference",
+         "CLI Commands Reference"
+
+      In cli.py, add "guide" subparser after sync-state (line 316):
+        p_guide = sub.add_parser("guide", help="Auto-generate capability guide")
+        p_guide.add_argument("--output", type=Path, default=None)
+
+      Add dispatch in main() before the audit block (line 324), alongside
+      other no-plan-file commands:
+        if args.command == "guide":
+            try:
+                return _cmd_guide(args)
+            except Exception as exc:
+                _emit_error_envelope("guide", exc)
+                return _EXIT_INTERNAL_ERROR
+
+      _cmd_guide() calls generate_guide() and writes to --output or stdout.
+
+      Reference: _cmd_show_schema() (line ~400) already extracts some model
+      fields — reuse that approach but be comprehensive.
+    acceptance_criteria: |
+      1. ralph guide outputs Markdown with all Plan schema fields
+      2. Output includes all W_*/E_* validation rule codes with descriptions
+      3. Output includes all CLI subcommands and their flags
+      4. ralph guide --output file.md writes to file
+      5. Output matches current code state (no stale/missing fields)
+      6. ModuleSpec, batch_e2e_command, provides/consumes all documented
+    verification:
+      level: unit
+      checks:
+        - name: test_guide_generator
+          command: "python -m pytest tests/ralph/test_guide_generator.py -v"
+          required: true
+        - name: test_guide_cli
+          command: "ralph guide 2>&1 | head -5"
+          required: true
+      covers:
+        tasks: ["T5"]
+        paths:
+          - src/cccc/ralph/guide_generator.py
+          - src/cccc/ralph/cli.py
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Batch 3 — ralph flow (largest feature, depends on batch 2)
+  # ══════════════════════════════════════════════════════════════════════
+
+  # ── T6: UX-6 core — flow engine + solve flow ─────────────────────
+  - id: T6
+    title: "UX-6 core: ralph flow engine with state management + solve flow"
+    role: leaf
+    addresses: ["UX-6"]
+    claimed_paths:
+      - src/cccc/ralph/flow_engine.py
+      - tests/ralph/test_flow_engine.py
+    depends_on: ["T5"]
+    goal_behavior: |
+      Create src/cccc/ralph/flow_engine.py implementing the progressive
+      workflow guidance system described in UX-6 of the issue tracker.
+
+      Core classes and functions:
+
+      1. FlowState dataclass: flow_type, workspace, started_at,
+         current_step, params (dict), steps_completed (list),
+         steps_failed (dict). Serialize to/from .ralph-flow/state.json.
+
+      2. StepSpec dataclass: number, name, description, instruction_text,
+         check_fn (callable returning CheckResult).
+
+      3. CheckResult dataclass: passed (bool), details (list of
+         {check: str, passed: bool, message: str}).
+
+      4. FlowEngine class:
+         - __init__(workspace: Path)
+         - start(flow_type: str, **params) → creates .ralph-flow/ dir,
+           state.json, step output dirs. Returns step 1 instruction.
+         - next() → loads state, runs check_fn for current step. If
+           passed, advance current_step, return next instruction. If
+           failed, return current step instruction + failure details.
+         - state property → current FlowState
+
+      5. SOLVE_STEPS: list of 7 StepSpec for the solve flow:
+         Step 1 (understand): always pass (no checkable output)
+         Step 2 (plan): check plan.yaml exists + ralph validate 0 errors
+         Step 3 (codex-review): scan .ralph-flow/step-3-review/ for
+           Codex JSON (SESSION_ID + agent_messages > 200 chars)
+         Step 4 (gap-record): git diff on --tracker file has new lines
+         Step 5 (codex-execute): scan .ralph-flow/step-5-execute/ for
+           Codex JSON count ≥ ralph suggest batch task count
+         Step 6 (verify): run --test-cmd, exit code = 0
+         Step 7 (guide): --guide-output file exists + mtime > start +
+           size > 1KB
+
+      6. validate_codex_output(dir_path, min_content_length=200):
+         shared validation for steps 3 and 5. Scans *.json files for
+         SESSION_ID (valid UUID) + success=True + agent_messages length.
+
+      Tests: test start creates state.json, test next advances on pass,
+      test next stays on fail, test codex validation rejects non-codex
+      output, test solve flow completes 7 steps.
+    acceptance_criteria: |
+      1. FlowEngine.start("solve") creates .ralph-flow/state.json
+      2. FlowEngine.next() runs check for current step
+      3. Step passes → advance and show next instruction
+      4. Step fails → show current step instruction + failure details
+      5. Codex steps reject output without SESSION_ID
+      6. Optional params (tracker, guide_output) skip corresponding steps
+      7. State persists across FlowEngine instances
+    verification:
+      level: unit
+      checks:
+        - name: test_flow_engine
+          command: "python -m pytest tests/ralph/test_flow_engine.py -v"
+          required: true
+      covers:
+        tasks: ["T6"]
+        paths:
+          - src/cccc/ralph/flow_engine.py
+
+  # ── T7: UX-6 e2e — flow e2e steps + CLI wiring ───────────────────
+  - id: T7
+    title: "UX-6 e2e: E2E flow steps + ralph flow CLI subcommands"
+    role: leaf
+    addresses: ["UX-6"]
+    claimed_paths:
+      - src/cccc/ralph/flow_steps_e2e.py
+      - src/cccc/ralph/cli.py
+      - tests/ralph/test_flow_e2e.py
+    depends_on: ["T6"]
+    goal_behavior: |
+      1. Create src/cccc/ralph/flow_steps_e2e.py with E2E_STEPS list
+         (7 StepSpec for the e2e flow):
+         Step 0 (code-verify): run pytest, check "0 failed"; ralph validate smoke
+         Step 1 (env-prepare): workspace exists + docs/ files exist +
+           cccc daemon status=running + cccc actor list has planner
+         Step 2 (task-submit): cccc tail has chat.message to planner
+         Step 3 (monitor-wait): cccc workflow status tasks.completed=total
+         Step 4 (codex-review): .ralph-flow/step-4-review/ has ≥2 codex
+           outputs + WORKFLOW_EVALUATION.md exists and >500 bytes
+         Step 5 (report-synthesize): e2e report file exists with
+           "评分摘要" and "交叉验证" strings
+         Step 6 (improvement-register): git diff shows changes in both
+           问题清单 short and full versions + 版本历史评分 has new line
+
+      2. Wire CLI in cli.py. Add "flow" subparser alongside existing
+         no-plan commands (guide, audit, sync-state). Place the subparser
+         after the guide subparser added by T5:
+
+         p_flow = sub.add_parser("flow", help="Progressive workflow guidance")
+         flow_sub = p_flow.add_subparsers(dest="flow_command")
+         p_flow_start = flow_sub.add_parser("start")
+         p_flow_start.add_argument("flow_type", choices=["solve", "e2e"])
+         p_flow_start.add_argument("--workspace", type=Path, required=True)
+         p_flow_start.add_argument("--test-cmd", default="pytest")
+         p_flow_start.add_argument("--tracker", type=Path, default=None)
+         p_flow_start.add_argument("--guide-output", type=Path, default=None)
+         p_flow_start.add_argument("--group", type=str, default=None)
+         p_flow_start.add_argument("--cccc-root", type=Path, default=None)
+         p_flow_start.add_argument("--version", type=str, default=None)
+         p_flow_next = flow_sub.add_parser("next")
+         p_flow_next.add_argument("--workspace", type=Path, default=Path("."))
+
+         Add dispatch in main() alongside guide/audit/sync-state (all are
+         no-plan-file commands):
+           if args.command == "flow":
+               try:
+                   return _cmd_flow(args)
+               except Exception as exc:
+                   _emit_error_envelope("flow", exc)
+                   return _EXIT_INTERNAL_ERROR
+
+         _cmd_flow() creates FlowEngine(workspace) and dispatches to
+         start() or next() based on flow_command.
+    acceptance_criteria: |
+      1. ralph flow start e2e --workspace /tmp/test creates state.json
+      2. E2E flow has 7 steps (0-6) with correct validation logic
+      3. CLI subcommands parse correctly
+      4. ralph flow next works for both solve and e2e flow types
+      5. E2E step 4 requires ≥2 Codex outputs (result + process review)
+      6. Flow state persists across invocations
+    verification:
+      level: unit
+      checks:
+        - name: test_flow_e2e
+          command: "python -m pytest tests/ralph/test_flow_e2e.py -v"
+          required: true
+        - name: test_flow_cli_parse
+          command: "ralph flow --help 2>&1 | head -3"
+          required: true
+      covers:
+        tasks: ["T7"]
+        paths:
+          - src/cccc/ralph/flow_steps_e2e.py
+          - src/cccc/ralph/cli.py
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Integration verification
+  # ══════════════════════════════════════════════════════════════════════
+
+  - id: T-int
+    title: "Integration: full regression + new feature verification"
+    role: integration
+    addresses: ["RO-80", "RO-81", "UX-1", "UX-2", "UX-4", "UX-5", "UX-6"]
+    claimed_paths:
+      - tests/test_v33_integration.py
+    depends_on: ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]
+    goal_behavior: |
+      Integration test covering all v33 features:
+      1. RO-80: challenge mode + OSError → overall_outcome="failed"
+      2. RO-81: plan with 3 tasks, C depends on A+B, A provides key_a,
+         B provides key_b, C expects both → 0 W_CROSS_TASK_IO_MISMATCH
+      3. UX-2: plan with 10 tasks all unknown verification shape →
+         output has grouped hint line (not 10 individual lines)
+      4. UX-5: ralph guide outputs non-empty markdown containing
+         "batch_e2e_command" and "provides"
+      5. UX-6: FlowEngine start+next cycle for solve flow
+
+      Also run full pytest regression suite.
+    acceptance_criteria: |
+      1. All integration scenarios pass
+      2. Full pytest run: 0 failures
+    verification:
+      level: integration
+      checks:
+        - name: test_v33_integration
+          command: "python -m pytest tests/test_v33_integration.py -v"
+          required: true
+        - name: full_regression
+          command: "python -m pytest --tb=short -q 2>&1 | tail -5"
+          required: true
+      covers:
+        tasks: ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T-int"]
+        flows:
+          - challenge_fail_closed
+          - multi_upstream_io_contract
+          - hint_deduplication
+          - guide_auto_generation
+          - flow_progressive_guidance
+
+# ── Critical flows ─────────────────────────────────────────────────────
+critical_flows:
+  - id: challenge_fail_closed
+    description: >
+      Challenge mode + agent infrastructure failure → overall_outcome="failed"
+      instead of degrading to worker-only "passed".
+    entrypoints:
+      - src/cccc/daemon/foreman/ralph_service.py::_verify_completion_with_challenge
+    required_verification_level: unit
+
+  - id: multi_upstream_io_contract
+    description: >
+      Task C depends on A+B, both provide expected_output keys that
+      collectively satisfy C's expected_input → no false W_CROSS_TASK_IO_MISMATCH.
+    entrypoints:
+      - src/cccc/ralph/validation_rules/contracts.py::_check_cross_task_io_contracts
+    required_verification_level: unit
+
+  - id: hint_deduplication
+    description: >
+      Same-code hints appearing >3 times → grouped into single summary line
+      with count and affected task list.
+    entrypoints:
+      - src/cccc/ralph/cli.py::_print_validation_text
+    required_verification_level: unit
+
+  - id: guide_auto_generation
+    description: >
+      ralph guide → generates complete capability guide from Pydantic
+      models, validation rules, and CLI parser.
+    entrypoints:
+      - src/cccc/ralph/guide_generator.py::generate_guide
+      - src/cccc/ralph/cli.py::main
+    required_verification_level: unit
+
+  - id: flow_progressive_guidance
+    description: >
+      ralph flow start solve → creates state → ralph flow next checks
+      step output → advances or fails with details.
+    entrypoints:
+      - src/cccc/ralph/flow_engine.py::FlowEngine
+      - src/cccc/ralph/cli.py::main
+    required_verification_level: unit
+
+# ── Forbidden flows ────────────────────────────────────────────────────
+forbidden_flows:
+  - id: challenge_fail_open
+    description: >
+      Challenge mode must NOT return "passed" when agent infrastructure is
+      unavailable. The RO-80 gap is the forbidden pattern.
+    test_created_by: ["T1"]
+    required_verification_level: unit
+
+  - id: multi_upstream_false_positive
+    description: >
+      Cross-task IO validation must NOT report W_CROSS_TASK_IO_MISMATCH when
+      multiple upstream tasks collectively provide all required keys.
+    test_created_by: ["T2"]
+    required_verification_level: unit
+
+# ── State ──────────────────────────────────────────────────────────────
+state:
+  completed_task_ids:
+    - T-int
+    - T7
+    - T6
+    - T5
+    - T4
+    - T3
+    - T2
+    - T1
+  running_tasks: []
+  failed_task_ids: []

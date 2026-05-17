@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current structural rule and suppression behavior,DONE,Relevant rule and suppression path understood,python -m pytest tests/test_write_conflict_upgrade.py -v,2026-05-17,0,
+2,Implement E_WRITE_CONFLICT upgrade,DONE,Leaf same-file conflict emits error and integration overlap is skipped,python -m pytest tests/test_write_conflict_upgrade.py -v,2026-05-17,0,
+3,Add focused tests,DONE,Requested test cases exist and assert error/suppression behavior,python -m pytest tests/test_write_conflict_upgrade.py -v,2026-05-17,0,
+4,Run verification,DONE,Focused pytest command passes within 60 seconds,python -m pytest tests/test_write_conflict_upgrade.py -v,2026-05-17,0,

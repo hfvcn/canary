@@ -38,6 +38,30 @@ GEMINI_JSON_RETRY_DELAY_SECONDS = 2
 GEMINI_WARMUP_PROMPT = 'Return exactly this JSON: {"ok": true}'
 ALLOWED_CONFIDENCE = frozenset({"low", "medium", "high"})
 ADVISORY_NOTICE = "Agent suggestions are advisory only and have no decision authority."
+SECURITY_CHECKLIST_HEADER = "## Security Checklist"
+SECURITY_CHECKLIST_ITEMS = (
+    (
+        ("input-validation", "input validation", "fts", "search", "xss", "injection"),
+        (
+            "Verify: Are all user inputs validated? Can query operators be injected? "
+            "Are there resource limits (pagination, body size)?"
+        ),
+    ),
+    (
+        ("ssrf", "url"),
+        (
+            "Verify: Does URL validation handle encoded IPs, DNS rebinding, "
+            "redirect chains?"
+        ),
+    ),
+    (
+        ("auth", "token", "key"),
+        (
+            "Verify: Is token comparison timing-safe? Are secrets hardcoded?"
+        ),
+    ),
+)
+CRITICAL_FLOW_NAME_FIELDS = ("id", "name", "title", "surface_type", "temporal_pattern")
 T = TypeVar("T")
 
 
@@ -174,6 +198,7 @@ class RalphAgent:
         source_context: Dict[str, str] | None = None,
         git_diff: str = "",
         verification_output: Dict[str, Any] | None = None,
+        critical_flows: list[Any] | None = None,
     ) -> Dict[str, Any]:
         """Run Ralph Agent verification for Foreman-preset simulation cases."""
         if not self.available:
@@ -187,6 +212,7 @@ class RalphAgent:
             source_context=source_context,
             git_diff=git_diff,
             verification_output=verification_output,
+            critical_flows=critical_flows,
         )
         task_id = str(task.id)
         return self._run_gemini_json_retry(
@@ -205,12 +231,18 @@ class RalphAgent:
         source_context: Dict[str, str] | None = None,
         git_diff: str = "",
         verification_output: Dict[str, Any] | None = None,
+        critical_flows: list[Any] | None = None,
     ) -> str:
+        task_context = self._agent_verification_task_context(task)
+        if critical_flows:
+            task_context["critical_flows"] = [
+                _critical_flow_context(flow) for flow in critical_flows
+            ]
         payload: Dict[str, Any] = {
             "workflow_id": self.workflow_id,
             "project_root": str(project_root),
             "changed_files": list(changed_files),
-            "task": self._agent_verification_task_context(task),
+            "task": task_context,
             "response_schema": {
                 "passed": "boolean",
                 "summary": "short explanation",
@@ -230,7 +262,7 @@ class RalphAgent:
         if verification_output:
             payload["verification_output"] = verification_output
         context = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
-        return (
+        base_prompt = (
             "Run Ralph Agent verification for a completed task.\n\n"
             "## Rules\n"
             "1. Base your analysis ONLY on the evidence provided below: "
@@ -255,9 +287,21 @@ class RalphAgent:
             "truncated, state what you CAN verify and what you CANNOT.\n"
             "6. Do not use tools, shell commands, file reads, MCP, or "
             "workspace inspection.\n"
-            "7. Return only JSON matching response_schema. No prose.\n\n"
+            "7. Return only JSON matching response_schema. No prose.\n"
+            "8. Validate goal_behavior logic: Check that any set construction, "
+            "loops, conditions, or variable transformations described in "
+            "goal_behavior are internally consistent. If the described logic "
+            "would produce wrong results (e.g., collecting from 'all tasks' "
+            "without excluding self, iterating without boundary), mark as "
+            "failed with specific explanation.\n"
+            "9. Validate goal_behavior assumptions: Check that goal_behavior "
+            "assumptions about pre-conditions, existing helper functions, data "
+            "structure state, and runtime behavior match what source_code "
+            "actually shows. If goal_behavior says 'function X only does Y' "
+            "but source_code shows X already does Z, flag the contradiction.\n\n"
             f"{context}"
         )
+        return _append_security_checklist(base_prompt, critical_flows)
 
     def _agent_verification_task_context(self, task: Any) -> Dict[str, Any]:
         verification = task.verification.model_dump() if task.verification else None
@@ -548,6 +592,56 @@ def _suggestion_from_payload(
         confidence=confidence,
         advisory=True,
     )
+
+
+def _append_security_checklist(
+    base_prompt: str,
+    critical_flows: list[Any] | None,
+) -> str:
+    items = _security_checklist_items(critical_flows)
+    if not items:
+        return base_prompt
+    checklist = "\n".join([SECURITY_CHECKLIST_HEADER, *[f"- {item}" for item in items]])
+    return f"{base_prompt}\n\n{checklist}"
+
+
+def _security_checklist_items(critical_flows: list[Any] | None) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+    for flow in critical_flows or []:
+        flow_text = _critical_flow_name_text(flow)
+        for keywords, item in SECURITY_CHECKLIST_ITEMS:
+            if item in seen:
+                continue
+            if any(keyword in flow_text for keyword in keywords):
+                items.append(item)
+                seen.add(item)
+    return items
+
+
+def _critical_flow_name_text(flow: Any) -> str:
+    context = _critical_flow_context(flow)
+    parts = [str(context.get(field) or "") for field in CRITICAL_FLOW_NAME_FIELDS]
+    return " ".join(parts).lower().replace("_", "-")
+
+
+def _critical_flow_context(flow: Any) -> Dict[str, Any]:
+    if isinstance(flow, str):
+        return {"id": flow}
+    if isinstance(flow, dict):
+        return dict(flow)
+    model_dump = getattr(flow, "model_dump", None)
+    if callable(model_dump):
+        data = model_dump()
+        if isinstance(data, dict):
+            return data
+    return {
+        "id": str(getattr(flow, "id", "") or ""),
+        "name": str(getattr(flow, "name", "") or ""),
+        "title": str(getattr(flow, "title", "") or ""),
+        "surface_type": str(getattr(flow, "surface_type", "") or ""),
+        "temporal_pattern": str(getattr(flow, "temporal_pattern", "") or ""),
+    }
 
 
 def _parse_agent_verification_payload(stdout: str, task_id: str) -> Dict[str, Any]:
@@ -1003,6 +1097,119 @@ RULE_DOCS: Dict[str, _RuleDoc] = {
             "--suppress W_EMPTY_ACCEPTANCE on the CLI."
         ),
     ),
+    "E_AEGIS_PLACEHOLDER_CONTENT": _RuleDoc(
+        description=(
+            "A task title, goal_behavior, or acceptance_criteria contains "
+            "placeholder wording such as TODO, TBD, or implement later."
+        ),
+        why_it_matters=(
+            "Placeholder task text gives workers an underspecified target and "
+            "turns validation into a false signal because the plan has not "
+            "committed to concrete behavior."
+        ),
+        fix_template=(
+            "Replace placeholder wording with the exact behavior and acceptance "
+            "condition:\n"
+            "  goal_behavior: |\n"
+            "    The validator emits E_X when condition Y occurs.\n"
+            "  acceptance_criteria: |\n"
+            "    pytest tests/test_validator.py::test_condition_y passes"
+        ),
+        suppress_hint=(
+            "Add 'E_AEGIS_PLACEHOLDER_CONTENT' to suppress_codes or pass "
+            "--suppress E_AEGIS_PLACEHOLDER_CONTENT on the CLI."
+        ),
+    ),
+    "E_AEGIS_RETIREMENT_TRACK_MISSING": _RuleDoc(
+        description=(
+            "A refactor task with fallback, adapter, guard, compat, legacy, "
+            "or similar patch-shape risk has no aegis.retirement_track."
+        ),
+        why_it_matters=(
+            "Risky refactors often leave the old path alive. Without an explicit "
+            "retirement track, compatibility code can become permanent hidden debt."
+        ),
+        fix_template=(
+            "Add retirement metadata to the task:\n"
+            "  aegis:\n"
+            "    intent: refactor\n"
+            "    retirement_track:\n"
+            "      old_owner: src/legacy/path.py\n"
+            "      deletion_trigger: after migration validation passes\n"
+            "      retained: true\n"
+            "      retention_reason: compatibility window"
+        ),
+        suppress_hint=(
+            "Add 'E_AEGIS_RETIREMENT_TRACK_MISSING' to suppress_codes or pass "
+            "--suppress E_AEGIS_RETIREMENT_TRACK_MISSING on the CLI."
+        ),
+    ),
+    "W_AEGIS_FIX_NO_REPAIR_TRACK": _RuleDoc(
+        description="A fix task has no aegis.repair_track metadata.",
+        why_it_matters=(
+            "Fix work should record the root cause, owner, minimal change, and "
+            "verification method so the repair is traceable instead of a patch "
+            "with unclear causality."
+        ),
+        fix_template=(
+            "Add repair metadata to the task:\n"
+            "  aegis:\n"
+            "    intent: fix\n"
+            "    repair_track:\n"
+            "      root_cause: missing validation branch\n"
+            "      canonical_owner: src/service.py\n"
+            "      minimal_change: add explicit branch\n"
+            "      verification_method: pytest tests/test_service.py -v"
+        ),
+        suppress_hint=(
+            "Add 'W_AEGIS_FIX_NO_REPAIR_TRACK' to suppress_codes or pass "
+            "--suppress W_AEGIS_FIX_NO_REPAIR_TRACK on the CLI."
+        ),
+    ),
+    "W_AEGIS_TDD_NO_TEST_PATH": _RuleDoc(
+        description=(
+            "A fix or feature task does not claim any test path containing "
+            "test_, _test, or tests/."
+        ),
+        why_it_matters=(
+            "Fixes and features should name the test surface they change or add. "
+            "Without a claimed test path, the plan can drift away from TDD-style "
+            "verification."
+        ),
+        fix_template=(
+            "Add a relevant test file or directory to claimed_paths:\n"
+            "  claimed_paths:\n"
+            "    - src/package/module.py\n"
+            "    - tests/test_module.py"
+        ),
+        suppress_hint=(
+            "Add 'W_AEGIS_TDD_NO_TEST_PATH' to suppress_codes or pass "
+            "--suppress W_AEGIS_TDD_NO_TEST_PATH on the CLI."
+        ),
+    ),
+    "W_AEGIS_COMPLEX_MISSING_BASELINE": _RuleDoc(
+        description=(
+            "A complex task has no aegis.baseline_refs even though it has "
+            "three or more dependencies, provides or consumes contracts, or "
+            "uses role=integration."
+        ),
+        why_it_matters=(
+            "Complex tasks need a named baseline so reviewers and workers can "
+            "see what existing behavior, contract, or prior task the change is "
+            "anchored to."
+        ),
+        fix_template=(
+            "Add one or more baseline references:\n"
+            "  aegis:\n"
+            "    baseline_refs:\n"
+            "      - plan.yaml#T2\n"
+            "      - docs/current-behavior.md#section"
+        ),
+        suppress_hint=(
+            "Add 'W_AEGIS_COMPLEX_MISSING_BASELINE' to suppress_codes or pass "
+            "--suppress W_AEGIS_COMPLEX_MISSING_BASELINE on the CLI."
+        ),
+    ),
     "E_MISSING_CLAIMED_PATHS": _RuleDoc(
         description="A task has no claimed_paths entries.",
         why_it_matters=(
@@ -1253,6 +1460,12 @@ RULE_VERSION_REGISTRY: Dict[str, int] = {
     "W_CRITICAL_FLOW_NO_ENTRYPOINTS": 1,
     "H_SUPPRESS_UNUSED": 1,
     "W_PLAN_SCOPE_UNUSED": 1,
+    # Aegis discipline rules
+    "E_AEGIS_PLACEHOLDER_CONTENT": 1,
+    "E_AEGIS_RETIREMENT_TRACK_MISSING": 1,
+    "W_AEGIS_FIX_NO_REPAIR_TRACK": 1,
+    "W_AEGIS_TDD_NO_TEST_PATH": 1,
+    "W_AEGIS_COMPLEX_MISSING_BASELINE": 1,
     # Filesystem rules
     "W_REGISTERED_PLAN_STALE": 1,
     "W_TEST_COVERAGE_GAP": 1,

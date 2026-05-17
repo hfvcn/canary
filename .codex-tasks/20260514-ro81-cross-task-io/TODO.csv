@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read plan and current implementation,DONE,T2 spec and current code/test patterns understood,test -f plans/v33-ux-and-ro-fixes.yaml,2026-05-14T00:00:00+08:00,0,
+2,Update taskmaster records,DONE,SPEC TODO and PROGRESS exist,test -f .codex-tasks/20260514-ro81-cross-task-io/SPEC.md && test -f .codex-tasks/20260514-ro81-cross-task-io/TODO.csv && test -f .codex-tasks/20260514-ro81-cross-task-io/PROGRESS.md,2026-05-14T00:00:00+08:00,0,
+3,Implement upstream union contract check,DONE,Validator compares expected_input against union of dependency expected_output keys,python -m pytest -o addopts= tests/ralph/test_contract_schema_validation.py -v -k 'cross_task_io',2026-05-14T00:00:00+08:00,0,
+4,Add cross-task IO regression tests,DONE,Collective multi-upstream missing-key and single-upstream cases are covered,python -m pytest -o addopts= tests/ralph/test_contract_schema_validation.py -v -k 'cross_task_io',2026-05-14T00:00:00+08:00,0,
+5,Run required verification,FAILED,Required pytest command passes,python -m pytest tests/ralph/test_contract_schema_validation.py -v -k 'cross_task_io',,1,Failed before collection because pyproject addopts uses -n auto and pytest-xdist is unavailable; targeted run with -o addopts= passed.

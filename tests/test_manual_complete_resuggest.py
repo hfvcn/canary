@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationResult
+from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationResult, VerificationSpec
 from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
 from cccc.daemon.ops import workflow_task_ops
 from cccc.kernel.group import attach_scope_to_group, create_group
@@ -76,6 +76,7 @@ def _tasks() -> list[TaskRef]:
             type="backend",
             depends_on=[],
             claimed_paths=["src/a.py"],
+            verification=VerificationSpec(command="echo ok"),
         ),
         TaskRef(
             id=DOWNSTREAM_TASK_ID,
@@ -83,6 +84,7 @@ def _tasks() -> list[TaskRef]:
             type="backend",
             depends_on=[UPSTREAM_TASK_ID],
             claimed_paths=["src/b.py"],
+            verification=VerificationSpec(command="echo ok"),
         ),
     ]
 

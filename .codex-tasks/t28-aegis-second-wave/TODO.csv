@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read T28 and existing validation patterns,DONE,Relevant APIs and test helpers identified,rg/sed reads complete,2026-05-17T00:00:00+08:00,0,Existing rules use ValidationIssue helpers; evidence gate returns warnings/errors.
+2,Implement second-wave rules,DONE,Rules emit requested codes and severities,python -m pytest tests/test_aegis_second_wave.py,2026-05-17T00:00:00+08:00,0,Implemented in discipline_second_wave.py and verification_gate.py.
+3,Add focused tests,DONE,One test exists for each requested rule,python -m pytest tests/test_aegis_second_wave.py,2026-05-17T00:00:00+08:00,0,Added tests/test_aegis_second_wave.py with one test per rule.
+4,Run validation,DONE,Focused and related tests pass,python -m pytest tests/test_aegis_second_wave.py tests/ralph/test_aegis_rules.py tests/test_aegis_evidence_gate.py,2026-05-17T00:00:00+08:00,0,30 related tests passed; py_compile passed; ruff unavailable in environment.

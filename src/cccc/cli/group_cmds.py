@@ -23,7 +23,7 @@ __all__ = [
 def cmd_attach(args: argparse.Namespace) -> int:
     if _ensure_daemon_running():
         resp = call_daemon(
-            {"op": "attach", "args": {"path": args.path, "by": "cli", "group_id": str(args.group_id or "")}}
+            {"op": "attach", "args": {"path": str(Path(args.path).resolve()), "by": "cli", "group_id": str(args.group_id or "")}}
         )
         if resp.get("ok"):
             try:

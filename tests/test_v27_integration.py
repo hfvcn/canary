@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
-from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef, VerificationResult
+from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef, VerificationResult, VerificationSpec
 from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
 from cccc.kernel.workflow_state_types import WorkflowTaskStatus
 
@@ -47,7 +47,7 @@ def _orchestrator(tmp_path: Path) -> WorkflowOrchestrator:
 
 
 def _task(task_id: str) -> TaskRef:
-    return TaskRef(id=task_id, title=task_id, type="backend", claimed_paths=[f"src/{task_id}.py"])
+    return TaskRef(id=task_id, title=task_id, type="backend", claimed_paths=[f"src/{task_id}.py"], verification=VerificationSpec(command="echo ok"))
 
 
 def _suggestion(*, workflow_id: str, tasks: list[TaskRef], suggestion_id: str) -> ReadyBatchSuggestion:

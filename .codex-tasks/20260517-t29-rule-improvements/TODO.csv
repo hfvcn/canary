@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current validation rule implementations,DONE,Relevant structural coverage discipline and template context reviewed,rg/sed context read,2026-05-17,0,
+2,Implement requested rule and documentation changes,DONE,All requested behavior changes are present in scoped files,python -m compileall src/cccc/ralph/validation_rules,2026-05-17,0,
+3,Add targeted regression tests,DONE,Three requested test files exist and assert new behavior,test -f tests/test_overlap_detail.py && test -f tests/test_claimed_path_incomplete.py && test -f tests/test_covers_auto_expand.py,2026-05-17,0,
+4,Run target validation,DONE,Target pytest command passes within 60 seconds,python -m pytest tests/test_overlap_detail.py tests/test_claimed_path_incomplete.py tests/test_covers_auto_expand.py -v,2026-05-17,0,
+5,Review working diff,DONE,Diff contains only intended scoped changes,git diff -- src/cccc/ralph/validation_rules/structural.py src/cccc/ralph/validation_rules/coverage.py src/cccc/ralph/validation_rules/discipline.py plans/_template.yaml tests/test_overlap_detail.py tests/test_claimed_path_incomplete.py tests/test_covers_auto_expand.py,2026-05-17,0,

@@ -107,6 +107,7 @@ def test_message_send_does_not_complete_task(client: TestClient, temp_group) -> 
                     "type": "backend",
                     "depends_on": [],
                     "claimed_paths": ["src/a.py"],
+                    "verification": {"command": "echo ok"},
                 }
             ],
             "auto_process": True,
@@ -183,9 +184,10 @@ def test_message_send_does_not_complete_task(client: TestClient, temp_group) -> 
 
     task_state = orchestrator.engine.get_task(task_id)
     assert task_state is not None
-    # RO-25: verification skipped → FAILED (no verification commands configured).
+    # With verification configured (command="echo ok"), the proper completion API
+    # triggers verification which passes, so the task reaches COMPLETED.
     # The anti-bypass invariant (message_send doesn't complete) is tested above.
-    assert task_state.status == WorkflowTaskStatus.FAILED
+    assert task_state.status == WorkflowTaskStatus.COMPLETED
     assert (
         _count_kind(temp_group.ledger_path, kind="workflow.task_reported_completed")
         == before_completion_events + 1

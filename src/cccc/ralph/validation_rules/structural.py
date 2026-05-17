@@ -5,15 +5,33 @@ Extracted from validator.py as a pure refactor (RO-31).
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Set
 
 from cccc.kernel.claimed_paths import normalize_write_set as _normalize_write_set, paths_overlap as _paths_overlap
 from ..graph_utils import transitive_deps, detect_cycle, find_components
 from ..models import (
+    CheckSpec,
     Plan,
     TaskSpec,
     Verification,
     ValidationIssue,
+)
+
+
+MAX_OVERLAP_DESCRIPTIONS = 3
+MAX_OVERLAP_EVIDENCE = 5
+WRITE_CONFLICT_CODE = "E_WRITE_CONFLICT"
+SHARED_PATH_CODE = "W_SHARED_PATH_NO_DEPENDENCY"
+CLAIMED_PATH_INCOMPLETE_CODE = "W_CLAIMED_PATH_INCOMPLETE"
+E2E_COMPILE_CHECK_CODE = "W_E2E_MISSING_COMPILE_CHECK"
+COMPILE_REQUIRED_LEVELS = frozenset({"api", "e2e", "integration"})
+COMPILE_SKIP_LEVELS = frozenset({"compile", "unit"})
+PYTHON_IMPORT_TOKEN_RE = re.compile(r"\b(import|from)\b")
+GOAL_FILE_REFERENCE_RE = re.compile(
+    r"(?:modify|write|add|change|edit|update)\s+(?:to\s+)?"
+    r"(\S+\.(?:py|js|ts|yaml|json))",
+    re.IGNORECASE,
 )
 
 
@@ -193,43 +211,156 @@ def _check_field_completeness(plan: Plan) -> List[ValidationIssue]:
     return issues
 
 
+def _check_claimed_path_incomplete(plan: Plan) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    for task in plan.tasks:
+        known_paths = _known_task_paths(task)
+        for referenced_path in _goal_file_references(task.goal_behavior):
+            if _task_knows_path(referenced_path, known_paths):
+                continue
+            issues.append(ValidationIssue(
+                code=CLAIMED_PATH_INCOMPLETE_CODE,
+                severity="warning",
+                message=(
+                    f"task '{task.id}' goal_behavior references '{referenced_path}' "
+                    "but it is not in claimed_paths or awareness_paths"
+                ),
+                task_ids=[task.id],
+                evidence={
+                    "referenced_path": referenced_path,
+                    "claimed_paths": list(task.claimed_paths),
+                    "awareness_paths": list(task.awareness_paths),
+                },
+            ))
+    return issues
+
+
+def _known_task_paths(task: TaskSpec) -> List[str]:
+    raw_paths = list(task.claimed_paths) + list(task.awareness_paths)
+    return _normalize_write_set(raw_paths) if raw_paths else []
+
+
+def _goal_file_references(goal_behavior: str) -> List[str]:
+    referenced: List[str] = []
+    for match in GOAL_FILE_REFERENCE_RE.finditer(goal_behavior or ""):
+        path = match.group(1).strip("\"'`()[]{}.,:;")
+        if not path:
+            continue
+        normalized = _normalize_write_set([path])[0]
+        if normalized not in referenced:
+            referenced.append(normalized)
+    return referenced
+
+
+def _task_knows_path(referenced_path: str, known_paths: List[str]) -> bool:
+    return any(_paths_overlap(referenced_path, known_path) for known_path in known_paths)
+
+
 # ---------------------------------------------------------------------------
 # 12. Implicit serialization warning
 # ---------------------------------------------------------------------------
 
 def _check_implicit_serialization(plan: Plan) -> List[ValidationIssue]:
-    """Warn when two tasks share claimed_paths but have no explicit depends_on."""
+    """Flag leaf task write overlaps that lack explicit depends_on."""
     issues: List[ValidationIssue] = []
     if len(plan.tasks) < 2:
         return issues
 
-    # Build pairs that share write-set overlap
     reported: Set[frozenset] = set()
     for i, t1 in enumerate(plan.tasks):
         for t2 in plan.tasks[i + 1:]:
-            # Skip if they already have explicit dependency
-            if t2.id in t1.depends_on or t1.id in t2.depends_on:
+            if not _should_check_write_overlap(t1, t2):
                 continue
 
             ws1 = _normalize_write_set(t1.claimed_paths)
             ws2 = _normalize_write_set(t2.claimed_paths)
+            overlap_pairs = _overlap_pairs(ws1, ws2)
+            if not overlap_pairs:
+                continue
 
-            if any(_paths_overlap(a, b) for a in ws1 for b in ws2):
-                pair = frozenset([t1.id, t2.id])
-                if pair not in reported:
-                    reported.add(pair)
-                    overlap = [a for a in ws1 for b in ws2 if _paths_overlap(a, b)]
-                    issues.append(ValidationIssue(
-                        code="W_SHARED_PATH_NO_DEPENDENCY",
-                        severity="warning",
-                        message=f"tasks '{t1.id}' and '{t2.id}' claim overlapping paths "
-                                f"({', '.join(overlap[:3])}) but have no explicit depends_on — "
-                                f"add depends_on if ordering matters, or split claimed_paths to avoid write conflicts",
-                        task_ids=[t1.id, t2.id],
-                        evidence={"shared_paths": overlap[:5]},
-                    ))
+            pair = frozenset([t1.id, t2.id])
+            if pair in reported:
+                continue
+
+            reported.add(pair)
+            issues.append(_write_overlap_issue(t1, t2, overlap_pairs))
 
     return issues
+
+
+def _should_check_write_overlap(t1: TaskSpec, t2: TaskSpec) -> bool:
+    if t1.role != "leaf" or t2.role != "leaf":
+        return False
+    return t2.id not in t1.depends_on and t1.id not in t2.depends_on
+
+
+def _overlap_pairs(ws1: List[str], ws2: List[str]) -> List[tuple[str, str]]:
+    return [(a, b) for a in ws1 for b in ws2 if _paths_overlap(a, b)]
+
+
+def _write_overlap_issue(
+    t1: TaskSpec,
+    t2: TaskSpec,
+    overlap_pairs: List[tuple[str, str]],
+) -> ValidationIssue:
+    shared_files = _same_source_files(overlap_pairs)
+    if shared_files:
+        descriptions = _describe_overlap_pairs(t1, t2, [(p, p) for p in shared_files])
+        return ValidationIssue(
+            code=WRITE_CONFLICT_CODE,
+            severity="error",
+            message=f"tasks '{t1.id}' and '{t2.id}' claim conflicting source file(s) "
+                    f"({', '.join(descriptions)}) without explicit depends_on",
+            task_ids=[t1.id, t2.id],
+            evidence={"shared_paths": shared_files},
+        )
+
+    descriptions = _describe_overlap_pairs(t1, t2, overlap_pairs)
+    return ValidationIssue(
+        code=SHARED_PATH_CODE,
+        severity="warning",
+        message=f"tasks '{t1.id}' and '{t2.id}' claim overlapping paths "
+                f"({', '.join(descriptions)}) but have no explicit depends_on — "
+                f"add depends_on if ordering matters, or split claimed_paths to avoid write conflicts",
+        task_ids=[t1.id, t2.id],
+        evidence={"shared_paths": overlap_pairs[:MAX_OVERLAP_EVIDENCE]},
+    )
+
+
+def _same_source_files(overlap_pairs: List[tuple[str, str]]) -> List[str]:
+    shared_files: List[str] = []
+    for left, right in overlap_pairs:
+        if left == right and _looks_like_source_file(left) and left not in shared_files:
+            shared_files.append(left)
+    return shared_files
+
+
+def _looks_like_source_file(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return path != "/" and "." in name and not name.startswith(".")
+
+
+def _describe_overlap_pairs(
+    t1: TaskSpec,
+    t2: TaskSpec,
+    overlap_pairs: List[tuple[str, str]],
+) -> List[str]:
+    descriptions: List[str] = []
+    for left, right in overlap_pairs[:MAX_OVERLAP_DESCRIPTIONS]:
+        display_left = _display_claimed_path(t1, left)
+        display_right = _display_claimed_path(t2, right)
+        descriptions.append(
+            f'{t1.id} claims "{display_left}" which overlaps with '
+            f'{t2.id}\'s "{display_right}"'
+        )
+    return descriptions
+
+
+def _display_claimed_path(task: TaskSpec, normalized_path: str) -> str:
+    for raw_path in task.claimed_paths:
+        if _normalize_write_set([raw_path])[0] == normalized_path:
+            return raw_path.strip().replace("\\", "/")
+    return normalized_path
 
 
 def _check_shared_file_verification(plan: Plan) -> List[ValidationIssue]:
@@ -446,6 +577,42 @@ def _check_early_integration_checkpoint(plan: Plan) -> List[ValidationIssue]:
         task_ids=verifier_ids,
         evidence={"min_depth": min_depth, "max_depth": max_depth, "depth_ratio": depth_ratio},
     )]
+
+
+def _check_e2e_compile_check(plan: Plan) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    for task in plan.tasks:
+        verification = task.verification
+        if verification is None or verification.level in COMPILE_SKIP_LEVELS:
+            continue
+        if verification.level not in COMPILE_REQUIRED_LEVELS:
+            continue
+        if any(_is_compile_or_import_check(check) for check in verification.checks):
+            continue
+        issues.append(ValidationIssue(
+            code=E2E_COMPILE_CHECK_CODE,
+            severity="warning",
+            message=(
+                f"task '{task.id}' has {verification.level} verification without "
+                "a compile/import check"
+            ),
+            task_ids=[task.id],
+            evidence={
+                "verification_level": verification.level,
+                "check_names": [check.name for check in verification.checks],
+            },
+        ))
+    return issues
+
+
+def _is_compile_or_import_check(check: CheckSpec) -> bool:
+    name = check.name.casefold()
+    command = check.command.casefold()
+    if "compile" in name or "import" in name:
+        return True
+    if "compile" in command:
+        return True
+    return "python -c" in command and PYTHON_IMPORT_TOKEN_RE.search(command) is not None
 
 
 # ---------------------------------------------------------------------------

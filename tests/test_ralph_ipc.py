@@ -545,7 +545,7 @@ class TestRalphIPCHandler(unittest.TestCase):
                     "workflow_id": "wf-1",
                     "group_id": "group-1",
                     "project_root": "/tmp/project",
-                    "tasks": [{"id": "t1", "title": "Task 1", "type": "backend"}],
+                    "tasks": [{"id": "t1", "title": "Task 1", "type": "backend", "claimed_paths": ["src/t1.py"], "verification": {"command": "echo ok"}}],
                     "rationale": "phase-ready",
                     "estimated_parallelism": 2,
                     "auto_start_agents": False,

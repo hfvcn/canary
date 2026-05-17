@@ -578,6 +578,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_workflow_verify = workflow_sub.add_parser("verify", help="Run Ralph verification for a task")
     p_workflow_verify.add_argument("task_id", help="Task id")
     p_workflow_verify.add_argument("--changed-file", action="append", default=[], help="Changed file path (repeatable)")
+    p_workflow_verify.add_argument("--refresh-spec", action="store_true", dest="refresh_spec", default=False, help="Reload TaskSpec from plan.yaml before verification")
     p_workflow_verify.add_argument("--group", default="", help="Target group_id (default: active group)")
     p_workflow_verify.set_defaults(func=cmd_workflow_verify)
 
@@ -586,6 +587,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_workflow_retry.add_argument("--group", default="", help="Target group_id (default: active group)")
     p_workflow_retry.add_argument("--assign", default="", help="Override assignment target agent_id")
     p_workflow_retry.set_defaults(func=cmd_workflow_retry)
+
+    p_workflow_override = workflow_sub.add_parser("override", help="Foreman override a task as completed")
+    p_workflow_override.add_argument("--task", dest="task_id", required=True, help="Task id")
+    p_workflow_override.add_argument("--reason", required=True, help="Override reason")
+    p_workflow_override.add_argument("--evidence", required=True, help="Override evidence")
+    p_workflow_override.add_argument("--workflow-id", default="", help="Workflow id (optional)")
+    p_workflow_override.add_argument("--group", default="", help="Target group_id (default: active group)")
+    p_workflow_override.set_defaults(func=cmd_workflow_override)
 
     p_workflow_fail = workflow_sub.add_parser("fail", help="Report task failure via task_event")
     p_workflow_fail.add_argument("task_id", help="Task id")

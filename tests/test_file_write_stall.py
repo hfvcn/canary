@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 import pytest
 
-from cccc.contracts.v1.ralph_ipc import TaskRef
+from cccc.contracts.v1.ralph_ipc import TaskRef, VerificationSpec
 from cccc.daemon.foreman.workflow_monitor import MonitorAlert
 from cccc.kernel.workflow_state import WorkflowTaskStatus
 
@@ -68,6 +68,7 @@ def _task_ref() -> TaskRef:
         title="Progress stall task",
         type="backend",
         claimed_paths=["src/progress.py"],
+        verification=VerificationSpec(command="echo ok"),
     )
 
 

@@ -26,6 +26,8 @@
 #     finding_refs      FindingRef[]
 #     registration_invariants RegistrationInvariant[]
 #     suppress_flows    string[]  — 豁免的 flow id
+#     batch_e2e_command string  — 批次完成后的计划级 E2E 命令
+#     batch_e2e_timeout int  — batch_e2e_command 超时秒数（默认 300）
 #     state             PlanState  — 运行时状态（通常由 suggest 自动管理）
 #
 #   TaskSpec：
@@ -45,6 +47,16 @@
 #     addresses         string[]  — 此 task 解决的 issue id（对应 required_issues）
 #     failure_path      string  — 失败时的处理路径
 #     semantic          SemanticBlock（可选，symbol 级别注解）
+#     expected_input    Dict[str, Any]  — 黑盒 worker 输入契约
+#     expected_output   Dict[str, Any]  — 黑盒 worker 输出契约
+#     modules           ModuleSpec[]  — task 内部模块拆分
+#
+#   ModuleSpec：
+#     id                string
+#     description       string
+#     input_spec        Dict[str, Any]
+#     output_spec       Dict[str, Any]
+#     internal_depends_on string[]  — 同一 task 内的 module id
 #
 #   Verification：
 #     level             "compile" | "unit" | "integration" | "e2e"
@@ -140,6 +152,8 @@ semantic_mode: "off"
 auto_infer: false
 
 # --- 抑制不适用的规则（按需添加，保持最小集）---
+# Best practice: prefer suppress_instances (with owner/expiry) over bare suppress_codes.
+# Bare suppress is a last resort — managed suppress with owner/expiry is preferred.
 suppress_codes:
   - E_CRITICAL_ENTRYPOINT_UNOWNED
   - E_CRITICAL_FLOW_UNCOVERED
@@ -179,6 +193,9 @@ tasks:
     provides:
       - name: feature_capability
         kind: runtime_capability
+    expected_output:
+      feature_capability:
+        type: runtime_capability
 
   # --- 有依赖的任务 ---
   # - id: T2
@@ -250,6 +267,157 @@ tasks:
   #       - name: guide-exists
   #         command: "test -s docs/foreman-capability-guide.md"
 
+  # --- 未注释完整字段示例：契约、结构化 I/O、多条 CheckSpec ---
+  - id: T-contract-example
+    title: "结构化契约示例：消费 T1 能力并产出报告"
+    depends_on:
+      - T1
+    addresses:
+      - "ISSUE-1"
+    goal_behavior: |
+      展示 provides/consumes 必须使用对象格式，而不是字符串：
+      - provides: {name, kind, schema_hint}
+      - consumes: {name, from, kind}
+    acceptance_criteria: |
+      1. 消费方显式 depends_on 提供方
+      2. expected_input 的 key 可由上游 expected_output/provides 解释
+      3. verification.checks 包含完整 CheckSpec 字段
+    claimed_paths:
+      - src/path/to/consumer.py
+      - tests/test_contract_example.py
+    expected_input:
+      feature_capability:
+        type: runtime_capability
+        provider: T1
+    expected_output:
+      paths:
+        - src/path/to/consumer.py
+      report:
+        type: object
+        required:
+          - report_path
+    provides:
+      - name: contract_report
+        kind: artifact
+        schema_hint:
+          type: object
+          required:
+            - report_path
+          properties:
+            report_path:
+              type: string
+    consumes:
+      - name: feature_capability
+        from: T1
+        kind: runtime_capability
+    verification:
+      level: integration
+      checks:
+        - name: contract-unit
+          command: "python -m pytest tests/test_contract_example.py -v"
+          required: true
+          expected_exit_code: 0
+          timeout: 60
+        - name: contract-integration
+          command: "python -m pytest tests/test_contract_integration.py -v"
+          required: true
+          expected_exit_code: 0
+          timeout: 120
+      covers:
+        tasks:
+          - T1
+          - T-contract-example
+        paths:
+          - src/path/to/consumer.py
+
+  # --- 未注释完整字段示例：TaskSpec.modules / ModuleSpec ---
+  - id: T-module-example
+    title: "模块拆分示例：单个 task 内部的 parser 与 renderer"
+    depends_on:
+      - T-contract-example
+    addresses:
+      - "ISSUE-1"
+    goal_behavior: |
+      使用 modules 描述 task 内部的实现顺序。modules 是提示性拆分，
+      不会变成独立 workflow task。
+    acceptance_criteria: |
+      1. module id 在同一 task 内唯一
+      2. internal_depends_on 只引用同一 task 的 module id
+      3. output_spec 描述该 module 完成后可观察的产物
+    claimed_paths:
+      - src/path/to/module_example.py
+      - tests/test_module_example.py
+    modules:
+      - id: parser
+        description: "解析输入配置并生成规范化 plan 数据"
+        input_spec:
+          raw_plan:
+            type: string
+        output_spec:
+          parsed_plan:
+            type: object
+        internal_depends_on: []
+      - id: renderer
+        description: "根据 parser 输出生成用户可读报告"
+        input_spec:
+          parsed_plan:
+            type: object
+        output_spec:
+          rendered_report:
+            type: string
+        internal_depends_on:
+          - parser
+    verification:
+      level: unit
+      checks:
+        - name: module-example-test
+          command: "python -m pytest tests/test_module_example.py -v"
+          required: true
+          expected_exit_code: 0
+          timeout: 60
+
+  # --- 安全验证示例：challenge 模式 + aegis + mock_tests ---
+  - id: T-challenge-example
+    title: "Challenge 模式安全验证示例：XSS 防御"
+    depends_on:
+      - T1
+    addresses:
+      - "ISSUE-1"
+    verification_mode: challenge
+    aegis:
+      intent: fix
+      repair_track:
+        root_cause: "用户输入未经转义直接渲染到 HTML"
+        canonical_owner: "src/rendering.py::render_user_content"
+        minimal_change: "在 render 入口添加 HTML escape"
+        verification_method: "mock_tests 包含 XSS 载荷"
+      baseline_refs:
+        - "OWASP XSS Prevention Cheat Sheet"
+    goal_behavior: |
+      修改 src/rendering.py 的 render_user_content()，
+      对所有用户输入执行 HTML escape 后再渲染。
+    acceptance_criteria: |
+      1. 所有用户输入经过 HTML escape
+      2. mock_tests 中的 XSS 载荷被拦截
+    claimed_paths:
+      - src/rendering.py
+      - tests/test_rendering.py
+    verification:
+      level: unit
+      checks:
+        - name: render-tests
+          command: "python -m pytest tests/test_rendering.py -v"
+      mock_tests:
+        - name: xss-script-tag
+          input: "<script>alert('xss')</script>"
+          expected_output: "&lt;script&gt;alert('xss')&lt;/script&gt;"
+          description: "Script tag should be HTML-escaped"
+        - name: xss-event-handler
+          input: "<img onerror='alert(1)' src=x>"
+          expected_output: "&lt;img onerror='alert(1)' src=x&gt;"
+          verify_command: "python -c \"assert '<script>' not in output\""
+          description: "Event handler injection should be escaped"
+
 # ============================================================================
 # Plan-level declarations（可选，按需启用）
 # ============================================================================
@@ -285,3 +453,18 @@ tasks:
 #     description: "新增 IPC op 必须在 handler 中注册"
 #     registry_file: src/cccc/daemon/ralph_ipc_handler.py
 #     registry_symbol: _DISPATCH_TABLE
+
+# ============================================================================
+# Plan-level full-field examples（未注释，可按需改值或删除）
+# ============================================================================
+
+# --- 批次完成后的计划级 E2E 验证 ---
+batch_e2e_command: "python -m pytest tests/e2e/test_workflow.py -v"
+batch_e2e_timeout: 300
+
+# --- 带 lease 的精细抑制；优先用于需要 owner/expiry/review_after 的抑制 ---
+suppress_instances:
+  - code: W_AGENT_REVIEW_SKIPPED
+    owner: "foreman-docs"
+    expiry: "2026-12-31"
+    review_after: "2026-06-30"

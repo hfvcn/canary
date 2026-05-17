@@ -39,11 +39,13 @@ from .validation_rules import (
     _check_graph_structure,
     _check_covers_graph,
     _check_field_completeness,
+    _check_claimed_path_incomplete,
     _check_implicit_serialization,
     _check_shared_file_verification,
     _check_integration_spine,
     _check_role_constraints,
     _check_early_integration_checkpoint,
+    _check_e2e_compile_check,
     _check_verification_strength,
     _check_verification_no_checks,
     _check_verification_shallow_checks,
@@ -78,6 +80,8 @@ from .validation_rules import (
     _check_contract_verification_coverage,
     _check_contract_dep_alignment,
     _check_cross_task_io_contracts,
+    collect_discipline_issues,
+    _check_security_recipes,
 )
 # Re-export internal helpers used by tests (backward compatibility)
 from .validation_rules.coverage import _covered_flow_summary  # noqa: F401
@@ -205,6 +209,7 @@ def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
     covers_issues = _check_covers_graph(plan)
     issues.extend(covers_issues)
     issues.extend(_check_field_completeness(plan))
+    issues.extend(_check_claimed_path_incomplete(plan))
     issues.extend(_check_verification_strength(plan))
     issues.extend(_check_verification_no_checks(plan))
     issues.extend(_check_verification_shallow_checks(plan))
@@ -238,6 +243,7 @@ def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
     issues.extend(_check_role_constraints(plan))
     if not _has_issue_codes(graph_issues, FATAL_STRUCTURAL_CODES):
         issues.extend(_check_early_integration_checkpoint(plan))
+    issues.extend(_check_e2e_compile_check(plan))
 
     # Completeness rules (CMP bundle)
     issues.extend(_check_covers_unknown_flow(plan))
@@ -248,6 +254,8 @@ def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
     issues.extend(_check_batch_e2e_command(plan))
     issues.extend(_check_cross_task_io_contracts(plan))
     issues.extend(_check_module_consistency(plan))
+    issues.extend(collect_discipline_issues(plan))
+    issues.extend(_check_security_recipes(plan))
 
     # CMP-5: H_SUPPRESS_UNUSED runs last — needs the full issue code set
     all_issue_codes = {i.code for i in issues}

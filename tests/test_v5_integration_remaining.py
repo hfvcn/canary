@@ -14,7 +14,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef, VerificationResult
+from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef, VerificationResult, VerificationSpec
 from cccc.daemon.foreman.prompt_builder import build_task_prompt
 from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
 from cccc.kernel.workflow_state import WorkflowTaskStatus
@@ -132,8 +132,8 @@ class TestManualCompleteAutoAdvanceE2E:
         workflow_id = "wf-advance"
 
         tasks = [
-            TaskRef(id="T-up", title="upstream", type="backend", claimed_paths=["src/a.py"]),
-            TaskRef(id="T-down", title="downstream", type="backend", depends_on=["T-up"], claimed_paths=["src/b.py"]),
+            TaskRef(id="T-up", title="upstream", type="backend", claimed_paths=["src/a.py"], verification=VerificationSpec(command="echo ok")),
+            TaskRef(id="T-down", title="downstream", type="backend", depends_on=["T-up"], claimed_paths=["src/b.py"], verification=VerificationSpec(command="echo ok")),
         ]
         for t in tasks:
             orchestrator.engine.register_task(t, workflow_id)
@@ -281,6 +281,57 @@ class TestForceCompleteEvent:
             event_kinds = [e["kind"] for e in events]
             assert KIND_VERIFICATION_SKIPPED in event_kinds
             assert KIND_VERIFICATION_PASSED not in event_kinds
+
+    def test_force_complete_emits_force_completed_event(self, orchestrator: WorkflowOrchestrator, tmp_path: Path, monkeypatch):
+        """RO-85: force-complete should produce an explicit workflow.force_completed ledger event."""
+        from cccc.kernel.workflow_state_types import KIND_FORCE_COMPLETED
+        from cccc.contracts.v1.ralph_ipc import TaskEvent
+
+        monkeypatch.setattr(orchestrator.reporter, "on_task_completed", lambda *a, **kw: True)
+        monkeypatch.setattr(orchestrator.reporter, "on_task_failed", lambda *a, **kw: True)
+
+        task = TaskRef(id="T-fc2", title="force me 2", type="backend")
+        orchestrator.engine.register_task(task, "wf-fc2")
+        orchestrator.engine.register_batch("b-fc2", ["T-fc2"])
+        orchestrator.engine.approve_batch("b-fc2", [{"task_id": "T-fc2", "agent_id": "w1", "claimed_paths": []}])
+        orchestrator.engine.report_worker_started("T-fc2", "w1")
+
+        orchestrator.apply_task_event(
+            TaskEvent(
+                task_id="T-fc2",
+                event_type="completed",
+                payload={"agent_id": "w1", "duration_seconds": 1, "changed_files": []},
+            ),
+            force_complete=True,
+        )
+
+        ledger_path = orchestrator.group.ledger_path
+        if ledger_path.exists():
+            events = [json.loads(line) for line in ledger_path.read_text().splitlines() if line.strip()]
+            force_events = [e for e in events if e["kind"] == KIND_FORCE_COMPLETED]
+            assert len(force_events) >= 1
+            assert force_events[0]["data"]["task_id"] == "T-fc2"
+            assert "reason" in force_events[0]["data"]
+
+    def test_task_registered_contains_failure_path_and_awareness_paths(self, orchestrator: WorkflowOrchestrator, tmp_path: Path):
+        """RO-82: task_registered event should contain failure_path and awareness_paths."""
+        from cccc.kernel.workflow_state_types import KIND_TASK_REGISTERED
+
+        task = TaskRef(
+            id="T-ro82", title="test fields", type="backend",
+            failure_path="rollback the migration",
+            awareness_paths=["src/config.py", "src/models.py"],
+        )
+        orchestrator.engine.register_task(task, "wf-ro82")
+
+        ledger_path = orchestrator.group.ledger_path
+        if ledger_path.exists():
+            events = [json.loads(line) for line in ledger_path.read_text().splitlines() if line.strip()]
+            reg_events = [e for e in events if e["kind"] == KIND_TASK_REGISTERED and e["data"].get("task", {}).get("id") == "T-ro82"]
+            assert len(reg_events) >= 1
+            task_data = reg_events[0]["data"]["task"]
+            assert task_data.get("failure_path") == "rollback the migration"
+            assert task_data.get("awareness_paths") == ["src/config.py", "src/models.py"]
 
 
 # ---------------------------------------------------------------------------

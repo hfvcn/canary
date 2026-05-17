@@ -36,6 +36,7 @@ class WorkflowEngine:
         self._monitor_config = self._default_monitor_config()
         self._pending_alerts: list[dict[str, Any]] = []
         self._pending_hook_alerts = self._pending_alerts
+        self._plan_digest_divergence_emitted: set[str] = set()
 
     # ------------------------------------------------------------------
     # Pre-transition hook management
@@ -310,11 +311,14 @@ class WorkflowEngine:
                 "started_at": now,
             }, hook_ctx=hook_ctx)
         except PreTransitionVetoed as exc:
-            self._append(kind=wt.KIND_PLAN_DIGEST_DIVERGENCE, data={
-                "workflow_id": prev.workflow_id, "task_id": tid,
-                "vetoed_kind": wt.KIND_TASK_STARTED,
-                "code": exc.code, "message": str(exc),
-            })
+            self._maybe_append_plan_digest_divergence(
+                prev.workflow_id,
+                {
+                    "workflow_id": prev.workflow_id, "task_id": tid,
+                    "vetoed_kind": wt.KIND_TASK_STARTED,
+                    "code": exc.code, "message": str(exc),
+                },
+            )
             raise
         self._append(kind=wt.KIND_TASK_STARTED, data={"workflow_id": prev.workflow_id, "task_id": tid, "agent_id": aid, "started_at": now})
         self._flush_pending_hook_alerts()
@@ -377,11 +381,14 @@ class WorkflowEngine:
                 "evidence": ev,
             }, hook_ctx=hook_ctx)
         except PreTransitionVetoed as exc:
-            self._append(kind=wt.KIND_PLAN_DIGEST_DIVERGENCE, data={
-                "workflow_id": prev.workflow_id, "task_id": tid,
-                "vetoed_kind": wt.KIND_TASK_REPORTED_COMPLETED,
-                "code": exc.code, "message": str(exc),
-            })
+            self._maybe_append_plan_digest_divergence(
+                prev.workflow_id,
+                {
+                    "workflow_id": prev.workflow_id, "task_id": tid,
+                    "vetoed_kind": wt.KIND_TASK_REPORTED_COMPLETED,
+                    "code": exc.code, "message": str(exc),
+                },
+            )
             raise
         self._append(kind=wt.KIND_TASK_REPORTED_COMPLETED, data={"workflow_id": prev.workflow_id, "task_id": tid, "idempotency_key": idem, "evidence": ev})
         self._flush_pending_hook_alerts()
@@ -407,11 +414,14 @@ class WorkflowEngine:
         try:
             self._run_pre_transition_hooks(wt.KIND_TASK_FAILED, data, hook_ctx=hook_ctx)
         except PreTransitionVetoed as exc:
-            self._append(kind=wt.KIND_PLAN_DIGEST_DIVERGENCE, data={
-                "workflow_id": prev.workflow_id, "task_id": tid,
-                "vetoed_kind": wt.KIND_TASK_FAILED,
-                "code": exc.code, "message": str(exc),
-            })
+            self._maybe_append_plan_digest_divergence(
+                prev.workflow_id,
+                {
+                    "workflow_id": prev.workflow_id, "task_id": tid,
+                    "vetoed_kind": wt.KIND_TASK_FAILED,
+                    "code": exc.code, "message": str(exc),
+                },
+            )
             raise
         self._append(kind=wt.KIND_TASK_FAILED, data=data)
         self._flush_pending_hook_alerts()
@@ -439,6 +449,11 @@ class WorkflowEngine:
                 status=WorkflowTaskStatus.COMPLETED,
                 hook_ctx=hook_ctx,
             )
+            self._append(kind=wt.KIND_FORCE_COMPLETED, data={
+                "workflow_id": prev.workflow_id,
+                "task_id": tid,
+                "reason": "foreman force-complete override",
+            })
             return
         if outcome == "passed":
             self._record_verification_transition(
@@ -457,6 +472,16 @@ class WorkflowEngine:
                 kind=wt.KIND_VERIFICATION_SKIPPED_BLOCKED,
                 data=data,
                 status=WorkflowTaskStatus.FAILED,
+                hook_ctx=hook_ctx,
+            )
+            return
+        if outcome == "infra_error":
+            self._record_verification_transition(
+                prev=prev,
+                task_id=tid,
+                kind=wt.KIND_VERIFICATION_INFRA_ERROR,
+                data=data,
+                status=WorkflowTaskStatus.VERIFYING,
                 hook_ctx=hook_ctx,
             )
             return
@@ -482,11 +507,14 @@ class WorkflowEngine:
         try:
             self._run_pre_transition_hooks(kind, data, hook_ctx=hook_ctx)
         except PreTransitionVetoed as exc:
-            self._append(kind=wt.KIND_PLAN_DIGEST_DIVERGENCE, data={
-                "workflow_id": prev.workflow_id, "task_id": task_id,
-                "vetoed_kind": kind,
-                "code": exc.code, "message": str(exc),
-            })
+            self._maybe_append_plan_digest_divergence(
+                prev.workflow_id,
+                {
+                    "workflow_id": prev.workflow_id, "task_id": task_id,
+                    "vetoed_kind": kind,
+                    "code": exc.code, "message": str(exc),
+                },
+            )
             raise
         self._append(kind=kind, data=data)
         self._flush_pending_hook_alerts()
@@ -501,11 +529,12 @@ class WorkflowEngine:
             WorkflowTaskStatus.VERIFYING,
             WorkflowTaskStatus.FAILED,
             WorkflowTaskStatus.ASSIGNED,
+            WorkflowTaskStatus.DEFERRED,
         }
         if prev.status not in retryable_statuses:
             raise ValueError(f"task not retryable: {tid} status={prev.status.value}")
         self._append(kind=wt.KIND_RETRY_REQUESTED, data={"workflow_id": prev.workflow_id, "task_id": tid})
-        self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.READY, agent_id="", attempt_id="")
+        self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.READY, agent_id="", attempt_id="", blocked_reason="")
 
     def record_verification_warning(self, task_id: str, warning_type: str, message: str, evidence: Optional[Dict[str, Any]] = None) -> None:
         """Record a non-blocking verification warning in the ledger."""
@@ -539,6 +568,7 @@ class WorkflowEngine:
             "total": total,
             "summary": str(summary or ""),
         })
+        self._plan_digest_divergence_emitted.discard(str(workflow_id or "").strip())
 
     def defer_task(self, task_id: str, reason: str) -> None:
         tid = str(task_id or "").strip()
@@ -551,13 +581,59 @@ class WorkflowEngine:
         self._append(kind=wt.KIND_TASK_DEFERRED, data={"workflow_id": prev.workflow_id, "task_id": tid, "reason": why})
         self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.DEFERRED, blocked_reason=why)
 
+    def foreman_override_task(self, task_id: str, reason: str, evidence: Any) -> None:
+        tid = str(task_id or "").strip()
+        if not tid:
+            raise ValueError("task_id is required")
+        why = str(reason or "").strip()
+        if not why:
+            raise ValueError("reason is required")
+        prev = self._require_task(tid)
+        terminal = {
+            WorkflowTaskStatus.COMPLETED,
+            WorkflowTaskStatus.COMPLETED_BY_OVERRIDE,
+            WorkflowTaskStatus.CANCELLED,
+            WorkflowTaskStatus.ARCHIVED,
+        }
+        if prev.status in terminal:
+            raise ValueError(f"cannot override terminal task: {tid} status={prev.status.value}")
+        timestamp = time.time()
+        data = {
+            "workflow_id": prev.workflow_id,
+            "task_id": tid,
+            "reason": why,
+            "evidence": evidence,
+            "timestamp": timestamp,
+        }
+        self._append(kind=wt.KIND_FOREMAN_OVERRIDE, data=data)
+        self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.COMPLETED_BY_OVERRIDE, blocked_reason="")
+
+    def cancel_task(self, task_id: str, reason: str) -> None:
+        tid = str(task_id or "").strip()
+        if not tid:
+            raise ValueError("task_id is required")
+        prev = self._require_task(tid)
+        if prev.status != WorkflowTaskStatus.DEFERRED:
+            raise ValueError(f"task not cancellable: {tid} status={prev.status.value}")
+        why = str(reason or "").strip()
+        self._append(
+            kind=wt.KIND_TASK_CANCELLED,
+            data={"workflow_id": prev.workflow_id, "task_id": tid, "reason": why},
+        )
+        self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.CANCELLED, blocked_reason=why)
+
     def block_task(self, task_id: str, reason: str, cascade: bool = False) -> List[Dict[str, Any]]:
         tid = str(task_id or "").strip()
         if not tid:
             raise ValueError("task_id is required")
         why = str(reason or "").strip()
         prev = self._require_task(tid)
-        if prev.status in {WorkflowTaskStatus.COMPLETED, WorkflowTaskStatus.ARCHIVED}:
+        if prev.status in {
+            WorkflowTaskStatus.COMPLETED,
+            WorkflowTaskStatus.COMPLETED_BY_OVERRIDE,
+            WorkflowTaskStatus.CANCELLED,
+            WorkflowTaskStatus.ARCHIVED,
+        }:
             raise ValueError(f"cannot block terminal task: {tid} status={prev.status.value}")
         if prev.status == WorkflowTaskStatus.BLOCKED:
             return []
@@ -587,7 +663,13 @@ class WorkflowEngine:
             prev = self._tasks.get(tid)
             if prev is None:
                 continue
-            if prev.status in {WorkflowTaskStatus.COMPLETED, WorkflowTaskStatus.ARCHIVED, WorkflowTaskStatus.BLOCKED}:
+            if prev.status in {
+                WorkflowTaskStatus.COMPLETED,
+                WorkflowTaskStatus.COMPLETED_BY_OVERRIDE,
+                WorkflowTaskStatus.CANCELLED,
+                WorkflowTaskStatus.ARCHIVED,
+                WorkflowTaskStatus.BLOCKED,
+            }:
                 continue
             previous_status = prev.status.value
             cascade_reason = f"upstream {blocked_task_id} blocked: {reason}"
@@ -658,6 +740,14 @@ class WorkflowEngine:
             data=dict(data),
         )
 
+    def _maybe_append_plan_digest_divergence(self, workflow_id: str, data: dict) -> None:
+        wf = str(workflow_id or "").strip()
+        if wf and wf in self._plan_digest_divergence_emitted:
+            return
+        self._append(kind=wt.KIND_PLAN_DIGEST_DIVERGENCE, data=data)
+        if wf:
+            self._plan_digest_divergence_emitted.add(wf)
+
     def _apply_event(self, kind: str, data: Dict[str, Any]) -> None:
         handlers = {
             wt.KIND_TASK_REGISTERED: self._apply_task_registered,
@@ -671,8 +761,11 @@ class WorkflowEngine:
             wt.KIND_VERIFICATION_SKIPPED: self._apply_verification_skipped,
             wt.KIND_VERIFICATION_SKIPPED_BLOCKED: self._apply_verification_skipped_blocked,
             wt.KIND_VERIFICATION_FAILED: self._apply_verification_failed,
+            wt.KIND_VERIFICATION_INFRA_ERROR: self._apply_verification_infra_error,
             wt.KIND_RETRY_REQUESTED: self._apply_retry_requested,
             wt.KIND_TASK_DEFERRED: self._apply_task_deferred,
+            wt.KIND_TASK_CANCELLED: self._apply_task_cancelled,
+            wt.KIND_FOREMAN_OVERRIDE: self._apply_foreman_override,
             wt.KIND_TASK_BLOCKED: self._apply_task_blocked,
             wt.KIND_VERIFICATION_WARNING: self._apply_verification_warning,
             wt.KIND_PLAN_DIGEST_DIVERGENCE: self._apply_plan_digest_divergence,
@@ -695,7 +788,7 @@ class WorkflowEngine:
         ids = data.get("task_ids") if isinstance(data.get("task_ids"), list) else []
         for tid in [str(t or "").strip() for t in ids if str(t or "").strip()]:
             prev = self._require_task(tid)
-            self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.READY, batch_id=bid)
+            self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.READY, batch_id=bid, blocked_reason="")
 
     def _apply_batch_approved(self, data: Dict[str, Any]) -> None:
         bid = str(data.get("batch_id") or "").strip()
@@ -762,27 +855,44 @@ class WorkflowEngine:
     def _apply_verification_failed(self, data: Dict[str, Any]) -> None:
         self._apply_verification(kind=wt.KIND_VERIFICATION_FAILED, data=data)
 
+    def _apply_verification_infra_error(self, data: Dict[str, Any]) -> None:
+        self._apply_verification(kind=wt.KIND_VERIFICATION_INFRA_ERROR, data=data)
+
     def _apply_verification(self, *, kind: str, data: Dict[str, Any]) -> None:
         tid = str(data.get("task_id") or "").strip()
         verification = data.get("verification") if isinstance(data.get("verification"), dict) else None
         prev = self._require_task(tid)
-        next_status = (
-            WorkflowTaskStatus.COMPLETED
-            if kind in {wt.KIND_VERIFICATION_PASSED, wt.KIND_VERIFICATION_SKIPPED}
-            else WorkflowTaskStatus.FAILED
-        )
+        next_status = self._verification_status_for_kind(kind)
         self._tasks[tid] = replace(prev, status=next_status, last_verification=verification)
+
+    def _verification_status_for_kind(self, kind: str) -> WorkflowTaskStatus:
+        if kind in {wt.KIND_VERIFICATION_PASSED, wt.KIND_VERIFICATION_SKIPPED}:
+            return WorkflowTaskStatus.COMPLETED
+        if kind == wt.KIND_VERIFICATION_INFRA_ERROR:
+            return WorkflowTaskStatus.VERIFYING
+        return WorkflowTaskStatus.FAILED
 
     def _apply_retry_requested(self, data: Dict[str, Any]) -> None:
         tid = str(data.get("task_id") or "").strip()
         prev = self._require_task(tid)
-        self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.READY, agent_id="", attempt_id="")
+        self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.READY, agent_id="", attempt_id="", blocked_reason="")
 
     def _apply_task_deferred(self, data: Dict[str, Any]) -> None:
         tid = str(data.get("task_id") or "").strip()
         why = str(data.get("reason") or "").strip()
         prev = self._require_task(tid)
         self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.DEFERRED, blocked_reason=why)
+
+    def _apply_task_cancelled(self, data: Dict[str, Any]) -> None:
+        tid = str(data.get("task_id") or "").strip()
+        why = str(data.get("reason") or "").strip()
+        prev = self._require_task(tid)
+        self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.CANCELLED, blocked_reason=why)
+
+    def _apply_foreman_override(self, data: Dict[str, Any]) -> None:
+        tid = str(data.get("task_id") or "").strip()
+        prev = self._require_task(tid)
+        self._tasks[tid] = replace(prev, status=WorkflowTaskStatus.COMPLETED_BY_OVERRIDE, blocked_reason="")
 
     def _apply_task_blocked(self, data: Dict[str, Any]) -> None:
         tid = str(data.get("task_id") or "").strip()

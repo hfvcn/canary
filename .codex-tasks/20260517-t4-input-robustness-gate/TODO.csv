@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing gate and plan context,DONE,Relevant current behavior and tests are understood,rg/sed inspection,2026-05-17T00:00:00+08:00,0,
+2,Implement input robustness warning enhancement,DONE,Gate reads critical flows from task/engine context and records non-blocking warning only when coverage is missing,python -m pytest tests/test_input_robustness_gate.py -v,2026-05-17T00:00:00+08:00,0,
+3,Add requested smoke tests,DONE,Three requested scenarios exist in tests/test_input_robustness_gate.py,python -m pytest tests/test_input_robustness_gate.py -v,2026-05-17T00:00:00+08:00,0,
+4,Run focused validation,DONE,Focused pytest passes within 60 seconds,python -m pytest tests/test_input_robustness_gate.py -v,2026-05-17T00:00:00+08:00,0,

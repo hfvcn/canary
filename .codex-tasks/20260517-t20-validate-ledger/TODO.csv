@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate validate and IPC patterns,DONE,Relevant validate and daemon-call code is identified,rg validate call_daemon src/cccc/ralph tests,2026-05-17T02:00:00Z,0,validate path and daemon transport located
+2,Implement workflow.plan_validated emission,DONE,validate emits event after success and failure while daemon-unavailable is skipped,python -m pytest tests/test_validate_ledger_event.py -v,2026-05-17T02:05:00Z,0,implementation verified by focused tests
+3,Add focused validate ledger tests,DONE,success failure and daemon-unavailable cases are covered,python -m pytest tests/test_validate_ledger_event.py -v,2026-05-17T02:10:00Z,0,tests/test_validate_ledger_event.py added
+4,Run validation and update task record,DONE,Focused tests pass and task record reflects outcome,python -m pytest tests/test_validate_ledger_event.py -v,2026-05-17T02:12:00Z,0,focused and adjacent ledger tests pass

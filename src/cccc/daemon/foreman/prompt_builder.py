@@ -307,6 +307,27 @@ def build_runtime_adapter_hint(runtime: str) -> str:
     return _RUNTIME_HINTS.get(str(runtime or "").strip().lower(), "")
 
 
+_AEGIS_INTENT_HINTS: Dict[str, str] = {
+    "fix": "Locate root cause first (symptom → reproduction → root cause → canonical owner), then fix.",
+    "feature": "Write a minimal failing test first (RED), then the minimal implementation to pass it.",
+    "refactor": "State the retirement path for old logic. Prefer deletion over retention.",
+}
+_AEGIS_EVIDENCE_HINT = "Before completion, provide Evidence: command run, exit status, what is covered, what is NOT covered."
+
+
+def _aegis_sections_for_task(task: Any) -> List[_PromptSection]:
+    aegis = getattr(task, "aegis", None)
+    if not aegis:
+        return []
+    from cccc.ralph.aegis import effective_intent
+    intent = effective_intent(task)
+    hint = _AEGIS_INTENT_HINTS.get(intent)
+    if not hint:
+        return []
+    text = f"Aegis Discipline ({intent}):\n- {hint}\n- {_AEGIS_EVIDENCE_HINT}"
+    return [_PromptSection(name="aegis_discipline", text=text, mandatory=True)]
+
+
 def _should_include_verification_command(task: Any) -> bool:
     if str(getattr(task, "verification_mode", "ralph") or "ralph") == "agent":
         return False
@@ -379,6 +400,7 @@ def build_task_prompt(
             text=f"Acceptance Criteria: {task.acceptance_criteria}",
             mandatory=True,
         ))
+    sections.extend(_aegis_sections_for_task(task))
     if _should_include_verification_command(task):
         # mock_tests are adversarial gate inputs and must never be rendered to workers.
         sections.append(_PromptSection(
