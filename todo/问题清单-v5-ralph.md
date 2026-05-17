@@ -31,7 +31,7 @@
 > v38 修复计划（2026-05-17，全量修复 P0-P3）：plan.yaml = plans/fix-v38-all-issues.yaml，29 leaf tasks + 1 integration，覆盖 RO-96/97/95/89/92/93/94/98/99 + AD-1~11 + SL-1~3 + FL-4~12 + UX-5/8/11 + RL-22/25/27
 > 验证轮次（2026-05-17 v38 修复后）：全量 pytest 2852 passed / 0 failed / 120 skipped
 > v38 新发现：RO-100（discipline rule 输出非确定性排序）/PLR-1 复现（code fence 内术语触发 aegis 检查）/RO-101（challenge upgrade 逻辑无独立测试保护）/RO-102（validate ledger event plan 不存在时 crash）/FL-13（e2e enhancement test xdist 下 flaky）
-> v38 E2E 新发现：RO-103（input_robustness_smoke 时序误判，已修复）/FL-14（flow step-4 未引导使用 collaborating-with-codex skill）/FL-15（flow step-6 未引导写入新发现+归档已修复）/FL-16（E2E flow 结束后应清理 cccc 进程）/UX-12（SUSPICIOUS 标记对 grep 检查误报）
+> v38 E2E 新发现：RO-103（input_robustness_smoke 时序误判，已修复）/FL-14（flow Codex 步骤未引导 skill+并行）/FL-15（flow step-6 未引导写入新发现+归档已修复）/FL-16（E2E flow 结束后应停进程）/FL-17（solve flow 完成后应清除残留 state.json）/UX-12（SUSPICIOUS 标记对 grep 检查误报）
 > **v37 复盘结论**：
 >   - RO-96 根因已定位：`cccc attach` 的 CLI→daemon 路径传递 bug（CLI 传 `"."` 相对路径，daemon 在自己 cwd 解析 → scope url 指向 `/Users/vfch/.cccc` 而非实际 workspace）。**一行修复**：`group_cmds.py:26` 传 `str(Path(args.path).resolve())` 即可
 >   - 修好路径后 challenge reviewer (Gemini) 能通过 `_read_claimed_paths()` 读到源代码 → 恢复 agent-level 代码审查能力
@@ -545,6 +545,14 @@ plan 声明了 `flask`/`fastapi`/`requests` 相关依赖但 critical_flows 无�
 - **根因**：SUSPICIOUS 阈值不区分命令类型；grep 天然快速
 - **改进方案**：对 `grep` / `test -f` 等已知快速命令豁免 SUSPICIOUS 标记，或将阈值从 10ms 提高到 50ms
 - **验收标准**：grep checks 不再显示 SUSPICIOUS
+
+#### FL-17 solve flow 完成后应自动清除 .ralph-flow/state.json（P2）
+
+> **来源**：2026-05-17 E2E v38 启动时被残留 solve flow 状态干扰
+- **严重度**：P2 — 残留状态导致下一个 flow 误判
+- **现象**：上一次 solve flow 完成后 `.ralph-flow/state.json` 残留在项目根目录，下次运行 `ralph flow next` 时读取到旧状态，报 "Flow solve completed" 而非执行新 flow
+- **改进方案**：flow engine 在所有 steps 完成后自动删除（或归档重命名为 `state.done.json`）`.ralph-flow/state.json`，确保下一个 flow 启动时不受干扰
+- **验收标准**：solve flow 完成后 `.ralph-flow/state.json` 不存在或已重命名，新 flow 可直接启动
 
 #### FL-16 E2E flow 结束后应停止 cccc 残留进程（P2）
 
