@@ -31,7 +31,7 @@
 > v38 修复计划（2026-05-17，全量修复 P0-P3）：plan.yaml = plans/fix-v38-all-issues.yaml，29 leaf tasks + 1 integration，覆盖 RO-96/97/95/89/92/93/94/98/99 + AD-1~11 + SL-1~3 + FL-4~12 + UX-5/8/11 + RL-22/25/27
 > 验证轮次（2026-05-17 v38 修复后）：全量 pytest 2852 passed / 0 failed / 120 skipped
 > v38 新发现：RO-100（discipline rule 输出非确定性排序）/PLR-1 复现（code fence 内术语触发 aegis 检查）/RO-101（challenge upgrade 逻辑无独立测试保护）/RO-102（validate ledger event plan 不存在时 crash）/FL-13（e2e enhancement test xdist 下 flaky）
-> v38 E2E 新发现：RO-103（input_robustness_smoke 时序误判，已修复）/FL-14（flow step-4 未引导使用 collaborating-with-codex skill）/FL-15（flow step-6 未引导写入新发现+归档已修复）/UX-12（SUSPICIOUS 标记对 grep 检查误报）
+> v38 E2E 新发现：RO-103（input_robustness_smoke 时序误判，已修复）/FL-14（flow step-4 未引导使用 collaborating-with-codex skill）/FL-15（flow step-6 未引导写入新发现+归档已修复）/FL-16（E2E flow 结束后应清理 cccc 进程）/UX-12（SUSPICIOUS 标记对 grep 检查误报）
 > **v37 复盘结论**：
 >   - RO-96 根因已定位：`cccc attach` 的 CLI→daemon 路径传递 bug（CLI 传 `"."` 相对路径，daemon 在自己 cwd 解析 → scope url 指向 `/Users/vfch/.cccc` 而非实际 workspace）。**一行修复**：`group_cmds.py:26` 传 `str(Path(args.path).resolve())` 即可
 >   - 修好路径后 challenge reviewer (Gemini) 能通过 `_read_claimed_paths()` 读到源代码 → 恢复 agent-level 代码审查能力
@@ -544,6 +544,14 @@ plan 声明了 `flask`/`fastapi`/`requests` 相关依赖但 critical_flows 无�
 - **根因**：SUSPICIOUS 阈值不区分命令类型；grep 天然快速
 - **改进方案**：对 `grep` / `test -f` 等已知快速命令豁免 SUSPICIOUS 标记，或将阈值从 10ms 提高到 50ms
 - **验收标准**：grep checks 不再显示 SUSPICIOUS
+
+#### FL-16 E2E flow 结束后应清理 cccc 进程（P2）
+
+> **来源**：2026-05-17 E2E v38 流程体验
+- **严重度**：P2 — 资源泄漏
+- **现象**：E2E flow 完成后 group 的 actors（foreman/worker PTY 进程）仍在运行，占用资源且可能与下一轮冲突
+- **改进方案**：在 E2E flow 最后一步（step 6 improvement-register 之后）增加 step 7 cleanup，自动执行 `cccc group stop --group <GID>` + `cccc group delete --group <GID> --confirm <GID>`，清理本轮 E2E 的 group 和 actors
+- **验收标准**：E2E flow 完成后 `cccc actor list` 不再显示本轮 actors 运行中
 
 ---
 
