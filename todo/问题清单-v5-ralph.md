@@ -545,13 +545,13 @@ plan 声明了 `flask`/`fastapi`/`requests` 相关依赖但 critical_flows 无�
 - **改进方案**：对 `grep` / `test -f` 等已知快速命令豁免 SUSPICIOUS 标记，或将阈值从 10ms 提高到 50ms
 - **验收标准**：grep checks 不再显示 SUSPICIOUS
 
-#### FL-16 E2E flow 结束后应清理 cccc 进程（P2）
+#### FL-16 E2E flow 结束后应停止 cccc 残留进程（P2）
 
 > **来源**：2026-05-17 E2E v38 流程体验
 - **严重度**：P2 — 资源泄漏
 - **现象**：E2E flow 完成后 group 的 actors（foreman/worker PTY 进程）仍在运行，占用资源且可能与下一轮冲突
-- **改进方案**：在 E2E flow 最后一步（step 6 improvement-register 之后）增加 step 7 cleanup，自动执行 `cccc group stop --group <GID>` + `cccc group delete --group <GID> --confirm <GID>`，清理本轮 E2E 的 group 和 actors
-- **验收标准**：E2E flow 完成后 `cccc actor list` 不再显示本轮 actors 运行中
+- **改进方案**：在 E2E flow 最后一步（step 6 improvement-register 之后）增加 step 7 cleanup，自动执行 `cccc group stop --group <GID>` 停止所有 actor 进程（保留 group 数据/ledger 不删除）
+- **验收标准**：E2E flow 完成后本轮 actors 进程已停止，group 数据仍可查阅
 
 ---
 
