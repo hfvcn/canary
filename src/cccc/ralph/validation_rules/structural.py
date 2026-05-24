@@ -5,6 +5,7 @@ Extracted from validator.py as a pure refactor (RO-31).
 
 from __future__ import annotations
 
+import pathlib
 import re
 from typing import Any, Dict, List, NamedTuple, Optional, Set
 
@@ -24,11 +25,15 @@ MAX_OVERLAP_EVIDENCE = 5
 WRITE_CONFLICT_CODE = "E_WRITE_CONFLICT"
 SHARED_PATH_CODE = "W_SHARED_PATH_NO_DEPENDENCY"
 CLAIMED_PATH_INCOMPLETE_CODE = "W_CLAIMED_PATH_INCOMPLETE"
+GOAL_REFERENCES_UNCLAIMED_CODE = "W_GOAL_REFERENCES_UNCLAIMED_PATH"
+GOAL_SYMBOL_NOT_IN_CLAIMED_CODE = "W_GOAL_SYMBOL_NOT_IN_CLAIMED_PATH"
+GOAL_CJK_TOKENIZATION_HINT_CODE = "W_GOAL_CJK_TOKENIZATION_HINT"
 E2E_COMPILE_CHECK_CODE = "W_E2E_MISSING_COMPILE_CHECK"
 COMPILE_REQUIRED_LEVELS = frozenset({"api", "e2e", "integration"})
 COMPILE_SKIP_LEVELS = frozenset({"compile", "unit"})
 PYTHON_IMPORT_TOKEN_RE = re.compile(r"\b(import|from)\b")
 GOAL_FILE_PATH = r"([A-Za-z0-9_./\\-]+\.(?:py|js|ts|yaml|yml|json))"
+GOAL_BACKTICK_SYMBOL_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*(?:\(\))?)`")
 GOAL_DIRECT_FILE_REFERENCE_RE = re.compile(
     rf"\b(?:add|modify|write|change|edit|update)\s+{GOAL_FILE_PATH}",
     re.IGNORECASE,
@@ -37,6 +42,32 @@ GOAL_TO_FILE_REFERENCE_RE = re.compile(
     rf"\b(?:add|write)\b[^.\n;:]*?\bto\s+{GOAL_FILE_PATH}",
     re.IGNORECASE,
 )
+GOAL_QUOTED_SEGMENT_RE = re.compile(r"`[^`\n]*`|'[^'\n]*'|\"[^\"\n]*\"")
+GOAL_MENTION_FILE_RE = re.compile(
+    r"(?<![A-Za-z0-9_./\\-])"
+    r"((?!tests[\\/])(?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.(?:py|js|ts|yaml|yml|json))"
+    r"(?![A-Za-z0-9_./\\-])",
+)
+TOKENIZATION_KEYWORDS = frozenset({
+    "split",
+    "tokenize",
+    "分词",
+    "whitespace",
+    ".split()",
+    "word boundary",
+    "token count",
+    "word count",
+})
+CJK_CONTEXT_KEYWORDS = frozenset({
+    "中文",
+    "cjk",
+    "chinese",
+    "japanese",
+    "korean",
+    "日本語",
+    "한국어",
+})
+CJK_CHAR_RE = re.compile(r"[一-鿿぀-ゟ゠-ヿ가-힯]")
 
 
 class _OverlapClaim(NamedTuple):
@@ -245,8 +276,109 @@ def _check_claimed_path_incomplete(plan: Plan) -> List[ValidationIssue]:
     return issues
 
 
+def _check_goal_mentions_unclaimed_path(plan: Plan) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    for task in plan.tasks:
+        claimed_paths = _normalize_task_paths(task.claimed_paths)
+        awareness_paths = _normalize_task_paths(task.awareness_paths)
+        for referenced_path in _goal_file_mentions(task.goal_behavior):
+            if _task_claims_path(referenced_path, claimed_paths):
+                continue
+            if _task_claims_path(referenced_path, awareness_paths):
+                continue
+            issues.append(ValidationIssue(
+                code=GOAL_REFERENCES_UNCLAIMED_CODE,
+                severity="warning",
+                message=(
+                    f"task '{task.id}' goal_behavior references '{referenced_path}' "
+                    "but it is neither in claimed_paths nor awareness_paths"
+                ),
+                task_ids=[task.id],
+                evidence={
+                    "referenced_path": referenced_path,
+                    "claimed_paths": list(task.claimed_paths),
+                    "awareness_paths": list(task.awareness_paths),
+                },
+            ))
+    return issues
+
+
+def _check_goal_symbol_in_claimed_paths(
+    plan: Plan,
+    project_root: pathlib.Path,
+) -> List[ValidationIssue]:
+    """Check that symbols mentioned in goal_behavior exist in claimed_paths files."""
+    issues: List[ValidationIssue] = []
+    for task in plan.tasks:
+        symbols = _extract_goal_symbols(task.goal_behavior or "")
+        if not symbols:
+            continue
+        claimed_paths = tuple(_normalize_task_paths(task.claimed_paths))
+        for symbol in symbols:
+            bare_symbol = symbol.rstrip("()")
+            if _symbol_defined_in_paths(bare_symbol, claimed_paths, project_root):
+                continue
+            issues.append(ValidationIssue(
+                code=GOAL_SYMBOL_NOT_IN_CLAIMED_CODE,
+                severity="warning",
+                message=(
+                    f"task '{task.id}' goal_behavior references `{symbol}` "
+                    "but its definition was not found in claimed_paths"
+                ),
+                task_ids=[task.id],
+                evidence={
+                    "symbol": symbol,
+                    "claimed_paths": list(task.claimed_paths or []),
+                },
+            ))
+    return issues
+
+
+def _check_goal_cjk_tokenization_hint(plan: Plan) -> List[ValidationIssue]:
+    """Hint when goal describes text tokenization in CJK context."""
+    issues: List[ValidationIssue] = []
+    for task in plan.tasks:
+        goal = (task.goal_behavior or "").lower()
+        if not any(keyword in goal for keyword in TOKENIZATION_KEYWORDS):
+            continue
+        goal_original = task.goal_behavior or ""
+        has_cjk_chars = bool(CJK_CHAR_RE.search(goal_original))
+        has_cjk_keywords = any(keyword in goal for keyword in CJK_CONTEXT_KEYWORDS)
+        if not (has_cjk_chars or has_cjk_keywords):
+            continue
+        issues.append(ValidationIssue(
+            code=GOAL_CJK_TOKENIZATION_HINT_CODE,
+            severity="hint",
+            message=(
+                f"task '{task.id}' describes text tokenization in a CJK context — "
+                "whitespace-based splitting may not work reliably for CJK text"
+            ),
+            task_ids=[task.id],
+            evidence={"goal_excerpt": goal_original[:200]},
+        ))
+    return issues
+
+
 def _normalize_task_paths(paths: List[str]) -> List[str]:
     return _normalize_write_set(paths) if paths else []
+
+
+def _extract_goal_symbols(goal: str) -> List[str]:
+    """Extract code symbols from backticks in goal_behavior."""
+    symbols: List[str] = []
+    for symbol in GOAL_BACKTICK_SYMBOL_RE.findall(goal):
+        bare_symbol = symbol.rstrip("()")
+        if "/" in bare_symbol or "\\" in bare_symbol:
+            continue
+        if any(
+            bare_symbol.endswith(extension)
+            for extension in (".py", ".js", ".ts", ".yaml", ".yml", ".json")
+        ):
+            continue
+        if len(bare_symbol) < 3:
+            continue
+        symbols.append(symbol)
+    return symbols
 
 
 def _goal_file_references(goal_behavior: str) -> List[str]:
@@ -255,6 +387,18 @@ def _goal_file_references(goal_behavior: str) -> List[str]:
         for match in pattern.finditer(goal_behavior or ""):
             _append_goal_file_reference(referenced, match.group(1))
     return referenced
+
+
+def _goal_file_mentions(goal_behavior: str) -> List[str]:
+    referenced: List[str] = []
+    sanitized_goal = _strip_quoted_goal_segments(goal_behavior)
+    for match in GOAL_MENTION_FILE_RE.finditer(sanitized_goal):
+        _append_goal_file_reference(referenced, match.group(1))
+    return referenced
+
+
+def _strip_quoted_goal_segments(goal_behavior: str) -> str:
+    return GOAL_QUOTED_SEGMENT_RE.sub(" ", goal_behavior or "")
 
 
 def _append_goal_file_reference(referenced: List[str], path: str) -> None:
@@ -268,6 +412,44 @@ def _append_goal_file_reference(referenced: List[str], path: str) -> None:
 
 def _task_claims_path(referenced_path: str, claimed_paths: List[str]) -> bool:
     return any(_paths_overlap(referenced_path, claimed_path) for claimed_path in claimed_paths)
+
+
+def _symbol_defined_in_paths(
+    symbol: str,
+    claimed_paths: tuple[str, ...],
+    project_root: pathlib.Path,
+) -> bool:
+    """Check if a symbol is defined in any of the claimed paths."""
+    pattern = re.compile(
+        rf"(?:^|\n)\s*(?:def|class|async\s+def)\s+{re.escape(symbol)}\b"
+        rf"|(?:^|\n)\s*{re.escape(symbol)}\s*="
+    )
+    for claimed_path in claimed_paths:
+        file_path = project_root / claimed_path
+        if file_path.is_dir():
+            if _symbol_defined_in_directory(pattern, file_path):
+                return True
+            continue
+        if not file_path.is_file():
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if pattern.search(content):
+            return True
+    return False
+
+
+def _symbol_defined_in_directory(pattern: re.Pattern[str], directory: pathlib.Path) -> bool:
+    for py_file in directory.rglob("*.py"):
+        try:
+            content = py_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if pattern.search(content):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -479,8 +661,7 @@ def _check_integration_spine(plan: Plan) -> List[ValidationIssue]:
             if dep_task is None:
                 continue
 
-            pair = frozenset([t.id, dep_id])
-            if pair in covered_pairs:
+            if _has_cross_boundary_glue(t, dep_id, covered_pairs):
                 continue
 
             # Check if they're in different path boundaries
@@ -520,6 +701,19 @@ def _check_integration_spine(plan: Plan) -> List[ValidationIssue]:
             ))
 
     return issues
+
+
+def _has_cross_boundary_glue(
+    task: TaskSpec,
+    dep_id: str,
+    covered_pairs: Set[frozenset[str]],
+) -> bool:
+    if frozenset([task.id, dep_id]) in covered_pairs:
+        return True
+    verification = task.verification
+    if verification is None:
+        return False
+    return dep_id in verification.covers.tasks
 
 
 def _check_role_constraints(plan: Plan) -> List[ValidationIssue]:

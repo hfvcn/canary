@@ -18,6 +18,7 @@ from .assignment_constants import (
 from .assignment_control_plane import AssignmentControlPlaneMixin
 from .assignment_deferrals import AssignmentDeferralMixin
 from .assignment_fallbacks import AssignmentFallbackMixin
+from .assignment_actor_registration import AssignmentActorRegistrationMixin
 from .assignment_startup import AssignmentStartContext, AssignmentStartupMixin
 
 
@@ -26,6 +27,7 @@ class AssignmentController(
     AssignmentFallbackMixin,
     AssignmentCompletionMixin,
     AssignmentDeferralMixin,
+    AssignmentActorRegistrationMixin,
     AssignmentStartupMixin,
     AssignmentControlPlaneMixin,
 ):

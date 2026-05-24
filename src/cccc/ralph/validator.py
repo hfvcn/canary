@@ -6,6 +6,7 @@ The validator reads the Plan and produces a ValidationReport without side effect
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -34,6 +35,11 @@ from .models import (
 from .plan_io import compute_structural_plan_digest
 from .workspace_index import WorkspaceIndex
 from .rules_advisory import check_goal_hardcoded_awareness, check_inline_assertions, check_verification_command_syntax
+from .validation_rules.structural import (
+    _check_goal_cjk_tokenization_hint,
+    _check_goal_mentions_unclaimed_path,
+    _check_goal_symbol_in_claimed_paths,
+)
 
 # Import all check functions from the validation_rules subpackage (RO-31)
 from .validation_rules import (
@@ -85,7 +91,7 @@ from .validation_rules import (
     _check_security_recipes,
 )
 # Re-export internal helpers used by tests (backward compatibility)
-from .validation_rules.coverage import _covered_flow_summary  # noqa: F401
+from .validation_rules.coverage import _check_acceptance_coverage, _covered_flow_summary  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +161,12 @@ SCHEMA_PROPERTIES_KEY = "properties"
 SCHEMA_ITEMS_KEY = "items"
 SCHEMA_REQUIRED_KEY = "required"
 H_SEMANTIC_UNCHECKED_SYMBOLS = "H_SEMANTIC_UNCHECKED_SYMBOLS"
+W_TEMPORAL_PATTERN_NOT_INTEGRATED = "W_TEMPORAL_PATTERN_NOT_INTEGRATED"
+W_PROVIDES_NOT_CONSUMED = "W_PROVIDES_NOT_CONSUMED"
+_STORE_THEN_USE_PATTERN = "store_then_use"
+_TEMPORAL_BUILTIN_TOKENS = ("logging", "logger", "getLogger", "audit")
+_TEMPORAL_PATH_HINTS = ("audit", "logging", "logger", "log")
+_UNUSED_PROVIDER_HINT_CODE = "W_PROVIDER_UNUSED"
 
 
 def _issue_sort_key(issue: ValidationIssue) -> tuple:
@@ -217,6 +229,8 @@ def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
     issues.extend(covers_issues)
     issues.extend(_check_field_completeness(plan))
     issues.extend(_check_claimed_path_incomplete(plan))
+    issues.extend(_check_goal_mentions_unclaimed_path(plan))
+    issues.extend(_check_goal_cjk_tokenization_hint(plan))
     issues.extend(_check_verification_strength(plan))
     issues.extend(_check_verification_no_checks(plan))
     issues.extend(_check_verification_shallow_checks(plan))
@@ -231,7 +245,11 @@ def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
     issues.extend(_check_verification_cross_scope(plan))
     if not _has_issue_codes(covers_issues, {"E_COVERS_UNKNOWN_TASK", "E_COVERS_WITHOUT_DEP_ORDER"}):
         issues.extend(_check_covers_verifiability(plan))
-    issues.extend(_check_contracts(plan))
+    contract_issues = _check_contracts(plan)
+    issues.extend(
+        issue for issue in contract_issues if issue.code != _UNUSED_PROVIDER_HINT_CODE
+    )
+    issues.extend(_check_provides_not_consumed(plan))
     issues.extend(_check_contract_verification_coverage(plan))
     issues.extend(_check_contract_dep_alignment(plan))
     issues.extend(_check_critical_coverage(plan))
@@ -269,6 +287,45 @@ def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
     issues.extend(_check_suppress_unused(plan, all_issue_codes))
 
     return issues
+
+
+def _check_provides_not_consumed(plan: Plan) -> List[ValidationIssue]:
+    consumed_by_task = _consumed_contract_names_by_task(plan.tasks)
+    issues: List[ValidationIssue] = []
+    for task in plan.tasks:
+        if task.role == "integration":
+            continue
+        for contract in task.provides:
+            if _is_contract_consumed_elsewhere(task.id, contract.name, consumed_by_task):
+                continue
+            issues.append(ValidationIssue(
+                code=W_PROVIDES_NOT_CONSUMED,
+                severity="warning",
+                message=f"task '{task.id}' provides '{contract.name}' but no other task consumes it",
+                task_ids=[task.id],
+                evidence={"contract_name": contract.name, "provider_task": task.id},
+            ))
+    return issues
+
+
+def _consumed_contract_names_by_task(tasks: List[TaskSpec]) -> Dict[str, Set[str]]:
+    return {
+        task.id: {contract.name for contract in task.consumes if contract.name}
+        for task in tasks
+        if task.consumes
+    }
+
+
+def _is_contract_consumed_elsewhere(
+    provider_task_id: str,
+    contract_name: str,
+    consumed_by_task: Dict[str, Set[str]],
+) -> bool:
+    return any(
+        contract_name in names
+        for task_id, names in consumed_by_task.items()
+        if task_id != provider_task_id
+    )
 
 
 def _build_report(
@@ -330,6 +387,7 @@ def validate_with_project(
     semantic_provider: object | None = None,
     has_semantic: bool = False,
     has_serena: bool = False,
+    tracker_path: Path | None = None,
 ) -> ValidationReport:
     """Run structural validation, then filesystem checks when the task graph is usable."""
     # Check for fatal structural issues before attempting filesystem validation
@@ -355,16 +413,29 @@ def validate_with_project(
 
     workspace = WorkspaceIndex(project_root)
     fs_issues = validate_filesystem(plan, project_root=project_root, workspace=workspace)
+    temporal_issues = _check_temporal_pattern_integration(plan, workspace)
     semantic_issues = _check_semantic_dependencies(plan, workspace)
     semantic_issues.extend(_check_semantic_unchecked_symbols(plan, semantic_provider))
     semantic_issues.extend(check_goal_hardcoded_awareness(plan, workspace))
     signature_issues = validate_provider_source_signatures(plan, project_root=project_root)
+    acceptance_issues = _check_acceptance_coverage(plan, tracker_path)
     capability_issues = _check_capability_coverage(
         project_root=project_root,
         has_semantic=has_semantic,
         has_serena=has_serena,
     )
-    all_issues = structural_issues + fs_issues + semantic_issues + signature_issues + capability_issues
+    all_issues = list(
+        structural_issues
+        + fs_issues
+        + temporal_issues
+        + semantic_issues
+        + signature_issues
+        + acceptance_issues
+        + capability_issues
+    )
+    if project_root is not None:
+        symbol_issues = _check_goal_symbol_in_claimed_paths(plan, project_root)
+        all_issues.extend(symbol_issues)
 
     # Apply suppression after combining structural + filesystem issues
     kept_issues, suppressed_hints = _apply_suppression(
@@ -387,6 +458,174 @@ def validate_with_project(
     return _build_report(
         kept_issues, suppressed_hints, semantic_mode=plan.semantic_mode,
     )
+
+
+# ---------------------------------------------------------------------------
+# Temporal integration checks
+# ---------------------------------------------------------------------------
+
+def _check_temporal_pattern_integration(
+    plan: Plan,
+    workspace: WorkspaceIndex,
+) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    for flow in plan.critical_flows:
+        issue = _temporal_pattern_integration_issue(plan, flow, workspace)
+        if issue is not None:
+            issues.append(issue)
+    return issues
+
+
+def _temporal_pattern_integration_issue(
+    plan: Plan,
+    flow: CriticalFlow,
+    workspace: WorkspaceIndex,
+) -> Optional[ValidationIssue]:
+    if _normalized_temporal_pattern(flow.temporal_pattern) != _STORE_THEN_USE_PATTERN:
+        return None
+    entrypoints = [ep for ep in flow.entrypoints if workspace.path_exists(ep)]
+    if not entrypoints:
+        return None
+    tokens, modules = _temporal_reference_tokens(plan, flow, workspace)
+    if any(_entrypoint_references_temporal_tokens(path, tokens, workspace) for path in entrypoints):
+        return None
+    return ValidationIssue(
+        code=W_TEMPORAL_PATTERN_NOT_INTEGRATED,
+        severity="warning",
+        message=(
+            f"critical flow '{flow.id}' declares temporal_pattern 'store_then_use' "
+            "but its entrypoints do not import or reference audit/logging integration"
+        ),
+        task_ids=[task.id for task in _tasks_covering_flow(plan, flow)],
+        evidence={
+            "flow_id": flow.id,
+            "temporal_pattern": flow.temporal_pattern,
+            "entrypoints": entrypoints,
+            "audit_modules": modules,
+        },
+    )
+
+
+def _temporal_reference_tokens(
+    plan: Plan,
+    flow: CriticalFlow,
+    workspace: WorkspaceIndex,
+) -> Tuple[List[str], List[str]]:
+    module_paths = _temporal_audit_module_paths(plan, flow)
+    tokens = list(_TEMPORAL_BUILTIN_TOKENS)
+    for path in module_paths:
+        tokens.extend(_module_reference_tokens(path, workspace))
+    deduped = list(dict.fromkeys(token for token in tokens if token))
+    return deduped, module_paths
+
+
+def _temporal_audit_module_paths(plan: Plan, flow: CriticalFlow) -> List[str]:
+    entrypoints = {
+        entrypoint.strip().replace("\\", "/").rstrip("/")
+        for entrypoint in flow.entrypoints
+    }
+    paths: List[str] = []
+    for task in _tasks_covering_flow(plan, flow):
+        verification = getattr(task, "verification", None)
+        cover_paths = list(getattr(getattr(verification, "covers", None), "paths", []))
+        for path in [*task.claimed_paths, *task.awareness_paths, *cover_paths]:
+            normalized = path.strip().replace("\\", "/").rstrip("/")
+            if not normalized or normalized in entrypoints:
+                continue
+            if any(_paths_overlap(normalized, entrypoint) for entrypoint in entrypoints):
+                continue
+            if _looks_like_temporal_audit_path(normalized):
+                paths.append(normalized)
+    return list(dict.fromkeys(paths))
+
+
+def _tasks_covering_flow(plan: Plan, flow: CriticalFlow) -> List[TaskSpec]:
+    matched: List[TaskSpec] = []
+    for task in plan.tasks:
+        verification = task.verification
+        if verification and flow.id in verification.covers.flows:
+            matched.append(task)
+            continue
+        owned_paths = [*task.claimed_paths, *task.awareness_paths]
+        if any(_paths_overlap(entrypoint, path) for entrypoint in flow.entrypoints for path in owned_paths):
+            matched.append(task)
+    return matched
+
+
+def _looks_like_temporal_audit_path(path: str) -> bool:
+    lowered = Path(path).name.casefold()
+    return any(hint in lowered for hint in _TEMPORAL_PATH_HINTS)
+
+
+def _module_reference_tokens(path: str, workspace: WorkspaceIndex) -> List[str]:
+    tokens = [Path(path).stem]
+    module = workspace.ast_parse(path)
+    if module is None:
+        return tokens
+    for node in module.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            tokens.append(node.name)
+    return list(dict.fromkeys(token for token in tokens if token))
+
+
+def _entrypoint_references_temporal_tokens(
+    rel_path: str,
+    tokens: List[str],
+    workspace: WorkspaceIndex,
+) -> bool:
+    module = workspace.ast_parse(rel_path)
+    if module is not None and _ast_references_temporal_tokens(module, set(tokens)):
+        return True
+    text = _workspace_text(workspace, rel_path)
+    if text is None:
+        return False
+    return any(re.search(rf"\b{re.escape(token)}\b", text) for token in tokens)
+
+
+def _ast_references_temporal_tokens(module: ast.Module, tokens: Set[str]) -> bool:
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            names = [part for alias in node.names for part in alias.name.split(".")]
+            if any(name in tokens for name in names):
+                return True
+        if isinstance(node, ast.ImportFrom):
+            module_name = node.module or ""
+            names = [*module_name.split("."), *(alias.name for alias in node.names)]
+            if any(name in tokens for name in names):
+                return True
+        if isinstance(node, ast.Call):
+            name = _call_name(node.func)
+            if name in tokens:
+                return True
+        if isinstance(node, ast.Name) and node.id in tokens:
+            return True
+    return False
+
+
+def _call_name(func: ast.expr) -> str:
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return ""
+
+
+def _workspace_text(workspace: WorkspaceIndex, rel_path: str) -> Optional[str]:
+    full_path = (workspace.project_root / rel_path).resolve()
+    try:
+        full_path.relative_to(workspace.project_root)
+    except ValueError:
+        return None
+    if not full_path.is_file():
+        return None
+    try:
+        return full_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _normalized_temporal_pattern(value: Optional[str]) -> str:
+    return str(value or "").strip().casefold()
 
 
 # ---------------------------------------------------------------------------

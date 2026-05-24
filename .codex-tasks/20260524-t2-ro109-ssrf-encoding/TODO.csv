@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect SSRF recipe matching and severity paths,DONE,Relevant security recipe and tests identified,,2026-05-24T00:00:00,0,Confirmed url_input currently treats any single matrix entry as full coverage and already passes task into _build_issue.
+2,Implement encoding coverage helpers and issue evidence,DONE,security_recipes.py distinguishes no coverage vs partial coverage for url_input,,2026-05-24T00:00:00,0,Added _missing_encoding_entries(), _resolve_recipe_severity(), url_input-specific coverage matching, and missing_encodings evidence.
+3,Add focused encoding regression tests,DONE,tests/test_security_recipes.py covers no coverage and partial coverage severity/evidence,,2026-05-24T00:00:00,0,Added explicit warning and hint tests using existing Plan/TaskSpec/CriticalFlow helpers.
+4,Run targeted pytest validation,DONE,python -m pytest tests/test_security_recipes.py -v -k "encoding" passes,python -m pytest tests/test_security_recipes.py -v -k "encoding",2026-05-24T00:00:00,0,Passed: 2 selected encoding tests.

@@ -1,67 +1,30 @@
 schema_version: "1.0.0"
 
-# 全量修复计划：覆盖问题清单 v5 全部未解决项（42 项）
-# 按依赖链分 Wave 组织，Wave 内可并行
+# v45 修复：RO-108/109/110/111 + FL-27 + FL-28
+# RO-108: SSRF 防护仅 import 检查，未验证路由调用链
+# RO-109: SSRF 编码绕过（0x7f000001 等）检查未强制要求
+# RO-110: FTS5+中文搜索假通过——验证仅整串匹配
+# RO-111: search.py 静默降级——catch-all 异常返回空列表
+# FL-27: 全部任务 verification_force_passed，叶子 check 过浅
+# FL-28: Worker desired_state=running 但 runtime_state=stopped
 
 required_issues:
-  # RO 系列
-  - RO-84
-  - RO-91
-  - RO-92
-  - RO-93
-  - RO-94
-  - RO-95
-  - RO-97
-  - RO-98
-  - RO-99
-  - RO-101
-  # FL 系列
-  - FL-4
-  - FL-5
-  - FL-6
-  - FL-7
-  - FL-8
-  - FL-9
-  - FL-10
-  - FL-11
-  - FL-12
-  - FL-13
-  - FL-15
-  # UX 系列
-  - UX-5
-  - UX-8
-  - UX-11
-  - UX-12
-  # AD 系列
-  - AD-1
-  - AD-2
-  - AD-3
-  - AD-4
-  - AD-7
-  - AD-8
-  - AD-9
-  - AD-11
-  # SL 系列
-  - SL-1
-  - SL-2
-  - SL-3
-  # RL 系列
-  - RL-22
-  - RL-25
-  # PLR 系列
-  - PLR-1
-  - PLR-2
-  # DOC 系列
-  - DOC-1
-  - DOC-2
+  - RO-108
+  - RO-109
+  - RO-110
+  - RO-111
+  - FL-27
+  - FL-28
 
 semantic_mode: "off"
 auto_infer: false
 
 plan_scope:
-  - src/cccc/daemon/foreman/
-  - src/cccc/ralph/
-  - src/cccc/contracts/
+  - src/cccc/ralph/validation_rules/discipline_security.py
+  - src/cccc/ralph/security_recipes.py
+  - src/cccc/daemon/foreman/verification_gate.py
+  - src/cccc/daemon/foreman/assignment_startup.py
+  - src/cccc/daemon/foreman/prompt_builder.py
   - tests/
 
 suppress_codes:
@@ -91,1119 +54,203 @@ suppress_codes:
   - W_PLAN_SCOPE_UNUSED
   - W_VERIFICATION_CROSS_SCOPE
   - W_COVERS_PATHS_UNVERIFIED
-
-critical_flows:
-  - id: verification_gate_processing
-    description: "process_completed_event dispatches by verification_mode, applies gates, records result"
-    entrypoints:
-      - src/cccc/daemon/foreman/verification_gate.py::process_completed_event
-    test_created_by:
-      - T2
-      - T3
-      - T4
-      - T8
-    required_verification_level: integration
-
-  - id: workflow_state_recovery
-    description: "task failure/deferred releases agent, enables retry, supports override"
-    entrypoints:
-      - src/cccc/daemon/foreman/workflow_orchestrator.py::on_verification_result
-    test_created_by:
-      - T1
-      - T14
-      - T15
-    required_verification_level: integration
-
-  - id: ralph_validation_pipeline
-    description: "ralph validate runs structural + discipline + security rules"
-    entrypoints:
-      - src/cccc/ralph/validator.py::validate
-    test_created_by:
-      - T7
-      - T9
-      - T21
-    required_verification_level: unit
-
-# ============================================================================
-# Tasks organized by dependency chain (Waves are approximate — check depends_on)
-# Wave 1: No deps; Wave 2+: depends on earlier tasks
-# ============================================================================
+  - W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION
+  - W_REGISTRATION_INVARIANT_UNCOVERED
+  - W_ACCEPTANCE_COVERAGE_GAP
+  - W_GOAL_REFERENCES_UNCLAIMED_PATH
+  - W_GOAL_SYMBOL_NOT_IN_CLAIMED_PATH
 
 tasks:
   - id: T1
-    title: "RO-95: release agent on verification failure + shadow blocked"
+    title: "RO-108: Aegis 规则要求 SSRF 函数必须有路由调用链证据"
     addresses:
-      - RO-95
+      - RO-108
     goal_behavior: |
-      Fix workflow_orchestrator.py so agent is released when verification fails:
-
-      1. on_verification_result() (line ~1769): after setting TASK_STATUS_FAILED (line ~1804),
-         call self._release_agent_for_task(task_id) to clear _active_assignments.
-      2. _update_shadow_blocked() (line ~1714): after setting TASK_STATUS_FAILED,
-         call self._release_agent_for_task(task_id).
-
-      This prevents the death loop where _active_assignments stays permanently
-      polluted after verification failure, causing defer_batch_for_single_writer
-      to block all future batches.
+      discipline_security.py 增加新规则 `_check_ssrf_route_binding`：
+      1. 遍历 plan 的 critical_flows，找到含 "ssrf" 关键词的 flow
+      2. 检查对应 task 的 verification checks 中是否有路由级验证（非仅 import 检查）
+      3. 路由级验证关键词：endpoint, route, handler, api, request, response, client, call-chain
+      4. 若 task 只有 import/compile 级别 check（通过 _is_import_only_check 判断），
+         emit warning W_SSRF_ROUTE_BINDING_MISSING：
+         "SSRF protection function declared but no route-level verification — import-only checks do not prove endpoint integration"
+      5. _is_import_only_check：check name 或 command 只含 import/compile 关键词，不含路由关键词
+      6. 将新规则注册到 _DISCIPLINE_RULES 列表
     acceptance_criteria: |
-      1. on_verification_result sets failed AND releases agent
-      2. _update_shadow_blocked sets failed AND releases agent
-      3. After verification failure, _active_assignments no longer contains the failed agent
-      4. New batch dispatch succeeds after a task verification failure
-    claimed_paths:
-      - src/cccc/daemon/foreman/workflow_orchestrator.py
-      - tests/test_deferred_recovery.py
-    verification:
-      level: unit
-      checks:
-        - name: deferred-recovery
-          command: "python -m pytest tests/test_deferred_recovery.py -v"
-    provides:
-      - name: agent_release_on_failure
-        kind: runtime_capability
-
-  - id: T2
-    title: "RO-97: make security_lint and input_robustness gates mode-aware"
-    addresses:
-      - RO-97
-    goal_behavior: |
-      In verification_gate.py, make _apply_security_lint_gate() (line ~541) and
-      _apply_input_robustness_gate() (line ~642) respect verification_mode:
-
-      1. Read mode from task_ref (same pattern as _apply_aegis_evidence_gate line ~490)
-      2. mode=ralph: gates record advisory warnings only, never block
-      3. mode=agent: gates record warnings only, never block
-      4. mode=challenge: gates remain blocking (current behavior)
-
-      Follow the existing pattern in _apply_aegis_evidence_gate (line ~490-505).
-
-      Note: _should_upgrade_to_challenge() may auto-upgrade ralph to challenge when
-      a task touches critical_flow entrypoints. This is by design (T26 tests it).
-      The mode-awareness here applies AFTER any upgrade has occurred.
-    acceptance_criteria: |
-      1. verification_mode=ralph task (no critical_flow) passes even if debug=True (warning only)
-      2. verification_mode=challenge task still blocked by debug=True (current behavior)
-      3. ralph task auto-upgraded to challenge via critical_flow still gets blocking gates
-      4. Same mode logic applied to input_robustness gate
-      5. Existing tests in test_verification_mode_routing.py still pass
-    claimed_paths:
-      - src/cccc/daemon/foreman/verification_gate.py
-      - tests/test_verification_mode_routing.py
-    awareness_paths:
-      - tests/test_security_lint_blocking.py
-      - tests/test_input_robustness_gate.py
-    verification:
-      level: unit
-      checks:
-        - name: mode-routing
-          command: "python -m pytest tests/test_verification_mode_routing.py -v"
-    provides:
-      - name: mode_aware_gates
-        kind: runtime_capability
-
-  - id: T5
-    title: "AD-1: AegisDiscipline sub-model + TaskSpec.aegis field"
-    addresses:
-      - AD-1
-    goal_behavior: |
-      Add AegisDiscipline schema to models.py and wire it through:
-
-      1. models.py: new AegisDiscipline model (intent, repair_track, retirement_track,
-         baseline_refs, patch_shape_triage) with all Optional fields and extra="ignore"
-      2. models.py: TaskSpec.aegis: Optional[AegisDiscipline] = None
-      3. ralph_ipc.py: TaskRef.aegis: Optional[Dict[str, Any]] = None (Dict to avoid circular import)
-      4. models.py: TaskSpec.to_task_ref() transparently passes aegis
-      5. plan_io.py: strict plan nested field check covers aegis sub-model
-      6. cli.py: ralph schema output includes AegisDiscipline
-      7. guide_generator.py: MODEL_REFERENCES includes AegisDiscipline
-
-      All fields Optional+default None, old plans unaffected.
-    acceptance_criteria: |
-      1. Old plan (no aegis) validates with zero new errors
-      2. New plan with aegis validates and parses correctly
-      3. TaskRef receives and passes aegis data
-      4. ralph schema output shows AegisDiscipline fields
-    claimed_paths:
-      - src/cccc/ralph/models.py
-      - src/cccc/contracts/v1/ralph_ipc.py
-      - src/cccc/ralph/plan_io.py
-      - src/cccc/ralph/cli.py
-      - src/cccc/ralph/guide_generator.py
-      - tests/test_aegis_discipline_infra.py
-    verification:
-      level: unit
-      checks:
-        - name: aegis-infra
-          command: "python -m pytest tests/test_aegis_discipline_infra.py -v"
-    provides:
-      - name: aegis_schema
-        kind: runtime_capability
-
-  - id: T16
-    title: "RO-84: ralph validate produces ledger event"
-    depends_on:
-      - T5
-      - T6
-    addresses:
-      - RO-84
-    goal_behavior: |
-      When ralph validate completes, send a ralph.validate_result event to the daemon:
-
-      1. In validator.py or cli.py, after validate() returns, emit event with:
-         - error_count, warning_count, hint_count
-         - plan_path digest (sha256 of file content)
-         - outcome: "passed" or "failed"
-      2. Use existing daemon IPC (call_daemon or similar) to send the event.
-      3. If daemon is not running, silently skip (validate works standalone).
-    acceptance_criteria: |
-      1. validate success sends ralph.validate_result with outcome=passed
-      2. validate failure sends ralph.validate_result with outcome=failed
-      3. Event includes error/warning/hint counts and plan digest
-      4. No daemon running: validate still works, no crash
-    claimed_paths:
-      - src/cccc/ralph/validator.py
-      - src/cccc/ralph/cli.py
-      - tests/test_ralph_validate_ledger.py
-      - tests/test_validate_ledger_event.py
-    verification:
-      level: unit
-      checks:
-        - name: validate-ledger
-          command: "python -m pytest tests/test_ralph_validate_ledger.py tests/test_validate_ledger_event.py -v"
-
-  - id: T18
-    title: "FL-6: flow step-4 distinguishes new vs pre-existing changes"
-    addresses:
-      - FL-6
-    goal_behavior: |
-      Modify _check_improvement_register() in flow_improvement_check.py:
-
-      Instead of just checking "git diff has additions", verify that the diff
-      contains additions from the current session. Use state.version or
-      state.started_at as discriminator:
-      - If state.version is set, check diff contains that version string (e.g. "v39")
-      - Otherwise, check that at least one added line has content not in the
-        pre-flow snapshot (compare against git stash or baseline)
-    acceptance_criteria: |
-      1. Tracker with only pre-existing additions (no current session marker) fails step-4
-      2. Tracker with current version marker passes step-4
-      3. Existing flow behavior preserved when version is set
-    claimed_paths:
-      - src/cccc/ralph/flow_improvement_check.py
-      - tests/test_flow_improvement_check.py
-    verification:
-      level: unit
-      checks:
-        - name: improvement-check
-          command: "python -m pytest tests/test_flow_improvement_check.py -v"
-
-  - id: T19
-    title: "FL-15 + FL-7: flow step-6 guidance for new findings, archive, and version marker"
-    addresses:
-      - FL-15
-      - FL-7
-    goal_behavior: |
-      Update E2E flow step-6 instruction in flow_steps_e2e.py (line ~253-259) and
-      solve flow step-4 instruction in flow_engine.py (SOLVE_STEPS line ~233):
-
-      E2E step-6 instruction should explicitly list three tasks:
-      1. Write new findings discovered during this E2E round into the short tracker
-      2. Move issues confirmed fixed (verified in this round) from short to full version
-      3. Add a version marker line (e.g. "v{N}") so git diff can detect current-session adds
-
-      Solve flow step-4 instruction should similarly guide:
-      1. Record discovered gaps and new findings
-      2. Archive resolved items
-      3. Include version marker
-    acceptance_criteria: |
-      1. E2E step-6 instruction_text contains guidance for all three tasks
-      2. Solve step-4 instruction_text mentions archive and version marker
-      3. Agent following instructions produces all three categories of tracker updates
-    claimed_paths:
-      - src/cccc/ralph/flow_steps_e2e.py
-      - src/cccc/ralph/flow_engine.py
-      - tests/test_flow_archive_prompt.py
-    verification:
-      level: unit
-      checks:
-        - name: flow-archive
-          command: "python -m pytest tests/test_flow_archive_prompt.py -v"
-
-  - id: T20
-    title: "FL-5: guide --update treats dev branch warnings as advisory"
-    depends_on:
-      - T5
-      - T17
-    addresses:
-      - FL-5
-    goal_behavior: |
-      In guide_generator.py update_guide() or the flow step-6 check:
-
-      When running on a non-main branch (e.g. dev) with many uncommitted changes,
-      the "affected by changes — review manually" warnings should not block the
-      flow step. Approach: flow step check treats these warnings as advisory
-      (non-blocking) — display them but do not fail the step.
-    acceptance_criteria: |
-      1. dev branch with pre-existing uncommitted changes does not block flow step-6/guide
-      2. Warnings still displayed for informational purposes
-      3. Main branch behavior unchanged
-    claimed_paths:
-      - src/cccc/ralph/guide_generator.py
-      - tests/test_flow_guide_advisory.py
-    verification:
-      level: unit
-      checks:
-        - name: guide-advisory
-          command: "python -m pytest tests/test_flow_guide_advisory.py -v"
-
-  - id: T24
-    title: "UX-12: exempt grep/test commands from SUSPICIOUS duration marking"
-    depends_on:
-      - T11
-    addresses:
-      - UX-12
-    goal_behavior: |
-      In ralph_service.py (line ~1697-1701), before marking a check as SUSPICIOUS:
-
-      Check if the command starts with known-fast prefixes: grep, test, [, true, false.
-      If so, skip the SUSPICIOUS marking regardless of duration.
-
-      SUSPICIOUS_DURATION_THRESHOLD_MS is already 50ms (line ~64). The exemption
-      is for commands that are inherently fast.
-    acceptance_criteria: |
-      1. grep command completing in 5ms is NOT marked SUSPICIOUS
-      2. test -f command completing in 2ms is NOT marked SUSPICIOUS
-      3. python command completing in 5ms IS still marked SUSPICIOUS
-      4. Threshold logic unchanged for non-exempt commands
-    claimed_paths:
-      - src/cccc/daemon/foreman/ralph_service.py
-      - tests/test_suspicious_exempt.py
-    verification:
-      level: unit
-      checks:
-        - name: suspicious-exempt
-          command: "python -m pytest tests/test_suspicious_exempt.py -v"
-
-  - id: T26
-    title: "FL-13 + RO-101: test infrastructure — xdist flaky fix + challenge upgrade unit test"
-    addresses:
-      - FL-13
-      - RO-101
-    goal_behavior: |
-      1. FL-13: Mark test_ralph_enhancement_surface_e2e as @pytest.mark.serial
-         or fix the underlying resource race in the E2E enhancement test.
-      2. RO-101: Add dedicated unit tests for _should_upgrade_to_challenge() in
-         tests/test_critical_flow_challenge_upgrade.py covering:
-         - ralph mode task touching critical_flow entrypoint -> upgrade to challenge
-         - ralph mode task not touching critical_flow -> no upgrade
-         - challenge mode task -> no change
-    acceptance_criteria: |
-      1. FL-13: test_ralph_enhancement_surface_e2e passes consistently under xdist
-      2. RO-101: _should_upgrade_to_challenge has at least 3 dedicated unit tests
-    claimed_paths:
-      - tests/test_flow_verify_xdist.py
-      - tests/test_critical_flow_challenge_upgrade.py
-    verification:
-      level: unit
-      checks:
-        - name: challenge-upgrade
-          command: "python -m pytest tests/test_critical_flow_challenge_upgrade.py -v"
-        - name: xdist-flaky
-          command: "python -m pytest tests/test_flow_verify_xdist.py -v"
-
-# ============================================================================
-# Tasks with dependencies on earlier tasks
-# ============================================================================
-
-  - id: T3
-    title: "RO-98: distinguish task failure from verifier infra failure"
-    depends_on:
-      - T2
-      - T5
-    addresses:
-      - RO-98
-    goal_behavior: |
-      In verification_gate.py, modify process_completed_event (line ~123):
-
-      1. Add verification_infra_error status. When verifier itself fails (e.g. cannot
-         read files, network error, timeout), the failure_type should be "infra_error"
-         rather than "task_quality".
-      2. Verifier return structure includes failure_type: task_quality | infra_error | timeout
-      3. infra_error does NOT count against worker retry count
-      4. infra_error triggers automatic verifier retry (up to 2 attempts)
-      5. After retries exhausted, escalate to foreman decision
-
-      In workflow_orchestrator.py, on_task_failed should check failure_type:
-      - task_quality -> normal retry logic (counts against limit)
-      - infra_error -> retry verifier only (does not count as worker retry)
-    acceptance_criteria: |
-      1. Challenge reviewer file-read failure -> verification_infra_error, not task_failed
-      2. infra_error does not decrement worker retry count
-      3. Normal task quality failure still counts as retry
-      4. infra_error auto-retries verifier up to 2 times
-    claimed_paths:
-      - src/cccc/daemon/foreman/verification_gate.py
-      - src/cccc/contracts/v1/ralph_ipc.py
-      - tests/test_verification_infra_error.py
-    awareness_paths:
-      - src/cccc/daemon/foreman/workflow_orchestrator.py
-    consumes:
-      - name: mode_aware_gates
-        from: T2
-        kind: runtime_capability
-    verification:
-      level: unit
-      checks:
-        - name: infra-error
-          command: "python -m pytest tests/test_verification_infra_error.py -v"
-
-  - id: T4
-    title: "SL-1/2/3: security lint upgrade — blocking + extended patterns + input robustness"
-    depends_on:
-      - T2
-      - T3
-    addresses:
-      - SL-1
-      - SL-2
-      - SL-3
-    goal_behavior: |
-      In verification_gate.py:
-
-      1. SL-1: _check_security_lint (line ~759) — when a pattern hits in challenge mode,
-         change record_verification_warning to record_verification_failure (blocking).
-         In ralph/agent mode, keep as warning (per T2 mode-awareness).
-      2. SL-2: Add new patterns to the lint matrix:
-         - bare_except: re.compile(r'except\s*:')
-         - eval_call: re.compile(r'\beval\s*\(')
-         - exec_call: re.compile(r'\bexec\s*\(')
-         - app_run_debug: re.compile(r'app\.run\(.*debug\s*=\s*True')
-         - hardcoded_secret: re.compile(r'(password|secret|api_key)\s*=\s*["\'][^"\']+["\']')
-         Add whitelist for test files and known-safe patterns.
-      3. SL-3: _check_input_robustness — same pattern: challenge mode blocking,
-         ralph/agent mode warning only.
-    acceptance_criteria: |
-      1. challenge mode + debug=True -> verification failed (blocking)
-      2. ralph mode + debug=True -> warning only (non-blocking)
-      3. eval() in non-test file detected
-      4. bare except in non-test file detected
-      5. Test files are whitelisted (no false positives on test assertions)
-    claimed_paths:
-      - src/cccc/daemon/foreman/verification_gate.py
-      - tests/test_security_lint_blocking.py
-      - tests/test_security_lint_extended.py
-    consumes:
-      - name: mode_aware_gates
-        from: T2
-        kind: runtime_capability
-    verification:
-      level: unit
-      checks:
-        - name: lint-blocking
-          command: "python -m pytest tests/test_security_lint_blocking.py -v"
-        - name: lint-extended
-          command: "python -m pytest tests/test_security_lint_extended.py -v"
-
-  - id: T6
-    title: "AD-2: intent inference helper + discipline.py rule infrastructure"
-    depends_on:
-      - T5
-    addresses:
-      - AD-2
-    goal_behavior: |
-      1. In src/cccc/ralph/aegis.py: add effective_intent(task) -> str function.
-         Priority: aegis.intent if set -> keyword inference from title/goal -> "general".
-         Keywords: fix/bug/debug -> "fix", add/feature/implement -> "feature",
-         refactor/migrate/replace -> "refactor", test -> "test".
-         Also add has_patch_shape_risk(task) -> bool helper.
-
-      2. In src/cccc/ralph/validation_rules/discipline.py: set up rule infrastructure
-         matching existing pattern in structural.py/coverage.py.
-
-      3. In validation_rules/__init__.py: re-export discipline module.
-
-      4. In validator.py: _collect_structural_issues() calls discipline rules.
-
-      5. In agent.py: RULE_DOCS and RULE_VERSION_REGISTRY include discipline rules.
-    acceptance_criteria: |
-      1. effective_intent works on both TaskSpec and TaskRef
-      2. discipline.py follows same pattern as structural.py
-      3. ralph explain --code AD_xxx outputs rule documentation
-      4. Existing tests pass (no regression)
-    claimed_paths:
-      - src/cccc/ralph/aegis.py
-      - src/cccc/ralph/validation_rules/discipline.py
-      - src/cccc/ralph/validation_rules/__init__.py
-      - src/cccc/ralph/validator.py
-      - src/cccc/ralph/agent.py
-      - tests/test_aegis_discipline_infra.py
-    consumes:
-      - name: aegis_schema
-        from: T5
-        kind: runtime_capability
-    verification:
-      level: unit
-      checks:
-        - name: discipline-infra
-          command: "python -m pytest tests/test_aegis_discipline_infra.py -v"
-
-  - id: T11
-    title: "RO-99: inject security checklist into challenge verification prompt"
-    depends_on:
-      - T2
-    addresses:
-      - RO-99
-    goal_behavior: |
-      In ralph_service.py _build_verification_prompt() (~30 lines change):
-
-      1. Read plan.critical_flows and extract security keywords
-         (input-validation, ssrf, auth, xss, injection, etc.)
-      2. For each matched keyword category, inject a security checklist section
-         into the Gemini verification prompt:
-         - input-validation -> "Are all user inputs validated? Can FTS5/SQL operators
-           be injected? Are there resource limits?"
-         - ssrf -> "Does URL validation handle encoded IPs, DNS rebinding, redirects?"
-         - *-auth -> "Is token comparison timing-safe? Are secrets hardcoded?"
-      3. No security critical_flow -> no checklist injected -> Gemini does functional review only
-      4. Checklist driven by critical_flow keywords, not project type
-    acceptance_criteria: |
-      1. Plan with input-validation critical_flow -> Gemini prompt contains security checklist
-      2. Plan without security critical_flow -> no checklist injected
-      3. Checklist content matches the declared critical_flow category
-      4. Existing challenge verification tests still pass
-    claimed_paths:
-      - src/cccc/daemon/foreman/ralph_service.py
-      - tests/test_challenge_security_checklist.py
-    consumes:
-      - name: mode_aware_gates
-        from: T2
-        kind: runtime_capability
-    verification:
-      level: unit
-      checks:
-        - name: security-checklist
-          command: "python -m pytest tests/test_challenge_security_checklist.py -v"
-
-  - id: T14
-    title: "FL-11: foreman override path for verification gate"
-    depends_on:
-      - T1
-    addresses:
-      - FL-11
-    goal_behavior: |
-      Add formal override mechanism to workflow_orchestrator.py:
-
-      1. New method: override_task(task_id, reason, evidence) that:
-         - Sets task status to completed_by_override
-         - Emits workflow.foreman_override ledger event (with reason, evidence, timestamp)
-         - Releases agent if still assigned
-         - Unblocks downstream dependency gate
-      2. Wire to CLI: cccc workflow override --task TASK_ID --reason "..." --evidence "..."
-      3. completed_by_override is treated as success by downstream dependency check
-    acceptance_criteria: |
-      1. override_task sets status and emits ledger event
-      2. Downstream tasks can start after override
-      3. Override reason and evidence recorded in ledger
-      4. CLI command works end-to-end
-    claimed_paths:
-      - src/cccc/daemon/foreman/workflow_orchestrator.py
-      - src/cccc/daemon/ralph_ipc_handler.py
-      - tests/test_workflow_override.py
-    awareness_paths:
-      - src/cccc/cli/group_cmds.py
-    consumes:
-      - name: agent_release_on_failure
-        from: T1
-        kind: runtime_capability
-    verification:
-      level: unit
-      checks:
-        - name: override
-          command: "python -m pytest tests/test_workflow_override.py -v"
-
-  - id: T17
-    title: "FL-4 + UX-5: guide Field descriptions + auto-generation"
-    depends_on:
-      - T5
-    addresses:
-      - FL-4
-      - UX-5
-    goal_behavior: |
-      1. FL-4: In models.py, add description= parameter to Field() for key fields:
-         verification_mode, aegis, mock_tests, provides, consumes.
-         This lets guide_generator extract descriptions automatically instead of
-         overwriting manually-written ones with empty strings.
-
-      2. UX-5: Enhance guide_generator.py so `ralph guide` produces a complete
-         capability guide from Pydantic schema + validation rules + CLI --help.
-         Output should include all Plan schema fields, all validation rule codes,
-         and all CLI commands.
-    acceptance_criteria: |
-      1. ralph guide --output generates non-empty Description for verification_mode,
-         aegis, mock_tests, provides, consumes
-      2. Guide includes all TaskSpec fields with descriptions
-      3. Guide includes validation rule codes (E_/W_/H_ prefixes)
-      4. Guide includes CLI subcommands
-    claimed_paths:
-      - src/cccc/ralph/models.py
-      - src/cccc/ralph/guide_generator.py
-      - tests/test_guide_description.py
-      - tests/test_guide_generator_coverage.py
-    consumes:
-      - name: aegis_schema
-        from: T5
-        kind: runtime_capability
-    verification:
-      level: unit
-      checks:
-        - name: guide-desc
-          command: "python -m pytest tests/test_guide_description.py -v"
-        - name: guide-coverage
-          command: "python -m pytest tests/test_guide_generator_coverage.py -v"
-
-  - id: T22
-    title: "FL-9: provides/consumes signature declaration + ast verification"
-    depends_on:
-      - T5
-      - T17
-    addresses:
-      - FL-9
-    goal_behavior: |
-      1. In models.py Contract, add optional field: signatures: Optional[Dict[str, str]]
-         where key is function name and value is "(args) -> return_type".
-      2. In contract_signatures.py (already exists), add advisory validation:
-         when ralph validate runs, if consumer's upstream provides has signatures,
-         use ast.parse to check exported function signatures match. Mismatch emits
-         W_CONTRACT_SIGNATURE_MISMATCH warning.
-      3. No signatures field -> no check (backward compatible).
-    acceptance_criteria: |
-      1. provides with signatures field validates correctly
-      2. Matching upstream signatures -> no warning
-      3. Mismatched signatures -> W_CONTRACT_SIGNATURE_MISMATCH warning
-      4. No signatures field -> no check (backward compatible)
-    claimed_paths:
-      - src/cccc/ralph/models.py
-      - src/cccc/ralph/contract_signatures.py
-      - tests/test_contract_signatures.py
-    consumes:
-      - name: aegis_schema
-        from: T5
-        kind: runtime_capability
-    verification:
-      level: unit
-      checks:
-        - name: signatures
-          command: "python -m pytest tests/test_contract_signatures.py -v"
-
-  - id: T21
-    title: "FL-8: validate enforces compile check for e2e/integration tasks"
-    addresses:
-      - FL-8
-    goal_behavior: |
-      In validation rules (structural.py or a new check in coverage.py):
-
-      For tasks with verification.level in (api, e2e, integration), check whether
-      checks[] contains an import/compile step (pattern: "python -c" with import,
-      or a check named *compile*/*import*).
-
-      If missing, emit W_E2E_MISSING_COMPILE_CHECK.
-    acceptance_criteria: |
-      1. e2e task without compile check -> W_E2E_MISSING_COMPILE_CHECK
-      2. e2e task with compile check -> no warning
-      3. unit-level task without compile check -> no warning (not required)
-    claimed_paths:
-      - src/cccc/ralph/validation_rules/coverage.py
-      - src/cccc/ralph/validation_rules/structural.py
-      - tests/test_e2e_compile_check.py
-    verification:
-      level: unit
-      checks:
-        - name: compile-check
-          command: "python -m pytest tests/test_e2e_compile_check.py -v"
-
-  - id: T25
-    title: "UX-8 + RO-91: overlap detail + claimed_paths mismatch detection"
-    depends_on:
-      - T21
-    addresses:
-      - UX-8
-      - RO-91
-    goal_behavior: |
-      1. UX-8: In overlap validation rule output, include the specific conflicting
-         task pair and path. Format: "T1 claims 'app/' which contains T2's 'app/routes.py'"
-
-      2. RO-91: New validation rule W_CLAIMED_PATH_INCOMPLETE:
-         Parse goal_behavior for phrases like "Add routes to app.py", "modify X",
-         "write to Y". If the mentioned file is not in claimed_paths (only in
-         awareness_paths or absent), emit warning.
-    acceptance_criteria: |
-      1. Overlap error message includes both task IDs and specific path
-      2. goal_behavior mentioning "modify app.py" without app.py in claimed_paths -> warning
-      3. File mentioned in both goal_behavior and claimed_paths -> no warning
-    claimed_paths:
-      - src/cccc/ralph/validation_rules/structural.py
-      - tests/test_overlap_detail.py
-      - tests/test_claimed_path_incomplete.py
-    verification:
-      level: unit
-      checks:
-        - name: overlap-detail
-          command: "python -m pytest tests/test_overlap_detail.py -v"
-        - name: claimed-incomplete
-          command: "python -m pytest tests/test_claimed_path_incomplete.py -v"
-
-  - id: T23
-    title: "FL-10: workflow state auto-persists to plan.yaml"
-    depends_on:
-      - T1
-      - T14
-      - T15
-    addresses:
-      - FL-10
-    goal_behavior: |
-      After workflow state transition (task completed/failed/deferred),
-      auto-write task status back to plan.yaml so ralph suggest reads
-      current state without manual ralph sync-state.
-
-      Approach: ralph suggest reads task status from workflow ledger by default
-      instead of plan.yaml. This avoids file write conflicts and keeps ledger
-      as single source of truth.
-    acceptance_criteria: |
-      1. After workflow completes a task, ralph suggest shows correct next batch
-         without running ralph sync-state
-      2. plan.yaml and ledger stay consistent
-    claimed_paths:
-      - src/cccc/daemon/foreman/workflow_orchestrator.py
-      - tests/test_plan_state_writeback.py
-    awareness_paths:
-      - src/cccc/ralph/core.py
-    verification:
-      level: unit
-      checks:
-        - name: state-writeback
-          command: "python -m pytest tests/test_plan_state_writeback.py -v"
-
-  - id: T27
-    title: "PLR-1 + PLR-2: code fence aegis exception + covers.paths auto-fill"
-    depends_on:
-      - T6
-      - T7
-      - T21
-    addresses:
-      - PLR-1
-      - PLR-2
-    goal_behavior: |
-      1. PLR-1: In discipline.py E_AEGIS_PLACEHOLDER_CONTENT check, add exception:
-         text inside code fences (triple-backtick or backtick-wrapped) or inside
-         YAML string literals that quote technical terms should NOT trigger the rule.
-         E.g. goal_behavior mentioning a stub-content keyword as a quoted term is OK.
-
-      2. PLR-2: In validator.py or covers_paths_validator.py, when a task has
-         covers.tasks but empty covers.paths, auto-expand covers.paths from the
-         covered tasks' claimed_paths. Change W_COVERS_NOT_EXERCISED to a hint
-         when auto-expanded paths are available.
-    acceptance_criteria: |
-      1. Plan with stub-content keyword inside code fence does not trigger the content check
-      2. Plan with bare stub-content marker in title still triggers the error
-      3. Integration task with covers.tasks auto-gets covers.paths from those tasks
-      4. W_COVERS_NOT_EXERCISED becomes hint when auto-expansion works
-    claimed_paths:
-      - src/cccc/ralph/validation_rules/discipline.py
-      - src/cccc/ralph/validation_rules/coverage.py
-      - src/cccc/ralph/covers_paths_validator.py
-      - tests/test_covers_auto_expand.py
-    verification:
-      level: unit
-      checks:
-        - name: covers-expand
-          command: "python -m pytest tests/test_covers_auto_expand.py -v"
-
-  - id: T28
-    title: "DOC-1/2 + RL-22/25: capability guide gap list + suppress docs + semantic direction"
-    addresses:
-      - DOC-1
-      - DOC-2
-      - RL-22
-      - RL-25
-    goal_behavior: |
-      1. DOC-1: Add "verify gate non-blocking warning types" section to
-         docs/foreman-capability-guide.md listing: contract_violation,
-         security_lint, aegis_evidence_card with severity and conditions.
-
-      2. DOC-2: Update plans/_template.yaml suppress_codes section to document
-         that bare suppress is last resort, managed suppress (suppress_instances
-         with owner/expiry) is preferred. Add examples.
-
-      3. RL-22 + RL-25: Document in docs/foreman-capability-guide.md that
-         goal_behavior semantic consistency and data structure compatibility
-         are checked by the Codex review step, not by ralph validate.
-         Ralph validate cannot detect these; the flow Codex review step
-         (step-3) can systematically catch them.
-    acceptance_criteria: |
-      1. foreman-capability-guide.md has verify gate warning types section
-      2. _template.yaml has enhanced suppress documentation
-      3. Guide documents Codex review coverage for semantic checks
-    claimed_paths:
-      - docs/foreman-capability-guide.md
-      - plans/_template.yaml
-    verification:
-      level: compile
-      checks:
-        - name: guide-warning-types
-          command: "grep -q 'contract_violation' docs/foreman-capability-guide.md && grep -q 'security_lint' docs/foreman-capability-guide.md && grep -q 'aegis_evidence_card' docs/foreman-capability-guide.md"
-        - name: template-suppress-docs
-          command: "grep -q 'suppress_instances' plans/_template.yaml && grep -q 'owner' plans/_template.yaml"
-        - name: guide-codex-coverage
-          command: "grep -q 'Codex' docs/foreman-capability-guide.md"
-
-# ============================================================================
-# Tasks with deeper dependencies
-# ============================================================================
-
-  - id: T7
-    title: "AD-3: first 5 high-signal discipline rules"
-    depends_on:
-      - T6
-    addresses:
-      - AD-3
-    goal_behavior: |
-      Add 5 rules to src/cccc/ralph/validation_rules/discipline.py:
-
-      1. Stub-content error: title/goal/acceptance contains deferred-work markers
-         (the 5 tokens defined in PLACEHOLDER_TOKENS, outside code fences per PLR-1).
-         Code: E_AEGIS_*_CONTENT
-      2. Retirement track error: intent=refactor/migration with new fallback/adapter/
-         provider but no aegis.retirement_track. Code: E_AEGIS_RETIREMENT_TRACK_MISSING
-      3. Repair track warning: intent=fix but no aegis.repair_track.
-         Code: W_AEGIS_FIX_NO_REPAIR_TRACK
-      4. TDD warning: intent=fix/feature, claimed_paths has no test file
-         (test_/tests/_test). Code: W_AEGIS_TDD_NO_TEST_PATH
-      5. Baseline warning: complex task (3+ deps or has contracts/critical_flows)
-         but empty aegis.baseline_refs. Code: W_AEGIS_COMPLEX_MISSING_BASELINE
-    acceptance_criteria: |
-      1. Plan with deferred-work marker in title triggers stub-content error
-      2. Refactor task without retirement_track triggers retirement error
-      3. Fix task without repair_track triggers repair warning
-      4. Feature task without test file triggers TDD warning
-      5. Full pytest suite: zero regression
-    claimed_paths:
-      - src/cccc/ralph/validation_rules/discipline.py
-      - tests/test_aegis_discipline_rules.py
-    verification:
-      level: unit
-      checks:
-        - name: discipline-rules
-          command: "python -m pytest tests/test_aegis_discipline_rules.py -v"
-
-  - id: T8
-    title: "AD-4: verification_gate aegis evidence quality check"
-    depends_on:
-      - T5
-      - T2
-      - T3
-      - T4
-    addresses:
-      - AD-4
-    goal_behavior: |
-      In verification_gate.py, add _check_aegis_evidence(payload, task_ref)
-      called in process_completed_event after verify_completion, before
-      record_verification_result:
-
-      1. Evidence empty or only "done"/"completed" -> fail (challenge mode) / warn (ralph/agent)
-      2. intent=fix and evidence lacks root cause keywords -> warn
-      3. intent=refactor and evidence lacks retirement keywords -> warn
-      4. No aegis field on task -> skip check entirely (backward compatible)
-      5. Results expressed as VerificationCheck items, not top-level field changes
-    acceptance_criteria: |
-      1. Empty evidence in challenge mode -> verification failed
-      2. Substantive evidence -> passes
-      3. No aegis field -> no check, no change
-      4. Existing workflow without aegis unaffected
-    claimed_paths:
-      - src/cccc/daemon/foreman/verification_gate.py
-      - tests/test_aegis_evidence_gate.py
-    consumes:
-      - name: aegis_schema
-        from: T5
-        kind: runtime_capability
-    verification:
-      level: unit
-      checks:
-        - name: evidence-gate
-          command: "python -m pytest tests/test_aegis_evidence_gate.py -v"
-
-  - id: T9
-    title: "AD-9: aegis intent -> verification enforcement chain"
-    depends_on:
-      - T6
-    addresses:
-      - AD-9
-    goal_behavior: |
-      In discipline.py or discipline_security.py, add rule:
-
-      _check_aegis_security_chain: when aegis.intent=feature AND plan has
-      security-related critical_flow AND verification.checks contains no
-      security test -> emit E_AEGIS_SECURITY_CHAIN_MISSING (error).
-
-      This ensures plans that declare security concern also have security tests.
-      Partially redundant with AD-11 (which auto-generates checks), but serves
-      as fail-safe if AD-11 is not used.
-    acceptance_criteria: |
-      1. intent=feature + security critical_flow + no security checks -> error
-      2. intent=feature + security critical_flow + has security checks -> no error
-      3. No security critical_flow -> no check triggered
+      1. plan 有 ssrf flow + task 只有 import check → W_SSRF_ROUTE_BINDING_MISSING
+      2. plan 有 ssrf flow + task 有 endpoint/route 级 check → 无 warning
+      3. plan 无 ssrf flow → 无 warning
+      4. plan 有 ssrf flow + task 无 check → 已有 E_AEGIS_SECURITY_CHAIN_MISSING 兜底
     claimed_paths:
       - src/cccc/ralph/validation_rules/discipline_security.py
+      - src/cccc/ralph/validation_rules/discipline.py
       - tests/test_aegis_security_chain.py
     verification:
       level: unit
       checks:
-        - name: security-chain
-          command: "python -m pytest tests/test_aegis_security_chain.py -v"
+        - name: ssrf-route-binding
+          command: "python -m pytest tests/test_aegis_security_chain.py -v -k 'ssrf_route_binding or route_binding'"
 
-  - id: T12
-    title: "AD-11: LLM behavioral security checks from plan metadata"
-    depends_on:
-      - T5
-      - T16
+  - id: T2
+    title: "RO-109: security recipe 强制要求 SSRF 编码矩阵测试覆盖"
     addresses:
-      - AD-11
+      - RO-109
     goal_behavior: |
-      1. New CLI subcommand: ralph validate --generate-security-checks plan.yaml
-      2. Enhance security_check_generator.py (already exists as deterministic template):
-         - Read plan metadata: goal_behavior, acceptance_criteria, provides.schema_hint,
-           critical_flows with security keywords
-         - Generate deterministic behavioral check commands based on security recipes
-           and critical_flow categories (no runtime LLM call required for core recipes)
-         - Output: JSON list of {name, command, auto_generated: true} check specs
-      3. No security critical_flow -> no generation -> zero noise
-      4. Generated checks can be reviewed/modified by foreman before adding to plan
+      security_recipes.py 的 url_input recipe 增强：
+      1. `_build_issue` 当前把 severity 写死为 "hint"。修改为动态决定：
+         新增 `_resolve_severity(task, flow, recipe_name)` 函数
+      2. 对 url_input recipe：检查 task 所有 verification check 的 name+command 文本，
+         是否包含 HOSTNAME_ENCODING_MATRIX 中任意条目
+      3. 若完全不含任何编码矩阵条目 → severity="warning"，否则 severity="hint"
+      4. 新增 `_missing_encodings(task)` helper：返回未在 check 文本中出现的 HOSTNAME_ENCODING_MATRIX 条目列表
+      5. 在 evidence 中添加 "missing_encodings" 字段
+      6. 其他 recipe 保持 severity="hint" 不变
     acceptance_criteria: |
-      1. Plan with input-validation critical_flow generates >= 3 behavioral checks
-      2. Generated checks are executable python -c commands
-      3. Plan without security critical_flow generates zero checks
-      4. Output is valid JSON matching CheckSpec schema
-    claimed_paths:
-      - src/cccc/ralph/security_check_generator.py
-      - src/cccc/ralph/cli.py
-      - tests/test_security_check_generator.py
-    consumes:
-      - name: aegis_schema
-        from: T5
-        kind: runtime_capability
-    verification:
-      level: unit
-      checks:
-        - name: security-gen
-          command: "python -m pytest tests/test_security_check_generator.py -v"
-
-  - id: T13
-    title: "RO-92/93/94: security recipe library (TOCTOU + hostname encoding + timing-safe)"
-    depends_on:
-      - T11
-    addresses:
-      - RO-92
-      - RO-93
-      - RO-94
-    goal_behavior: |
-      In security_recipes.py (already exists), implement recipe system:
-
-      1. RO-92 TOCTOU: critical_flow with temporal_pattern: store_then_use |
-         check_then_act triggers two-phase test template. No temporal_pattern -> silent.
-      2. RO-93 hostname encoding: critical_flow with ssrf/url keywords AND no
-         encoding matrix in checks -> emit W_SSRF_ENCODING_UNCOVERED (hint).
-         Matrix: [0177.0.0.1, 2130706433, 0x7f000001, [::ffff:127.0.0.1], [::1]]
-      3. RO-94 timing-safe: critical_flow with auth/token/key keywords AND
-         claimed_paths source has token comparison without secrets.compare_digest
-         -> emit W_AUTH_TIMING_UNSAFE (hint).
-
-      All recipes: no matching critical_flow -> zero output -> zero noise.
-      New recipes start at hint level (upgrade to warning is a future manual decision).
-    acceptance_criteria: |
-      1. Plan with temporal_pattern: store_then_use -> recipe triggers
-      2. Plan with ssrf critical_flow + no encoding tests -> W_SSRF_ENCODING_UNCOVERED
-      3. Plan with auth critical_flow + == comparison -> W_AUTH_TIMING_UNSAFE
-      4. Plan without security flows -> zero recipe output
+      1. task check 含至少一个编码矩阵条目 → severity=hint（现有行为）
+      2. task check 不含任何编码矩阵条目 → severity=warning + missing_encodings
+      3. 无 ssrf flow → 不触发
     claimed_paths:
       - src/cccc/ralph/security_recipes.py
       - tests/test_security_recipes.py
     verification:
       level: unit
       checks:
-        - name: recipes
-          command: "python -m pytest tests/test_security_recipes.py -v"
+        - name: ssrf-encoding-severity
+          command: "python -m pytest tests/test_security_recipes.py -v -k 'encoding_matrix or encoding_severity'"
 
-  - id: T15
-    title: "FL-12 + UX-11: deferred state recovery + re-verify with refreshed spec"
-    depends_on:
-      - T1
-      - T14
+  - id: T3
+    title: "RO-110: Aegis 规则对 FTS5+中文场景强制子串匹配用例"
+    depends_on: [T1]
     addresses:
-      - FL-12
-      - UX-11
+      - RO-110
     goal_behavior: |
-      1. FL-12: Add transitions from deferred state in workflow state engine:
-         - retry_worker: re-dispatch to worker
-         - retry_verifier: re-run verification only
-         - foreman_accept: accept as-is (via override from T14)
-         - cancel: abandon task
-         Max deferred duration before auto-escalate to human decision.
-
-      2. UX-11: cccc workflow verify --task TASK_ID --refresh-spec
-         Re-reads plan.yaml to get latest verification commands instead of
-         using cached task spec. Enables re-verify after plan fix.
+      discipline_security.py 增加新规则 `_check_fts_cjk_coverage`：
+      1. 遍历 plan 的 critical_flows，找到含 "fts" 或 "search" 或 "fulltext" 关键词的 flow
+      2. 检查 flow description 或 plan 上下文是否涉及 CJK 语言（中文/日文/韩文关键词：
+         chinese, cjk, 中文, unicode, i18n, cjk, zh, ja, ko, multilingual）
+      3. 若匹配，检查对应 task 的 verification checks 是否包含子串匹配测试关键词：
+         substring, partial, 子串, 分词, tokenize, segment, bigram, ngram
+      4. 若不包含，emit warning W_FTS_CJK_SUBSTRING_MISSING：
+         "FTS/search with CJK context lacks substring/segmentation test coverage"
+      5. 将新规则注册到 _DISCIPLINE_RULES
     acceptance_criteria: |
-      1. Deferred task can be retried by foreman
-      2. Deferred task can be accepted via override
-      3. --refresh-spec uses latest plan.yaml commands
-      4. Downstream tasks unblock after deferred recovery
+      1. plan 有 search flow + CJK 上下文 + 无子串测试 → warning
+      2. plan 有 search flow + CJK 上下文 + 有子串测试 → 无 warning
+      3. plan 有 search flow + 无 CJK 上下文 → 无 warning
+      4. plan 无 search flow → 无 warning
     claimed_paths:
-      - src/cccc/daemon/foreman/workflow_orchestrator.py
-      - src/cccc/daemon/foreman/assignment_deferrals.py
-      - tests/test_deferred_recovery.py
-      - tests/test_verify_refresh_spec.py
-    consumes:
-      - name: agent_release_on_failure
-        from: T1
-        kind: runtime_capability
+      - src/cccc/ralph/validation_rules/discipline_security.py
+      - tests/test_aegis_security_chain.py
     verification:
       level: unit
       checks:
-        - name: deferred
-          command: "python -m pytest tests/test_deferred_recovery.py -v"
-        - name: refresh-spec
-          command: "python -m pytest tests/test_verify_refresh_spec.py -v"
+        - name: fts-cjk-coverage
+          command: "python -m pytest tests/test_aegis_security_chain.py -v -k 'fts_cjk or cjk_coverage'"
 
-# ============================================================================
-# Late-stage tasks
-# ============================================================================
-
-  - id: T10
-    title: "AD-7 + AD-8: suggest Aegis filter + second-wave rules"
-    depends_on:
-      - T7
-      - T24
-      - T11
+  - id: T4
+    title: "RO-111: Aegis 规则检测 catch-all 异常静默降级模式"
+    depends_on: [T1, T3]
     addresses:
-      - AD-7
-      - AD-8
+      - RO-111
     goal_behavior: |
-      1. AD-7: In ralph_service.py suggest_ready_batch(), add task-local Aegis
-         E_ quick-check. Tasks with E_AEGIS_PLACEHOLDER_CONTENT etc. are excluded
-         from ready batch. W_ rules only append rationale, don't block.
-         Blocked tasks logged with reason.
-
-      2. AD-8: Add second-wave rules to discipline_second_wave.py:
-         - W_AEGIS_PATCH_SHAPE_TRIAGE_MISSING
-         - W_AEGIS_RIPPLE_TRIAGE_MISSING
-         - W_AEGIS_PLAN_NO_COMPAT_BOUNDARY
-         - E_AEGIS_RIPPLE_VERIFICATION_TOO_NARROW
-         Each rule has dedicated test + false positive rate < 10%.
+      discipline_security.py 增加新规则 `_check_silent_degradation_pattern`：
+      1. 遍历 plan 的 critical_flows，找到含 "search" 或 "query" 或 "database" 关键词的 flow
+      2. 检查对应 task 的 verification checks 是否包含异常处理验证关键词：
+         error-propagation, exception, error-handling, fault, degradation, fallback-test
+      3. 若 flow 涉及 search/query 且 task 无异常处理验证 → emit warning
+         W_SILENT_DEGRADATION_UNCHECKED：
+         "search/query critical flow lacks error-propagation test — catch-all exceptions may mask failures"
+      4. 将新规则注册到 _DISCIPLINE_RULES
     acceptance_criteria: |
-      1. Task with E_AEGIS_PLACEHOLDER_CONTENT excluded from suggest result
-      2. Blocked reason visible in rationale or log
-      3. Second-wave rules each have test coverage
-      4. No regression on existing plans
+      1. plan 有 search flow + 无 error-propagation check → warning
+      2. plan 有 search flow + 有 error-propagation check → 无 warning
+      3. plan 无 search flow → 无 warning
     claimed_paths:
-      - src/cccc/daemon/foreman/ralph_service.py
-      - src/cccc/ralph/validation_rules/discipline_second_wave.py
-      - tests/test_suggest_aegis_filter.py
-      - tests/test_aegis_second_wave.py
+      - src/cccc/ralph/validation_rules/discipline_security.py
+      - tests/test_aegis_security_chain.py
     verification:
       level: unit
       checks:
-        - name: suggest-filter
-          command: "python -m pytest tests/test_suggest_aegis_filter.py -v"
-        - name: second-wave
-          command: "python -m pytest tests/test_aegis_second_wave.py -v"
+        - name: silent-degradation
+          command: "python -m pytest tests/test_aegis_security_chain.py -v -k 'silent_degradation'"
 
-# ============================================================================
-# Integration
-# ============================================================================
+  - id: T5
+    title: "FL-27: verification gate 拒绝 import-only check 作为有效验证"
+    depends_on: [T1]
+    addresses:
+      - FL-27
+    goal_behavior: |
+      verification_gate.py 增加 shallow check rejection gate（遵循现有 _apply_*_gate 模式）：
+      1. 新增 `_apply_shallow_check_gate(verification, task_ref)` 函数，
+         位于 `_apply_input_robustness_gate` 之后调用
+      2. 复用 structural.py 中已有的 `_is_compile_or_import_check` 判定逻辑：
+         从 structural 导入或内联等价判定，避免重复造分类器
+      3. 新增常量 SHALLOW_CHECK_NAME = "shallow_check_depth"
+      4. 新增常量 SHALLOW_CHECK_FAILURE =
+         "W_VERIFICATION_SHALLOW_CHECKS: all verification checks are import/compile-only — no behavioral verification"
+      5. 检查逻辑：从 task_ref 获取 verification.checks，若所有 check 均为 compile/import 级别，
+         追加 failed VerificationCheck 到 verification.checks，并将 overall_outcome 降级为 "failed"
+      6. 遵循 security_lint gate 的模式：产出正式 failed check + summary，不是只加 warning 文案
+      7. 跳过 agent_pending / infra_error / force_passed 分支（已在 process_completed_event 中短路）
+      8. 这解决 FL-27 根因：叶子 check 仅 import/compile → runtime gate 拒绝 → foreman 必须产出更深的 check
+    acceptance_criteria: |
+      1. 所有 check 都是 import/compile → overall_outcome=failed + SHALLOW_CHECK_WARNING
+      2. 至少一个 check 含 behavioral 关键词 → 正常 passed
+      3. force_complete 的 task（无 check）→ 现有 force_passed 行为不变
+      4. 无 verification checks → 现有 skipped 行为不变
+    claimed_paths:
+      - src/cccc/daemon/foreman/verification_gate.py
+      - tests/test_verification_gate.py
+    verification:
+      level: unit
+      checks:
+        - name: shallow-check-rejection
+          command: "python -m pytest tests/test_verification_gate.py -v -k 'shallow_check or import_only_check'"
+
+  - id: T6
+    title: "FL-28: daemon actor spawn 确保 pty runner 自动拉起"
+    addresses:
+      - FL-28
+    goal_behavior: |
+      assignment_startup.py `_start_actor_for_assignment` 增强，消费 actor_add 返回的详细状态：
+      1. `add_actor_via_daemon` 调用后，从 response 中提取 `running` 和 `start_error` 字段
+         （actor_add_ops.py 返回这两个字段）
+      2. 若 resp.ok 但 running=False 或 start_error 非空：
+         - log warning "W_ACTOR_START_ERROR: actor {agent_id} added but not running: {start_error}"
+         - 尝试 actor_restart（通过 daemon request op="actor_restart"），而非 _legacy_start_actor
+      3. 若 restart 也失败，再 fallback 到 _legacy_start_actor
+      4. 新增 `_restart_stalled_actor` 方法：
+         - 发送 DaemonRequest(op="actor_restart", args={group_id, actor_id, by="orchestrator"})
+         - 成功返回 True，失败 log + 返回 False
+      5. `_start_actor_for_assignment` 的完整流程：
+         add_actor_via_daemon → 检查 running/start_error → restart_stalled_actor → legacy_start_actor
+    acceptance_criteria: |
+      1. actor_add 成功 + runtime_state=running → 正常继续
+      2. actor_add 成功 + runtime_state=stopped → log warning + fallback restart
+      3. actor_add 失败 → 现有 fallback 到 _legacy_start_actor 行为不变
+    claimed_paths:
+      - src/cccc/daemon/foreman/assignment_startup.py
+      - tests/test_assignment_startup.py
+    verification:
+      level: unit
+      checks:
+        - name: actor-runtime-verify
+          command: "python -m pytest tests/test_assignment_startup.py -v -k 'runtime_stall or verify_actor_running'"
 
   - id: T-int
-    title: "Integration: full regression + cross-task verification"
-    depends_on:
-      - T1
-      - T2
-      - T3
-      - T4
-      - T5
-      - T6
-      - T7
-      - T8
-      - T9
-      - T10
-      - T11
-      - T12
-      - T13
-      - T14
-      - T15
-      - T16
-      - T17
-      - T18
-      - T19
-      - T20
-      - T21
-      - T22
-      - T23
-      - T24
-      - T25
-      - T26
-      - T27
-      - T28
+    title: "全量回归测试"
+    depends_on: [T1, T2, T3, T4, T5, T6]
     role: integration
     addresses:
-      - RO-84
-      - RO-91
-      - RO-92
-      - RO-93
-      - RO-94
-      - RO-95
-      - RO-97
-      - RO-98
-      - RO-99
-      - RO-101
-      - FL-4
-      - FL-5
-      - FL-6
-      - FL-7
-      - FL-8
-      - FL-9
-      - FL-10
-      - FL-11
-      - FL-12
-      - FL-13
-      - FL-15
-      - UX-5
-      - UX-8
-      - UX-11
-      - UX-12
-      - AD-1
-      - AD-2
-      - AD-3
-      - AD-4
-      - AD-7
-      - AD-8
-      - AD-9
-      - AD-11
-      - SL-1
-      - SL-2
-      - SL-3
-      - RL-22
-      - RL-25
-      - PLR-1
-      - PLR-2
-      - DOC-1
-      - DOC-2
+      - RO-108
+      - RO-109
+      - RO-110
+      - RO-111
+      - FL-27
+      - FL-28
     goal_behavior: |
-      Run full pytest suite to confirm zero regression across all 28 tasks.
-      Verify cross-task interactions:
-      - Aegis schema flows through validate -> suggest -> dispatch -> verify
-      - Verification mode respected end-to-end
-      - Workflow recovery works after verification failure
+      运行全量 pytest 确认零回归。
     acceptance_criteria: |
-      1. Full pytest: 0 failures
-      2. No new warnings in existing plan validation
+      1. 全量 pytest 0 failures
     claimed_paths:
       - tests/
     verification:
@@ -1213,35 +260,7 @@ tasks:
           command: "python -m pytest -q"
           timeout: 600
       covers:
-        tasks:
-          - T1
-          - T2
-          - T3
-          - T4
-          - T5
-          - T6
-          - T7
-          - T8
-          - T9
-          - T10
-          - T11
-          - T12
-          - T13
-          - T14
-          - T15
-          - T16
-          - T17
-          - T18
-          - T19
-          - T20
-          - T21
-          - T22
-          - T23
-          - T24
-          - T25
-          - T26
-          - T27
-          - T28
+        tasks: [T1, T2, T3, T4, T5, T6]
 
 batch_e2e_command: "python -m pytest -q"
 batch_e2e_timeout: 600

@@ -53,6 +53,25 @@ INPUT_ROBUSTNESS_FAILURE = (
 INPUT_ROBUSTNESS_WARNING = (
     "input_robustness warning: input/search/query critical_flow lacks malformed input coverage"
 )
+SHALLOW_CHECK_DEPTH_NAME = "shallow_check_depth"
+SHALLOW_CHECK_FAILURE = (
+    "shallow_check_depth failed: all verification checks are import/compile-only — no behavioral verification"
+)
+SHALLOW_CHECK_WARNING = (
+    "shallow_check_depth warning: all verification checks are import/compile-only — no behavioral verification"
+)
+_SHALLOW_PATTERNS = ("import", "compile", "syntax", "lint")
+_BEHAVIORAL_PATTERNS = (
+    "test",
+    "assert",
+    "behavior",
+    "endpoint",
+    "response",
+    "result",
+    "output",
+    "pytest",
+    "unittest",
+)
 SECURITY_LINT_HIT_LIMIT = 20
 ENTRYPOINT_DEBUG_HIT_LIMIT = 10
 _TRIVIAL_EVIDENCE = frozenset({"done", "completed", "完成", "已完成"})
@@ -265,6 +284,10 @@ def process_completed_event(
             engine=engine,
             task_id=task_id,
             workspace_root=workspace_root,
+            task_ref=gate_task_ref,
+        )
+        verification = _apply_shallow_check_gate(
+            verification=verification,
             task_ref=gate_task_ref,
         )
     engine.record_verification_result(task_id, verification, hook_ctx=hook_ctx)
@@ -785,6 +808,66 @@ def _input_robustness_gap_blocks(plan_data: Optional[Dict[str, Any]]) -> bool:
         if _has_any_keyword(flow_text, _INPUT_ROBUSTNESS_BLOCKING_KEYWORDS):
             return True
     return False
+
+
+def _is_shallow_check(check_name: str, check_command: str) -> bool:
+    text = f"{check_name} {check_command}".casefold()
+    return _has_any_keyword(text, _SHALLOW_PATTERNS) and not _has_any_keyword(
+        text,
+        _BEHAVIORAL_PATTERNS,
+    )
+
+
+def _verification_check_spec_value(check: Any, field: str) -> str:
+    if isinstance(check, dict):
+        return str(check.get(field) or "")
+    return str(getattr(check, field, "") or "")
+
+
+def _all_checks_shallow(task_ref: Any) -> bool:
+    verification = (
+        task_ref.get("verification")
+        if isinstance(task_ref, dict)
+        else getattr(task_ref, "verification", None)
+    )
+    checks = (
+        verification.get("checks")
+        if isinstance(verification, dict)
+        else getattr(verification, "checks", None)
+    )
+    if not checks:
+        return False
+    return all(
+        _is_shallow_check(
+            _verification_check_spec_value(check, "name"),
+            _verification_check_spec_value(check, "command"),
+        )
+        for check in checks
+    )
+
+
+def _apply_shallow_check_gate(
+    verification: VerificationResult,
+    task_ref: Any,
+) -> VerificationResult:
+    if verification.overall_outcome in {"failed", "force_passed", "agent_pending", "infra_error"}:
+        return verification
+    if not _all_checks_shallow(task_ref):
+        return verification
+    summary = str(verification.summary or "").strip()
+    gate_summary = SHALLOW_CHECK_FAILURE if not summary else f"{summary}; {SHALLOW_CHECK_FAILURE}"
+    shallow_failure = VerificationCheck(
+        name=SHALLOW_CHECK_DEPTH_NAME,
+        outcome="failed",
+        message=SHALLOW_CHECK_FAILURE,
+    )
+    return verification.model_copy(
+        update={
+            "overall_outcome": "failed",
+            "checks": [*verification.checks, shallow_failure],
+            "summary": gate_summary,
+        }
+    )
 
 
 def _fail_verification_for_input_robustness(

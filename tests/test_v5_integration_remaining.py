@@ -18,6 +18,7 @@ from cccc.contracts.v1.ralph_ipc import ReadyBatchSuggestion, TaskRef, Verificat
 from cccc.daemon.foreman.prompt_builder import build_task_prompt
 from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
 from cccc.kernel.workflow_state import WorkflowTaskStatus
+from cccc.ralph.flow_steps_e2e import E2E_STEPS
 from cccc.ralph.plan_io import compute_structural_plan_digest, save_plan_state
 
 
@@ -243,6 +244,13 @@ class TestDocsCleanup:
         assert not found, f"MCP tool references still in docs: {found}"
 
 
+def test_failure_recovery_instruction_in_e2e_flow() -> None:
+    instruction = E2E_STEPS[2].instruction_text.lower()
+
+    assert "failure" in instruction
+    assert "override" in instruction or "recovery" in instruction
+
+
 # ---------------------------------------------------------------------------
 # 5. RO-62: force-complete emits verification_skipped, not verification_passed
 # ---------------------------------------------------------------------------
@@ -397,7 +405,7 @@ class TestAssignedStallDetection:
         orchestrator.engine.approve_batch(
             "b-st",
             [{"task_id": "T-st", "agent_id": "gemini-1", "claimed_paths": [],
-              "assigned_at": time.time() - 200}],
+              "assigned_at": time.time() - 700}],
         )
 
         state = orchestrator.engine.get_task("T-st")
@@ -418,3 +426,351 @@ class TestAssignedStallDetection:
 
         stalled = orchestrator.check_stalled_tasks(threshold_seconds=300)
         assert "T-fs" not in stalled
+
+    def test_cold_start_500s_not_stalled(self, orchestrator: WorkflowOrchestrator, monkeypatch):
+        """UX-14: ASSIGNED task at 500s should NOT be flagged (600s threshold)."""
+        import time
+
+        monkeypatch.setattr(orchestrator.reporter, "on_task_completed", lambda *a, **kw: True)
+        monkeypatch.setattr(orchestrator.reporter, "on_task_failed", lambda *a, **kw: True)
+
+        task = TaskRef(id="T-cs", title="cold start", type="backend")
+        orchestrator.engine.register_task(task, "wf-cs")
+        orchestrator.engine.register_batch("b-cs", ["T-cs"])
+        orchestrator.engine.approve_batch(
+            "b-cs",
+            [{"task_id": "T-cs", "agent_id": "gemini-2", "claimed_paths": [],
+              "assigned_at": time.time() - 500}],
+        )
+
+        stalled = orchestrator.check_stalled_tasks(threshold_seconds=300)
+        assert "T-cs" not in stalled
+
+
+def _create_actor_group_for_exit_tests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    desired_state: str = "running",
+    runtime_state: str = "running",
+    crash_count: int = 0,
+) -> str:
+    monkeypatch.setenv("CCCC_HOME", str(tmp_path / "home"))
+
+    from cccc.kernel.actors import add_actor, update_actor
+    from cccc.kernel.group import create_group
+    from cccc.kernel.registry import load_registry
+
+    group = create_group(load_registry(), title="pty-exit-tests", topic="")
+    add_actor(group, actor_id="peer1", title="Peer 1", runner="pty", runtime="codex")
+    update_actor(
+        group,
+        "peer1",
+        {
+            "desired_state": desired_state,
+            "runtime_state": runtime_state,
+            "crash_count": int(crash_count),
+        },
+    )
+    return group.group_id
+
+
+def _load_actor_for_exit_tests(group_id: str) -> Dict[str, Any]:
+    from cccc.kernel.actors import find_actor
+    from cccc.kernel.group import load_group
+
+    group = load_group(group_id)
+    assert group is not None
+    actor = find_actor(group, "peer1")
+    assert isinstance(actor, dict)
+    return actor
+
+
+# ---------------------------------------------------------------------------
+# 8. UX-16 + UX-17: PTY crash exit logging, restart, and last_output
+# ---------------------------------------------------------------------------
+
+
+class TestPtyCrashExitRecovery:
+    def test_normal_exit_marks_stopped_without_restart(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from cccc.daemon.actors.actor_lifecycle_ops import _mark_actor_stopped_on_exit
+
+        group_id = _create_actor_group_for_exit_tests(
+            tmp_path,
+            monkeypatch,
+            desired_state="stopped",
+            runtime_state="running",
+            crash_count=2,
+        )
+        scheduled: List[tuple[str, str, int, int]] = []
+
+        _mark_actor_stopped_on_exit(
+            group_id,
+            "peer1",
+            schedule_restart=lambda gid, aid, count, delay: scheduled.append((gid, aid, count, delay)),
+        )
+
+        actor = _load_actor_for_exit_tests(group_id)
+        assert actor["desired_state"] == "stopped"
+        assert actor["runtime_state"] == "stopped"
+        assert actor["crash_count"] == 2
+        assert scheduled == []
+
+    def test_crash_exit_marks_crashed_and_schedules_restart(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from cccc.daemon.actors.actor_lifecycle_ops import _mark_actor_stopped_on_exit
+
+        group_id = _create_actor_group_for_exit_tests(tmp_path, monkeypatch, crash_count=0)
+        scheduled: List[tuple[str, str, int, int]] = []
+        published: List[tuple[str, Dict[str, Any]]] = []
+
+        _mark_actor_stopped_on_exit(
+            group_id,
+            "peer1",
+            schedule_restart=lambda gid, aid, count, delay: scheduled.append((gid, aid, count, delay)),
+            publish_global_event=lambda kind, data: published.append((kind, dict(data))),
+        )
+
+        actor = _load_actor_for_exit_tests(group_id)
+        assert actor["desired_state"] == "running"
+        assert actor["runtime_state"] == "crashed"
+        assert actor["crash_count"] == 1
+        assert scheduled == [(group_id, "peer1", 1, 1)]
+        assert published == []
+
+    def test_crash_limit_stops_actor_and_emits_event(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
+        import logging
+
+        from cccc.daemon.actors.actor_lifecycle_ops import _mark_actor_stopped_on_exit
+
+        group_id = _create_actor_group_for_exit_tests(tmp_path, monkeypatch, crash_count=2)
+        scheduled: List[tuple[str, str, int, int]] = []
+        published: List[tuple[str, Dict[str, Any]]] = []
+
+        with caplog.at_level(logging.ERROR, logger="cccc.daemon.actors"):
+            _mark_actor_stopped_on_exit(
+                group_id,
+                "peer1",
+                schedule_restart=lambda gid, aid, count, delay: scheduled.append((gid, aid, count, delay)),
+                publish_global_event=lambda kind, data: published.append((kind, dict(data))),
+            )
+
+        actor = _load_actor_for_exit_tests(group_id)
+        assert actor["desired_state"] == "stopped"
+        assert actor["runtime_state"] == "crashed"
+        assert actor["crash_count"] == 3
+        assert scheduled == []
+        assert published == [("actor.crash_limit", {"group_id": group_id, "actor_id": "peer1", "crash_count": 3})]
+        assert "Actor crash limit reached" in caplog.text
+
+    def test_server_restart_scheduler_dispatches_actor_restart(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from cccc.contracts.v1 import DaemonResponse
+        from cccc.daemon import server as daemon_server
+
+        group_id = _create_actor_group_for_exit_tests(tmp_path, monkeypatch, crash_count=1)
+        requests: List[Dict[str, Any]] = []
+
+        def _fake_handle_request(req: Any):
+            requests.append(req.model_dump())
+            return DaemonResponse(ok=True, result={}), False
+
+        thread = daemon_server._schedule_actor_restart_after_crash(
+            group_id,
+            "peer1",
+            1,
+            0,
+            sleep_fn=lambda _delay: None,
+            request_fn=_fake_handle_request,
+        )
+        thread.join(timeout=1.0)
+
+        assert requests == [
+            {
+                "v": 1,
+                "op": "actor_restart",
+                "args": {"group_id": group_id, "actor_id": "peer1", "by": "user"},
+            }
+        ]
+
+    def test_server_exit_handler_logs_warning_on_actor_exit_failure(self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch):
+        import logging
+        from types import SimpleNamespace
+
+        from cccc.daemon import server as daemon_server
+
+        session = SimpleNamespace(group_id="g-exit", actor_id="peer1", pid=321)
+        monkeypatch.setattr(daemon_server, "_remove_pty_state_if_pid", lambda *args, **kwargs: None)
+
+        def _boom(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("exit hook failed")
+
+        monkeypatch.setattr(daemon_server, "_on_actor_pty_session_exit", _boom)
+
+        with caplog.at_level(logging.WARNING, logger="cccc.daemon.server"):
+            daemon_server._handle_pty_session_exit(session)
+
+        assert "Failed to process PTY session exit" in caplog.text
+        assert "g-exit" in caplog.text
+        assert "peer1" in caplog.text
+
+    def test_scrollback_last_output_persists_tail(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from cccc.runners import pty as pty_runner
+
+        monkeypatch.setenv("CCCC_HOME", str(tmp_path / "home"))
+        payload = (b"A" * 5_000) + b"TAIL"
+
+        pty_runner._write_last_output_snapshot("g-scroll", "peer1", payload)
+
+        saved = pty_runner.last_output_path("g-scroll", "peer1").read_bytes()
+        assert saved == payload[-pty_runner.LAST_OUTPUT_MAX_BYTES :]
+
+    def test_scrollback_last_output_write_failure_is_logged(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
+        import logging
+        from pathlib import Path as StdPath
+
+        from cccc.runners import pty as pty_runner
+
+        monkeypatch.setenv("CCCC_HOME", str(tmp_path / "home"))
+
+        def _fail_write(self: StdPath, _data: bytes) -> int:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(StdPath, "write_bytes", _fail_write)
+
+        with caplog.at_level(logging.WARNING, logger="cccc.runners.pty"):
+            pty_runner._write_last_output_snapshot("g-scroll", "peer1", b"hello")
+
+        assert "Failed to persist PTY last output" in caplog.text
+
+    def test_pty_supervisor_logs_exit_warning(self, caplog: pytest.LogCaptureFixture):
+        import logging
+
+        from cccc.runners.pty import PtySupervisor
+
+        class _FakeSession:
+            group_id = "g-log"
+            actor_id = "peer1"
+
+            def exit_code(self) -> int:
+                return 17
+
+            def runtime_seconds(self) -> float:
+                return 2.5
+
+        session = _FakeSession()
+        supervisor = PtySupervisor()
+        supervisor._sessions[("g-log", "peer1")] = session  # type: ignore[assignment]
+
+        with caplog.at_level(logging.WARNING, logger="cccc.runners.pty"):
+            supervisor._on_session_exit(session)  # type: ignore[arg-type]
+
+        assert "PTY session exited" in caplog.text
+        assert "g-log" in caplog.text
+        assert "peer1" in caplog.text
+        assert "17" in caplog.text
+
+
+def _collect_pytest_count_for_path(project_root: Path) -> str:
+    import subprocess
+
+    result = subprocess.run(
+        ["pytest", "--co", "-q"],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    assert lines, "pytest collection output is empty"
+    return lines[-1].split(" ", 1)[0]
+
+
+class TestWorkflowEvaluationTestCount:
+    def test_evaluation_test_count_actual(self, orchestrator: WorkflowOrchestrator, tmp_path: Path):
+        (tmp_path / "test_eval_count.py").write_text(
+            "def test_eval_count_value():\n    assert True\n",
+            encoding="utf-8",
+        )
+        expected = _collect_pytest_count_for_path(tmp_path)
+
+        orchestrator._write_workflow_evaluation(
+            workflow_id="wf-eval-count",
+            completed_count=1,
+            failed_count=0,
+            total=1,
+            summary="summary",
+        )
+
+        content = (tmp_path / "WORKFLOW_EVALUATION.md").read_text(encoding="utf-8")
+        assert f"- test_count_actual: {expected}" in content
+        assert f"| test_count_actual | {expected} |" in content
+
+    def test_evaluation_test_count_fallback(
+        self,
+        orchestrator: WorkflowOrchestrator,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from cccc.daemon.foreman import workflow_orchestrator as orchestrator_module
+
+        def _raise_missing_pytest(*_args: Any, **_kwargs: Any) -> Any:
+            raise FileNotFoundError("pytest")
+
+        monkeypatch.setattr(orchestrator_module.subprocess, "run", _raise_missing_pytest)
+
+        orchestrator._write_workflow_evaluation(
+            workflow_id="wf-eval-fallback",
+            completed_count=1,
+            failed_count=0,
+            total=1,
+            summary="summary",
+        )
+
+        content = (tmp_path / "WORKFLOW_EVALUATION.md").read_text(encoding="utf-8")
+        assert "- test_count_actual: N/A (collection failed)" in content
+        assert "| test_count_actual | N/A (collection failed) |" in content
+
+
+class TestDispatchObservability:
+    def test_dispatch_log_contains_batch_info(self, orchestrator: WorkflowOrchestrator):
+        from types import SimpleNamespace
+
+        from cccc.daemon.foreman import workflow_orchestrator as orchestrator_module
+
+        workflow_id = "wf-dispatch-log"
+        task = TaskRef(id="T-dispatch", title="dispatch me", type="backend")
+        orchestrator.engine.register_task(task, workflow_id)
+        orchestrator._ensure_active_workflow(workflow_id, auto_process=True)
+
+        suggestion = ReadyBatchSuggestion(
+            suggestion_id="batch-dispatch",
+            workflow_id=workflow_id,
+            tasks=[task],
+            estimated_parallelism=1,
+            assignments={"T-dispatch": "worker-1"},
+        )
+        batch_result = SimpleNamespace(
+            parallel_count=1,
+            assignments=[SimpleNamespace(task=task, agent_id="worker-1", is_new_agent=False)],
+        )
+
+        with (
+            patch.object(orchestrator.ralph, "suggest_ready_batch", return_value=suggestion),
+            patch.object(orchestrator._assignment_controller, "process_batch_suggestion", return_value=batch_result),
+            patch.object(orchestrator_module.logger, "info") as mock_log_info,
+        ):
+            orchestrator._resuggest_ready_tasks(workflow_id)
+
+        formatted_messages = [
+            call.args[0] % call.args[1:] if len(call.args) > 1 else call.args[0]
+            for call in mock_log_info.call_args_list
+        ]
+        assert any(
+            msg == "[dispatch] batch processed: 1 tasks, parallel=1"
+            for msg in formatted_messages
+        )
+        assert any(
+            msg == "[dispatch] batch batch-dispatch: 1 tasks dispatched to agents"
+            for msg in formatted_messages
+        )

@@ -6,7 +6,13 @@ import pathlib
 import shutil
 import subprocess
 
-from .flow_engine import CheckResult, FlowState, StepSpec, validate_codex_output
+from .flow_engine import (
+    CheckResult,
+    FlowState,
+    StepSpec,
+    review_keyword_reference_detail,
+    validate_codex_output,
+)
 from .flow_improvement_check import _check_improvement_register
 
 SUCCESS_EXIT_CODE = 0
@@ -18,6 +24,27 @@ REQUIRED_REPORT_SECTIONS = ("评分摘要", "交叉验证")
 
 def _check_code_verify(state: FlowState) -> CheckResult:
     return CheckResult(True, [_detail("code baseline", True, "skipped — no pytest gate")])
+
+
+def _check_cleanup(state: FlowState) -> CheckResult:
+    details: list[dict] = []
+    try:
+        result = subprocess.run(
+            ["cccc", "group", "stop"],
+            capture_output=True,
+            text=True,
+            cwd=state.workspace,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return CheckResult(False, [_detail("group stop", False, "timed out after 30s")])
+    except OSError as exc:
+        return CheckResult(False, [_detail("group stop", False, str(exc))])
+    if result.returncode == SUCCESS_EXIT_CODE:
+        details.append(_detail("group stop", True, "actors stopped"))
+    else:
+        details.append(_detail("group stop", False, f"failed: {_process_message(result)}"))
+    return CheckResult(_details_passed(details), details)
 
 
 def _ensure_workspace(workspace: pathlib.Path) -> list[dict]:
@@ -125,6 +152,14 @@ def _check_report_synthesize(state: FlowState) -> CheckResult:
     for section in REQUIRED_REPORT_SECTIONS:
         found = section in content
         details.append(_detail(f"e2e report contains {section}", found, section))
+    details.append(
+        review_keyword_reference_detail(
+            pathlib.Path(state.workspace) / ".ralph-flow" / "step-4-review",
+            content,
+            "e2e report references step-4 review findings",
+            minimum_matches=2,
+        )
+    )
     return CheckResult(_details_passed(details), details)
 
 
@@ -196,6 +231,9 @@ E2E_STEPS: list[StepSpec] = [
             "5. 声明 critical_flows\n"
             "6. 运行 `ralph validate plan.yaml --project-root .` 直到 0 error\n"
             "7. 用 `ralph suggest plan.yaml` 查看可并行批次\n"
+            "Suggested: include at least one non-critical task with a strict acceptance_criteria that may fail on first verification attempt "
+            "(e.g. requiring a specific external condition). This exercises the verification failure -> retry -> foreman override "
+            "recovery path, validating CCCC system resilience.\n"
             "\n"
             "### 执行阶段\n"
             "1. 创建 Worker actor（按需选择 runtime）\n"
@@ -235,7 +273,8 @@ E2E_STEPS: list[StepSpec] = [
         description="Review Codex E2E outputs",
         instruction_text=(
             "1. Save at least two Codex review JSON (results review + process review) under .ralph-flow/step-4-review/.\n"
-            "   Use codex_bridge.py with dedicated review prompts for each.\n"
+            "   Use the codex_bridge.py script (full path: ~/.claude/skills/collaborating-with-codex/scripts/codex_bridge.py) with dedicated review prompts for each, and launch both reviews with run_in_background so they execute in parallel.\n"
+            "   Use the collaborating-with-codex skill/prompt style for both review runs.\n"
             "2. Ensure WORKFLOW_EVALUATION.md exists in workspace root (produced by foreman during step 2-3).\n"
             "Do NOT run extra analysis — only Codex reviews belong here."
         ),
@@ -245,7 +284,11 @@ E2E_STEPS: list[StepSpec] = [
         number=5,
         name="report-synthesize",
         description="Synthesize E2E report",
-        instruction_text="Create the E2E report at params.report_path with required sections (评分摘要, 交叉验证).\nOnly write the report — do NOT update the issue tracker yet (step 6 handles that).",
+        instruction_text=(
+            "Create the E2E report at {cccc_root}/todo/e2e-实战评估报告-{version}.md (or params.report_path when explicitly provided).\n"
+            "The report must include required sections (评分摘要, 交叉验证), summarize key Codex review findings including implementation defects and workflow defects, and convert them into system 改进建议.\n"
+            "Only write the report — do NOT update the issue tracker yet (step 6 handles that)."
+        ),
         check_fn=_check_report_synthesize,
     ),
     StepSpec(
@@ -254,10 +297,18 @@ E2E_STEPS: list[StepSpec] = [
         description="Register improvements",
         instruction_text=(
             "Update the issue trackers for this E2E round:\n"
-            "1. Write new findings discovered during this E2E round into the short tracker.\n"
-            "2. Move issues confirmed fixed (verified in this round) from the short tracker to the full version/archive.\n"
-            "3. Add a version marker line (for example v{N}) so git diff can detect current-session adds."
+            "1. 移出已验证项：从短版删除详细描述，并把完整内容写入 full tracker 的归档段落。\n"
+            "2. 转化 Codex 发现：把 results/process review 中的新缺陷按 RO/RV/FL 系列登记到短版 tracker。\n"
+            "3. 提取 foreman negative feedback：从 WORKFLOW_EVALUATION.md 的负面反馈中抽出流程问题并登记到 tracker。\n"
+            "4. Add a version marker line (for example v{N}) so git diff can detect current-session adds."
         ),
         check_fn=_check_improvement_register,
+    ),
+    StepSpec(
+        number=7,
+        name="cleanup",
+        description="Stop actors and clean up",
+        instruction_text="Run ralph flow next to stop running actors and clean up resources.",
+        check_fn=_check_cleanup,
     ),
 ]

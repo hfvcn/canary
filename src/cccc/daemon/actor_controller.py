@@ -97,6 +97,7 @@ class ActorController:
     ):
         self.config = config or ActorControllerConfig()
         self.state = ActorControllerState()
+        logger.info("actor_controller max_concurrent=%d", self.config.max_parallel_actors)
 
         # 依赖注入
         self._restart_actor_fn = restart_actor_fn

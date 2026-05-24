@@ -166,8 +166,13 @@ def test_generated_checks_are_marked_auto_generated(tmp_path: Path) -> None:
     assert all(check["auto_generated"] is True for check in checks)
 
 
-def test_cli_flag_prints_generated_checks_json(tmp_path: Path, capsys) -> None:
+def test_cli_flag_prints_generated_checks_json(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
     plan_path = _write_plan(tmp_path, _input_validation_plan())
+    monkeypatch.setattr("cccc.ralph.cli.generate_llm_security_checks", lambda _: [])
 
     exit_code = ralph_main([
         "validate",

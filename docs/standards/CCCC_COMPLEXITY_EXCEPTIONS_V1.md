@@ -28,6 +28,9 @@ this file as permission to add size or branching to these modules.
 | `src/cccc/ralph/flow_engine.py` | file size | Flow engine combines state management, step orchestration, and check functions for solve/e2e flows. | Split check functions into per-flow modules (already started with flow_steps_e2e.py). |
 | `src/cccc/ralph/flow_steps_e2e.py` | file size | E2E flow step checks combine env preparation, tracker scanning, version-marker enforcement, and archive advisory in one module. | Extract tracker-diff helpers (HEAD baseline, header parsing, body remnant scan) into a dedicated submodule once the per-step ownership stabilizes. |
 | `src/cccc/ralph/validation_rules/__init__.py` | `get_all_rules` function length | Registry function lists all validation rule references in a single return statement for discoverability. | Not planned — a flat list is the simplest correct form for a registry. |
+| `src/cccc/ralph/flow_improvement_check.py` | file size | Improvement-register checks grew with archive-advisory, pre-flow snapshot, and substance verification for FL-20C/FL-22. | Extract tracker-diff helpers into shared submodule with flow_steps_e2e.py. |
+| `src/cccc/ralph/security_check_generator.py` | file size | Security check generator grew with token-type-confusion recipe (RO-105) and coverage-term regex support. | Split recipe-specific generators into per-recipe modules. |
+| `src/cccc/ralph/security_recipes.py` | file size | Security recipes grew with token-type-confusion recipe and regex-aware coverage matching. | Split each recipe into its own data module. |
 
 ## Rules
 

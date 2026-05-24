@@ -7,7 +7,7 @@ from typing import Any, Callable, List
 
 from ..aegis import effective_intent
 from ..models import Plan, ValidationIssue
-from .discipline_security import _check_aegis_security_chain
+from .discipline_security import _check_aegis_security_chain, _check_fts_cjk_coverage, _check_silent_degradation_pattern, _check_ssrf_route_binding
 from .discipline_second_wave import (
     check_decision_hygiene_missing,
     check_drift_check_missing,
@@ -155,6 +155,9 @@ _DISCIPLINE_RULES: List[DisciplineRule] = [
     check_plan_compat_boundary_missing,
     check_ripple_verification_too_narrow,
     _check_aegis_security_chain,
+    _check_ssrf_route_binding,
+    _check_fts_cjk_coverage,
+    _check_silent_degradation_pattern,
 ]
 DISCIPLINE_CHECKS: tuple[DisciplineRule, ...] = tuple(_DISCIPLINE_RULES)
 

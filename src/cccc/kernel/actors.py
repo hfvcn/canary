@@ -429,6 +429,12 @@ def update_actor(group: Group, actor_id: str, patch: Dict[str, Any]) -> Dict[str
     if "run_id" in patch:
         item["run_id"] = patch["run_id"]
 
+    if "crash_count" in patch:
+        try:
+            item["crash_count"] = max(0, int(patch["crash_count"] or 0))
+        except Exception as exc:
+            raise ValueError("invalid crash_count") from exc
+
     if "runner" in patch:
         runner = patch.get("runner")
         if runner is None:

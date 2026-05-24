@@ -95,14 +95,36 @@ def test_security_recipes_contain_required_payloads() -> None:
     assert temporal_recipe["toctou_test_templates"]
 
 
-def test_url_input_all_three_gates_emit_hint() -> None:
+def test_url_input_no_encoding_coverage_warns() -> None:
     plan = _plan()
 
     issues = _security_issues(plan)
 
     assert [issue.code for issue in issues] == ["W_SSRF_ENCODING_UNCOVERED"]
-    assert issues[0].severity == "hint"
+    assert issues[0].severity == "warning"
     assert issues[0].evidence["surface_type"] == "url_input"
+    assert issues[0].evidence["missing_encodings"] == [
+        "0177.0.0.1",
+        "2130706433",
+        "0x7f000001",
+        "[::ffff:127.0.0.1]",
+        "[::1]",
+    ]
+
+
+def test_url_input_partial_encoding_coverage_hints() -> None:
+    plan = _plan(checks=[_check("covers 2130706433 hostname form")])
+
+    issues = _security_issues(plan)
+
+    assert [issue.code for issue in issues] == ["W_SSRF_ENCODING_UNCOVERED"]
+    assert issues[0].severity == "hint"
+    assert issues[0].evidence["missing_encodings"] == [
+        "0177.0.0.1",
+        "0x7f000001",
+        "[::ffff:127.0.0.1]",
+        "[::1]",
+    ]
 
 
 def test_gate_one_requires_security_keyword() -> None:

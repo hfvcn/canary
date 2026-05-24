@@ -7,6 +7,7 @@ import socket
 import signal
 import shutil
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -774,6 +775,101 @@ def handle_request(req: DaemonRequest) -> Tuple[DaemonResponse, bool]:
     return dispatch_request(req, deps=_request_dispatch_deps(), recurse=handle_request)
 
 
+def _should_restart_actor_after_crash(group_id: str, actor_id: str, crash_count: int) -> bool:
+    group = load_group(group_id)
+    if group is None:
+        return False
+    actor = find_actor(group, actor_id)
+    if not isinstance(actor, dict):
+        return False
+    desired_state = str(actor.get("desired_state") or "running").strip() or "running"
+    try:
+        current_crash_count = max(0, int(actor.get("crash_count") or 0))
+    except Exception:
+        current_crash_count = 0
+    return desired_state == "running" and current_crash_count == int(crash_count)
+
+
+def _restart_actor_after_crash(
+    group_id: str,
+    actor_id: str,
+    *,
+    crash_count: int,
+    request_fn: Any = None,
+) -> bool:
+    if not _should_restart_actor_after_crash(group_id, actor_id, crash_count):
+        return False
+    runner = request_fn or handle_request
+    req = DaemonRequest.model_validate(
+        {"op": "actor_restart", "args": {"group_id": group_id, "actor_id": actor_id, "by": "user"}}
+    )
+    resp, _ = runner(req)
+    if resp.ok:
+        return True
+    logger.warning(
+        "Actor auto-restart failed group_id=%s actor_id=%s crash_count=%s code=%s message=%s",
+        group_id,
+        actor_id,
+        crash_count,
+        getattr(resp.error, "code", ""),
+        getattr(resp.error, "message", ""),
+    )
+    return False
+
+
+def _schedule_actor_restart_after_crash(
+    group_id: str,
+    actor_id: str,
+    crash_count: int,
+    delay_seconds: int,
+    *,
+    sleep_fn: Any = time.sleep,
+    request_fn: Any = None,
+) -> threading.Thread:
+    def _run() -> None:
+        delay = max(0, int(delay_seconds or 0))
+        if delay > 0:
+            sleep_fn(delay)
+        _restart_actor_after_crash(
+            group_id,
+            actor_id,
+            crash_count=crash_count,
+            request_fn=request_fn,
+        )
+
+    thread = threading.Thread(
+        target=_run,
+        name=f"cccc-actor-restart:{group_id}:{actor_id}:{crash_count}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _on_actor_pty_session_exit(group_id: str, actor_id: str) -> None:
+    from .actors.actor_lifecycle_ops import _mark_actor_stopped_on_exit
+
+    _mark_actor_stopped_on_exit(
+        group_id,
+        actor_id,
+        schedule_restart=_schedule_actor_restart_after_crash,
+    )
+
+
+def _handle_pty_session_exit(session: pty_runner.PtySession) -> None:
+    _remove_pty_state_if_pid(session.group_id, session.actor_id, pid=session.pid)
+    try:
+        _on_actor_pty_session_exit(session.group_id, session.actor_id)
+    except Exception:
+        logger.warning(
+            "Failed to process PTY session exit group_id=%s actor_id=%s pid=%s",
+            session.group_id,
+            session.actor_id,
+            session.pid,
+            exc_info=True,
+        )
+
+
 def serve_forever(paths: Optional[DaemonPaths] = None) -> int:
     p = paths or default_paths()
     p.daemon_dir.mkdir(parents=True, exist_ok=True)
@@ -829,16 +925,8 @@ def serve_forever(paths: Optional[DaemonPaths] = None) -> int:
     except Exception:
         pass
 
-    def _on_session_exit(session: pty_runner.PtySession) -> None:
-        _remove_pty_state_if_pid(session.group_id, session.actor_id, pid=session.pid)
-        try:
-            from .actors.actor_lifecycle_ops import _mark_actor_stopped_on_exit
-            _mark_actor_stopped_on_exit(session.group_id, session.actor_id)
-        except Exception:
-            pass
-
     try:
-        pty_runner.SUPERVISOR.set_exit_hook(_on_session_exit)
+        pty_runner.SUPERVISOR.set_exit_hook(_handle_pty_session_exit)
     except Exception:
         pass
 

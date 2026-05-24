@@ -48,6 +48,7 @@ class Actor(BaseModel):
     runtime_state: Literal["starting", "running", "stopping", "stopped", "crashed"] = "stopped"
     admin_hold: Literal["none", "manual", "policy"] = "none"
     run_id: int = 0
+    crash_count: int = 0
     runner: RunnerKind = "pty"  # "pty" for interactive, "headless" for MCP-driven
     runtime: AgentRuntime = "codex"  # Agent CLI runtime
     worker_prompt: str = ""

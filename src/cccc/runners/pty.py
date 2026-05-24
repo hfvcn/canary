@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import logging
 import os
 import pty
 import queue
@@ -18,7 +19,11 @@ from typing import Callable, Dict, Iterable, Optional, Tuple
 
 import termios
 
+from ..paths import ensure_home
+
 PTY_SUPPORTED = True
+LAST_OUTPUT_MAX_BYTES = 4_096
+LOGGER = logging.getLogger("cccc.runners.pty")
 
 
 def _set_winsize(fd: int, *, cols: int, rows: int) -> None:
@@ -39,6 +44,28 @@ def _best_effort_killpg(pid: int, sig: signal.Signals) -> None:
             os.kill(pid, sig)
         except Exception:
             pass
+
+
+def last_output_path(group_id: str, actor_id: str) -> Path:
+    return ensure_home() / "groups" / str(group_id) / "state" / "runners" / "pty" / f"{actor_id}.last_output"
+
+
+def _write_last_output_snapshot(group_id: str, actor_id: str, data: bytes) -> None:
+    payload = bytes(data or b"")
+    if len(payload) > LAST_OUTPUT_MAX_BYTES:
+        payload = payload[-LAST_OUTPUT_MAX_BYTES:]
+    path = last_output_path(group_id, actor_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    except Exception:
+        LOGGER.warning(
+            "Failed to persist PTY last output group_id=%s actor_id=%s path=%s",
+            group_id,
+            actor_id,
+            str(path),
+            exc_info=True,
+        )
 
 
 @dataclass
@@ -147,6 +174,13 @@ class PtySession:
     def started_at_monotonic(self) -> float:
         return float(self._started_at)
 
+    def runtime_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self._started_at)
+
+    def exit_code(self) -> Optional[int]:
+        code = self._proc.poll()
+        return None if code is None else int(code)
+
     def first_output_at_monotonic(self) -> Optional[float]:
         with self._lock:
             return None if self._first_output_at is None else float(self._first_output_at)
@@ -205,6 +239,13 @@ class PtySession:
                 self._backlog = deque()
             self._backlog_bytes = 0
             self._mode_tail = b""
+
+    def _persist_last_output(self) -> None:
+        try:
+            data = self.tail_output(max_bytes=LAST_OUTPUT_MAX_BYTES)
+        except Exception:
+            data = b""
+        _write_last_output_snapshot(self.group_id, self.actor_id, data)
 
     def resize(self, *, cols: int, rows: int) -> None:
         if cols <= 0 or rows <= 0:
@@ -565,6 +606,7 @@ class PtySession:
                             self._on_client_writable(fileno)
         finally:
             self._running = False
+            self._persist_last_output()
             self._close_all()
             if self._on_exit is not None:
                 try:
@@ -590,6 +632,13 @@ class PtySupervisor:
                 self._sessions.pop(key, None)
 
     def _on_session_exit(self, session: PtySession) -> None:
+        LOGGER.warning(
+            "PTY session exited group_id=%s actor_id=%s exit_code=%s runtime_seconds=%.3f",
+            session.group_id,
+            session.actor_id,
+            session.exit_code(),
+            session.runtime_seconds(),
+        )
         try:
             self._drop_if_same(session.group_id, session.actor_id, session)
         finally:

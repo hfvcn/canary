@@ -19,7 +19,9 @@ HOSTNAME_ENCODING_MATRIX = [
 TOCTOU_TEST_TEMPLATES = [
     "phase 1: store accepted value; phase 2: mutate backing state before use",
     "phase 1: store path or URL; phase 2: swap target and assert revalidation",
+    "phase 1: barrier.wait() to synchronize revoke and access threads; phase 2: both threads start simultaneously, assert no stale reads",
 ]
+AUTH_RECIPE_SURFACE_TYPES = ("auth_token", "token_type_confusion")
 TIMING_SAFE_COMPARE = "secrets.compare_digest"
 TOKEN_NAME_PATTERN = (
     r"\b(?=[A-Za-z_][A-Za-z0-9_]*\b)"
@@ -61,6 +63,18 @@ SECURITY_RECIPES: dict[str, dict[str, Any]] = {
             "constant time",
         ),
     },
+    "token_type_confusion": {
+        "issue_code": "W_TOKEN_TYPE_CONFUSION_UNCOVERED",
+        "keywords": ("auth", "token", "oauth", "jwt"),
+        "coverage_terms": (
+            "token_type",
+            "type==access",
+            "type confusion",
+            "token type",
+            "refresh.*access",
+            "access.*refresh",
+        ),
+    },
     "temporal:store_then_use": {
         "issue_code": "W_VERIFICATION_TOCTOU_GAP",
         "keywords": ("temporal", "toctou", "store_then_use"),
@@ -72,6 +86,8 @@ SECURITY_RECIPES: dict[str, dict[str, Any]] = {
             "store_then_use",
             "store then use",
             "temporal",
+            "barrier",
+            "synchronize",
         ),
     },
 }
@@ -115,6 +131,8 @@ def _recipe_matches(flow: CriticalFlow, task: TaskSpec, recipe_name: str) -> boo
         return _url_recipe_matches(flow, task, recipe)
     if recipe_name == "auth_token":
         return _auth_recipe_matches(flow, task, recipe)
+    if recipe_name == "token_type_confusion":
+        return _token_type_recipe_matches(flow, task, recipe)
     return False
 
 
@@ -123,10 +141,7 @@ def _url_recipe_matches(
     task: TaskSpec,
     recipe: dict[str, Any],
 ) -> bool:
-    return _flow_has_security_keyword(flow, recipe) and not _task_has_recipe_coverage(
-        task,
-        recipe,
-    )
+    return _flow_has_security_keyword(flow, recipe) and not _url_input_is_covered(task)
 
 
 def _auth_recipe_matches(
@@ -139,6 +154,18 @@ def _auth_recipe_matches(
     )
 
 
+def _token_type_recipe_matches(
+    flow: CriticalFlow,
+    task: TaskSpec,
+    recipe: dict[str, Any],
+) -> bool:
+    return (
+        (_flow_has_security_keyword(flow, recipe) or _flow_has_auth_surface_type(flow))
+        and _flow_has_token_type_context(flow, task, recipe)
+        and not _task_has_recipe_coverage(task, recipe)
+    )
+
+
 def _flow_has_security_keyword(flow: CriticalFlow, recipe: dict[str, Any]) -> bool:
     text = _flow_security_text(flow)
     return any(str(keyword).casefold() in text for keyword in recipe["keywords"])
@@ -148,19 +175,61 @@ def _flow_security_text(flow: CriticalFlow) -> str:
     return " ".join([flow.id, flow.description]).casefold()
 
 
+def _flow_has_auth_surface_type(flow: CriticalFlow) -> bool:
+    surface_type = str(getattr(flow, "surface_type", "") or "")
+    return surface_type in AUTH_RECIPE_SURFACE_TYPES
+
+
 def _task_has_recipe_coverage(task: TaskSpec, recipe: dict[str, Any]) -> bool:
+    return _text_has_coverage_terms(_verification_check_text(task), recipe)
+
+
+def _verification_check_text(task: TaskSpec) -> str:
     verification = task.verification
     if verification is None or not verification.checks:
-        return False
-    check_text = " ".join(
+        return ""
+    return " ".join(
         f"{check.name} {check.command}" for check in verification.checks
     ).casefold()
-    return any(term in check_text for term in _coverage_terms(recipe))
+
+
+def _missing_encoding_entries(task: TaskSpec) -> List[str]:
+    check_text = _verification_check_text(task)
+    return [
+        entry
+        for entry in HOSTNAME_ENCODING_MATRIX
+        if entry.casefold() not in check_text
+    ]
+
+
+def _url_input_is_covered(task: TaskSpec) -> bool:
+    check_text = _verification_check_text(task)
+    if any(term in check_text for term in ("encoding matrix", "hostname matrix")):
+        return True
+    return not _missing_encoding_entries(task)
+
+
+def _resolve_recipe_severity(task: TaskSpec, recipe_name: str) -> str:
+    if recipe_name != "url_input":
+        return "hint"
+    if len(_missing_encoding_entries(task)) == len(HOSTNAME_ENCODING_MATRIX):
+        return "warning"
+    return "hint"
 
 
 def _coverage_terms(recipe: dict[str, Any]) -> List[str]:
     terms = [str(term).casefold() for term in recipe.get("coverage_terms", ())]
     return [term for term in terms if term]
+
+
+def _text_has_coverage_terms(text: str, recipe: dict[str, Any]) -> bool:
+    return any(_text_has_coverage_term(text, term) for term in _coverage_terms(recipe))
+
+
+def _text_has_coverage_term(text: str, term: str) -> bool:
+    if ".*" in term:
+        return re.search(term, text) is not None
+    return term in text
 
 
 def _build_issue(
@@ -171,7 +240,7 @@ def _build_issue(
     recipe = SECURITY_RECIPES[recipe_name]
     return ValidationIssue(
         code=str(recipe["issue_code"]),
-        severity="hint",
+        severity=_resolve_recipe_severity(task, recipe_name),
         message=(
             f"task '{task.id}' verification lacks {recipe_name} security "
             f"recipe coverage for critical flow '{flow.id}'"
@@ -194,6 +263,8 @@ def _issue_evidence(
         "surface_type": recipe_name,
         "check_names": check_names,
     }
+    if recipe_name == "url_input":
+        evidence["missing_encodings"] = _missing_encoding_entries(task)
     if recipe_name == "temporal:store_then_use":
         evidence["temporal_pattern"] = _flow_temporal_pattern(flow)
     if recipe_name == "auth_token":
@@ -215,6 +286,21 @@ def _recipe_evidence_keys(recipe: dict[str, Any]) -> List[str]:
 
 def _flow_temporal_pattern(flow: CriticalFlow) -> str:
     return str(getattr(flow, "temporal_pattern", "") or "")
+
+
+def _flow_has_token_type_context(
+    flow: CriticalFlow,
+    task: TaskSpec,
+    recipe: dict[str, Any],
+) -> bool:
+    context = " ".join(
+        [
+            _flow_security_text(flow),
+            task.goal_behavior,
+            task.acceptance_criteria,
+        ]
+    ).casefold()
+    return _text_has_coverage_terms(context, recipe)
 
 
 def _flow_entrypoint_owned_by_task(flow: CriticalFlow, task: TaskSpec) -> bool:

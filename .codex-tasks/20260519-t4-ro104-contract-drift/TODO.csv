@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm T4 scope and inspect target code,DONE,"T4 behavior, data shape, and edit points are identified","rg -n \"RO-104|contract drift|verify gate\" plan.yaml","2026-05-19 23:04",0,"Preserved unrelated uncommitted edits in tests/test_ralph_verification.py"
+2,Implement contract usage drift warning in core.verify,DONE,"verify() appends a warning when consumed symbols are missing from changed files","python -m pytest tests/test_ralph_verification.py -v -k 'contract_drift_detected'","2026-05-19 23:05",0,"Uses consumes.signatures keys as explicit entrypoint symbols to avoid conceptual-name false positives"
+3,Add regression tests and run focused pytest,DONE,"Both contract drift tests pass","python -m pytest tests/test_ralph_verification.py -v -k 'contract_drift or contract_usage'","2026-05-19 23:06",0,"2 tests passed"

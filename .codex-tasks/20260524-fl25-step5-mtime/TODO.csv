@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect target implementation and tests,DONE,"Target functions and test locations identified","rg -n \"_check_execute_and_verify|validate_codex_output|test_codex_validation\" src/cccc/ralph/flow_engine.py tests/ralph/test_flow_engine.py","2026-05-24 00:00",0,"Initial context gathered"
+2,Implement advisory mtime lag check,DONE,"Constant and helper are added and wired into step-5","rg -n \"CODEX_EXECUTION_MAX_LAG_SECONDS|_check_codex_mtime_lag|_check_execute_and_verify\" src/cccc/ralph/flow_engine.py","2026-05-24 00:01",0,"Implemented advisory helper and merged details into step-5"
+3,Add focused tests,DONE,"Two mtime tests added without changing existing tests","rg -n \"test_codex_mtime_lag_normal|test_codex_mtime_lag_overwrite\" tests/ralph/test_flow_engine.py","2026-05-24 00:02",0,"Imported helper and constant, added two focused tests"
+4,Run targeted validation,DONE,"Relevant pytest target passes","pytest tests/ralph/test_flow_engine.py","2026-05-24 00:03",0,"18 tests passed"

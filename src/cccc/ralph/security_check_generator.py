@@ -9,6 +9,7 @@ from typing import Any
 
 from .models import CriticalFlow, Plan, TaskSpec
 from .plan_io import load_plan
+from .security_check_generator_llm import generate_llm_security_checks as _generate_llm_security_checks
 from .security_recipes import SECURITY_RECIPES
 
 DEFAULT_ENDPOINT = "/"
@@ -19,11 +20,13 @@ HTTP_METHODS = "GET|POST|PUT|PATCH|DELETE"
 INPUT_VALIDATION_CATEGORY = "input_validation"
 URL_INPUT_RECIPE = "url_input"
 AUTH_TOKEN_RECIPE = "auth_token"
+TOKEN_TYPE_RECIPE = "token_type_confusion"
 TEMPORAL_RECIPE = "temporal:store_then_use"
 FLOW_CATEGORY_ORDER = (
     INPUT_VALIDATION_CATEGORY,
     URL_INPUT_RECIPE,
     AUTH_TOKEN_RECIPE,
+    TOKEN_TYPE_RECIPE,
     TEMPORAL_RECIPE,
 )
 INPUT_VALIDATION_TERMS = (
@@ -46,6 +49,17 @@ AUTH_CATEGORY_TERMS = (
     "secret",
     "password",
 )
+AUTH_FLOW_TERMS = ("auth", "oauth", "jwt")
+TOKEN_TYPE_CATEGORY_TERMS = (
+    "token type",
+    "type confusion",
+    "type==access",
+    "access token",
+    "refresh token",
+)
+TOKEN_TYPE_EXPLICIT_TERMS = ("token type", "type confusion", "type==access")
+ACCESS_TOKEN_TERMS = ("access token",)
+REFRESH_TOKEN_TERMS = ("refresh token",)
 INPUT_VALIDATION_TESTS = (
     ("fts5-sql-injection", "test_fts5_sql_injection"),
     ("pagination-lower-bound", "test_pagination_lower_bound"),
@@ -53,6 +67,10 @@ INPUT_VALIDATION_TESTS = (
 )
 SSRF_TEST_TARGET = "tests/security/test_ssrf.py::test_encoded_ip_matrix"
 AUTH_TEST_TARGET = "tests/security/test_auth_timing.py::test_timing_safe_token_compare"
+TOKEN_TYPE_TEST_TARGET = (
+    "tests/security/test_auth_token_types.py::"
+    "test_reject_refresh_token_as_access_token"
+)
 TOCTOU_TEST_TARGET = "tests/security/test_toctou.py::test_store_then_use_revalidation"
 ENDPOINT_RE = re.compile(rf"(?:^|\s)(?:{HTTP_METHODS})?\s*(/[A-Za-z0-9_./{{}}:-]+)", re.I)
 METHOD_ENDPOINT_RE = re.compile(rf"\b({HTTP_METHODS})\s+(/[A-Za-z0-9_./{{}}:-]+)", re.I)
@@ -63,31 +81,53 @@ def generate_security_checks(plan_path: str) -> list[dict[str, object]]:
     plan = load_plan(Path(plan_path))
     checks: list[dict[str, object]] = []
     for flow in plan.critical_flows:
-        categories = _flow_categories(flow)
+        context = _context_for_flow(plan, flow)
+        categories = _flow_categories(flow, context["category_text"])
         if not categories:
             continue
-        context = _context_for_flow(plan, flow)
         for category in categories:
             checks.extend(_checks_for_category(category, context))
     return checks
 
 
-def _flow_categories(flow: CriticalFlow) -> list[str]:
-    text = _flow_text(flow)
+def generate_llm_security_checks(
+    plan_path: str,
+    *,
+    provider: str = "gemini",
+) -> list[dict[str, object]]:
+    """Return LLM-generated behavioral security checks for a Ralph plan."""
+    return _generate_llm_security_checks(plan_path, provider=provider)
+
+
+def _flow_categories(flow: CriticalFlow, category_text: str) -> list[str]:
+    flow_text = _flow_text(flow)
     return [
         category
         for category in FLOW_CATEGORY_ORDER
-        if _flow_matches_category(flow, text, category)
+        if _flow_matches_category(flow, flow_text, category_text, category)
     ]
 
 
-def _flow_matches_category(flow: CriticalFlow, text: str, category: str) -> bool:
+def _flow_matches_category(
+    flow: CriticalFlow,
+    flow_text: str,
+    category_text: str,
+    category: str,
+) -> bool:
     if category == INPUT_VALIDATION_CATEGORY:
-        return _has_any(text, INPUT_VALIDATION_TERMS)
+        return _has_any(flow_text, INPUT_VALIDATION_TERMS)
     if category == URL_INPUT_RECIPE:
-        return _has_any(text, _recipe_terms(URL_INPUT_RECIPE, URL_CATEGORY_TERMS))
+        return _has_any(
+            flow_text,
+            _recipe_terms(URL_INPUT_RECIPE, URL_CATEGORY_TERMS),
+        )
     if category == AUTH_TOKEN_RECIPE:
-        return _has_any(text, _recipe_terms(AUTH_TOKEN_RECIPE, AUTH_CATEGORY_TERMS))
+        return _has_any(
+            flow_text,
+            _recipe_terms(AUTH_TOKEN_RECIPE, AUTH_CATEGORY_TERMS),
+        )
+    if category == TOKEN_TYPE_RECIPE:
+        return _token_type_category_matches(flow, flow_text, category_text)
     if category == TEMPORAL_RECIPE:
         return bool(_temporal_pattern(flow))
     return False
@@ -97,6 +137,7 @@ def _context_for_flow(plan: Plan, flow: CriticalFlow) -> dict[str, str]:
     tasks = _tasks_for_flow(plan, flow)
     text = "\n".join([_flow_text(flow), *[_task_text(task) for task in tasks]])
     return {
+        "category_text": text,
         "flow_id": flow.id,
         "flow_slug": _slug(flow.id),
         "endpoint": _extract_endpoint(text),
@@ -138,6 +179,12 @@ def _checks_for_category(category: str, context: dict[str, str]) -> list[dict[st
             "auth-timing-safe-compare",
             AUTH_TEST_TARGET,
             extra_env=_auth_recipe_env(),
+        )]
+    if category == TOKEN_TYPE_RECIPE:
+        return [_template_check(
+            context,
+            "token-type-confusion",
+            TOKEN_TYPE_TEST_TARGET,
         )]
     if category == TEMPORAL_RECIPE:
         return [_template_check(
@@ -221,6 +268,7 @@ def _temporal_recipe_env(context: dict[str, str]) -> dict[str, str]:
     templates = _recipe_sequence(TEMPORAL_RECIPE, "two_phase_test_template")
     return {
         "SECURITY_TEMPORAL_PATTERN": context["temporal_pattern"],
+        "SECURITY_TOCTOU_BARRIER": "true",
         "SECURITY_TOCTOU_TEMPLATES": " | ".join(templates),
     }
 
@@ -290,6 +338,29 @@ def _contains_term(normalized_text: str, term: str) -> bool:
         return False
     pattern = rf"(?<![a-z0-9]){re.escape(normalized_term)}(?![a-z0-9])"
     return re.search(pattern, normalized_text) is not None
+
+
+def _token_type_category_matches(
+    flow: CriticalFlow,
+    flow_text: str,
+    category_text: str,
+) -> bool:
+    return _is_auth_flow(flow, flow_text) and (
+        _has_any(category_text, TOKEN_TYPE_EXPLICIT_TERMS)
+        or (
+            _has_any(category_text, ACCESS_TOKEN_TERMS)
+            and _has_any(category_text, REFRESH_TOKEN_TERMS)
+            and _has_any(category_text, TOKEN_TYPE_CATEGORY_TERMS)
+        )
+    )
+
+
+def _is_auth_flow(flow: CriticalFlow, flow_text: str) -> bool:
+    surface_type = str(getattr(flow, "surface_type", "") or "")
+    return surface_type in {AUTH_TOKEN_RECIPE, TOKEN_TYPE_RECIPE} or _has_any(
+        flow_text,
+        AUTH_FLOW_TERMS,
+    )
 
 
 def _normalized_text(value: str) -> str:

@@ -6,6 +6,7 @@ Extracted from validator.py as a pure refactor (RO-31).
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from cccc.kernel.claimed_paths import normalize_write_set as _normalize_write_set, paths_overlap as _paths_overlap
@@ -59,6 +60,21 @@ _COMMAND_SKIP_TOKENS = frozenset({
 _PATH_EXTENSIONS = frozenset({
     ".py", ".js", ".ts", ".tsx", ".jsx", ".rs", ".go", ".java", ".c", ".cpp",
     ".h", ".yml", ".yaml", ".json", ".toml", ".cfg", ".ini", ".sh", ".sql",
+})
+_TRACKER_SECTION_PREFIX = "#### "
+_TRACKER_ISSUE_RE = re.compile(r"\b[A-Z]{1,4}-\d+[A-Za-z]?\b")
+_ACCEPTANCE_HEADER_RE = re.compile(r"(验收标准|acceptance(?:\s+criteria)?)", re.IGNORECASE)
+_ACCEPTANCE_INLINE_RE = re.compile(
+    r"(?:验收标准|acceptance(?:\s+criteria)?)(?:\*\*|__)?\s*[：:]\s*(.*)",
+    re.IGNORECASE,
+)
+_ACCEPTANCE_FIELD_BREAK_RE = re.compile(r"^(?:[-*>]\s*)?\*\*[^*]+\*\*[:：]")
+_ASCII_KEYWORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
+_ACCEPTANCE_COVERAGE_THRESHOLD = 0.5
+_ACCEPTANCE_STOPWORDS = frozenset({
+    "acceptance", "criteria", "issue", "plan", "task", "tasks", "code",
+    "must", "should", "when", "then", "with", "from", "into", "only",
+    "without", "after", "before", "under", "this", "that", "have",
 })
 
 
@@ -781,6 +797,155 @@ def _check_issue_coverage(plan: Plan) -> List[ValidationIssue]:
             ))
 
     return issues
+
+
+def _check_acceptance_coverage(
+    plan: Plan,
+    tracker_path: Path | str | None,
+) -> List[ValidationIssue]:
+    raw_tracker_path = str(tracker_path or "").strip()
+    if not raw_tracker_path:
+        return []
+    tracker_file = Path(raw_tracker_path)
+    if not tracker_file.is_file():
+        return []
+
+    tracker_text = tracker_file.read_text(encoding="utf-8")
+    tracker_sections = _tracker_issue_sections(tracker_text)
+    issues: List[ValidationIssue] = []
+    for issue_id in plan.required_issues:
+        tracker_section = tracker_sections.get(issue_id.upper())
+        addressed_tasks = [task for task in plan.tasks if issue_id in task.addresses]
+        issue = _acceptance_coverage_issue(
+            issue_id,
+            tracker_section,
+            addressed_tasks,
+            str(tracker_file),
+        )
+        if issue is not None:
+            issues.append(issue)
+    return issues
+
+
+def _acceptance_coverage_issue(
+    issue_id: str,
+    tracker_section: List[str] | None,
+    addressed_tasks: List[TaskSpec],
+    tracker_path: str,
+) -> ValidationIssue | None:
+    if tracker_section is None or not addressed_tasks:
+        return None
+    tracker_acceptance = _tracker_acceptance_text(tracker_section)
+    tracker_keywords = _acceptance_keywords(tracker_acceptance)
+    if not tracker_keywords:
+        return None
+    plan_acceptance = " ".join(task.acceptance_criteria for task in addressed_tasks).lower()
+    matched_keywords = [keyword for keyword in tracker_keywords if keyword in plan_acceptance]
+    coverage = len(matched_keywords) / len(tracker_keywords)
+    if coverage >= _ACCEPTANCE_COVERAGE_THRESHOLD:
+        return None
+    return ValidationIssue(
+        code="W_ACCEPTANCE_COVERAGE_GAP",
+        severity="warning",
+        message=(
+            f"issue '{issue_id}' acceptance coverage is {coverage:.2f} "
+            f"({len(matched_keywords)}/{len(tracker_keywords)} tracker keywords matched)"
+        ),
+        task_ids=[task.id for task in addressed_tasks],
+        evidence={
+            "issue_id": issue_id,
+            "coverage": coverage,
+            "tracker_keywords": tracker_keywords,
+            "matched_keywords": matched_keywords,
+            "tracker_path": tracker_path,
+        },
+    )
+
+
+def _tracker_issue_sections(tracker_text: str) -> Dict[str, List[str]]:
+    sections: Dict[str, List[str]] = {}
+    current_issue_ids: List[str] = []
+    current_lines: List[str] = []
+    for line in tracker_text.splitlines():
+        if line.startswith(_TRACKER_SECTION_PREFIX):
+            _store_tracker_section(sections, current_issue_ids, current_lines)
+            current_issue_ids = _heading_issue_ids(line)
+            current_lines = []
+            continue
+        if current_issue_ids:
+            current_lines.append(line)
+    _store_tracker_section(sections, current_issue_ids, current_lines)
+    return sections
+
+
+def _store_tracker_section(
+    sections: Dict[str, List[str]],
+    issue_ids: List[str],
+    lines: List[str],
+) -> None:
+    for issue_id in issue_ids:
+        sections.setdefault(issue_id, list(lines))
+
+
+def _heading_issue_ids(heading_line: str) -> List[str]:
+    seen: Set[str] = set()
+    issue_ids: List[str] = []
+    for match in _TRACKER_ISSUE_RE.findall(heading_line.upper()):
+        if match in seen:
+            continue
+        seen.add(match)
+        issue_ids.append(match)
+    return issue_ids
+
+
+def _tracker_acceptance_text(section_lines: List[str]) -> str:
+    collected: List[str] = []
+    collecting = False
+    for line in section_lines:
+        stripped = line.strip()
+        if not stripped:
+            if collecting:
+                collected.append("")
+            continue
+        if not collecting:
+            if _ACCEPTANCE_HEADER_RE.search(stripped) is None:
+                continue
+            collecting = True
+            inline = _acceptance_inline_text(stripped)
+            if inline:
+                collected.append(inline)
+            continue
+        if _is_acceptance_block_break(stripped):
+            break
+        collected.append(stripped)
+    return "\n".join(part for part in collected if part).replace("`", " ").strip()
+
+
+def _acceptance_inline_text(line: str) -> str:
+    matched = _ACCEPTANCE_INLINE_RE.search(line)
+    if matched is None:
+        return ""
+    return matched.group(1).replace("**", " ").replace("__", " ").strip()
+
+
+def _is_acceptance_block_break(line: str) -> bool:
+    return bool(
+        re.match(r"^#{1,6}\s+", line)
+        or _ACCEPTANCE_FIELD_BREAK_RE.match(line)
+    )
+
+
+def _acceptance_keywords(acceptance_text: str) -> List[str]:
+    seen: Set[str] = set()
+    keywords: List[str] = []
+    for raw_keyword in _ASCII_KEYWORD_RE.findall(acceptance_text.lower()):
+        if raw_keyword in _ACCEPTANCE_STOPWORDS:
+            continue
+        if raw_keyword in seen:
+            continue
+        seen.add(raw_keyword)
+        keywords.append(raw_keyword)
+    return keywords
 
 
 def _check_task_addresses_disjoint(plan: Plan) -> List[ValidationIssue]:

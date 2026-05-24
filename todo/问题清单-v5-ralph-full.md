@@ -5,6 +5,166 @@
 
 ---
 
+## v42 E2E 归档：RO-108/RO-109/RO-110/RO-111/FL-27/FL-28 已验证（2026-05-24，FastAPI Blog Platform）
+
+v42 E2E 验证了 v45 代码修复的 6 项 v41 发现。综合 4.3/5（结果 4.5/5，过程 4/5，体验 4.5/5）。
+
+| ID | 标题 | v42 验证结果 |
+|----|------|-------------|
+| RO-108 | SSRF 防护未接入路由 | v42 项目无外部 URL endpoint，攻击面极低。Codex review 确认"未实现但无需" |
+| RO-109 | SSRF 编码绕过 | 同 RO-108，无 SSRF 攻击面 |
+| RO-110 | FTS5 中文搜索假通过 | v42 search.py 对 CJK 显式走 LIKE fallback，不假装 FTS5 能用。新问题 RO-112 跟踪 |
+| RO-111 | search.py 静默降级 | v42 search.py 无 catch-all 降级，空结果来自显式空白查询分支。Codex review 确认 |
+| FL-27 | 全部 verification_force_passed | v42 10/11 verification_passed + 1 foreman_override（T02 shallow_check_depth 误报）。显著改善 |
+| FL-28 | Worker 未启动 | v42 双 worker（worker-1 + worker-2）真并行执行，各自完成 4+7 个任务。0 crash |
+
+v42 新发现 5 项（RO-112/FL-29/FL-30/FL-31/RO-113）已登记到短版 tracker。
+
+---
+
+## 代码修复归档（2026-05-24 第三批，2 项）— HMAC 全链路打通
+
+| ID | 标题 | 修复内容 |
+|----|------|----------|
+| FL-20 | E2E flow check 机制 HMAC 生效（P1） | HMAC 全链路：codex_bridge.py 输出时用 `_sign_result()` 添加 `_sig` 字段；flow_engine.py `_resolve_codex_bridge_secret()` 从环境变量或 `.env` 文件读取 secret；未签名 JSON 强制 FAIL（不再 skip） |
+| FL-21 | CODEX_BRIDGE_SECRET 配置 + codex_bridge.py 签名（P1） | `.env` 中配置 secret；codex_bridge.py 添加 `_sign_result()` + `_load_secret_from_env_file()` 自动从 `--cd` 目录的 `.env` 读取 secret 并签名 |
+
+---
+
+## 代码修复归档（2026-05-24 第二批，4 项）
+
+| ID | 标题 | 修复内容 |
+|----|------|----------|
+| FL-25 | step-5 check 手写 JSON 绕过防护——mtime 检测（P1） | `_check_codex_mtime_lag()` 检测 JSON mtime 异常晚于 step-5 目录创建时间（阈值 CODEX_EXECUTION_MAX_LAG_SECONDS=3600s），emit advisory warning |
+| FL-26 | step-5 git diff 与 Codex changed_files 交叉验证（P2） | `_collect_codex_changed_files()` 提取 JSON 中 changed_files 字段，`_check_diff_source_correlation()` 验证 changed_files ⊆ git diff |
+| FL-27 | codex_bridge.py 路径解析——flow instruction 动态注入完整路径 | `_resolve_codex_bridge()` 在 `~/.claude/skills/` 下搜索完整路径，`_build_solve_steps()` 动态生成 instruction 含完整路径。SOLVE_STEPS 从模块级常量改为函数调用 |
+| — | E2E flow step-4 instruction 补充 codex_bridge.py 路径提示 | flow_steps_e2e.py step-4 instruction 增加完整路径提示 |
+
+### 已知局限归档（2026-05-24，无需代码修复）
+
+| ID | 标题 | 优先级 | 处理 |
+|----|------|--------|------|
+| RV-9 | validate 不检测 check 注册到错误的 validation phase | P3 | 已知局限——validate 不理解 check 的运行时依赖（需要文件系统 vs 纯结构） |
+| RV-10 | validate 不检测 plan 描述的实现方案与现有代码功能重复 | P3 | 已知局限——语义级检查超出结构验证的合理范围 |
+| RV-11 | validate 不检测 Codex changed_files 与 git diff 的集合方向性 | P3 | 已知局限——方向性逻辑语义超出结构验证范围 |
+
+---
+
+## 代码修复归档（2026-05-24 第一批，5 项）
+
+| ID | 标题 | 修复内容 |
+|----|------|----------|
+| FL-23 | step-4 gap recording instruction 增加能力差距分析指导 + check 增强（P1） | instruction 重写为"Ralph 系统检测能力缺陷"定位 + 反例指导 + GAP_CAPABILITY_KEYWORDS 检查。`_check_gap_record()` 增加 capability keywords 检查 |
+| FL-24 | step-5 instruction 禁止直接编辑（P2） | instruction 增加 "MUST use codex_bridge.py" + "Do NOT use Edit/Write" 明确禁止语句 |
+| RV-6 | validate 检查 goal_behavior 中符号是否在 claimed_paths 中定义（P2） | `_check_goal_symbol_in_claimed_paths()` 实现，提取 backtick 符号做文件系统 grep，注册到 `validate_with_project()` |
+| RV-7 | validate 检查 claimed_paths 是否为 goal 目标的真实控制层（P2） | 合并到 RV-6 实现——符号定义位置检查等价于控制层验证 |
+| RV-8 | validate 检查 CJK 文本处理算法可行性提示（P3） | `_check_goal_cjk_tokenization_hint()` 实现，检测 tokenization 关键词 + CJK 上下文 → emit hint |
+
+---
+
+## 代码已修复，场景未触发归档（v41 修复，v42 未触发，2026-05-24 迁入）
+
+以下 9 项在 v41 代码修复完成，v42 solve flow 中未触发对应场景。待后续 E2E 自然触发时验证。
+
+### RO 系列
+
+| ID | 标题 | 优先级 | 修复内容 | 验收标准 |
+|----|------|--------|---------|---------|
+| RO-104 | verify gate 无法检测 provides/consumes 合同漂移 | P1 | v41 代码已修复 | task consumes `scope_enforcement` 但代码未 import/调用 `require_scope` → verify gate 报 warning |
+| RO-105 | verify gate 不检测 token type 混用（refresh 当 access） | P1 | v41 代码已修复 | plan 含 auth critical_flow 且 token 有多种 type → challenge mock_tests 自动包含 type confusion 测试 |
+| RO-106 | temporal_pattern store_then_use 只查声明不查集成 | P2 | v41 代码已修复 | audit helper 存在但 entrypoint 未调用 → validate 报 W_TEMPORAL_PATTERN_NOT_INTEGRATED |
+| RO-107 | foreman 自评数字不一致（总测试数与分项不匹配） | P2 | v41 代码已修复 | WORKFLOW_EVALUATION.md 中的总测试数与 `pytest --co -q` 输出一致 |
+
+### RV 系列
+
+| ID | 标题 | 优先级 | 修复内容 | 验收标准 |
+|----|------|--------|---------|---------|
+| RV-1 | validate 应检测 plan 中 task 职责重叠 | P2 | W_PROVIDES_NOT_CONSUMED 已实现 | task A provides X 但无 task consumes X → validate 报 W_PROVIDES_NOT_CONSUMED |
+| RV-2 | validate 应检测 W_CROSS_BOUNDARY_WITHOUT_GLUE 误报 | P3 | covers.tasks 满足 glue 已实现 | verification task 声明 covers.tasks 包含跨边界 task → 不再误报 |
+
+### UX 系列
+
+| ID | 标题 | 优先级 | 修复内容 | 验收标准 |
+|----|------|--------|---------|---------|
+| UX-15 | 多 Worker 并行 dispatch | P3 | dispatch 日志增强 + max_concurrent 确认 >= 2 | E2E 实测观察实际并行度 |
+| UX-16 | Actor PTY 进程异常退出零日志 + 不自动重启 | P1 | crash 日志 + 自动重启 + crash_limit | actor 异常退出 → WARNING 日志 + 30s 内重启；3 次后放弃 + 通知 foreman |
+| UX-17 | Actor 进程退出时应保留 scrollback 用于诊断 | P2 | .last_output 保存已实现 | actor 退出后 .last_output 文件存在含最后输出 |
+
+---
+
+## v40 E2E 归档：RO-96/E2E-1/E2E-2/E2E-3 已验证（2026-05-19，Flask OAuth2 Resource Server）
+
+> Foreman：Claude runtime | Workers：3x Claude runtime (worker-1, claude-general-worker, claude-general-worker-1)
+> 综合评分：3.7/5（结果 3.5/5，过程 4/5，体验 3.5/5）
+> 8 任务（setup → token mgmt/scope/audit 并行 → security/challenge/race → integration）
+> 评估报告：[e2e-实战评估报告-v40.md](./e2e-实战评估报告-v40.md)
+
+### 已验证归档
+
+| ID | 标题 | 实测证据 |
+|----|------|---------|
+| RO-96 | attach 相对路径解析 bug（P0） | `cd /tmp/cccc-e2e-v40 && cccc attach .` → ledger scope url = `/private/tmp/cccc-e2e-v40`（绝对路径）✅。`group_cmds.py:26` 的 `Path(args.path).resolve()` 修复生效 |
+| E2E-1 | 相对路径 attach 验证策略（P1） | v40 使用相对路径 attach，RO-96 验证通过 ✅ |
+| E2E-2 | challenge mode 验证策略（P1） | T6 声明 `verification_mode: challenge`，4 个 mock_tests（forgery/escalation/revoked/expired）触发，27 个 adversarial tests 通过。Codex 评价 4/5 ✅ |
+| E2E-3 | security recipe / temporal_pattern 验证策略（P2） | `token_store_then_use` 声明 `temporal_pattern: store_then_use`，worker 正确实现先 `db.session.commit()` 再返回 token ✅。**部分**：审计 flow 的 store-then-use 未集成（`log_token_event` 零调用） |
+
+### v40 Codex 独立审查发现
+
+| 严重度 | 发现 | 位置 |
+|---|---|---|
+| 严重 | refresh token 可直接访问资源 API（`verify_token` 不校验 `type==access`） | src/auth.py:55, :100 |
+| 高 | 审计日志未接入真实 token 生命周期（`log_token_event` 零调用） | src/auth.py:19, :55, :84 |
+| 高 | JSON array 输入导致 500 | src/security.py:31, :73 |
+| 中 | scope 层级语义不一致 | src/permissions.py:5, src/resources.py:11 |
+| 中 | 限流只作用于 `/api/*`，未使用 `RATE_LIMIT_AUTH` | src/security.py:49, :62 |
+| 中 | race test 是并发后置检查，非真正 TOCTOU 窗口 | tests/test_race.py:90 |
+
+### v40 新发现（共 10 项）
+
+**来自 Codex 独立审查 → 系统改进项：**
+
+| ID | 标题 | 优先级 | 来源 |
+|----|------|--------|------|
+| RO-104 | verify gate 无法检测 provides/consumes 合同漂移 | P1 | Codex process review：T3 provides `require_scope` 但 T2 用本地 `_has_scope`，合同未落地 |
+| RO-105 | verify gate 不检测 token type 混用（refresh 当 access） | P1 | Codex results review：严重认证漏洞，challenge mode + 98% coverage 均未拦截 |
+| RO-106 | temporal_pattern store_then_use 只查声明不查集成 | P2 | Codex results + process review：`log_token_event` 存在但零调用，运行时 AuditLog 计数 = 0 |
+| RO-107 | foreman 自评数字不一致（总 tests vs 分项） | P2 | Codex process review：摘要 94 tests 与分项加总不符 |
+| RV-1 | validate 应检测 task 职责重叠 | P2 | Codex process review：T2/T3 功能重叠，T3 产出未被消费 |
+| RV-2 | covers.tasks 应满足 cross-boundary glue | P3 | Foreman 自评 negative feedback：11 个 false positive W_CROSS_BOUNDARY_WITHOUT_GLUE |
+| RV-3 | race test TOCTOU 窗口验证深度不足 | P2 | Codex results review：test_race.py 是后置检查非真正 TOCTOU |
+
+**来自 flow 执行体验：**
+
+| ID | 标题 | 优先级 | 来源 |
+|----|------|--------|------|
+| FL-20 | E2E flow instruction 表述模糊 + check 机制不充分 | **P1** | 三类问题：(A) 路径表述不清致 4 步 retry；(B) step-5/6 未指导结合 Codex 反馈和 foreman 自评提取改进项，导致只产出打勾表；(C) check 只查文件存在/diff 有变更，不查内容是否引用 Codex 发现，形式正确但内容空洞也能 PASS |
+| UX-16 | Actor PTY 进程异常退出零日志 + 不自动重启 | P1 | 4 次复现（lead x1, worker-1 x1, 两个 general-worker 各 x1） |
+| UX-17 | Actor 进程退出时 scrollback 丢失无法诊断 | P2 | foreman 崩溃后无法追查 CLI 退出原因 |
+
+### v40 关键洞察
+
+1. **Challenge mode 首次实战验证成功**——机制正确触发，mock_tests 生成有意义的 adversarial 测试
+2. **UX-16 是当前最大体验痛点**——4 次 actor 进程崩溃需手动重启，`try/except: pass` 吞掉所有诊断信息
+3. **Codex 审查发现真实漏洞**——refresh token misuse（RO-105）和 audit 未集成（RO-106），说明 98% coverage 不等于正确性
+4. **验证深度的系统性缺口**——verify gate 只检查"test 存在 + 通过"，不检查"合同落地"（RO-104）、"helper 被调用"（RO-106）、"攻击面完整"（RO-105）
+5. **Flow 表述问题累计 4 处偏差**（FL-20）——相对路径解析、报告路径、并行提示、git diff cwd，每处都需 retry
+6. **Failure recovery 连续两轮零触发**——需要更极端的不可能条件设计
+
+---
+
+## v40 代码修复归档：FL-17b/FL-18/FL-16/PLN-1/UX-14/UX-13（2026-05-18）
+
+| ID | 标题 | 修复内容 |
+|----|------|---------|
+| FL-17b | solve flow 完成后 state.json 残留（P2 复现） | flow_engine.py `_cleanup()` 在两个 completion 路径都调用，`shutil.rmtree` 清除 `.ralph-flow` 目录。测试 `test_completion_removes_flow_dir` 验证 |
+| FL-18 | step-6 归档迁移应为 blocking（P2） | flow_improvement_check.py `_check_short_tracker_archive_advisory` 改 `passed=False`，check name 改 "blocking"。成功路径 advisory print 残留已清理 |
+| FL-16 | E2E flow 结束后应停止 actors（P2） | flow_steps_e2e.py 新增 `_check_cleanup()` + step 7 cleanup。含 `TimeoutExpired`/`OSError` 异常处理（Codex 审查追加修复） |
+| PLN-1 | ledger event too large（P2） | cli.py `_write_validation_event()` 改为 compact 格式（counts + outcome），不再序列化完整 issues 列表。向后兼容（Pydantic model `extra="allow"` + `default_factory=list`） |
+| UX-14 | 首任务 stall 阈值过低（P3） | workflow_orchestrator.py `ASSIGNED_STALL_THRESHOLD_SECONDS` 120→600，`min→max`。测试 `test_cold_start_500s_not_stalled` 验证 |
+| UX-13 | workflow.completed 后未自动生成 evaluation（P3） | workflow_orchestrator.py 新增 `_write_workflow_evaluation()` 在 `_on_workflow_completed` 中调用，生成含统计表格的 WORKFLOW_EVALUATION.md |
+
+---
+
 ## v38 E2E 归档：RO-103 已修复（2026-05-17）
 
 | ID | 标题 | 实测证据 |

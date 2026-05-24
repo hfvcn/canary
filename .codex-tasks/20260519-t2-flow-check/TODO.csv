@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current T2 code paths and tests,DONE,Relevant functions and tests identified,,2026-05-19T00:00:00Z,0,fast-context attempted twice and cancelled; used shell fallback
+2,Implement FL-21 authenticity and FL-22/FL-20C substance checks,DONE,Code updated in targeted modules,,2026-05-19T00:00:00Z,0,flow_engine flow_steps_e2e flow_improvement_check updated
+3,Add/adjust tests for fail and pass scenarios,DONE,Targeted tests cover authenticity and substance cases,,2026-05-19T00:00:00Z,0,flow_engine e2e archive tests expanded
+4,Run targeted pytest command and fix regressions,DONE,Specified pytest command passes,\"python -m pytest tests/ralph/test_flow_e2e.py tests/ralph/test_flow_engine.py tests/test_flow_archive_prompt.py -v -k 'check or archive or hmac or sig or gap_substance'\",2026-05-19T00:00:00Z,0,20 passed after invalid-sig and issue-id report coverage

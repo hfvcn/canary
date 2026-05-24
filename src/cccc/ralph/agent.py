@@ -67,6 +67,29 @@ SECURITY_CHECKLIST_ITEMS = (
             "Verify: Is token comparison timing-safe? Are secrets hardcoded?"
         ),
     ),
+    (
+        ("token type", "type confusion", "token-type"),
+        (
+            "Verify: Does token validation check the type field? Can a refresh "
+            "token be used as an access token? Are different token types "
+            "handled distinctly?"
+        ),
+    ),
+    (
+        ("toctou", "temporal", "store-then-use", "store_then_use"),
+        (
+            "Verify: Is data revalidated after retrieval? Can backing state "
+            "change between store and use? Are concurrent mutations handled "
+            "safely?"
+        ),
+    ),
+    (
+        ("race condition", "race-condition", "concurrent write"),
+        (
+            "Verify: Are critical sections protected? Do concurrent operations "
+            "use barrier-based synchronization for true concurrency testing?"
+        ),
+    ),
 )
 CRITICAL_FLOW_NAME_FIELDS = (
     "id",

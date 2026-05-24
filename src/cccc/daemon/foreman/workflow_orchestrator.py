@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json as _json
 import logging
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -91,6 +92,9 @@ ORCHESTRATOR_SERVICE_ACTOR = "service:workflow_orchestrator"
 COMPLETER_MISMATCH_BLOCKED_REASON = "completer_mismatch_blocked"
 AUTO_DISPATCH_BATCH_SUFFIX = "-auto"
 MANUAL_ASSIGN_BATCH_PREFIX = "manual-send"
+PYTEST_COLLECTION_COMMAND = ["pytest", "--co", "-q"]
+PYTEST_COLLECTION_TIMEOUT_SECONDS = 60
+TEST_COUNT_COLLECTION_FAILED = "N/A (collection failed)"
 
 from .verification_gate import (  # noqa: E402
     auto_start_assigned_task_for_completion as _vg_auto_start,
@@ -517,6 +521,21 @@ class WorkflowOrchestrator:
             serialized["task_ref"] = task_ref.model_dump()
         return serialized
 
+    @staticmethod
+    def _format_planned_dispatch_assignments(suggestion: ReadyBatchSuggestion) -> List[str]:
+        return [
+            f"{task.id}->{str(suggestion.assignments.get(task.id) or '').strip() or 'pool'}"
+            for task in suggestion.tasks
+        ]
+
+    @staticmethod
+    def _format_result_dispatch_assignments(result: BatchEvaluationResult) -> List[str]:
+        return [
+            f"{assignment.task.id}->{assignment.agent_id}(reused={'no' if assignment.is_new_agent else 'yes'})"
+            for assignment in result.assignments
+            if assignment.agent_id
+        ]
+
     def _get_running_write_sets(self) -> List[List[str]]:
         return [
             self._extract_assignment_claimed_paths(assignment)
@@ -541,10 +560,16 @@ class WorkflowOrchestrator:
         auto_start_agents: bool = True,
     ) -> BatchEvaluationResult:
         """Process a batch suggestion through the full workflow."""
-        return self._assignment_controller.process_batch_suggestion(
+        result = self._assignment_controller.process_batch_suggestion(
             suggestion,
             auto_start_agents=auto_start_agents,
         )
+        logger.info(
+            "[dispatch] batch processed: %d tasks, parallel=%s",
+            len(suggestion.tasks),
+            getattr(result, "parallel_count", "N/A"),
+        )
+        return result
 
     def register_and_suggest(
         self,
@@ -968,7 +993,11 @@ class WorkflowOrchestrator:
             return
 
         ready_ids = [t.id for t in suggestion.tasks]
-        self._log(f"[DAG gating] {len(ready_ids)} downstream tasks now ready: {ready_ids}")
+        planned_assignments = self._format_planned_dispatch_assignments(suggestion)
+        self._log(
+            f"[DAG gating] {len(ready_ids)} downstream tasks now ready: {ready_ids} "
+            f"(parallel={suggestion.estimated_parallelism}, assignments={planned_assignments})"
+        )
 
         workflow_data = self._active_workflows.get(workflow_id, {})
         if self._auto_dispatch_ready_tasks(workflow_id, suggestion, workflow_data):
@@ -976,9 +1005,19 @@ class WorkflowOrchestrator:
 
         if workflow_data.get("auto_process"):
             self._log(f"[DAG gating] auto_process=True, auto-advancing batch for {ready_ids}")
-            self.process_batch_suggestion(
+            result = self.process_batch_suggestion(
                 suggestion,
                 auto_start_agents=workflow_data.get("auto_start_agents", True),
+            )
+            logger.info(
+                "[dispatch] batch %s assignments=%s",
+                suggestion.suggestion_id,
+                self._format_result_dispatch_assignments(result),
+            )
+            logger.info(
+                "[dispatch] batch %s: %d tasks dispatched to agents",
+                suggestion.suggestion_id,
+                len(ready_ids),
             )
             return
 
@@ -1227,14 +1266,13 @@ class WorkflowOrchestrator:
             agent_name=agent_name or str(getattr(state, "agent_id", "") or "").strip(),
         )
 
-    ASSIGNED_STALL_THRESHOLD_SECONDS = 120
+    ASSIGNED_STALL_THRESHOLD_SECONDS = 600
 
     def check_stalled_tasks(self, threshold_seconds: int = 300) -> List[str]:
         """Return task IDs whose last heartbeat exceeds the threshold.
 
         Checks both RUNNING and ASSIGNED tasks. ASSIGNED tasks use a
-        shorter threshold (120s) since a worker that never starts is
-        likely stuck.
+        relaxed threshold (600s) to accommodate first-task cold start.
         """
         threshold = int(threshold_seconds)
         now = time.time()
@@ -1248,7 +1286,7 @@ class WorkflowOrchestrator:
             )
         for task in self.engine.list_tasks(status=WorkflowTaskStatus.ASSIGNED):
             effective = self._effective_stall_threshold(task, threshold)
-            assigned_threshold = min(effective, self.ASSIGNED_STALL_THRESHOLD_SECONDS)
+            assigned_threshold = max(effective, self.ASSIGNED_STALL_THRESHOLD_SECONDS)
             ref_time = getattr(task, "assigned_at", None)
             if ref_time is None:
                 continue
@@ -2098,11 +2136,109 @@ class WorkflowOrchestrator:
         except Exception:
             logger.debug("Failed to emit workflow terminal event", exc_info=True)
 
+        # Auto-generate WORKFLOW_EVALUATION.md (UX-13)
+        self._write_workflow_evaluation(
+            workflow_id=workflow_id,
+            completed_count=completed_count,
+            failed_count=failed_count,
+            total=total,
+            summary=summary,
+        )
+
         # Clean up
         self._active_workflows.pop(workflow_id, None)
 
         # Report completion
         return self.reporter.on_workflow_completed(summary=summary)
+
+    def _write_workflow_evaluation(
+        self,
+        *,
+        workflow_id: str,
+        completed_count: int,
+        failed_count: int,
+        total: int,
+        summary: str,
+    ) -> None:
+        if self.project_root is None:
+            return
+        try:
+            eval_path = self.project_root / "WORKFLOW_EVALUATION.md"
+            if eval_path.exists():
+                return
+            rate = completed_count / max(total, 1) * 100
+            test_count_actual = self._collect_actual_test_count()
+            lines = [
+                f"# Workflow Evaluation — {workflow_id}",
+                "",
+                "## 评分摘要",
+                "",
+                f"- Total tasks: {total}",
+                f"- Completed: {completed_count}",
+                f"- Failed: {failed_count}",
+                f"- Completion rate: {rate:.0f}%",
+                f"- test_count_actual: {test_count_actual}",
+                "",
+                "## 任务执行明细",
+                "",
+                f"| Metric | Value |",
+                f"|--------|-------|",
+                f"| Workflow ID | {workflow_id} |",
+                f"| Total tasks dispatched | {total} |",
+                f"| Tasks completed successfully | {completed_count} |",
+                f"| Tasks failed | {failed_count} |",
+                f"| Overall completion rate | {rate:.0f}% |",
+                f"| test_count_actual | {test_count_actual} |",
+                "",
+                "## 交叉验证",
+                "",
+                summary or "(no summary provided)",
+                "",
+                "## 改进建议",
+                "",
+                "- (auto-generated stub — expand with detailed evaluation)",
+                "",
+            ]
+            eval_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception:
+            logger.debug("Failed to write WORKFLOW_EVALUATION.md", exc_info=True)
+
+    def _collect_actual_test_count(self) -> str:
+        if self.project_root is None:
+            return TEST_COUNT_COLLECTION_FAILED
+        try:
+            result = subprocess.run(
+                PYTEST_COLLECTION_COMMAND,
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=PYTEST_COLLECTION_TIMEOUT_SECONDS,
+            )
+            if result.returncode not in {0, 5}:
+                raise subprocess.CalledProcessError(
+                    result.returncode,
+                    result.args,
+                    output=result.stdout,
+                    stderr=result.stderr,
+                )
+            return self._parse_pytest_collection_count(result.stdout)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            logger.debug("Failed to collect pytest test count", exc_info=True)
+            return TEST_COUNT_COLLECTION_FAILED
+
+    @staticmethod
+    def _parse_pytest_collection_count(output: str) -> str:
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        if not lines:
+            raise ValueError("pytest collection output is empty")
+        last_line = lines[-1]
+        if last_line.startswith("no tests collected"):
+            return "0"
+        count = last_line.split(" ", 1)[0]
+        if count.isdigit() and "collected" in last_line:
+            return count
+        raise ValueError(f"unexpected pytest collection output: {last_line}")
 
     def get_workflow_state(self, workflow_id: str) -> Dict[str, Any]:
         """Get current state of a workflow."""

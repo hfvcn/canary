@@ -43,17 +43,19 @@ def _check_improvement_register(state: FlowState) -> CheckResult:
     )
     details: list[dict] = []
     short_diff = ""
+    full_diff = ""
 
     for label, tracker_path in [("short", tracker_short), ("full", tracker_full)]:
         tracker_details, diff_text = _check_tracker_diff(label, tracker_path, context)
         details.extend(tracker_details)
         if label == "short":
             short_diff = diff_text
+        if label == "full":
+            full_diff = diff_text
 
+    details.extend(_check_archive_migration(cwd, tracker_short, tracker_full, short_diff, full_diff))
     details.extend(_check_short_tracker_archive_advisory(cwd, tracker_short))
     passed = _details_passed(details)
-    if passed and _diff_adds_completed_header(short_diff):
-        print(ARCHIVE_ADVISORY_MESSAGE)
     return CheckResult(passed, details)
 
 
@@ -175,6 +177,14 @@ def _diff_added_contents(diff_text: str) -> tuple[str, ...]:
     )
 
 
+def _diff_deleted_contents(diff_text: str) -> tuple[str, ...]:
+    return tuple(
+        line[1:]
+        for line in diff_text.splitlines()
+        if line.startswith("-") and not line.startswith("---")
+    )
+
+
 def _diff_adds_completed_header(diff_text: str) -> bool:
     return any(
         _is_completed_header_addition(line)
@@ -210,11 +220,102 @@ def _check_short_tracker_archive_advisory(cwd: str, tracker_short: str) -> list[
         return []
     return [
         _detail(
-            "short tracker archive advisory",
-            True,
-            f"completed-but-not-archived: {sorted(remnants)}",
+            "short tracker archive blocking",
+            False,
+            f"completed-but-not-archived: {sorted(remnants)} — archive these to full tracker before proceeding",
         )
     ]
+
+
+def _check_archive_migration(
+    cwd: str,
+    tracker_short: str,
+    tracker_full: str,
+    short_diff: str,
+    full_diff: str,
+) -> list[dict]:
+    try:
+        baseline_short = _git_head_tracker_text(cwd, tracker_short)
+        current_short = _read_worktree_tracker_text(cwd, tracker_short)
+        current_full = _read_worktree_tracker_text(cwd, tracker_full)
+    except OSError as exc:
+        message = str(exc)
+        return [
+            _detail("short tracker archived deletions", False, message),
+            _detail("full tracker archive paragraph additions", False, message),
+        ]
+    completed_ids = _new_completed_tracker_ids(baseline_short, current_short)
+    if not completed_ids:
+        message = "no newly completed items added in short tracker"
+        return [
+            _detail("short tracker archived deletions", True, message),
+            _detail("full tracker archive paragraph additions", True, message),
+        ]
+    return [
+        _short_tracker_archive_detail(short_diff, completed_ids),
+        _full_tracker_archive_detail(full_diff, current_full, completed_ids),
+    ]
+
+
+def _short_tracker_archive_detail(short_diff: str, completed_ids: set[str]) -> dict:
+    deleted_ids = _deleted_tracker_ids(short_diff)
+    missing_ids = sorted(completed_ids - deleted_ids)
+    if not missing_ids:
+        archived_ids = sorted(completed_ids)
+        return _detail("short tracker archived deletions", True, f"deleted short-tracker sections for: {archived_ids}")
+    return _detail(
+        "short tracker archived deletions",
+        False,
+        f"missing short-tracker deletions for completed items: {missing_ids}",
+    )
+
+
+def _full_tracker_archive_detail(full_diff: str, current_full: str, completed_ids: set[str]) -> dict:
+    added_ids = _tracker_ids_in_text("\n".join(_diff_added_contents(full_diff)))
+    missing_ids = sorted(completed_ids - added_ids)
+    has_paragraph = _full_diff_has_archive_paragraph(full_diff)
+    if not missing_ids and has_paragraph:
+        archived_ids = sorted(completed_ids)
+        return _detail("full tracker archive paragraph additions", True, f"archive content added for: {archived_ids}")
+    if missing_ids:
+        return _detail(
+            "full tracker archive paragraph additions",
+            False,
+            f"full tracker archive additions missing completed items: {missing_ids}",
+        )
+    return _detail(
+        "full tracker archive paragraph additions",
+        False,
+        f"full tracker missing archive paragraph additions for completed items ({len(current_full.splitlines())} current lines)",
+    )
+
+
+def _deleted_tracker_ids(diff_text: str) -> set[str]:
+    return _tracker_ids_in_text("\n".join(_diff_deleted_contents(diff_text)))
+
+
+def _tracker_ids_in_text(text: str) -> set[str]:
+    return set(_TRACKER_ID_RE.findall(text))
+
+
+def _full_diff_has_archive_paragraph(full_diff: str) -> bool:
+    return any(_is_archive_paragraph_line(content) for content in _diff_added_contents(full_diff))
+
+
+def _is_archive_paragraph_line(content: str) -> bool:
+    stripped = content.strip()
+    if not stripped or stripped == _TRACKER_HEADER_END:
+        return False
+    if _is_completed_header_addition(f"+{stripped}") or stripped.startswith("#### "):
+        return False
+    if stripped.startswith("|"):
+        return not _is_table_separator_row(stripped)
+    return not _looks_like_header_line(stripped)
+
+
+def _is_table_separator_row(content: str) -> bool:
+    raw = content.replace("|", "").replace("-", "").replace(":", "").strip()
+    return not raw
 
 
 def _git_head_tracker_text(cwd: str, tracker_short: str) -> str:

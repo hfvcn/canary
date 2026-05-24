@@ -13,8 +13,27 @@ from unittest.mock import patch
 
 import pytest
 
+from cccc.ralph.agent import _security_checklist_items
+from cccc.ralph.security_check_generator import (
+    generate_llm_security_checks,
+    generate_security_checks,
+)
+from cccc.ralph.security_recipes import SECURITY_RECIPES, TOCTOU_TEST_TEMPLATES
+
 TEST_GROUP_ID = "group-1"
 TEST_PROJECT_ROOT = Path("/tmp/test")
+TOKEN_TYPE_CHECK = (
+    "Verify: Does token validation check the type field? Can a refresh token "
+    "be used as an access token? Are different token types handled distinctly?"
+)
+TOCTOU_CHECK = (
+    "Verify: Is data revalidated after retrieval? Can backing state change "
+    "between store and use? Are concurrent mutations handled safely?"
+)
+RACE_CHECK = (
+    "Verify: Are critical sections protected? Do concurrent operations use "
+    "barrier-based synchronization for true concurrency testing?"
+)
 
 
 def _python_exit_command(code: int) -> str:
@@ -44,6 +63,60 @@ def _make_validation_task(**overrides: object) -> dict[str, object]:
     }
     task.update(overrides)
     return task
+
+
+def _goal_reference_plan(
+    *,
+    goal_behavior: str,
+    claimed_paths: list[str],
+    awareness_paths: list[str] | None = None,
+):
+    from cccc.ralph.models import Plan, TaskSpec, Verification, VerificationCovers
+
+    return Plan(tasks=[TaskSpec(
+        id="T1",
+        claimed_paths=claimed_paths,
+        awareness_paths=awareness_paths or [],
+        goal_behavior=goal_behavior,
+        acceptance_criteria="feature works",
+        verification=Verification(
+            level="unit",
+            command="pytest -q",
+            covers=VerificationCovers(tasks=["T1"]),
+        ),
+    )])
+
+
+def _project_goal_report(
+    tmp_path: Path,
+    *,
+    goal_behavior: str,
+    claimed_paths: list[str],
+    files: dict[str, str],
+    awareness_paths: list[str] | None = None,
+):
+    from cccc.ralph.validator import validate_with_project
+
+    for relative_path, content in files.items():
+        file_path = tmp_path / relative_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+
+    plan = _goal_reference_plan(
+        goal_behavior=goal_behavior,
+        claimed_paths=claimed_paths,
+        awareness_paths=awareness_paths,
+    )
+    with (
+        patch("cccc.ralph.validator.validate_filesystem", return_value=[]),
+        patch("cccc.ralph.validator._check_temporal_pattern_integration", return_value=[]),
+        patch("cccc.ralph.validator._check_semantic_dependencies", return_value=[]),
+        patch("cccc.ralph.validator._check_semantic_unchecked_symbols", return_value=[]),
+        patch("cccc.ralph.validator.check_goal_hardcoded_awareness", return_value=[]),
+        patch("cccc.ralph.validator.validate_provider_source_signatures", return_value=[]),
+        patch("cccc.ralph.validator._check_capability_coverage", return_value=[]),
+    ):
+        return validate_with_project(plan, project_root=tmp_path)
 
 
 def _report_signature(report: object) -> tuple[bool, list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
@@ -225,12 +298,13 @@ def test_validate_ledger_writes_event(tmp_path: Path) -> None:
     events = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(events) == 1
     assert events[0]["kind"] == "workflow.plan_validated"
-    payload = PlanValidatedData.model_validate(events[0]["data"])
-    assert payload.valid is True
-    assert payload.ruleset_digest == "digest-valid"
-    assert payload.counts == {"errors": 0, "warnings": 1, "hints": 0, "total": 1}
-    assert payload.warnings[0].code == "W_TEST"
-    assert payload.warnings[0].summary == "warning"
+    data = events[0]["data"]
+    assert data["valid"] is True
+    assert data["ruleset_digest"] == "digest-valid"
+    assert data["error_count"] == 0
+    assert data["warning_count"] == 1
+    assert data["hint_count"] == 0
+    assert data["outcome"] == "passed"
 
 
 def test_validate_ledger_invalid_plan(tmp_path: Path) -> None:
@@ -253,12 +327,13 @@ def test_validate_ledger_invalid_plan(tmp_path: Path) -> None:
     events = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(events) == 1
     assert events[0]["kind"] == "workflow.plan_validation_failed"
-    payload = PlanValidationFailedData.model_validate(events[0]["data"])
-    assert payload.valid is False
-    assert payload.ruleset_digest == "digest-invalid"
-    assert payload.counts == {"errors": 1, "warnings": 0, "hints": 0, "total": 1}
-    assert payload.errors[0].code == "E_TEST"
-    assert payload.errors[0].summary == "invalid plan"
+    data = events[0]["data"]
+    assert data["valid"] is False
+    assert data["ruleset_digest"] == "digest-invalid"
+    assert data["error_count"] == 1
+    assert data["warning_count"] == 0
+    assert data["hint_count"] == 0
+    assert data["outcome"] == "failed"
 
 
 def test_validation_event_has_plan_hash(tmp_path: Path) -> None:
@@ -483,6 +558,91 @@ def test_scope_subdirectory_match(group, temp_project_dir: Path) -> None:
     )
 
     assert result.warnings == []
+
+
+def _make_contract_usage_task(*, symbol: str = "require_scope"):
+    from cccc.ralph.models import Contract, TaskSpec, Verification, VerificationCovers
+
+    return TaskSpec(
+        id="T-contract",
+        claimed_paths=["src/consumer.py"],
+        verification=Verification(
+            level="unit",
+            command="true",
+            covers=VerificationCovers(tasks=["T-contract"]),
+        ),
+        consumes=[
+            Contract(
+                name="scope_enforcement",
+                from_task="T-provider",
+                kind="runtime_capability",
+                signatures={symbol: "(scope: str) -> callable"},
+            )
+        ],
+    )
+
+
+def _passed_check(**kwargs: object) -> dict[str, object]:
+    return {
+        "name": str(kwargs["name"]),
+        "outcome": "passed",
+        "message": "",
+        "duration_ms": 1,
+    }
+
+
+def test_contract_drift_detected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from cccc.ralph.core import verify
+
+    consumer_path = tmp_path / "src" / "consumer.py"
+    consumer_path.parent.mkdir(parents=True, exist_ok=True)
+    consumer_path.write_text(
+        "def handler():\n"
+        "    return _has_scope('admin')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("cccc.ralph.core._run_check", _passed_check)
+    monkeypatch.setattr("cccc.ralph.core._run_security_scan", lambda **kwargs: [])
+
+    result = verify(
+        _make_contract_usage_task(),
+        changed_files=["src/consumer.py"],
+        project_root=tmp_path,
+    )
+
+    warnings = result["security_warnings"]
+    assert result["outcome"] == "passed"
+    assert len(warnings) == 1
+    assert warnings[0]["type"] == "contract_usage_drift"
+    assert warnings[0]["contract_name"] == "scope_enforcement"
+    assert warnings[0]["symbols"] == ["require_scope"]
+    assert "require_scope" in warnings[0]["message"]
+
+
+def test_contract_usage_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from cccc.ralph.core import verify
+
+    consumer_path = tmp_path / "src" / "consumer.py"
+    consumer_path.parent.mkdir(parents=True, exist_ok=True)
+    consumer_path.write_text(
+        "from auth.scope import require_scope\n"
+        "\n"
+        "@require_scope('admin')\n"
+        "def handler():\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("cccc.ralph.core._run_check", _passed_check)
+    monkeypatch.setattr("cccc.ralph.core._run_security_scan", lambda **kwargs: [])
+
+    result = verify(
+        _make_contract_usage_task(),
+        changed_files=["src/consumer.py"],
+        project_root=tmp_path,
+    )
+
+    assert result["outcome"] == "passed"
+    assert result["security_warnings"] == []
 
 
 def test_orchestrator_verify_gate_marks_completed(group, temp_project_dir: Path) -> None:
@@ -786,6 +946,178 @@ def test_shallow_checks_no_checks_field() -> None:
     assert "W_VERIFICATION_SHALLOW_CHECKS" not in warning_codes
 
 
+def test_goal_references_unclaimed_path_reports() -> None:
+    from cccc.ralph.validator import validate
+
+    report = validate(_goal_reference_plan(
+        goal_behavior="Update codex_bridge.py to fix relay flow.",
+        claimed_paths=["src/feature.py"],
+    ))
+
+    assert "W_GOAL_REFERENCES_UNCLAIMED_PATH" in [issue.code for issue in report.warnings]
+
+
+def test_goal_references_in_awareness_no_warning() -> None:
+    from cccc.ralph.validator import validate
+
+    report = validate(_goal_reference_plan(
+        goal_behavior="Coordinate codex_bridge.py with the worker flow.",
+        claimed_paths=["src/feature.py"],
+        awareness_paths=["codex_bridge.py"],
+    ))
+
+    assert "W_GOAL_REFERENCES_UNCLAIMED_PATH" not in [issue.code for issue in report.warnings]
+
+
+def test_goal_references_in_claimed_no_warning() -> None:
+    from cccc.ralph.validator import validate
+
+    report = validate(_goal_reference_plan(
+        goal_behavior="Refine flow_engine.py for the handoff.",
+        claimed_paths=["flow_engine.py"],
+    ))
+
+    assert "W_GOAL_REFERENCES_UNCLAIMED_PATH" not in [issue.code for issue in report.warnings]
+
+
+def test_goal_references_in_backticks_no_warning() -> None:
+    from cccc.ralph.validator import validate
+
+    report = validate(_goal_reference_plan(
+        goal_behavior="Run `codex_bridge.py --verify` after the change.",
+        claimed_paths=["src/feature.py"],
+    ))
+
+    assert "W_GOAL_REFERENCES_UNCLAIMED_PATH" not in [issue.code for issue in report.warnings]
+
+
+def test_goal_symbol_found_in_claimed_paths(tmp_path: Path) -> None:
+    """RV-6: symbol in goal exists in claimed file -> no warning."""
+    report = _project_goal_report(
+        tmp_path,
+        goal_behavior="Refactor `build_index()` to support caching.",
+        claimed_paths=["src/search.py"],
+        files={
+            "src/search.py": (
+                "def build_index():\n"
+                "    return True\n"
+            ),
+        },
+    )
+
+    assert "W_GOAL_SYMBOL_NOT_IN_CLAIMED_PATH" not in [issue.code for issue in report.warnings]
+
+
+def test_goal_symbol_not_found_in_claimed_paths(tmp_path: Path) -> None:
+    """RV-6+RV-7: symbol in goal not in any claimed file -> warning."""
+    report = _project_goal_report(
+        tmp_path,
+        goal_behavior="Refactor `build_index()` to support caching.",
+        claimed_paths=["src/search.py"],
+        files={
+            "src/search.py": (
+                "def lookup_index():\n"
+                "    return True\n"
+            ),
+        },
+    )
+
+    issue = next(
+        issue for issue in report.warnings
+        if issue.code == "W_GOAL_SYMBOL_NOT_IN_CLAIMED_PATH"
+    )
+    assert issue.evidence == {
+        "symbol": "build_index()",
+        "claimed_paths": ["src/search.py"],
+    }
+
+
+def test_goal_no_backtick_symbols(tmp_path: Path) -> None:
+    """RV-6: goal without backtick symbols -> no warning."""
+    report = _project_goal_report(
+        tmp_path,
+        goal_behavior="Refactor the indexing flow to support caching.",
+        claimed_paths=["src/search.py"],
+        files={
+            "src/search.py": (
+                "def lookup_index():\n"
+                "    return True\n"
+            ),
+        },
+    )
+
+    assert "W_GOAL_SYMBOL_NOT_IN_CLAIMED_PATH" not in [issue.code for issue in report.warnings]
+
+
+def test_goal_file_path_backtick_not_treated_as_symbol(tmp_path: Path) -> None:
+    """RV-6: backtick containing file path is not treated as symbol."""
+    report = _project_goal_report(
+        tmp_path,
+        goal_behavior="Update `src/search.py` to support caching.",
+        claimed_paths=["src/search.py"],
+        files={
+            "src/search.py": (
+                "def lookup_index():\n"
+                "    return True\n"
+            ),
+        },
+    )
+
+    assert "W_GOAL_SYMBOL_NOT_IN_CLAIMED_PATH" not in [issue.code for issue in report.warnings]
+
+
+def test_cjk_tokenization_hint_triggered() -> None:
+    """RV-8: split + CJK context -> hint."""
+    report = _validate_plan({
+        "tasks": [
+            _make_validation_task(
+                goal_behavior="Use split to tokenize 中文 search queries.",
+            )
+        ],
+    })
+
+    assert "W_GOAL_CJK_TOKENIZATION_HINT" in [issue.code for issue in report.hints]
+
+
+def test_cjk_tokenization_no_cjk_context() -> None:
+    """RV-8: split without CJK -> no hint."""
+    report = _validate_plan({
+        "tasks": [
+            _make_validation_task(
+                goal_behavior="Use split to tokenize user search queries.",
+            )
+        ],
+    })
+
+    assert "W_GOAL_CJK_TOKENIZATION_HINT" not in [issue.code for issue in report.hints]
+
+
+def test_cjk_tokenization_no_tokenization_keyword() -> None:
+    """RV-8: CJK without split/tokenize -> no hint."""
+    report = _validate_plan({
+        "tasks": [
+            _make_validation_task(
+                goal_behavior="Normalize 中文 search queries before ranking.",
+            )
+        ],
+    })
+
+    assert "W_GOAL_CJK_TOKENIZATION_HINT" not in [issue.code for issue in report.hints]
+
+
+def test_cjk_tokenization_japanese_katakana() -> None:
+    """RV-8: tokenize + Japanese text -> hint."""
+    report = _validate_plan({
+        "tasks": [
+            _make_validation_task(
+                goal_behavior="Tokenize カタカナ and 日本語 product names before scoring.",
+            )
+        ],
+    })
+
+    assert "W_GOAL_CJK_TOKENIZATION_HINT" in [issue.code for issue in report.hints]
+
+
 def test_validate_with_project_suppress_instances_fatal_path(
     temp_project_dir: Path,
 ) -> None:
@@ -858,6 +1190,204 @@ def test_validate_and_validate_with_project_suppress_consistent(
 
     report = validate(plan)
     assert _report_signature(project_report) == _report_signature(report)
+
+
+def _acceptance_coverage_report(
+    tmp_path: Path,
+    *,
+    acceptance_criteria: str,
+    tracker_text: str | None,
+):
+    from cccc.ralph.models import Plan
+    from cccc.ralph.validator import validate_with_project
+
+    tracker_path = None
+    if tracker_text is not None:
+        tracker_path = tmp_path / "tracker.md"
+        tracker_path.write_text(tracker_text, encoding="utf-8")
+
+    plan = Plan.model_validate({
+        "required_issues": ["RV-5"],
+        "tasks": [{
+            **_make_validation_task(
+                acceptance_criteria=acceptance_criteria,
+                addresses=["RV-5"],
+            ),
+        }],
+    })
+
+    with (
+        patch("cccc.ralph.validator.validate_filesystem", return_value=[]),
+        patch("cccc.ralph.validator._check_temporal_pattern_integration", return_value=[]),
+        patch("cccc.ralph.validator._check_semantic_dependencies", return_value=[]),
+        patch("cccc.ralph.validator._check_semantic_unchecked_symbols", return_value=[]),
+        patch("cccc.ralph.validator.check_goal_hardcoded_awareness", return_value=[]),
+        patch("cccc.ralph.validator.validate_provider_source_signatures", return_value=[]),
+        patch("cccc.ralph.validator._check_capability_coverage", return_value=[]),
+    ):
+        return validate_with_project(
+            plan,
+            project_root=tmp_path,
+            tracker_path=tracker_path,
+        )
+
+
+def test_acceptance_coverage_gap_detected(tmp_path: Path) -> None:
+    report = _acceptance_coverage_report(
+        tmp_path,
+        acceptance_criteria="verify gate",
+        tracker_text=(
+            "#### RV-5 acceptance coverage\n"
+            "- **验收标准**：verify gate warning runtime audit check\n"
+        ),
+    )
+
+    warning_codes = [issue.code for issue in report.warnings]
+    assert "W_ACCEPTANCE_COVERAGE_GAP" in warning_codes
+    issue = next(issue for issue in report.warnings if issue.code == "W_ACCEPTANCE_COVERAGE_GAP")
+    assert issue.evidence["coverage"] < 0.5
+
+
+def test_acceptance_coverage_all_covered(tmp_path: Path) -> None:
+    report = _acceptance_coverage_report(
+        tmp_path,
+        acceptance_criteria="verify gate warning runtime audit check",
+        tracker_text=(
+            "#### RV-5 acceptance coverage\n"
+            "- **验收标准**：verify gate warning runtime audit check\n"
+        ),
+    )
+
+    assert "W_ACCEPTANCE_COVERAGE_GAP" not in [issue.code for issue in report.warnings]
+
+
+def test_acceptance_coverage_no_tracker(tmp_path: Path) -> None:
+    report = _acceptance_coverage_report(
+        tmp_path,
+        acceptance_criteria="verify gate",
+        tracker_text=None,
+    )
+
+    assert "W_ACCEPTANCE_COVERAGE_GAP" not in [issue.code for issue in report.warnings]
+
+
+def test_tracker_archive_moves_completed(tmp_path: Path) -> None:
+    short_path = tmp_path / "short.md"
+    full_path = tmp_path / "full.md"
+    short_path.write_text(
+        "> 日期：2026-05-20\n"
+        "> 已完成（v42 代码修复）：FL-19\n"
+        "---\n"
+        "#### FL-19\n"
+        "archive detail line 1\n"
+        "archive detail line 2\n"
+        "#### UX-15\n"
+        "keep this item\n",
+        encoding="utf-8",
+    )
+    full_path.write_text(
+        "> 日期：2026-05-20\n"
+        "---\n"
+        "existing full content\n",
+        encoding="utf-8",
+    )
+
+    rc, stdout, stderr = _capture_ralph_main([
+        "tracker",
+        "archive",
+        "--version",
+        "v42",
+        "--tracker",
+        str(short_path),
+        "--full",
+        str(full_path),
+    ])
+
+    assert rc == 0
+    assert stderr == ""
+    assert "Archived 1 items (3 lines) from short to full tracker" in stdout
+    short_text = short_path.read_text(encoding="utf-8")
+    full_text = full_path.read_text(encoding="utf-8")
+    assert "> 已完成（v42 代码修复）：FL-19" in short_text
+    assert "#### FL-19" not in short_text
+    assert "#### UX-15" in short_text
+    assert "> 已完成（v42 归档）：FL-19" in full_text
+    assert "archive detail line 1" in full_text
+
+
+def test_tracker_archive_dry_run(tmp_path: Path) -> None:
+    short_path = tmp_path / "short.md"
+    full_path = tmp_path / "full.md"
+    short_text = (
+        "> 日期：2026-05-20\n"
+        "> 已完成（v42 代码修复）：FL-19\n"
+        "---\n"
+        "#### FL-19\n"
+        "archive detail line 1\n"
+    )
+    full_text = (
+        "> 日期：2026-05-20\n"
+        "---\n"
+        "existing full content\n"
+    )
+    short_path.write_text(short_text, encoding="utf-8")
+    full_path.write_text(full_text, encoding="utf-8")
+
+    rc, stdout, stderr = _capture_ralph_main([
+        "tracker",
+        "archive",
+        "--version",
+        "v42",
+        "--tracker",
+        str(short_path),
+        "--full",
+        str(full_path),
+        "--dry-run",
+    ])
+
+    assert rc == 0
+    assert stderr == ""
+    assert "Dry run: would archive 1 items (2 lines) from short to full tracker: FL-19" in stdout
+    assert short_path.read_text(encoding="utf-8") == short_text
+    assert full_path.read_text(encoding="utf-8") == full_text
+
+
+def test_tracker_archive_preserves_uncompleted(tmp_path: Path) -> None:
+    short_path = tmp_path / "short.md"
+    full_path = tmp_path / "full.md"
+    short_path.write_text(
+        "> 日期：2026-05-20\n"
+        "> 已验证（v42 E2E 确认）：FL-19\n"
+        "---\n"
+        "#### FL-19\n"
+        "archive detail line 1\n"
+        "#### UX-15\n"
+        "keep this item\n",
+        encoding="utf-8",
+    )
+    full_path.write_text(
+        "> 日期：2026-05-20\n"
+        "---\n",
+        encoding="utf-8",
+    )
+
+    rc, _, stderr = _capture_ralph_main([
+        "tracker",
+        "archive",
+        "--version",
+        "v42",
+        "--tracker",
+        str(short_path),
+        "--full",
+        str(full_path),
+    ])
+
+    assert rc == 0
+    assert stderr == ""
+    short_text = short_path.read_text(encoding="utf-8")
+    assert "#### FL-19" not in short_text
+    assert "#### UX-15" in short_text
+    assert "keep this item" in short_text
 
 
 def test_test_created_by_defers_forbidden() -> None:
@@ -963,3 +1493,555 @@ def test_finding_refs_optional() -> None:
     codes = [issue.code for issue in report.warnings + report.hints]
     assert "W_FINDING_REF_INCOMPLETE" not in codes
     assert "W_FINDING_REF_UNKNOWN_ENFORCER" not in codes
+
+
+def _write_security_generation_plan(tmp_path: Path, payload: dict[str, object]) -> Path:
+    plan_path = tmp_path / "plan.yaml"
+    plan_path.write_text(json.dumps(payload), encoding="utf-8")
+    return plan_path
+
+
+def _llm_security_generation_plan() -> dict[str, object]:
+    return {
+        "schema_version": "1.0.0",
+        "critical_flows": [
+            {
+                "id": "admin-auth-behavior",
+                "description": "Admin auth token rejects sql injection, ssrf, and race abuse.",
+                "surface_type": "auth_token",
+                "entrypoints": ["src/auth.py"],
+                "required_verification_level": "unit",
+            }
+        ],
+        "tasks": [
+            {
+                "id": "T1",
+                "claimed_paths": ["src/auth.py"],
+                "goal_behavior": "POST /admin/login validates auth token before session creation.",
+                "acceptance_criteria": "Reject malformed token input and encoded SSRF targets.",
+                "verification": {
+                    "level": "unit",
+                    "checks": [],
+                    "covers": {"tasks": ["T1"], "flows": ["admin-auth-behavior"]},
+                },
+            }
+        ],
+    }
+
+
+def _wrapped_gemini_security_checks(checks: list[dict[str, str]]) -> str:
+    return json.dumps({"response": json.dumps(checks)})
+
+
+def test_generate_llm_security_checks_with_mock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+    plan_path = _write_security_generation_plan(tmp_path, _llm_security_generation_plan())
+    llm_payload = [
+        {
+            "name": "admin-auth-behavior-auth-header-rejects-sql-injection",
+            "command": "python -m pytest tests/security/test_auth_behavior.py::test_sql_injection_rejected -q",
+        },
+        {
+            "name": "admin-auth-behavior-auth-header-blocks-encoded-ssrf",
+            "command": "python -m pytest tests/security/test_auth_behavior.py::test_ssrf_target_rejected -q",
+        },
+        {
+            "name": "admin-auth-behavior-session-write-race",
+            "command": "python -m pytest tests/security/test_auth_behavior.py::test_session_write_race -q",
+        },
+    ]
+
+    def fake_retry(self, prompt: str, *, parser, operation: str, fallback=None):
+        del self, fallback
+        captured["prompt"] = prompt
+        captured["operation"] = operation
+        return parser(_wrapped_gemini_security_checks(llm_payload))
+
+    monkeypatch.setattr("cccc.ralph.agent.RalphAgent._run_gemini_json_retry", fake_retry)
+
+    checks = generate_llm_security_checks(str(plan_path))
+
+    assert len(checks) == 3
+    assert all(check["source"] == "llm" for check in checks)
+    assert all(check["auto_generated"] is True for check in checks)
+    assert captured["operation"] == "security check generation"
+    assert "admin-auth-behavior" in captured["prompt"]
+    assert "security_recipe_hints" in captured["prompt"]
+
+
+def test_generate_llm_security_checks_provider_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    plan_path = _write_security_generation_plan(tmp_path, _llm_security_generation_plan())
+
+    def fake_init(self, *args: object, **kwargs: object) -> None:
+        del self, args, kwargs
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr("cccc.ralph.agent.RalphAgent.__init__", fake_init)
+
+    with caplog.at_level("WARNING", logger="cccc.ralph.security_check_generator_llm"):
+        checks = generate_llm_security_checks(str(plan_path))
+
+    assert checks == []
+    assert "LLM security check generation skipped: provider unavailable" in caplog.text
+
+
+def test_generate_llm_security_checks_dedup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from cccc.ralph.cli import _print_generated_security_checks
+
+    plan_path = _write_security_generation_plan(tmp_path, _llm_security_generation_plan())
+    deterministic_checks = [
+        {
+            "name": "shared-check",
+            "command": "python -m pytest tests/security/test_auth.py::test_shared -q",
+            "auto_generated": True,
+        },
+        {
+            "name": "deterministic-only",
+            "command": "python -m pytest tests/security/test_auth.py::test_det -q",
+            "auto_generated": True,
+        },
+    ]
+    llm_checks = [
+        {
+            "name": "shared-check",
+            "command": "python -m pytest tests/security/test_auth.py::test_llm_shared -q",
+            "auto_generated": True,
+            "source": "llm",
+        },
+        {
+            "name": "llm-only",
+            "command": "python -m pytest tests/security/test_auth.py::test_llm_only -q",
+            "auto_generated": True,
+            "source": "llm",
+        },
+    ]
+    monkeypatch.setattr("cccc.ralph.cli.generate_security_checks", lambda _: deterministic_checks)
+    monkeypatch.setattr("cccc.ralph.cli.generate_llm_security_checks", lambda _: llm_checks)
+
+    _print_generated_security_checks(plan_path)
+
+    output_checks = json.loads(capsys.readouterr().out)
+    assert [check["name"] for check in output_checks] == [
+        "shared-check",
+        "deterministic-only",
+        "llm-only",
+    ]
+    assert output_checks[0]["command"] == deterministic_checks[0]["command"]
+
+
+def test_token_type_confusion_check_generated(tmp_path: Path) -> None:
+    from cccc.ralph.security_check_generator import generate_security_checks
+
+    plan_path = _write_security_generation_plan(
+        tmp_path,
+        {
+            "schema_version": "1.0.0",
+            "critical_flows": [
+                {
+                    "id": "admin-token-flow",
+                    "description": "Admin auth flow must reject refresh token as an access token.",
+                    "surface_type": "auth_token",
+                    "entrypoints": ["src/auth.py"],
+                    "required_verification_level": "unit",
+                }
+            ],
+            "tasks": [
+                {
+                    "id": "T1",
+                    "claimed_paths": ["src/auth.py"],
+                    "goal_behavior": "POST /oauth/token returns access token and refresh token pairs.",
+                    "acceptance_criteria": (
+                        "Reject refresh token when type==access to prevent token type confusion."
+                    ),
+                    "verification": {
+                        "level": "unit",
+                        "checks": [],
+                        "covers": {"tasks": ["T1"], "flows": ["admin-token-flow"]},
+                    },
+                }
+            ],
+        },
+    )
+
+    checks = generate_security_checks(str(plan_path))
+
+    token_type_checks = [
+        check for check in checks if check["name"] == "admin-token-flow-token-type-confusion"
+    ]
+    assert len(token_type_checks) == 1
+    assert "test_reject_refresh_token_as_access_token" in token_type_checks[0]["command"]
+    assert "/oauth/token" in token_type_checks[0]["command"]
+
+
+def test_token_type_no_auth_no_check(tmp_path: Path) -> None:
+    from cccc.ralph.security_check_generator import generate_security_checks
+
+    plan_path = _write_security_generation_plan(
+        tmp_path,
+        {
+            "schema_version": "1.0.0",
+            "critical_flows": [
+                {
+                    "id": "background-token-rotation",
+                    "description": "Background token rotation handles access token and refresh token pairs.",
+                    "entrypoints": ["src/tokens.py"],
+                    "required_verification_level": "unit",
+                }
+            ],
+            "tasks": [
+                {
+                    "id": "T1",
+                    "claimed_paths": ["src/tokens.py"],
+                    "goal_behavior": "Rotate access token and refresh token values in a worker loop.",
+                    "acceptance_criteria": (
+                        "Track token_type metadata and reject refresh token when type==access."
+                    ),
+                    "verification": {
+                        "level": "unit",
+                        "checks": [],
+                        "covers": {"tasks": ["T1"], "flows": ["background-token-rotation"]},
+                    },
+                }
+            ],
+        },
+    )
+
+    checks = generate_security_checks(str(plan_path))
+
+    assert all(check["name"] != "background-token-rotation-token-type-confusion" for check in checks)
+
+
+def _temporal_integration_report(tmp_path: Path, entrypoint_source: str):
+    from cccc.ralph.models import Plan
+    from cccc.ralph.validator import validate_with_project
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / "entry.py").write_text(entrypoint_source, encoding="utf-8")
+    (src_dir / "audit_helper.py").write_text(
+        "def record_audit(payload):\n"
+        "    return payload\n",
+        encoding="utf-8",
+    )
+    plan = Plan.model_validate({
+        "tasks": [{
+            **_make_validation_task(
+                claimed_paths=["src/entry.py", "src/audit_helper.py"],
+                verification={
+                    "level": "unit",
+                    "command": "pytest -q",
+                    "checks": [{"name": "unit", "command": "pytest -q"}],
+                    "covers": {"tasks": ["T1"], "flows": ["CF1"]},
+                },
+            )
+        }],
+        "critical_flows": [{
+            "id": "CF1",
+            "temporal_pattern": "store_then_use",
+            "entrypoints": ["src/entry.py"],
+        }],
+    })
+    with (
+        patch("cccc.ralph.validator.validate_filesystem", return_value=[]),
+        patch("cccc.ralph.validator._check_semantic_dependencies", return_value=[]),
+        patch("cccc.ralph.validator._check_semantic_unchecked_symbols", return_value=[]),
+        patch("cccc.ralph.validator.check_goal_hardcoded_awareness", return_value=[]),
+        patch("cccc.ralph.validator.validate_provider_source_signatures", return_value=[]),
+        patch("cccc.ralph.validator._check_capability_coverage", return_value=[]),
+    ):
+        return validate_with_project(plan, project_root=tmp_path)
+
+
+def test_temporal_integration_static_missing(tmp_path: Path) -> None:
+    report = _temporal_integration_report(
+        tmp_path,
+        "def handler():\n"
+        "    return True\n",
+    )
+
+    assert "W_TEMPORAL_PATTERN_NOT_INTEGRATED" in [issue.code for issue in report.warnings]
+
+
+def test_toctou_barrier_template_exists() -> None:
+    assert any("barrier" in template for template in TOCTOU_TEST_TEMPLATES)
+
+
+def test_toctou_check_has_barrier_env(tmp_path: Path) -> None:
+    plan_path = _write_security_generation_plan(
+        tmp_path,
+        {
+            "schema_version": "1.0.0",
+            "critical_flows": [
+                {
+                    "id": "stored-redirect",
+                    "description": "Redirect target is stored then used after validation.",
+                    "temporal_pattern": "store_then_use",
+                    "entrypoints": ["src/search.py"],
+                    "required_verification_level": "unit",
+                }
+            ],
+            "tasks": [
+                {
+                    "id": "T1",
+                    "claimed_paths": ["src/search.py"],
+                    "goal_behavior": "GET /api/search accepts JSON query input.",
+                    "acceptance_criteria": "Revalidate stored redirect target before use.",
+                    "verification": {
+                        "level": "unit",
+                        "checks": [],
+                        "covers": {"tasks": ["T1"], "flows": ["stored-redirect"]},
+                    },
+                }
+            ],
+        },
+    )
+
+    checks = generate_security_checks(str(plan_path))
+
+    assert [check["name"] for check in checks] == [
+        "stored-redirect-toctou-store-then-use",
+    ]
+    assert "SECURITY_TOCTOU_BARRIER=true" in str(checks[0]["command"])
+
+
+def test_toctou_coverage_terms_include_barrier() -> None:
+    recipe = SECURITY_RECIPES["temporal:store_then_use"]
+    coverage_terms = tuple(str(term) for term in recipe["coverage_terms"])
+    assert "barrier" in coverage_terms
+
+
+def test_temporal_integration_static_present(tmp_path: Path) -> None:
+    report = _temporal_integration_report(
+        tmp_path,
+        "from audit_helper import record_audit\n"
+        "\n"
+        "def handler(payload):\n"
+        "    return record_audit(payload)\n",
+    )
+
+    assert "W_TEMPORAL_PATTERN_NOT_INTEGRATED" not in [issue.code for issue in report.warnings]
+
+
+def test_temporal_runtime_audit_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from cccc.ralph.core import verify
+    from cccc.ralph.models import CheckSpec, TaskSpec, Verification
+
+    consumer_path = tmp_path / "src" / "consumer.py"
+    consumer_path.parent.mkdir(parents=True, exist_ok=True)
+    consumer_path.write_text("def handler():\n    return True\n", encoding="utf-8")
+
+    def _temporal_check(**kwargs: object) -> dict[str, object]:
+        return {
+            "name": str(kwargs["name"]),
+            "outcome": "passed",
+            "message": "",
+            "duration_ms": 1,
+            "stdout": "audit_count=0",
+            "stderr": "",
+        }
+
+    monkeypatch.setattr("cccc.ralph.core._run_check", _temporal_check)
+    monkeypatch.setattr("cccc.ralph.core._run_security_scan", lambda **kwargs: [])
+
+    task = TaskSpec(
+        id="T-temporal",
+        claimed_paths=["src/consumer.py"],
+        verification=Verification(
+            level="unit",
+            checks=[
+                CheckSpec(
+                    name="toctou-store-then-use",
+                    command=(
+                        "SECURITY_TEMPORAL_PATTERN=store_then_use "
+                        "python -m pytest tests/security/test_toctou.py -q"
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = verify(task, changed_files=["src/consumer.py"], project_root=tmp_path)
+
+    assert result["outcome"] == "passed"
+    assert any(
+        warning["type"] == "temporal_runtime_audit_empty"
+        for warning in result["security_warnings"]
+    )
+
+
+def test_provides_not_consumed_detected() -> None:
+    report = _validate_plan({
+        "tasks": [
+            _make_validation_task(
+                provides=[{"name": "scope_enforcement", "kind": "runtime_capability"}],
+            )
+        ],
+    })
+
+    warning_codes = [issue.code for issue in report.warnings]
+    hint_codes = [issue.code for issue in report.hints]
+
+    assert "W_PROVIDES_NOT_CONSUMED" in warning_codes
+    assert "W_PROVIDER_UNUSED" not in hint_codes
+
+
+def test_provides_consumed_no_warning() -> None:
+    provider = _make_validation_task(
+        provides=[{"name": "scope_enforcement", "kind": "runtime_capability"}],
+    )
+    consumer = _make_validation_task(
+        id="T2",
+        claimed_paths=["src/consumer.py", "tests/test_consumer.py"],
+        depends_on=["T1"],
+        verification={
+            "level": "unit",
+            "command": "pytest -q",
+            "checks": [{"name": "unit", "command": "pytest -q"}],
+            "covers": {"tasks": ["T2"]},
+        },
+        consumes=[
+            {
+                "name": "scope_enforcement",
+                "from": "T1",
+                "kind": "runtime_capability",
+            }
+        ],
+    )
+
+    report = _validate_plan({"tasks": [provider, consumer]})
+    codes = [issue.code for issue in report.warnings + report.hints]
+
+    assert "W_PROVIDES_NOT_CONSUMED" not in codes
+    assert "W_PROVIDER_UNUSED" not in codes
+
+
+def test_provides_not_consumed_no_warning_when_consumed() -> None:
+    provider = _make_validation_task(
+        provides=[{"name": "scope_enforcement", "kind": "runtime_capability"}],
+    )
+    consumer = _make_validation_task(
+        id="T2",
+        claimed_paths=["src/consumer.py", "tests/test_consumer.py"],
+        depends_on=["T1"],
+        verification={
+            "level": "unit",
+            "command": "pytest -q",
+            "checks": [{"name": "unit", "command": "pytest -q"}],
+            "covers": {"tasks": ["T2"]},
+        },
+        consumes=[
+            {
+                "name": "scope_enforcement",
+                "from": "T1",
+                "kind": "runtime_capability",
+            }
+        ],
+    )
+
+    report = _validate_plan({"tasks": [provider, consumer]})
+    codes = [issue.code for issue in report.warnings + report.hints]
+
+    assert "W_PROVIDES_NOT_CONSUMED" not in codes
+    assert "W_PROVIDER_UNUSED" not in codes
+
+
+def test_provides_not_consumed_detected_for_verification_role() -> None:
+    report = _validate_plan({
+        "tasks": [
+            _make_validation_task(
+                role="verification",
+                claimed_paths=["tests/test_feature.py"],
+                provides=[{"name": "scope_enforcement", "kind": "runtime_capability"}],
+            )
+        ],
+    })
+
+    warning_codes = [issue.code for issue in report.warnings]
+
+    assert "W_PROVIDES_NOT_CONSUMED" in warning_codes
+
+
+def _cross_boundary_warning_codes(*, downstream_covers: list[str] | None) -> list[str]:
+    provider = _make_validation_task(
+        id="T1",
+        claimed_paths=["src/provider.py", "tests/test_provider.py"],
+    )
+    consumer_verification: dict[str, object] = {
+        "level": "unit",
+        "command": "pytest -q",
+        "checks": [{"name": "unit", "command": "pytest -q"}],
+    }
+    if downstream_covers is not None:
+        consumer_verification["covers"] = {"tasks": downstream_covers}
+    consumer = _make_validation_task(
+        id="T2",
+        claimed_paths=["tests/test_glue.py"],
+        depends_on=["T1"],
+        verification=consumer_verification,
+    )
+
+    report = _validate_plan({"tasks": [provider, consumer]})
+    return [issue.code for issue in report.warnings]
+
+
+def test_covers_tasks_suppresses_cross_boundary() -> None:
+    warning_codes = _cross_boundary_warning_codes(downstream_covers=["T1"])
+
+    assert "W_CROSS_BOUNDARY_WITHOUT_GLUE" not in warning_codes
+
+
+def test_no_covers_still_reports_cross_boundary() -> None:
+    warning_codes = _cross_boundary_warning_codes(downstream_covers=None)
+
+    assert "W_CROSS_BOUNDARY_WITHOUT_GLUE" in warning_codes
+
+
+def test_token_type_checklist_triggered() -> None:
+    checklist = _security_checklist_items([
+        SimpleNamespace(id="token type", name="", title="", surface_type=""),
+    ])
+
+    assert TOKEN_TYPE_CHECK in checklist
+
+
+def test_toctou_checklist_triggered() -> None:
+    checklist = _security_checklist_items([
+        SimpleNamespace(id="toctou", name="", title="", surface_type=""),
+    ])
+
+    assert TOCTOU_CHECK in checklist
+
+
+def test_race_checklist_triggered() -> None:
+    checklist = _security_checklist_items([
+        SimpleNamespace(id="race condition", name="", title="", surface_type=""),
+    ])
+
+    assert RACE_CHECK in checklist
+
+
+def test_plain_auth_no_token_type_checklist() -> None:
+    checklist = _security_checklist_items([
+        SimpleNamespace(id="auth", name="", title="", surface_type=""),
+    ])
+
+    assert TOKEN_TYPE_CHECK not in checklist
+
+
+def test_plain_text_no_race_checklist() -> None:
+    checklist = _security_checklist_items([
+        SimpleNamespace(id="payment", name="", title="", surface_type=""),
+    ])
+
+    assert RACE_CHECK not in checklist

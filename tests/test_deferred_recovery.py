@@ -298,3 +298,73 @@ def test_batch_dispatch_works_after_verification_failure(orchestrator, monkeypat
 
     assert result.decision == "approved"
     assert [task.id for task in result.approved_tasks] == [next_task.id]
+
+
+def test_impossible_acceptance_override_path(orchestrator, monkeypatch) -> None:
+    workflow_id = "wf-impossible-acceptance"
+    task = TaskRef(
+        id="T-impossible-acceptance",
+        title="Impossible acceptance recovery",
+        type="backend",
+        claimed_paths=["src/impossible_acceptance.py"],
+        acceptance_criteria="Requires an external condition that cannot be satisfied in test.",
+        verification=VerificationSpec(command="false"),
+    )
+    monkeypatch.setattr(orchestrator.reporter, "on_task_failed", lambda *args, **kwargs: True)
+    monkeypatch.setattr(orchestrator, "_resuggest_ready_tasks", lambda workflow_id: None)
+    _register_verifying_task(
+        orchestrator,
+        task,
+        workflow_id=workflow_id,
+        agent_id="worker-impossible-1",
+    )
+
+    first_verification = orchestrator.ralph.verify_completion(
+        task.id,
+        list(task.claimed_paths),
+        workflow_id=workflow_id,
+        task_ref=task,
+    )
+    assert first_verification.overall_outcome == "failed"
+    orchestrator.on_verification_result(first_verification)
+    state = orchestrator.engine.get_task(task.id)
+    assert state is not None
+    assert state.status == WorkflowTaskStatus.FAILED
+
+    retry_result = orchestrator.retry_task(task.id)
+    assert retry_result["accepted"] is True
+    state = orchestrator.engine.get_task(task.id)
+    assert state is not None
+    assert state.status == WorkflowTaskStatus.READY
+
+    orchestrator.manual_assign_task(task.id, "worker-impossible-2")
+    orchestrator.engine.report_worker_completion(
+        task.id,
+        {
+            "agent_id": "worker-impossible-2",
+            "changed_files": list(task.claimed_paths),
+            "idempotency_key": "done-impossible-2",
+        },
+    )
+    second_verification = orchestrator.ralph.verify_completion(
+        task.id,
+        list(task.claimed_paths),
+        workflow_id=workflow_id,
+        task_ref=task,
+    )
+    assert second_verification.overall_outcome == "failed"
+    orchestrator.on_verification_result(second_verification)
+    state = orchestrator.engine.get_task(task.id)
+    assert state is not None
+    assert state.status == WorkflowTaskStatus.FAILED
+
+    override_result = orchestrator.override_task(
+        task.id,
+        "accepted after repeated verification failure",
+        {"reason": "exercise recovery path"},
+    )
+
+    assert override_result["status"] == "completed_by_override"
+    state = orchestrator.engine.get_task(task.id)
+    assert state is not None
+    assert state.status == WorkflowTaskStatus.COMPLETED_BY_OVERRIDE

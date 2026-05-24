@@ -8,8 +8,6 @@ from typing import Any, Dict, List, Optional
 
 from ...contracts.v1 import DaemonRequest
 from ...contracts.v1.ralph_ipc import TaskRef
-from ...kernel.actors import find_actor
-from ...kernel.group import load_group
 from ...kernel.workflow_state import WorkflowTaskStatus
 from ..ops.agent_ops import get_agent
 from .agent_pool import TaskAssignment
@@ -81,9 +79,64 @@ class AssignmentStartupMixin:
 
     def _start_actor_for_assignment(self, assignment: TaskAssignment) -> bool:
         started = self._owner._add_actor_via_daemon(assignment)
-        if started or not self._owner._start_actor_fn:
+        if started and self._check_actor_actually_running(assignment):
+            return True
+        if started and self._restart_stalled_actor(assignment):
+            return True
+        if not self._owner._start_actor_fn:
             return started
         return self._legacy_start_actor(assignment)
+
+    def _restart_stalled_actor(self, assignment: TaskAssignment) -> bool:
+        """Attempt to restart an actor that was added but not running."""
+        runner = self._owner._daemon_request_fn
+        if runner is None:
+            return False
+        try:
+            req = DaemonRequest.model_validate(
+                {
+                    "op": "actor_restart",
+                    "args": {
+                        "group_id": self._owner.group_id,
+                        "actor_id": assignment.agent_id,
+                        "by": ORCHESTRATOR_SERVICE_ACTOR,
+                    },
+                }
+            )
+            resp, _ = runner(req)
+        except Exception as exc:
+            logger.warning("W_ACTOR_RESTART_ERROR: actor %s restart error: %s", assignment.agent_id, exc)
+            return False
+        if resp.ok:
+            logger.info("Actor restart succeeded for %s", assignment.agent_id)
+            return True
+        logger.warning(
+            "W_ACTOR_RESTART_FAILED: actor %s restart failed: %s",
+            assignment.agent_id,
+            getattr(resp.error, "message", "unknown"),
+        )
+        return False
+
+    def _check_actor_actually_running(self, assignment: TaskAssignment) -> bool:
+        """Check if an actor is actually running after being added."""
+        try:
+            from ...kernel.actors import find_actor
+            from ...kernel.group import load_group
+
+            if (group := load_group(self._owner.group_id)) is None:
+                return True
+            actor = find_actor(group, assignment.agent_id)
+        except Exception:
+            return True
+        if not isinstance(actor, dict):
+            return True
+        if str(actor.get("desired_state", "running")).strip() == "running" and str(actor.get("runtime_state", "")).strip() == "stopped":
+            logger.warning(
+                "W_ACTOR_RUNTIME_STALL: actor %s desired_state=running but runtime_state=stopped",
+                assignment.agent_id,
+            )
+            return False
+        return True
 
     def _legacy_start_actor(self, assignment: TaskAssignment) -> bool:
         try:
@@ -125,12 +178,9 @@ class AssignmentStartupMixin:
         if tracked_task is None:
             return AssignmentPromptProjection([], [], [])
         return AssignmentPromptProjection(
-            issues=self._required_list(tracked_task, PROMPT_ISSUES_KEY),
-            recommended_tests=self._required_string_list(
-                tracked_task,
-                RECOMMENDED_TESTS_KEY,
-            ),
-            forbidden_flows=self._forbidden_flows_for(tracked_task),
+            self._required_list(tracked_task, PROMPT_ISSUES_KEY),
+            self._required_string_list(tracked_task, RECOMMENDED_TESTS_KEY),
+            self._forbidden_flows_for(tracked_task),
         )
 
     def _forbidden_flows_for(self, tracked_task: Dict[str, Any]) -> List[Any]:
@@ -233,52 +283,3 @@ class AssignmentStartupMixin:
             self._owner._log(f"[orchestrator] Error loading agent prompt for {agent_id}: {exc}")
             return ""
         return str((agent.prompt if agent else "") or "").strip()
-
-    def add_actor_via_daemon(self, assignment: TaskAssignment) -> bool:
-        """Register a foreman agent as a real group actor via daemon actor_add."""
-        if not self._owner._daemon_request_fn:
-            return False
-
-        group = load_group(self._owner.group_id)
-        if group is None:
-            self._owner._log(
-                f"[orchestrator] Cannot register agent {assignment.agent_id}: "
-                f"group {self._owner.group_id} not found"
-            )
-            return False
-        if find_actor(group, assignment.agent_id) is not None:
-            self._owner._log(f"[orchestrator] Agent {assignment.agent_id} already registered as group actor")
-            return True
-        return self._dispatch_actor_add(assignment)
-
-    def _dispatch_actor_add(self, assignment: TaskAssignment) -> bool:
-        agent_id = assignment.agent_id
-        runtime = assignment.model_runtime or "claude"
-        try:
-            req = self._build_actor_add_request(assignment, runtime)
-            resp, _ = self._owner._daemon_request_fn(req)
-            if resp.ok:
-                self._owner._log(f"[orchestrator] Registered agent {agent_id} as group actor (runtime={runtime})")
-                return True
-            err_msg = resp.error.message if resp.error else "unknown"
-            self._owner._log(f"[orchestrator] Failed to register agent {agent_id}: {err_msg}")
-            return False
-        except Exception as exc:
-            self._owner._log(f"[orchestrator] Error registering agent {agent_id} as actor: {exc}")
-            return False
-
-    def _build_actor_add_request(self, assignment: TaskAssignment, runtime: str) -> DaemonRequest:
-        agent_id = assignment.agent_id
-        return DaemonRequest(
-            op="actor_add",
-            args={
-                "group_id": self._owner.group_id,
-                "actor_id": agent_id,
-                "title": assignment.agent_name or agent_id,
-                "runner": "pty",
-                "runtime": runtime,
-                "worker_prompt": self.load_worker_prompt(agent_id),
-                "capability_autoload": ["pack:group-runtime"],
-                "by": ORCHESTRATOR_SERVICE_ACTOR,
-            },
-        )

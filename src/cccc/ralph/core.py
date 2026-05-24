@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import sys
 import time
@@ -20,6 +21,7 @@ from .aegis import suggest_aegis_issues
 from .models import (
     BatchResult,
     BlockedTask,
+    Contract,
     Plan,
     PlanState,
     RunningTask,
@@ -39,6 +41,9 @@ from cccc.kernel.claimed_paths import (
 
 
 _logger = logging.getLogger("cccc.ralph.core")
+_CONTRACT_USAGE_WARNING_TYPE = "contract_usage_drift"
+_TEMPORAL_RUNTIME_AUDIT_EMPTY_WARNING_TYPE = "temporal_runtime_audit_empty"
+_STORE_THEN_USE_TOKEN = "store_then_use"
 
 
 _LEDGER_STATUS_COMPLETED = "completed"
@@ -685,6 +690,14 @@ def verify(
         project_root=project_root,
         task=task,
     )
+    security_warnings.extend(
+        _check_contract_usage(
+            task=task,
+            changed_files=changed_files,
+            project_root=project_root,
+        )
+    )
+    security_warnings.extend(_check_temporal_runtime_audit(task=task, specs=specs, checks=checks))
 
     return {
         "task_id": task.id,
@@ -692,6 +705,119 @@ def verify(
         "checks": checks,
         "security_warnings": security_warnings,
     }
+
+
+def _check_contract_usage(
+    task: TaskSpec,
+    changed_files: List[str],
+    project_root: Path,
+) -> List[Dict[str, Any]]:
+    warnings: List[Dict[str, Any]] = []
+    for contract in task.consumes:
+        symbols = _contract_entrypoint_symbols(contract)
+        if not symbols:
+            continue
+        if _changed_files_reference_any_symbol(changed_files, symbols, project_root):
+            continue
+        warnings.append({
+            "type": _CONTRACT_USAGE_WARNING_TYPE,
+            "message": (
+                f"task '{task.id}' consumes '{contract.name}' but changed files "
+                f"do not reference declared entrypoint symbols: {', '.join(symbols)}"
+            ),
+            "contract_name": contract.name,
+            "from_task": contract.from_task,
+            "symbols": symbols,
+            "changed_files": list(changed_files),
+        })
+    return warnings
+
+
+def _contract_entrypoint_symbols(contract: Contract) -> List[str]:
+    if not contract.signatures:
+        return []
+    return list(dict.fromkeys(name for name in contract.signatures if name))
+
+
+def _changed_files_reference_any_symbol(
+    changed_files: List[str],
+    symbols: List[str],
+    project_root: Path,
+) -> bool:
+    patterns = [re.compile(rf"\b{re.escape(symbol)}\b") for symbol in symbols]
+    for changed_file in changed_files:
+        text = _read_changed_file_text(changed_file, project_root)
+        if text is None:
+            continue
+        if any(pattern.search(text) for pattern in patterns):
+            return True
+    return False
+
+
+def _read_changed_file_text(changed_file: str, project_root: Path) -> str | None:
+    path = Path(changed_file)
+    if not path.is_absolute():
+        path = project_root / path
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+def _check_temporal_runtime_audit(
+    *,
+    task: TaskSpec,
+    specs: List[Dict[str, Any]],
+    checks: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not _has_store_then_use_verification(specs):
+        return []
+    audit_empty = _audit_records_empty(checks)
+    if audit_empty is not True:
+        return []
+    return [{
+        "type": _TEMPORAL_RUNTIME_AUDIT_EMPTY_WARNING_TYPE,
+        "message": (
+            f"task '{task.id}' appears to verify a store_then_use flow but "
+            "audit records look empty at runtime"
+        ),
+    }]
+
+
+def _has_store_then_use_verification(specs: List[Dict[str, Any]]) -> bool:
+    for spec in specs:
+        text = f"{spec['name']} {spec['command']}".casefold().replace("-", "_")
+        if _STORE_THEN_USE_TOKEN in text:
+            return True
+    return False
+
+
+_EMPTY_AUDIT_PATTERNS = (
+    re.compile(r'"audit_count"\s*:\s*0\b', re.IGNORECASE),
+    re.compile(r"\baudit(?:_records?|_count)?\b[^0-9]{0,12}0\b", re.IGNORECASE),
+    re.compile(r"\b0\s+audit\s+records?\b", re.IGNORECASE),
+    re.compile(r"\bno\s+audit\s+records?\b", re.IGNORECASE),
+)
+_NONEMPTY_AUDIT_PATTERNS = (
+    re.compile(r'"audit_count"\s*:\s*[1-9]\d*\b', re.IGNORECASE),
+    re.compile(r"\baudit(?:_records?|_count)?\b[^0-9]{0,12}[1-9]\d*\b", re.IGNORECASE),
+    re.compile(r"\b[1-9]\d*\s+audit\s+records?\b", re.IGNORECASE),
+)
+
+
+def _audit_records_empty(checks: List[Dict[str, Any]]) -> bool | None:
+    saw_empty = False
+    for check in checks:
+        text = " ".join(
+            str(check.get(field) or "")
+            for field in ("stdout", "stderr", "message")
+        ).strip()
+        if not text:
+            continue
+        if any(pattern.search(text) for pattern in _NONEMPTY_AUDIT_PATTERNS):
+            return False
+        if any(pattern.search(text) for pattern in _EMPTY_AUDIT_PATTERNS):
+            saw_empty = True
+    return True if saw_empty else None
 
 
 def _run_security_scan(

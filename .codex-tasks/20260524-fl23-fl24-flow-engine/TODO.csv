@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Create task artifacts,DONE,Task files exist,test -f .codex-tasks/20260524-fl23-fl24-flow-engine/TODO.csv,,0,Initialized taskmaster directory
+2,Implement FL-23 and FL-24 in flow_engine.py,DONE,Requested constants checks and instruction text are updated,rg -n "GAP_CAPABILITY_KEYWORDS|tracker capability gap content|Do NOT use Edit/Write tools|Analyze step-3 Codex review findings" src/cccc/ralph/flow_engine.py,,0,Validated with rg
+3,Add regression test coverage,DONE,New capability-keyword test exists,rg -n "test_gap_record_requires_capability_keywords" tests/ralph/test_flow_engine.py,,0,Validated with rg
+4,Run targeted verification,DONE,Targeted pytest passes,pytest tests/ralph/test_flow_engine.py,,0,16 passed

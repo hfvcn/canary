@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current rule and test structure,DONE,"Target files and reuse pattern are identified","sed -n '1,260p' src/cccc/ralph/validation_rules/discipline_security.py && sed -n '1,260p' tests/test_aegis_security_chain.py",2026-05-24T00:00:00,0,Completed during initial repo inspection
+2,Implement silent degradation rule and register it,DONE,"New rule exists in discipline_security.py and is included in discipline.py","rg -n \"silent_degradation|W_SILENT_DEGRADATION_UNCHECKED\" src/cccc/ralph/validation_rules",2026-05-24T00:00:00,0,Also compacted rule helpers to keep discipline_security.py under the 300-line project limit
+3,Add targeted tests and run requested pytest selection,DONE,"Three silent degradation tests pass","python -m pytest tests/test_aegis_security_chain.py -v -k \"silent_degradation\"",2026-05-24T00:00:00,0,3 tests passed in 0.99s

@@ -42,7 +42,7 @@ from .report_diff import (
     format_report_diff_text,
     load_validation_report,
 )
-from .security_check_generator import generate_security_checks
+from .security_check_generator import generate_llm_security_checks, generate_security_checks
 from .validator import _sort_issues, validate, validate_with_project
 
 
@@ -55,6 +55,7 @@ _REPEATED_HINT_GROUP_THRESHOLD = 3
 _VALIDATE_DAEMON_EVENT_KIND = "ralph.validate_result"
 _VALIDATE_DAEMON_EVENT_OP = "ralph_validate_event"
 _VALIDATE_DAEMON_TIMEOUT_S = 1.0
+_FLOW_STATE_PATH = Path(".ralph-flow") / "state.json"
 
 
 def _warning_exc_info(exc_info: object | None) -> object | None:
@@ -278,6 +279,28 @@ def _group_matches_project_root(group: Any, project_root: Path) -> bool:
     return str(Path(raw_project_root).resolve()) == str(project_root.resolve())
 
 
+def _resolve_validate_tracker_path(
+    args: argparse.Namespace,
+    project_root: Path,
+) -> Path | None:
+    explicit_tracker = getattr(args, "tracker", None)
+    if explicit_tracker is not None:
+        return _project_relative_path(explicit_tracker, project_root)
+    state_path = project_root / _FLOW_STATE_PATH
+    if not state_path.is_file():
+        return None
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    params = state.get("params", {})
+    raw_tracker = params.get("tracker") if isinstance(params, dict) else None
+    if not isinstance(raw_tracker, str) or not raw_tracker.strip():
+        return None
+    return _project_relative_path(Path(raw_tracker), project_root)
+
+
+def _project_relative_path(path_value: Path, project_root: Path) -> Path:
+    return path_value if path_value.is_absolute() else project_root / path_value
+
+
 def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ralph",
@@ -290,6 +313,12 @@ def main(argv: List[str] | None = None) -> int:
     p_val.add_argument("plan", nargs="?", type=Path, help="Path to plan.yaml or plan.json")
     p_val.add_argument("--format", choices=["json", "text"], default="text")
     p_val.add_argument("--project-root", type=Path, help="Project root directory")
+    p_val.add_argument(
+        "--tracker",
+        type=Path,
+        default=None,
+        help="Issue tracker markdown path for acceptance coverage checks",
+    )
     p_val.add_argument(
         "--diff",
         nargs=2,
@@ -408,6 +437,15 @@ def main(argv: List[str] | None = None) -> int:
         help="Git ref for diff base (default: last commit that touched the guide file)",
     )
 
+    # --- tracker ---
+    p_tracker = sub.add_parser("tracker", help="Tracker maintenance commands")
+    tracker_sub = p_tracker.add_subparsers(dest="tracker_action")
+    p_tracker_archive = tracker_sub.add_parser("archive", help="Archive completed tracker sections")
+    p_tracker_archive.add_argument("--version", type=str, required=True, help="Version tag")
+    p_tracker_archive.add_argument("--tracker", type=Path, required=True, help="Short tracker path")
+    p_tracker_archive.add_argument("--full", type=Path, required=True, help="Full tracker path")
+    p_tracker_archive.add_argument("--dry-run", action="store_true", help="Show what would move without writing files")
+
     # --- flow ---
     p_flow = sub.add_parser("flow", help="Progressive workflow guidance")
     flow_sub = p_flow.add_subparsers(dest="flow_command")
@@ -443,6 +481,16 @@ def main(argv: List[str] | None = None) -> int:
             return _cmd_flow(args)
         except Exception as exc:
             _emit_error_envelope("flow", exc)
+            return _EXIT_INTERNAL_ERROR
+
+    if args.command == "tracker":
+        try:
+            if args.tracker_action == "archive":
+                return _cmd_tracker_archive(args)
+            print("error: tracker requires a subcommand (archive)", file=sys.stderr)
+            return _EXIT_VALIDATION_FAILURE
+        except Exception as exc:
+            _emit_error_envelope("tracker", exc)
             return _EXIT_INTERNAL_ERROR
 
     # ``audit`` does not require a plan file
@@ -606,9 +654,17 @@ def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
     )
     if args.suppress:
         plan.suppress_codes = list(set(plan.suppress_codes) | set(args.suppress))
+    tracker_path = _resolve_validate_tracker_path(args, project_root)
 
     try:
-        report = validate_with_project(plan, project_root=project_root)
+        if tracker_path is None:
+            report = validate_with_project(plan, project_root=project_root)
+        else:
+            report = validate_with_project(
+                plan,
+                project_root=project_root,
+                tracker_path=tracker_path,
+            )
     except Exception as exc:
         _emit_error_envelope("semantic", exc)
         return _EXIT_INTERNAL_ERROR
@@ -663,8 +719,26 @@ def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
 
 
 def _print_generated_security_checks(plan_path: Path) -> None:
-    checks = generate_security_checks(str(plan_path))
+    checks = _merged_generated_security_checks(plan_path)
     print(json.dumps(checks, indent=2, ensure_ascii=False))
+
+
+def _merged_generated_security_checks(plan_path: Path) -> list[dict[str, object]]:
+    deterministic_checks = generate_security_checks(str(plan_path))
+    llm_checks = generate_llm_security_checks(str(plan_path))
+    merged = list(deterministic_checks)
+    seen_names = {
+        str(check.get("name", "")).strip()
+        for check in deterministic_checks
+        if str(check.get("name", "")).strip()
+    }
+    for check in llm_checks:
+        name = str(check.get("name", "")).strip()
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        merged.append(check)
+    return merged
 
 
 def _write_validate_ledger_event_if_requested(
@@ -920,25 +994,31 @@ def _write_validation_event(
     group_id: str,
 ) -> None:
     from ..contracts.v1.ralph_ipc import (
-        IpcValidationError,
-        serialize_validation_event_v1,
         validation_event_kind,
     )
     from ..kernel.ledger import append_event
 
-    def to_ipc(issue: ValidationIssue) -> IpcValidationError:
-        return IpcValidationError.model_validate(issue.model_dump())
-
     plan_hash = hashlib.sha256(plan_path.read_bytes()).hexdigest()
-    data = serialize_validation_event_v1(
-        valid=report.valid,
-        errors=[to_ipc(issue) for issue in report.errors],
-        warnings=[to_ipc(issue) for issue in report.warnings],
-        hints=[to_ipc(issue) for issue in report.hints],
-        ruleset_digest=report.ruleset_digest,
-        plan_hash=plan_hash,
-    )
-    data["plan_path"] = str(plan_path)
+    error_count = len(report.errors)
+    warning_count = len(report.warnings)
+    hint_count = len(report.hints)
+    data = {
+        "event_schema_version": 1,
+        "valid": report.valid,
+        "error_count": error_count,
+        "warning_count": warning_count,
+        "hint_count": hint_count,
+        "counts": {
+            "errors": error_count,
+            "warnings": warning_count,
+            "hints": hint_count,
+            "total": error_count + warning_count + hint_count,
+        },
+        "ruleset_digest": report.ruleset_digest,
+        "plan_hash": plan_hash,
+        "plan_path": str(plan_path),
+        "outcome": "passed" if report.valid else "failed",
+    }
     append_event(
         ledger_path,
         kind=validation_event_kind(report.valid),
@@ -1375,6 +1455,30 @@ def _cmd_guide(args: argparse.Namespace) -> int:
         print(content, end="")
         return _EXIT_OK
     args.output.write_text(content, encoding="utf-8")
+    return _EXIT_OK
+
+
+def _cmd_tracker_archive(args: argparse.Namespace) -> int:
+    from .tracker_archive import archive_completed_tracker_sections
+
+    result = archive_completed_tracker_sections(
+        version=args.version,
+        short_tracker_path=args.tracker,
+        full_tracker_path=args.full,
+        dry_run=args.dry_run,
+    )
+    archived_ids = ", ".join(result.archived_ids)
+    if args.dry_run:
+        suffix = f": {archived_ids}" if archived_ids else ""
+        print(
+            f"Dry run: would archive {result.archived_count} items "
+            f"({result.archived_line_count} lines) from short to full tracker{suffix}",
+        )
+        return _EXIT_OK
+    print(
+        f"Archived {result.archived_count} items "
+        f"({result.archived_line_count} lines) from short to full tracker",
+    )
     return _EXIT_OK
 
 

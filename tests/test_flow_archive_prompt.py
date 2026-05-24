@@ -14,7 +14,7 @@ TRACKER_FULL = Path("todo/issues-ralph-full.md")
 CURRENT_VERSION = "v38"
 
 
-def test_completed_header_addition_prints_archive_advisory(tmp_path: Path, capsys) -> None:
+def test_completed_header_addition_blocks_when_unarchived(tmp_path: Path, capsys) -> None:
     repo = _repo_with_trackers(tmp_path)
     completed_header = f"> 已完成（{CURRENT_VERSION} 代码修复）：FL-7\n"
     _write_tracker_pair(
@@ -24,11 +24,12 @@ def test_completed_header_addition_prints_archive_advisory(tmp_path: Path, capsy
     )
 
     result = _check_improvement_register(_state(repo))
-    output = capsys.readouterr()
+    _output = capsys.readouterr()
 
-    assert result.passed
-    assert ARCHIVE_ADVISORY_MESSAGE in output.out
-    assert output.err == ""
+    assert not result.passed
+    blocking = [d for d in result.details if d["check"] == "short tracker archive blocking"]
+    assert len(blocking) == 1
+    assert "FL-7" in blocking[0]["message"]
 
 
 def test_without_completed_header_addition_prints_no_archive_advisory(
@@ -48,6 +49,39 @@ def test_without_completed_header_addition_prints_no_archive_advisory(
     assert result.passed
     assert ARCHIVE_ADVISORY_MESSAGE not in output.out
     assert output.err == ""
+
+
+def test_completed_header_without_short_deletion_fails_archive_deletion_check(tmp_path: Path) -> None:
+    repo = _repo_with_trackers(tmp_path)
+    completed_header = f"> 已完成（{CURRENT_VERSION} 代码修复）：FL-7\n"
+    _write_tracker_pair(
+        repo,
+        f"{completed_header}---\nbase short\n",
+        f"{completed_header}---\n| FL-7 | archived evidence |\n",
+    )
+
+    result = _check_improvement_register(_state(repo))
+
+    detail = next(d for d in result.details if d["check"] == "short tracker archived deletions")
+    assert not detail["passed"]
+    assert "FL-7" in detail["message"]
+
+
+def test_completed_header_without_full_archive_paragraph_fails_archive_content_check(
+    tmp_path: Path,
+) -> None:
+    repo = _repo_with_trackers(tmp_path)
+    completed_header = f"> 已完成（{CURRENT_VERSION} 代码修复）：FL-7\n"
+    _write_tracker_pair(
+        repo,
+        f"{completed_header}---\n#### FL-20\nnew finding\n",
+        f"{completed_header}---\n",
+    )
+
+    result = _check_improvement_register(_state(repo))
+
+    detail = next(d for d in result.details if d["check"] == "full tracker archive paragraph additions")
+    assert not detail["passed"]
 
 
 def _repo_with_trackers(repo: Path) -> Path:

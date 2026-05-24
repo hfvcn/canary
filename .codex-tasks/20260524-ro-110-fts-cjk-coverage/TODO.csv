@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing SSRF rule and test pattern,DONE,Implementation shape and target files are confirmed,rg -n "_check_ssrf_route_binding|test_ssrf_route_binding" src tests,2026-05-24T16:31:11+0800,0,
+2,Implement FTS CJK coverage rule and register it,DONE,New rule and imports are present,rg -n "W_FTS_CJK_SUBSTRING_MISSING|_check_fts_cjk_coverage" src/cccc/ralph/validation_rules,2026-05-24T16:31:11+0800,0,
+3,Add focused security-chain tests,DONE,Four FTS CJK tests exist,rg -n "test_fts_cjk|test_no_search_flow_passes" tests/test_aegis_security_chain.py,2026-05-24T16:31:11+0800,0,
+4,Run targeted pytest verification,DONE,Requested pytest command passes,python -m pytest tests/test_aegis_security_chain.py -v -k "fts_cjk or cjk_coverage",2026-05-24T16:31:11+0800,0,Also ran full security-chain file and discipline rule registration tests.

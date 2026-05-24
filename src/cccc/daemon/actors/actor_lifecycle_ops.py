@@ -18,6 +18,10 @@ from ...util.conv import coerce_bool
 from .actor_profile_runtime import ActorProfileAccessDeniedError, resolve_linked_actor_before_start
 
 LOGGER = logging.getLogger("cccc.daemon.actors")
+CRASH_RESTART_BACKOFF_SECONDS = (1, 2, 4)
+CRASH_RESTART_LIMIT = len(CRASH_RESTART_BACKOFF_SECONDS)
+CrashRestartScheduler = Callable[[str, str, int, int], None]
+GlobalEventPublisher = Callable[[str, Dict[str, Any]], None]
 
 
 def _error(code: str, message: str, *, details: Optional[Dict[str, Any]] = None) -> DaemonResponse:
@@ -39,6 +43,70 @@ def _reset_inbox_cursor_on_actor_restart(group: Any, actor_id: str) -> None:
             "Failed to reset inbox cursor for actor %s on restart",
             actor_id,
             exc_info=True,
+        )
+
+
+def _actor_crash_count(actor: Dict[str, Any]) -> int:
+    try:
+        return max(0, int(actor.get("crash_count") or 0))
+    except Exception:
+        return 0
+
+
+def _crash_restart_backoff_seconds(crash_count: int) -> int:
+    idx = min(max(int(crash_count) - 1, 0), CRASH_RESTART_LIMIT - 1)
+    return int(CRASH_RESTART_BACKOFF_SECONDS[idx])
+
+
+def _mark_normal_actor_exit(group: Any, actor_id: str) -> None:
+    update_actor(group, actor_id, {"runtime_state": "stopped"})
+
+
+def _publish_actor_crash_limit(
+    group_id: str,
+    actor_id: str,
+    crash_count: int,
+    publish_global_event: Optional[GlobalEventPublisher],
+) -> None:
+    publisher = publish_global_event
+    if publisher is None:
+        from ...kernel.events import publish_event
+
+        publisher = publish_event
+    publisher(
+        "actor.crash_limit",
+        {"group_id": group_id, "actor_id": actor_id, "crash_count": int(crash_count)},
+    )
+
+
+def _mark_crashed_actor_exit(
+    group: Any,
+    actor_id: str,
+    actor: Dict[str, Any],
+    *,
+    schedule_restart: Optional[CrashRestartScheduler],
+    publish_global_event: Optional[GlobalEventPublisher],
+) -> None:
+    crash_count = _actor_crash_count(actor) + 1
+    patch: Dict[str, Any] = {"desired_state": "running", "runtime_state": "crashed", "crash_count": crash_count}
+    if crash_count >= CRASH_RESTART_LIMIT:
+        patch["desired_state"] = "stopped"
+        update_actor(group, actor_id, patch)
+        LOGGER.error(
+            "Actor crash limit reached group_id=%s actor_id=%s crash_count=%s",
+            group.group_id,
+            actor_id,
+            crash_count,
+        )
+        _publish_actor_crash_limit(group.group_id, actor_id, crash_count, publish_global_event)
+        return
+    update_actor(group, actor_id, patch)
+    if schedule_restart is not None:
+        schedule_restart(
+            group.group_id,
+            actor_id,
+            crash_count,
+            _crash_restart_backoff_seconds(crash_count),
         )
 
 
@@ -112,7 +180,7 @@ def handle_actor_start(
 
     # Mark runtime_state as running on successful start
     try:
-        actor = update_actor(group, actor_id, {"runtime_state": "running"})
+        actor = update_actor(group, actor_id, {"runtime_state": "running", "crash_count": 0})
     except Exception:
         pass
 
@@ -185,15 +253,31 @@ def handle_actor_stop(
     return DaemonResponse(ok=True, result={"actor": actor, "event": event})
 
 
-def _mark_actor_stopped_on_exit(group_id: str, actor_id: str) -> None:
-    """Mark actor as desired_state=stopped when its process exits."""
+def _mark_actor_stopped_on_exit(
+    group_id: str,
+    actor_id: str,
+    *,
+    schedule_restart: Optional[CrashRestartScheduler] = None,
+    publish_global_event: Optional[GlobalEventPublisher] = None,
+) -> None:
+    """Update actor runtime state after process exit and trigger crash recovery when needed."""
     group = load_group(group_id)
     if group is None:
         return
-    try:
-        update_actor(group, actor_id, {"desired_state": "stopped", "runtime_state": "stopped"})
-    except Exception:
-        pass
+    actor = _find_actor(group, actor_id)
+    if not isinstance(actor, dict):
+        return
+    desired_state = str(actor.get("desired_state") or "running").strip() or "running"
+    if desired_state == "stopped":
+        _mark_normal_actor_exit(group, actor_id)
+        return
+    _mark_crashed_actor_exit(
+        group,
+        actor_id,
+        actor,
+        schedule_restart=schedule_restart,
+        publish_global_event=publish_global_event,
+    )
 
 
 def handle_actor_restart(
@@ -366,7 +450,7 @@ def handle_actor_restart(
 
     # Mark runtime_state as running after successful restart
     try:
-        actor = update_actor(group, actor_id, {"runtime_state": "running"})
+        actor = update_actor(group, actor_id, {"runtime_state": "running", "crash_count": 0})
     except Exception:
         pass
 
