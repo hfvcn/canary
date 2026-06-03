@@ -76,7 +76,8 @@
 > 已归档至 full（已实现/已知局限）：RV-15/RV-16/RV-17/RV-33。
 > 已验证并归档至 full（v51 E2E）：FL-55/FL-56/FL-58/FL-59/FL-60/FL-62/RV-30/UX-22 ✅；FL-57+FL-50/FL-61/RV-31/RV-32 场景未触发归档。
 > **E2E v51 验证（2026-06-03，FastAPI 安全文件共享服务 JWT+RBAC+文件上传+分享链接+审计日志）：综合 4.0/5（结果 4.0 / 过程 4.0 / 体验 4.0）** —— 报告：[e2e-实战评估报告-v51.md](./e2e-实战评估报告-v51.md)
-> v51 E2E 新发现（共 5 项）：FL-63/FL-64/FL-65/UX-23/RV-39（见下）
+> v51 E2E 新发现（共 5+2 项）：FL-63/FL-64/FL-65/UX-23/RV-39 + FL-66/RV-48（见下）
+> v52 RV-34 v51 E2E 验证：⚠️部分——`W_SIGNOFF_STRUCTURE_WEAK` 规则触发（T09 对两条安全 flow 报警），说明 RV-34 代码路径被执行；但 T09 signoff 本身就弱，无法单独确认 grep 排除和路径引用细节是否真正区分了强/弱 signoff（需要一个有正确 signoff 结构的任务才能验证不误报）。
 > **v52 solve flow（2026-05-31）**：本批修复 RV-34（1 项，3 tasks：非压制集+路径引用+集成验证）。step-3 双路 Codex 审查（plan-correctness + capability-gaps，均 HMAC 签名）：plan-correctness（verdict=revise，conf 5/5）修订 T2 coverage 旁路矛盾（删除 coverage token bypass、所有 structured check 须引用 signoff path）、T1 test 文件明确创建、AC2 用 _non_suppressible_codes 单元测试；capability-gaps（verdict=revise，conf 5/5）新发现 RV-38（已知局限：non-required check 可满足规则）、修订 RV-37 path source（从 claimed_paths+verification.command 双源提取）、修订 RV-35 grep 排除（grep 命令含 structured tokens 仍报 weak-check）。
 > 已完成（2026-05-31 v52 代码修复，3 tasks）：**RV-34**（signoff 校验强化：不可压制集 + 路径引用 + grep 排除 + 集成验证，20 tests）+ RV-35/RV-37（v52 内修复）。
 > v53 solve flow（2026-05-31）：本批全量实现 FL-42 + MSE-1~6 + AgentFlow M0~M6（22 tasks）。step-3 双路 Codex 审查（plan-correctness + capability-gaps，均 HMAC 签名）：PC 修订 16 项、CG 新发现 RV-41/RV-43b/RV-47（已知局限，3 项）+ 6 项一次性 plan 修正已合入。
@@ -166,6 +167,23 @@ WORKFLOW_EVALUATION.md 第一次生成时大部分章节为"待 foreman 补充"�
 
 T08 plan 目标声明 revoke 后返回 410 Gone，但实现为 404。validate 和 verification 均未检测
 此类规格与实现的漂移。（注：v53 Codex review 中 RV-39 编号已被使用，本条为 E2E 发现复验）
+
+#### FL-66（**P1** solve flow 集成测试验证不检测主路径接入，组件独立通过≠系统集成）
+
+v53 声称全链路集成（T21-T22），Codex review 和 pytest 均 PASS，但 AF 引擎组件
+（AFExecutionEngine/PlanCompiler/CCCCActorRunner）**从未被 WorkflowOrchestrator 调用**——
+零件造好了但没装到车上。原因：solve flow 的 step-4 gap check 和 Codex review 只验证
+"代码存在+单元测试通过"，不验证"新代码是否被主路径调用"。这是结构化验证的系统性盲区：
+**组件级测试通过≠集成到主路径**。需要新的 validate/verification 规则检测"新增模块是否被
+声明的入口路径 import/调用"。
+
+#### RV-48（**P1** validate 不检测 plan 声称的集成是否有主路径调用证据）
+
+v53 plan 中 T21-T22 声称"全链路集成测试"，claimed_paths 包含 orchestrator 和引擎文件，
+但 validate 不检测这些路径是否真的存在调用关系（import chain / function call）。
+当 task 声称集成 A→B 但实际只在测试中 mock 了 A→B 而未改动 A 的生产代码时，
+validate 无法区分"真集成"与"测试级伪集成"。这是 RV-6（plan 前提与代码一致性）
+的延伸——从"前提正确"扩展到"集成声明有调用证据"。
 
 ---
 
