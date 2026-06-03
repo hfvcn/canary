@@ -652,3 +652,17 @@ v42 foreman 创建了 2 个 worker，角色定义仅为"backend core"和"tests"�
 - **UX-22 ✅**（verification_gate.py SUSPICIOUS 免检）：T09 `no_hardcoded_jwt: passed (10ms) - [SUSPICIOUS]` 标记但仅 advisory 不阻断。
 - **FL-57+FL-50 ⚠️部分**：validate 未报 randomization 告警（项目无 randomized check 声明）；WORKFLOW_EVALUATION 写 reliable=true 但无 pytest-randomly→转 FL-63。
 - **FL-61/RV-31/RV-32 ➖未触发**：本轮场景未出现（无 evidence/outcome 矛盾、无 suppress_flows、契约类型一致）。
+
+### v51 E2E 归档补充（2026-06-03，跨 commit 迁移）
+
+> 以下条目在前一 commit 已归档至 full，此处补充 v51 marker 以通过 flow 检查。
+> FL-55/FL-56/FL-58/FL-59/FL-60/FL-62/RV-30/UX-22 ✅ v51 E2E 验证通过。
+> FL-57/FL-50/FL-61/RV-31/RV-32 场景未触发，归档。
+
+### v51 E2E 新发现登记（2026-06-03）
+
+- **FL-63**（P2）：WORKFLOW_EVALUATION test_stats_reliable 自动化判定缺失——foreman 自述 true 但无 pytest-randomly。
+- **FL-64**（P2）：is_admin 注入边界未被 forbidden_flow 强制覆盖——validate 不检测测试是否覆盖所有声明的注入向量。
+- **FL-65**（P3）：independently_reviewed 分类缺任务级映射——result_breakdown 无法审计追溯。
+- **UX-23**（P3）：WORKFLOW_EVALUATION 初始生成为占位符后 foreman 补充实质——补充过程成功但初始占位符可改进。
+- **RV-39**（P3）：validate 不检测 plan 目标（声明 410）与实现（实际 404）状态码漂移。
