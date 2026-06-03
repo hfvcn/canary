@@ -5,6 +5,43 @@
 
 ---
 
+## v51 归档：RV-15/16/17/33 已解决或已知局限（2026-05-31）
+
+| ID | 标题 | 归档原因 |
+|----|------|---------|
+| RV-15 | validate 不检测 plan 引用的函数名与代码不匹配 | ✅ v48 确认已实现（`_check_goal_symbol_in_claimed_paths`）|
+| RV-16 | validate 不检测 assignment-map 绕过 agent_pool | ✅ v48 确认已解决（guide 640-659 已说明 assignment-map 绕过效应）|
+| RV-17 | validate 不检测跨层返回值类型压缩导致信息丢失 | 已知局限：语义级检查超出结构验证范围 |
+| RV-33 | 弱加密语义不可结构检测 | 已知局限：validate/test 无法区分 Base64 混淆与真实加密 |
+
+---
+
+## v48 E2E 归档：FL-45/FL-33/FL-20-21 已验证（2026-05-30，FastAPI RBAC 任务协作平台）
+
+v48 E2E 验证了 v48 solve flow 代码修复。综合 3.5/5（结果 3.5/5，过程 3.0/5，体验 4.0/5）。报告：[e2e-实战评估报告-v48.md](./e2e-实战评估报告-v48.md)。
+
+| ID | 标题 | v48 验证结果 |
+|----|------|-------------|
+| FL-45 | Foreman 仅创建执行者角色 | ✅ **修复已生效**：安全敏感 RBAC/JWT 关键流下 foreman 主动创建非执行者 `sec-reviewer`（Security Reviewer）角色，actor 列表实测确认，不再是 v47 的 executor-only team。|
+| FL-33 | Codex review 前 secret 预检 | ✅ **修复已生效**：step-4 `_check_codex_review` 含 `secret_preflight`，未配置 `CODEX_BRIDGE_SECRET` 直接 FAIL；应用层 `app/config.py:18-27` 亦无 JWT_SECRET 默认值（fail-closed）。|
+| FL-20/21 | codex_bridge HMAC 签名链路 | ✅ **修复已生效**：两路 review JSON 均含 `_sig`，flow 校验 `valid HMAC signature` 通过，未签名/伪造 JSON 无法蒙混。|
+
+**部分生效（衍生新发现，留短版跟踪）**：FL-46（validate 0 error 但运行代码 `POST /projects` 无角色门禁 → RV-22）、FL-47（默认顺序全绿但反序 `test_config`+`test_auth` 2 failed → FL-50）、UX-18（必需章节齐全但全占位符仍过闸 → UX-18b）。
+**v48 E2E 新发现（短版跟踪）**：UX-18b/FL-48/FL-49/RV-22/FL-50/UX-19/FL-51。
+**核心教训**：「ralph validate 0 error + flow 全 PASS」≠「实现正确 + 评估闭合」，结构校验需向实质内容（占位符检测、恢复留痕、reviewer 参与证据、乱序测试）延伸。
+
+### v47 新发现条目归档（从短版迁入，2026-05-30）
+
+> 以下 v47 E2E 发现经 v48 复验后从短版移出：FL-45 已修复、FL-44 转已知局限、FL-46/47/UX-18 部分生效（残留转 RV-22/FL-50/UX-18b）。原始 v47-instance 描述保留如下。
+
+- **FL-44（challenge verification 对正确代码 false positive 率偏高）→ 已知局限**：T1/T2 代码实际正确（本地 pytest 通过），但 challenge verification 失败需 foreman override。T1 `config_env_guard` check 因 `exec()` 不触发模块级 Settings 实例化而误判；T2 challenge 理由"DB 配置与 User model 实现正确"却仍 FAIL。v48 判定与 `W_VERIFICATION_PYTHON_IMPORT_OPAQUE` 重叠，记为已知局限。
+- **FL-45（Foreman 仍只创建执行者角色）→ ✅ 已修复（v48 验证）**：v46 修了 FL-41（guide 加多角色指引）但 v47 foreman 仍只建 2 执行者。v48 E2E 中 foreman 在 RBAC/JWT 安全敏感关键流下主动创建非执行者 sec-reviewer，修复生效。
+- **FL-46（端点 RBAC 缺陷未被 plan/security test 检测）→ 部分，残留转 RV-22**：v47 `/api/users/search` 无认证暴露 email/role，forbidden_flows 未覆盖未认证端点暴露。v48 validate 仍不检测写端点授权覆盖（`POST /projects` 无门禁），残留转 RV-22。
+- **FL-47（测试隔离问题未被系统发现）→ 部分，残留转 FL-50**：v47 test_routers.py 模块级共享状态致全量运行失败，verification 不跑该测试。v48 仍存在（reload 顺序依赖默认顺序全绿掩盖），残留转 FL-50（乱序/隔离验证）。
+- **UX-18（WORKFLOW_EVALUATION.md 过简）→ 部分，残留转 UX-18b**：v47 仅 568B 纯统计。v48 flow 加了必需章节+size 闸门，但 header-only 占位符骨架仍过闸，残留转 UX-18b（占位符检测）。
+
+---
+
 ## v42 E2E 归档：RO-108/RO-109/RO-110/RO-111/FL-27/FL-28 已验证（2026-05-24，FastAPI Blog Platform）
 
 v42 E2E 验证了 v45 代码修复的 6 项 v41 发现。综合 4.3/5（结果 4.5/5，过程 4/5，体验 4.5/5）。
@@ -474,3 +511,144 @@ CLI：`ralph flow start {solve|e2e}` / `ralph flow next` / `ralph flow status`
 - FL-17b（P2）：solve flow state.json 清除仍未生效——cwd 下残留旧状态阻塞新 flow
 - UX-13（P3）：foreman 未在 workflow.completed 后自动生成 WORKFLOW_EVALUATION.md
 - UX-14（P3）：Worker 首任务冷启动 stall 阈值过低（300s 触发，实际 ~400s 完成）
+
+### v47 E2E 验证（2026-05-24，FastAPI 用户管理 + JWT 认证）
+
+> 综合 4.0/5（结果 3.5/5，过程 4.5/5，体验 4/5）
+> 报告：[e2e-实战评估报告-v47.md](./e2e-实战评估报告-v47.md)
+
+**已验证生效（v46 修复）：**
+- FL-40/43（模型选择双路径）：worker-1=claude, worker-2=codex，foreman 主动选择不同 runtime
+- FL-38（auto-dispatch）：所有 batch 走 auto_fallback 路径，无 assignment-map
+- FL-31/39（负载均衡+并行度 guide）：T2+T3、T5+T6 双 worker 真并行
+- RO-113（JWT 默认密钥 guide）：config.py 无硬编码，RuntimeError 守卫，T6 AST 安全测试
+- RO-112（FTS5 CJK guide）：LIKE fallback 正确实现和文档化
+- FL-32（state.json HMAC）：flow state 未被篡改
+
+**已验证归档（从短版迁入）：**
+
+- **FL-32**（state.json HMAC 签名）：v46 修复增加了 HMAC 签名字段，v47 E2E 中 flow state 未被篡改。
+- **FL-35**（Codex sandbox 改进）：v46 修复后 Codex review 明确标注环境限制（read-only sandbox 无法运行 pytest），不再因环境问题产生失真评分。
+- **RO-112**（FTS5 CJK guide）：v46 在 guide 中增加了 FTS5 中文搜索最佳实践。v47 E2E 中 plan 明确指定 LIKE fallback，search 端点正确使用 LIKE '%q%'。
+- **RO-113**（JWT 默认密钥 guide）：v46 在 guide 中增加了检测默认密钥的指引。v47 E2E 中 config.py 无硬编码密钥，缺失时 RuntimeError，T6 security test 用 AST 扫描检测。
+- **FL-29**（越界检测统一）：v46 修复后 verification gate 统一了越界检测逻辑。v47 中 T4 修改了 main.py（T1 claimed_path），虽未见 ledger 越界警告（因 main.py 在 T4 的 awareness_paths 中），但 claimed_paths 精确到文件级。
+- **FL-30**（verification 偏浅 guide）：v46 在 plan template 中增加了行为验证指引。v47 plan 中 T5 的 verification 包含 pytest_run（行为验证），T4 包含 route_count（结构验证+行为验证）。
+- **FL-31**（负载均衡 guide）：v46 在 guide 中增加了负载均衡指引。v47 中双 worker 真并行分配，T2+T3 和 T5+T6 均双路并行。
+- **FL-38**（auto-dispatch 负载均衡）：v46 修复 guide 引导不传 assignment-map。v47 所有 batch 走 auto_fallback 路径，无 assignment-map。
+- **FL-39**（并行度 guide）：v46 在 guide 中增加了并行度指引。v47 foreman 创建 2 个 worker 并实现了双路并行。
+- **FL-40/43**（模型选择双路径+description fallback）：v46 修复了 select_model_for_task 的 description fallback。v47 foreman 主动选择了不同 runtime（worker-1=claude, worker-2=codex）。
+
+**代码已修复，场景未触发（迁入 full 归档）：**
+- FL-34（归档检测改为内容比较而非 git diff）、FL-36（step-2 模板增加 .env 指引）、FL-37（check 逻辑明确推导路径）
+
+**未充分验证：**
+- FL-41（多角色 guide）：只创建 2 个执行者 worker，未创建 reviewer/auditor
+- FL-42（评价闭环）：无 foreman_rating 记录
+- FL-33（secret 预检）：手动创建 .env，未触发 pre-flight check
+- RV-12/13/14：validate 0 error 但无法确认规则自查是否触发
+
+**v47 新发现：**
+- FL-44（P2）：challenge verification false positive（T1/T2 代码正确但 challenge 失败）
+- FL-45（P2）：Foreman 仍只创建执行者角色
+- FL-46（P2）：/search 端点 RBAC 缺陷未被 plan/security test 检测
+- FL-47（P2）：test_routers.py 隔离问题未被 verification 发现
+- UX-18（P3）：WORKFLOW_EVALUATION.md 自动生成内容过简
+
+---
+
+## v49 归档（2026-05-30 solve flow）：从短版迁入的已完成项详情
+
+> 这些条目在 v46（RV-12/13/14）/ v46（FL-41）已标记「已完成」，但详细 `####` 段落一直滞留短版，
+> 本轮按 FL-51 的归档纪律迁入 full。短版仅保留 header 的一行 `已完成` 摘要。
+
+### v45 Codex review（已完成，v46 代码修复）
+
+#### RV-12（validate 不检测 discipline rule 注册遗漏）
+
+discipline_security.py 中定义的规则函数不一定被注册到 discipline.py 的 `_DISCIPLINE_RULES` 列表。现有 validate 无法检测"规则定义了但未注册"的情况。需要：validate 规则自查——扫描 discipline_*.py 模块中 `_check_*` 函数签名符合 `DisciplineRule` 的函数，验证它们是否出现在 `_DISCIPLINE_RULES` 或被其内部调用。（已实现 `check_rule_registration_completeness`）
+
+#### RV-13（verification gate 与 validate 的 shallow check 判定不统一）
+
+coverage.py 已有 `_is_compile_or_import_check` 等 shallow check 分类器，但 verification_gate.py 的 runtime gate 需要独立实现同样的判定逻辑。两套判定标准可能漂移，导致 validate 通过但 runtime gate 拒绝（或反之）。需要：抽取公共 shallow check classifier 到共享模块，让 validate 和 runtime gate 共用同一套判定。（已抽取 `shallow_check_classifier.py`）
+
+#### RV-14（assignment_startup 不消费 actor_add 返回的 running/start_error 字段）
+
+`_start_actor_for_assignment` 只检查 `resp.ok`，但 `actor_add_ops.py` 返回中包含 `running` 和 `start_error` 字段。不消费这些字段会丢失第一手失败原因，导致 actor 注册成功但实际未运行时无法及时发现。需要：消费 `running`/`start_error` 字段，对已注册但 stopped 的 actor 走 restart 语义。
+
+### v42 E2E agent 架构缺陷（FL-41 已完成，v46 代码修复）
+
+#### FL-41（**P1** Foreman 只创建"执行者" agent——缺少 reviewer/fixer 等多视角角色）
+
+v42 foreman 创建了 2 个 worker，角色定义仅为"backend core"和"tests"，本质是同质化的执行者。没有创建 reviewer（代码审查）、bug fixer（缺陷修复）、security auditor（安全审计）等角色。这导致整个工作流是"写完就交"的单向流程，缺少真实团队中的交叉审查和多维度质量保障。
+
+**对比真实团队**：一个 tech lead 不会只派 2 个 coder 写完代码就交付——会安排人 review、有人专门跑安全扫描、有人负责集成测试。Foreman 应该像真正的 tech lead 一样思考"这个项目需要哪些角色"，而不仅仅是"我要几个人写代码"。
+
+**当前 agent_pool 的能力支持**：
+- `role_type` 枚举已支持 `"worker" | "reviewer" | "specialist"`
+- `create_agent_for_task()` 可以生成任意 worker_prompt
+- `task_affinity` 可以标记 agent 的专长
+- 但 foreman 不知道应该创建这些角色，因为 guide 和模板都只提到 "创建 Worker actor"
+
+**需要**：
+1. **foreman guide 增加"团队组建"指引**——明确列出可选角色及适用场景：executor（执行）、reviewer（审查关键路径的代码质量和安全）、fixer（验证失败后专门修复）、integrator（跨模块集成测试）
+2. **plan.yaml 增加 `recommended_roles` 字段**——ralph suggest 根据 critical_flows/forbidden_flows 自动建议"建议为安全关键路径增加 reviewer agent"
+3. **Foreman 规划阶段主动评估**——"11 个任务中有 security tests 和 XSS 防护需求，应该创建一个 security-reviewer agent 专门审查安全实现"
+
+> 注：FL-41 的"多角色"能力后续由 FL-45（v48 E2E 确认 foreman 自动创建非执行者 sec-reviewer 角色）实战验证生效。
+
+---
+
+## v50 归档（2026-05-31 代码修复，17 tasks）
+
+> 来源：solve flow（plan.yaml v50 批次），step-3 双路 Codex 审查（HMAC 签名）+ 全量回归 3174 passed。
+> 以下条目本批完成代码修复并单测验证，从短版移出归档。
+
+### validate 检测能力缺口（新增 8 条规则）
+
+- **RV-22**（`W_RBAC_WRITE_ENDPOINT_UNCOVERED`，security.py）：RBAC critical_flow 写端点在「已有 auth check」前提下缺授权负例（403/role/matrix）用例时告警；去重前置避免与 `W_RBAC_FLOW_AUTH_UNVERIFIED` 双报。
+- **RV-23**（`E_STATE_TASK_STATUS_CONFLICT`，coverage.py）：state 三桶（completed/failed/running）id 交集非空或桶内重复。
+- **RV-24**（`E_STATE_RUNNING_TASK_INVALID_CLAIMS`，coverage.py）：running_tasks.claimed_paths 空或非对应 TaskSpec.claimed_paths 子集。
+- **RV-25**（`E_CONSUMER_FROM_NOT_PROVIDER`，contracts.py）：consume.from_task 已填但该 task 的 provides 不含同名 contract。
+- **RV-26**（`E_MODULE_DEP_CYCLE`，structural.py）：per-task modules.internal_depends_on 自环/成环检测。
+- **RV-27**（`W_CRITICAL_DECLARATION_OUTSIDE_PLAN_SCOPE`，coverage.py）：critical_flows.entrypoints/critical_entrypoints 整体落在 plan_scope 之外被静默跳过；复用 `_entrypoint_in_scope`。
+- **RV-28**（`E_FLOW_TEST_CREATOR_FAILED`，coverage.py）：test_created_by 创建者失败（在 failed_task_ids）仍维持 deferred 降级 → 恢复 hard error；`_pending_test_creator_ids` 增 failed_task_ids 入参。
+- **RV-29**（🔴致命，`W_AUTH_PRIVILEGED_ROLE_FIELD`，security.py + guide）：身份获取面（注册/登录/角色变更）特权 role 字段边界缺负例覆盖；surface_type/标签驱动，删除不成立的 undeclared 误报分支，与 RV-22 去重；guide 增「身份获取面越权检查模板」。
+
+### flow/UX 修复
+
+- **FL-48**（context_store.py + workflow_orchestrator.py）：retry/override 决策（override_task/retry_verifier/retry_task）写回 TaskContext 审计字段（决策留痕，向后兼容）。
+- **FL-49**（`W_REVIEWER_SIGNOFF_MISSING`，security.py）：安全敏感流有独立审查语义任务但无可审计 sign-off 产物引用时告警；复用 `_task_has_independent_review_semantics`，与 `W_CRITICAL_FLOW_NO_INDEPENDENT_REVIEW` 去重。
+- **FL-51**（flow_improvement_check.py）：step-6 归档 check 扩展「已验证生效/已修复」标记——未从短版归档则 FAIL；同步修 `_is_archive_paragraph_line`/`_full_diff_has_archive_paragraph` 防 bare header 误判。
+- **FL-52**（`W_FLOW_COVERAGE_DEFERRED` 配套 + validator.py/cli.py 双通道）：安全关键码（含 W_AGENT_REVIEW_SKIPPED）在含 RBAC/auth 关键流时不可被 suppress_codes 静默压制；helper `_plan_has_security_critical_flow`/`_non_suppressible_codes` 抽取至 `validation_rules/security.py` 共享。
+- **FL-53**（`W_FLOW_COVERAGE_DEFERRED`，coverage.py）：deferred 未覆盖 flow 额外 emit 独立 warning 新码（不被 uncovered 的 suppress 压回 hint），计划期可见、不随文件系统漂移。
+- **FL-54**（`W_FULL_REGRESSION_OVERRIDE_RISK`，coverage.py）：全量回归门 × 计划内 override（仅扫 verification command/checks/mock_tests 的 xfail/importorskip/pytest.skip，不扫 prose）双存在时预警。
+- **UX-18b**（flow_steps_e2e.py）：evaluation 占位符内容检测——章节齐全但实质为占位符（待补充/TODO 等）判 FAIL。
+- **UX-19**（workflow_orchestrator.py）：测试采集失败时仅降级 test_count_actual 表述 + test_stats_reliable=false，保留兼容原始 N/A 值，不出具「0 failed」绝对断言、不误降 task 级 Completed/Failed。
+- **UX-20**（workflow_orchestrator.py）：stall 判定新增可注入 actor_idle_provider，actor 在产出（idle 低）时不误判 stalled；provider 不可得回退原 task 级判定。
+- **UX-21**（cli/main.py + cli/model_cmds.py + guide）：新增 `cccc model rate <model> --rating <1-5> [--registry PATH]` 本地直写 registry，接 `rate_model_by_foreman`；guide 措辞校正。
+
+### 补归档历史欠账（v49 已修，短版未删）
+
+- **RV-18**（`E_VERIFICATION_NON_GATING`）/ **RV-19**（`E_FLOW_TEST_CREATED_BY_UNKNOWN_TASK`）/ **RV-20**（`E_FLOW_ID_CROSS_NAMESPACE_COLLISION`）/ **RV-21**（`E_CONSUME_PROVIDER_UNRESOLVED`）：v49 solve flow 已实现并单测，本批补归档（闭合 FL-51 亲历的「verified-but-not-archived」问题）。
+
+### v50 E2E 复验归档（2026-05-31，团队密钥保管箱 API）
+
+- **RV-29 ✅✅ E2E 闭环**：validate 报 `W_AUTH_PRIVILEGED_ROLE_FIELD`→foreman 模型/路由/集成三层防御+负向测试+forbidden_flow；runtime 探测注册塞 role=admin→落库 member+`/admin/users` 403；Codex results-review 独立确认闭合。v49 致命提权漏洞闭环。
+- **FL-48/FL-54 ✅**：`workflow.foreman_override` 结构化 reason+evidence；T6 故意失败→retry→override 全程留痕。**UX-20 ✅** 无误报 stall。**UX-18b ✅** 完成时 741B→foreman 补 10.6KB。
+- 短版面包屑迁入归档：**FL-20/21**（codex_bridge HMAC 链路，v48 已验证）、**FL-45**（自动建非执行者 sec-reviewer，v48 归档 v49 复确认）、**FL-43**（select_model_for_task description fallback，v47 E2E 确认）三项 breadcrumb 从短版精简，详情归此处归档段。
+
+### v51 E2E 验证归档（2026-06-03，FastAPI 安全文件共享服务）
+
+> v51 综合 4.0/5（结果 4.0 / 过程 4.0 / 体验 4.0）。9 tasks 全完成，100 tests pass，~32min。
+> 报告：[e2e-实战评估报告-v51.md](./e2e-实战评估报告-v51.md)
+
+- **FL-55 ✅**（security.py `_NON_SUPPRESSIBLE_WHEN_SECURITY`）：validate 输出 `W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION [T03_ROUTERS]` 未被 suppress，规则生效。
+- **FL-56 ✅**（security.py `W_SIGNOFF_STRUCTURE_WEAK`）：对 authentication_flow 和 authorization_flow 两条安全 flow 分别报警，规则生效。
+- **FL-58 ✅**（workflow_orchestrator.py result_breakdown）：WORKFLOW_EVALUATION.md 含 `result_breakdown: passed=6, overridden=1, assumption_based=0, independently_reviewed=2`，T01 明确归类为 overridden 而非 passed。
+- **FL-59 ✅**（ralph/plan_io.py 原子写入）：plan.yaml 在 workflow 全程保持结构完整（foreman 多次 validate 无 YAML parse error），未触发 YAML 损坏。
+- **FL-60 ✅**（workflow_monitor.py `_plan_state_from_ledger_statuses`）：T01 verification_failed→foreman_override→T02 started 状态转换正确，无 ledger 死锁。
+- **FL-62 ✅**（structural.py `_normalize_entrypoint`）：validate 输出无 entrypoint 格式误报（v50 有 5 个误报，本轮 0 个）。
+- **RV-30 ✅**（structural.py `E_TASK_PATH_OUTSIDE_PLAN_SCOPE`）：第一次 validate 报 2 errors 含路径越界类错误，foreman 修复后 0 errors 通过。
+- **UX-22 ✅**（verification_gate.py SUSPICIOUS 免检）：T09 `no_hardcoded_jwt: passed (10ms) - [SUSPICIOUS]` 标记但仅 advisory 不阻断。
+- **FL-57+FL-50 ⚠️部分**：validate 未报 randomization 告警（项目无 randomized check 声明）；WORKFLOW_EVALUATION 写 reliable=true 但无 pytest-randomly→转 FL-63。
+- **FL-61/RV-31/RV-32 ➖未触发**：本轮场景未出现（无 evidence/outcome 矛盾、无 suppress_flows、契约类型一致）。

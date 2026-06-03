@@ -47,271 +47,151 @@
 > **E2E v42 验证（2026-05-24，FastAPI Blog Platform）：综合 4.3/5（结果 4.5/5，过程 4/5，体验 4.5/5）——历史并列最高**
 > v42 E2E 新发现（共 5+6+3+3 项）：RO-112/FL-29/FL-30/FL-31/RO-113 + 会话回顾：FL-32/FL-33/FL-34/FL-35/FL-36/FL-37 + 并行度/runtime 分析：FL-38/FL-39/FL-40 + agent 架构：FL-41/FL-42/FL-43
 > 全量版本：[问题清单-v5-ralph-full.md](./问题清单-v5-ralph-full.md)
-> 评估报告：[e2e-实战评估报告-v42.md](./e2e-实战评估报告-v42.md)（最新）| [v41](./e2e-实战评估报告-v41.md) | [v40](./e2e-实战评估报告-v40.md) | [v39](./e2e-实战评估报告-v39.md)
+> **E2E v47 验证（2026-05-24，FastAPI 用户管理 + JWT 认证）：综合 4.0/5（结果 3.5/5，过程 4.5/5，体验 4/5）**
+> v47 已验证生效：FL-40/43（模型选择双路径）、FL-38（auto-dispatch）、FL-31/39（负载均衡+并行度）、RO-113（JWT 默认密钥）、RO-112（FTS5 CJK）、FL-32（state HMAC）
+> v47 新发现（共 5 项）：FL-44/FL-45/FL-46/FL-47/UX-18
+> 评估报告：[e2e-实战评估报告-v51.md](./e2e-实战评估报告-v51.md)（最新）| [v50](./e2e-实战评估报告-v50.md) | [v48](./e2e-实战评估报告-v48.md) | [v47](./e2e-实战评估报告-v47.md) | [v42](./e2e-实战评估报告-v42.md) | [v41](./e2e-实战评估报告-v41.md) | [v40](./e2e-实战评估报告-v40.md) | [v39](./e2e-实战评估报告-v39.md)
+> 已完成（2026-05-24 v46 代码修复，10 tasks）：FL-32/FL-33/FL-35/FL-36/FL-34/FL-37/FL-29/FL-40/FL-43/RV-12/RV-13/RV-14/FL-30/FL-31/FL-38/FL-39/FL-41/RO-112/RO-113
+> 部分完成（guide-only，flow 步骤未实现）：FL-42（评价闭环——guide 已加，retrospective step 已补入 v47）
+> 验证轮次（2026-05-24 v46 修复后）：全量 pytest 3042 passed / 0 failed / 120 skipped（+50 新测试）
+> v46 Codex review（6 轮，2→2→3→3→4→4，明确批准实现）发现（共 3 项）：RV-15/RV-16/RV-17
+> **v48 solve flow（2026-05-30）**：本批修复 FL-46/FL-45/FL-47/FL-33/UX-18（5 项，6 tasks，validate 规则 + flow check 强化）。
+> v48 Codex review（plan-correctness + capability-gaps 双路）修订：删 RV-15（已实现 `_check_goal_symbol_in_claimed_paths`）、RV-16（guide 640-659 已说明 assignment-map 绕过，确认已解决）、FL-44（与 `W_VERIFICATION_PYTHON_IMPORT_OPAQUE` 重叠，记为已知局限）。
+> v48 capability-gaps review 新发现 4 项 validate 检测能力缺口（见下）。
+> **E2E v48 验证（2026-05-30，FastAPI RBAC 任务协作平台）：综合 3.5/5（结果 3.5/5，过程 3.0/5，体验 4.0/5）** —— 报告：[e2e-实战评估报告-v48.md](./e2e-实战评估报告-v48.md)
+> v48 E2E 已验证生效（详情已删短版、归档至 full）：**FL-33**（step-4 secret_preflight + 应用无 JWT 默认密钥）。codex_bridge HMAC 签名链路与安全敏感流自动创建非执行者 sec-reviewer 角色亦已 v48 归档、v49 复确认（详见 full 归档段落）。
+> v48 E2E 部分生效（结构闸门已建但实质可绕过，残留转 RV-22/FL-50/UX-18b）：**FL-46**（validate 0 error 但运行代码 `POST /projects` 无角色门禁）、**FL-47**（默认顺序测试全绿但 `test_config` reload 致 `test_auth` 反序 2 failed）、**UX-18**（必需章节齐全但全为"待补充"占位符仍通过闸门）
+> v48 E2E 新发现（共 7 项）：UX-18b/FL-48/FL-49/RV-22/FL-50/UX-19/**FL-51**（flow step-6 不强制把确认修复的条目从短版归档——本轮亲历）（见下）
+> **v49 solve flow（2026-05-30）**：本批修复 RV-18/RV-19/RV-20/RV-21（4 项 validate 检测能力缺口 → 5 tasks）。step-3 双路 Codex 审查（plan-correctness + capability-gaps，均 HMAC 签名）：plan-correctness 修订 RV-18 谓词（删「required check 命令须非空」误判，runtime 空命令 check outcome=error+required 仍 gate）、RV-21 provider 去重（按 task_id）；capability-gaps 新发现 6 项 validate 漏检（RV-23~28，见下）。
+> **E2E v49 验证（2026-05-30，FastAPI 文档管理平台 RBAC+分享）：综合 3.0/5（结果 2.5/5，过程 3.5/5，体验 3.0/5）** —— 报告：[e2e-实战评估报告-v49.md](./e2e-实战评估报告-v49.md)
+> v49 E2E 复验 v48 衍生项：**FL-45** ✅仍生效（建 codex sec-reviewer 非执行者）；**RV-22** 文档/分享写端点三重校验正确+IDOR 404 掩蔽（但 validate 仍漏「身份获取面」→ RV-29）；**UX-18b** ⚠️改善（完成时 698B 占位符，foreman 5min 后补成 8125B 实质内容，但结构闸门仍不查占位符）；**FL-49** ⚠️部分（reviewer 实质参与但 plan.yaml 无 reviewer 节点/`W_AGENT_REVIEW_SKIPPED` 被压制/git 零提交，且漏检致命 bug）；**FL-50** ⚠️部分（函数级隔离好，但集成测试复用全局 app+限流中间件有隐藏共享态）；**FL-48** ⚠️未闭合（T7 override 仅自由文本笔记，plan 最终状态漏记 T7、state.json 无 override 记录）；**UX-19** 本轮未触发（测试采集正常 122 条）。
+> v49 E2E 新发现（共 6 项）：**RV-29**（🔴致命，注册自带 role 提权击穿 RBAC，validate/verify/审查/全量回归全放行）/**FL-52**（`W_AGENT_REVIEW_SKIPPED` 可被 suppress_codes 静默压制）/**FL-53**（validate 判定随文件系统状态漂移）/**FL-54**（全量回归门×计划内 override 用例=死结无预警）/**UX-20**（stall 心跳误报，task 级不随产出刷新）/**UX-21**（指南 `cccc model rate` 不存在，CLI 仅 `cccc model review`）（见下）。
+> **v50 solve flow（2026-05-31）**：本批全量修复 tracker open 项 18 项 → 17 tasks（RV-22~29 八条 validate 规则 + FL-48/49/51/52/53/54 + UX-18b/19/20/21）。step-3 双路 Codex 审查（plan-correctness + capability-gaps，均 HMAC 签名）：plan-correctness（verdict=revise，conf 4/5）修订 13 个 task 的规格错误（scope helper 复用 `_entrypoint_in_scope`、FL-53 改新码 `W_FLOW_COVERAGE_DEFERRED` 避开 suppress、RV-22/29 去重 `W_RBAC_FLOW_AUTH_UNVERIFIED`、FL-49 复用 `_task_has_independent_review_semantics`、FL-52 W_AGENT_REVIEW_SKIPPED 实际在 cli.py 分流、UX-19 区分 task 计数 vs 测试统计、UX-20 actor idle 源在 serve_ops、UX-21 handler 在 model_cmds.py、FL-48 决策点在 orchestrator）；capability-gaps（conf 4/5）新发现 3 项 validate 漏检（RV-30~32，见下）。
+> 已完成（2026-05-31 v50 代码修复，17 tasks，归档至 full）：**RV-22/23/24/25/26/27/28/29、FL-48/49/51/52/53/54、UX-18b/19/20/21**。验证：全量 pytest 3174 passed / 0 failed / 120 skipped（+44 新测试），module-size 守卫复绿（validator.py 946<950、orchestrator 2495<2500，FL-52 helper 抽取至 `validation_rules/security.py` 共享）。
+> 同批归档历史欠账（v49 已修但短版未删）：**RV-18/19/20/21**（v49 代码修复，本批补归档至 full，闭合 FL-51 亲历问题）。
+> **E2E v50 验证（2026-05-31，团队密钥保管箱 API RBAC+注册登录+资源归属）：综合 3.5/5（结果 3.5 / 过程 3.0 / 体验 4.0）** —— 报告：[e2e-实战评估报告-v50.md](./e2e-实战评估报告-v50.md)
+> v50 E2E 复验 v50 代码修复项：🔴**RV-29** ✅✅ 三层闭合（validate 报 `W_AUTH_PRIVILEGED_ROLE_FIELD`→foreman 模型/路由/集成三层防御+负向测试+forbidden_flow；runtime 探测注册塞 role=admin→落库 member+`/admin/users` 403；Codex results-review 独立确认闭合）—— v49 致命提权漏洞闭环。**FL-48/54** ✅override 结构化留痕（`workflow.foreman_override` 含 reason+evidence，T6 故意失败→retry→override 全程记录）。**UX-20** ✅无误报 stall。**UX-18b** ✅完成时 741B→foreman 补至 10.6KB。**FL-49** ⚠️部分（驱动产出 SECURITY_REVIEW.md 签核，但 gate 弱可绕过→FL-56）。**FL-50** ⚠️部分（DB 隔离健全但 randomized check 缺插件未真乱序→FL-57）。**FL-52** ➖未触发（reviewer 真参与无 skip，但独立验证类告警不在不可压制集→FL-55）。RO-71 completer_mismatch/RV-13 shallow-classifier ✅触发。
+> v50 E2E 新发现（共 10 项）：FL-55/FL-56/FL-57/FL-58/FL-59/FL-60/FL-61/FL-62、RV-33、UX-22（见「v50 E2E 新发现」段）。核心教训：RV-29 这条「身份面提权」轴已闭合，但「结构绿≠实质安全」在**弱加密轴**（Base64≠加密）与**流程可信度轴**（独立验证可被 plan suppress、sign-off 弱门禁、randomized/reliable 空头支票）两条新轴延续。
+> **v51 solve flow（2026-05-31）**：本批全量修复 tracker open 项 13 tasks（RV-30/31/32 + FL-55/56/57/58/59/60/61/62 + FL-50 + UX-22）。step-3 双路 Codex 审查（plan-correctness + capability-gaps，均 HMAC 签名）：plan-correctness（verdict=revise，conf 5/5）修订 T2 循环导入→移至 security.py、T2/RV-31 自身不可压制、T6 normalize 需覆盖全部比较点、T3 多 provider kind 歧义处理、T13 coverage 范围对齐、RV-30 路径边界感知（startswith → slash-aware）；capability-gaps（verdict=revise，conf 4/5）新发现 0 项系统检测缺口（FL-56 signoff 缺口已修入 plan）。
+> 已归档至 full（已实现/已知局限）：RV-15/RV-16（v48 确认已实现）、RV-17/RV-33（已知局限：语义级/弱加密不可结构检测）。
+> v51 代码修复完成（2026-05-31，13 tasks + module-size fix）：**RV-30/31/32、FL-55/56/57/58/59/60/61/62、FL-50、UX-22**。验证：全量 pytest 3241 passed / 0 failed / 120 skipped（+67 新测试），module-size 守卫复绿（validator.py 947<950、orchestrator 2484<2500）。
+> 已验证（v51 E2E 确认，归档至 full）：**FL-55** ✅（W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION 出现在 validate 未被 suppress）、**FL-56** ✅（W_SIGNOFF_STRUCTURE_WEAK 对两条安全 flow 报警）、**FL-58** ✅（result_breakdown passed=6/overridden=1/independently_reviewed=2 正确分类）、**FL-59** ✅（plan.yaml 全程完整无 YAML 损坏）、**FL-60** ✅（T01 failed→override→T02 started 状态转换正确）、**FL-62** ✅（无 entrypoint 格式误报）、**RV-30** ✅（第一次 validate 报路径越界 error，修复后通过）、**UX-22** ✅（SUSPICIOUS 标签仅 advisory 不阻断）。
+> v51 E2E 部分生效/未触发（场景未出现，归档至 full）：**FL-57+FL-50** ⚠️（validate 未报 randomization 告警——项目无 randomized check 声明；WORKFLOW_EVALUATION 写 reliable=true 但无 pytest-randomly→FL-63）、**FL-61** ➖（未遇到 evidence/outcome 矛盾场景）、**RV-31** ➖（foreman 未使用 suppress_flows）、**RV-32** ➖（契约类型一致未触发）。
+> **E2E v51 验证（2026-06-03，FastAPI 安全文件共享服务 JWT+RBAC+文件上传+分享链接+审计日志）：综合 4.0/5（结果 4.0 / 过程 4.0 / 体验 4.0）** —— 报告：[e2e-实战评估报告-v51.md](./e2e-实战评估报告-v51.md)
+> v51 E2E 新发现（共 5 项）：FL-63/FL-64/FL-65/UX-23/RV-39（见下）
+> **v52 solve flow（2026-05-31）**：本批修复 RV-34（1 项，3 tasks：非压制集+路径引用+集成验证）。step-3 双路 Codex 审查（plan-correctness + capability-gaps，均 HMAC 签名）：plan-correctness（verdict=revise，conf 5/5）修订 T2 coverage 旁路矛盾（删除 coverage token bypass、所有 structured check 须引用 signoff path）、T1 test 文件明确创建、AC2 用 _non_suppressible_codes 单元测试；capability-gaps（verdict=revise，conf 5/5）新发现 RV-38（已知局限：non-required check 可满足规则）、修订 RV-37 path source（从 claimed_paths+verification.command 双源提取）、修订 RV-35 grep 排除（grep 命令含 structured tokens 仍报 weak-check）。
+> 已完成（2026-05-31 v52 代码修复，3 tasks）：**RV-34**（signoff 校验强化：不可压制集 + 路径引用 + grep 排除 + 集成验证，20 tests）+ RV-35/RV-37（v52 内修复）。
+> v53 solve flow（2026-05-31）：本批全量实现 FL-42 + MSE-1~6 + AgentFlow M0~M6（22 tasks）。step-3 双路 Codex 审查（plan-correctness + capability-gaps，均 HMAC 签名）：PC 修订 16 项、CG 新发现 RV-41/RV-43b/RV-47（已知局限，3 项）+ 6 项一次性 plan 修正已合入。
 > **本文档只保留未解决的改进项和已知局限。已完成条目与历史实现记录保存在 full 版本中。**
 
 ---
 
 ## 未解决改进项
 
-### v45 Codex review 新发现
+### ~~RV-34~~（v52 代码修复：signoff 引用满足后实质校验缺失，3 tasks + 20 tests 通过）
+> v52 T1（W_SIGNOFF_STRUCTURE_WEAK 加入不可压制集）+ T2（signoff check 须引用 signoff 路径 + grep 排除 + basename fallback）+ T3（集成验证）。
 
-#### RV-12（validate 不检测 discipline rule 注册遗漏）
+### ~~RV-33~~（已知局限，v51 归档至 full：弱加密语义不可结构检测）
+> 归档：validate/test 无法区分 Base64 混淆与真实加密——语义级检查超出结构验证范围。
 
-discipline_security.py 中定义的规则函数不一定被注册到 discipline.py 的 `_DISCIPLINE_RULES` 列表。现有 validate 无法检测"规则定义了但未注册"的情况。需要：validate 规则自查——扫描 discipline_*.py 模块中 `_check_*` 函数签名符合 `DisciplineRule` 的函数，验证它们是否出现在 `_DISCIPLINE_RULES` 或被其内部调用。
+### v52 Codex review 新发现
 
-#### RV-13（verification gate 与 validate 的 shallow check 判定不统一）
+#### RV-38（validate 不检测 non-required signoff check 满足规则）
 
-coverage.py 已有 `_is_compile_or_import_check` 等 shallow check 分类器，但 verification_gate.py 的 runtime gate 需要独立实现同样的判定逻辑。两套判定标准可能漂移，导致 validate 通过但 runtime gate 拒绝（或反之）。需要：抽取公共 shallow check classifier 到共享模块，让 validate 和 runtime gate 共用同一套判定。
+`_signoff_checks` 不检查 `CheckSpec.required` 字段。task 可包含 `required: false` 的 structured signoff check，
+该 check 不实际 gate 任务完成，但 `_has_structured_signoff_fields` 会认为结构化校验已满足。
+已知局限：required=false 仍声明了校验意图，且实际 foreman workflow 中 required=false check
+失败不阻塞但会在 evaluation 记录——风险较低。
 
-#### RV-14（assignment_startup 不消费 actor_add 返回的 running/start_error 字段）
+> ~~RV-35~~（v52 代码修复，归档至 full）：`_has_structured_signoff_fields` 排除 grep/egrep/fgrep 开头的命令。
+> ~~RV-37~~（v52 代码修复，归档至 full）：`_signoff_paths_from_task` 同时从 claimed_paths 和 verification.command 提取。
 
-`_start_actor_for_assignment` 只检查 `resp.ok`，但 `actor_add_ops.py` 返回中包含 `running` 和 `start_error` 字段。不消费这些字段会丢失第一手失败原因，导致 actor 注册成功但实际未运行时无法及时发现。需要：消费 `running`/`start_error` 字段，对已注册但 stopped 的 actor 走 restart 语义。
+### v53 Codex review 新发现
 
-### v42 E2E 新发现
+> v53 双路 Codex 审查（plan-correctness + capability-gaps，均 HMAC 签名）：plan-correctness（verdict=revise，conf 4/5）修订 16 项 task 规格错误（T2 prompt 直写→候选生成、T8 lease 索引+explicit 验证、T9 claim workflow.py、T11 AttemptLink 需 node_id+prompt_version、T12 需 duration/outcome 指标、T5 复杂任务判定信号、T22 covers 扩展）；capability-gaps（verdict=revise，conf 4/5）新发现 9 项系统检测缺口（RV-39~47）。
 
-#### RO-112（FTS5 中文查询走 LIKE fallback）
+#### RV-41（validate 不检测 AF node completion 绕过 VerificationGate）
 
-search.py 对含 CJK 的查询直接退回 `LIKE '%query%'`，FTS5 MATCH 不支持中文子串匹配。功能可用但未使用 FTS5 原生能力。需要：在 foreman-capability-guide 中增加 FTS5 中文搜索最佳实践（ICU tokenizer 或 jieba 自定义 tokenize），或在 plan template 中标注 CJK 限制。
+AF `node_completed` 仅表示执行完成，但 CCCC 任务完成需要 VerificationGate 验证通过。
+当前 validate 不检测 plan 中 AF engine 路径是否在 node_raw_completed → verification_requested →
+VerificationGate → node_completed 之间有正确的 gating 声明。缺少此检测时，AF 成功和 CCCC
+任务成功可能分歧——AF 认为 node 完成但 CCCC 验证未通过。
+已知局限：需要 AF 引擎实际集成后才能进行结构化检测，当前阶段标记为待实现。
 
-#### FL-29（claimed_paths 越界修改）
+#### RV-43b（validate 不检测 agent prompt 直接变更绕过 promotion）
 
-v42 中 5 个任务（T03/T04/T05/T07/T11）修改了未声明的 app/main.py 和 tests/conftest.py。Codex process review 确认 ledger 记录了 W_WORKER_EXCEEDED_SCOPE。需要：workflow engine 在 task complete 时校验 changed_files ⊆ claimed_paths，越界时拒绝或要求 foreman 确认。
+T2 原设计直接写入 `.cccc/agents/*.yaml` 的 prompt 字段，绕过 T14 的 TunedAgentVersion
+promotion 安全机制。validate 应检测 plan 中是否有 task 直接 claim agent YAML 写入
+而未声明对应的 promotion 流程依赖。此检测可防止未来 plan 回归到"直接变更 active prompt"模式。
+已知局限：promotion 机制尚未实现（T13/T14），检测规则需在机制建立后添加。
 
-#### FL-30（实现任务 verification 偏浅）
+#### RV-47（validate 缺少 AgentFlow/评价闭环新不变量检测）
 
-实现任务（T03/T04/T05）的 verification.checks[] 主要是 import/router registration 检查，不验证 CRUD 行为或返回状态码。需要：plan template 强制实现任务包含至少一个行为验证（如 endpoint 调用返回正确状态码）。
-
-#### FL-31（Worker 负载不均衡）
-
-后半段 T07/T08/T09 全分给 worker-2，worker-1 闲置。需要：auto-dispatch 在批次分配时选择空闲最久的 worker，或支持动态 worker 负载均衡。
-
-#### RO-113（默认 JWT 密钥硬编码）
-
-config.py 默认 JWT 密钥 `change-me-in-production`。虽然非生产场景可接受，但 Aegis 应增加"检测默认密钥"规则，在 verification 阶段警告使用默认密钥。
-
-### v42 E2E 会话回顾发现
-
-#### FL-32（**P1** state.json 无完整性保护——可直接编辑跳过 flow 步骤）
-
-`.ralph-flow/state.json` 存储 `current_step` 和 `steps_completed`，但无任何签名、校验和或加密保护。agent 可以直接 `Edit` 修改 state.json 的 `current_step` 和 `steps_completed` 字段来跳过任意步骤（本轮实际发生：step 6 被手动跳过）。这是与 FL-21（HMAC 签名绕过）同级别的完整性问题——HMAC 保护了 Codex 输出，但 flow 自身状态完全裸奔。
-需要：state.json 增加 HMAC 签名字段，`ralph flow next` 每次验证签名后才执行 check，检测到篡改时拒绝推进并报告。
-
-#### FL-33（**P1** Step 4 不预检 CODEX_BRIDGE_SECRET——浪费完整 Codex 调用后才报错）
-
-Step 4 指令要求运行 Codex review，但不检查 `.env` 是否存在及 `CODEX_BRIDGE_SECRET` 是否配置。agent 跑完两轮 Codex（约 3 分钟 + API 费用）后 `ralph flow next` 才报 authenticity FAIL。本轮实际发生：两次 Codex review 白跑一轮后才发现要配密钥。
-需要：step 4 的指令输出或 `ralph flow next` 在 step 3→4 过渡时增加 pre-flight check：检查 `.env` 存在且含 `CODEX_BRIDGE_SECRET`，不满足时直接 FAIL 并给出 fix 命令，避免浪费 Codex 调用。
-
-#### FL-34（Step 6 归档删除检测基于 git diff，跨会话状态不一致导致误判）
-
-Step 6 check 要求 `git diff` 中出现已完成项（FL-27/FL-28/RO-108~111）的删除行（`-` 行）。但这些 ID 是前几轮会话在工作区加入但从未 commit 的内容——它们不在 git HEAD 中，因此 diff 中不可能出现删除行。check 连续 3 次 FAIL，最终只能通过手动修改 state.json 跳过（触发了 FL-32）。
-需要：step 6 的归档检测不应只依赖 git diff，应改为比较当前文件内容与已知完成项列表——如果短版 tracker 中不再包含已完成项的详细描述段落，则视为已归档。或者要求 flow 开始前先 commit 工作区变更，建立干净基准。
-
-#### FL-35（Codex review 用 read-only sandbox 无法跑 pytest——review 分数失真）
-
-Step 4 的 Codex review 使用 `--sandbox read-only`，但 pytest 的 conftest.py 需要 `tempfile.mkstemp()` 创建临时数据库，read-only sandbox 无可写临时目录。导致 41 个测试全部报 `FileNotFoundError`，Codex results review score 被拉到 2-3/5，但本地跑实际 41/41 全绿。
-需要：E2E flow 的 Codex review 步骤应使用 `--sandbox workspace-write`（或至少在 prompt 中明确说明 sandbox 限制，让 Codex 不要因环境问题降分），否则 results review 的分数不反映真实代码质量。
-
-#### FL-36（Step 2 需求模板缺少 .env 配置指引）
-
-Step 2 输出的需求模板没有提醒在 workspace 中创建 `.env` 文件并配置 `CODEX_BRIDGE_SECRET`。这导致到 step 4 才暴露配置缺失问题。模板应增加一个"环境准备"步骤，或 flow engine 在 step 1（workspace prepare）阶段自动生成 `.env`。
-
-#### FL-37（Step 6 "已完成项"来源不明确——check 如何确定哪些项需要删除？）
-
-Step 6 check 判定 FL-27/FL-28/RO-108~111 需要从短版 tracker 删除，但没有明确说明这个"需要删除"列表的来源。是从 full tracker 的"已完成"标记中提取的？还是从短版 tracker header 的"已完成（v45 代码修复）"行解析的？如果来源是未 commit 的工作区内容，那 check 的可靠性取决于前几轮会话是否正确标记——一旦标记格式偏移，check 就会产生 false positive 或 false negative。
-需要：check 逻辑应明确记录"需要删除"列表的推导路径，并在 FAIL 输出中展示来源，方便 agent 定位问题。
-
-### v42 E2E 并行度分析发现
-
-#### FL-38（**P1** auto-dispatch 只查 assignment-map 不做负载均衡——空闲 worker 被浪费）
-
-auto-dispatch 的任务分配完全依赖 foreman 在 `cccc workflow submit --assignment-map` 中指定的静态映射。当 batch 中有 3 个可并行任务但 assignment-map 全指向同一个 worker 时，其余 worker 闲置。v42 Batch 5 实际发生：T07/T08/T09 全分给 worker-2，worker-1 从 09:15 到 09:22 完全空闲（7 分钟）。
-
-**根因**：`assignment_batches.py:220-244` 的 `_build_explicit_assignment_result()` 只从 `suggestion.assignments` 查找预设映射，没有 fallback 到空闲 worker 的逻辑。`workflow_orchestrator.py:1040-1043` 的 `_auto_dispatch_ready_tasks()` 在构造 batch 时也不检查 worker 空闲状态。
-
-**需要**：auto-dispatch 在分配任务时增加负载感知——当 assignment-map 中的目标 worker 已有 running 任务时，将新任务分配给空闲 worker。或者实现 round-robin / least-loaded 策略作为 assignment-map 的补充。
-
-#### FL-39（Foreman 默认只创建 2 个 worker——未根据 DAG 最大并行度调整）
-
-Foreman 固定创建 2 个 worker（worker-1 + worker-2），但 v42 plan 的 DAG 最大并行度为 3（Batch 4: T04/T05/T06 和 Batch 5: T07/T08/T09 都是 3 路并行）。`ralph suggest` 输出的 `estimated_parallelism` 字段是 informational only，foreman 没有利用它来决定 worker 数量。
-
-**根因**：foreman prompt/guide 中没有"根据 `ralph suggest` 的 estimated_parallelism 创建对应数量 worker"的指引。`agent_pool.py` 的 AgentPoolManager 支持动态创建 worker（无上限），但 foreman 在规划阶段就固定了 2 个。
-
-**需要**：
-1. foreman-capability-guide 增加指引："运行 `ralph suggest` 后，根据 estimated_parallelism 创建至少该数量的 worker"
-2. 或者 workflow engine 在 auto-dispatch 时自动按需创建 worker——当 batch 中任务数超过现有空闲 worker 时，调用 agent_pool 创建新 worker
-
-#### FL-40（**P1** 模型选择全链路断裂——5 个断点导致 agent_pool 系统完全失效）
-
-v42 所有 worker 全用 `--runtime claude`，agent_pool 的自动选模型系统完全没被调用。问题不是单个环节，而是 5 个断点叠加导致整个设计意图落空。
-
-**系统代码实际状态**：agent_pool + select_model_for_task + ModelRegistry + ForemanWorkflow + agent 自动创建——**代码全部实现且通过测试**。但在实际 E2E 中没有一个环节被执行。
-
-**5 个断点：**
-
-| # | 断点 | 位置 | 影响 |
-|---|------|------|------|
-| 1 | Foreman 用 `--assignment-map` 绕过 agent_pool | `assignment_batches.py:211-212` — `suggestion.assignments` 非空时直接走 `_build_explicit_assignment_result()`，不调 `foreman.process_batch_suggestion()` | agent_pool 评分/创建逻辑完全跳过 |
-| 2 | 全局 registry 的 `strengths` 字段全部为空 | `~/.cccc/.cccc/models/registry.yaml` — 7 个模型无一填充 strengths | 即使走 agent_pool，`select_model_for_task()` 所有模型得分=0，退化为随机选择 |
-| 3 | `description` 有评价但 `select_model_for_task()` 不读 | `agent_ops.py:464` — 只匹配 `model.strengths`，不用 `model.description` | 用户写的丰富评价（"综合能力强,逻辑思维强"）完全浪费 |
-| 4 | `foreman_rating` 从未被填充 | 所有模型 `foreman_rating=None` | agent_pool 评分中 rating bonus=0，评价反馈循环断裂 |
-| 5 | workspace registry 不继承全局 registry | `/tmp/cccc-e2e-v42/.cccc/models/registry.yaml` 只有 1 个模型 | agent_pool 在 workspace 中看不到 codex/gemini |
-
-**预期设计 vs 当前现实：**
-
-```
-预期流程：
-  Foreman 决定需要的 agent 角色
-    → agent_pool 根据 registry 建议每个 agent 的 runtime
-      → Foreman 根据评价信息审核建议，做最终决策
-        → 任务分配系统自动分发
-        
-当前现实：
-  Foreman 手动 cccc actor add worker-1 --runtime claude
-  Foreman 手动 cccc actor add worker-2 --runtime claude
-  Foreman 传 --assignment-map → 完全绕过 agent_pool
-```
-
-**修复路径（按依赖顺序）：**
-
-1. **registry 数据完善**（断点 2/3）— 填充所有模型的 `strengths`/`weaknesses` 结构化字段；或让 `select_model_for_task()` 同时参考 `description`（LLM 解析或关键词匹配）
-2. **workspace registry 继承**（断点 5）— `cccc attach` 或 flow step-1 workspace 准备时，自动从全局 registry 复制/链接到 workspace
-3. **foreman 引导不传 assignment-map**（断点 1）— E2E 模板和 foreman guide 引导 foreman 只提交 `cccc workflow submit --plan plan.yaml`（不传 `--assignment-map`），让 auto-dispatch 走 `foreman.process_batch_suggestion()` → agent_pool 路径
-4. **评价反馈循环**（断点 4）— 在 `workflow.task_reported_completed` 事件中自动调用 `record_model_usage()`（函数已存在但从未被调用），任务完成后触发 `request_model_review()` 让 foreman 评分
-
-### v42 E2E agent 架构缺陷
-
-#### FL-41（**P1** Foreman 只创建"执行者" agent——缺少 reviewer/fixer 等多视角角色）
-
-v42 foreman 创建了 2 个 worker，角色定义仅为"backend core"和"tests"，本质是同质化的执行者。没有创建 reviewer（代码审查）、bug fixer（缺陷修复）、security auditor（安全审计）等角色。这导致整个工作流是"写完就交"的单向流程，缺少真实团队中的交叉审查和多维度质量保障。
-
-**对比真实团队**：一个 tech lead 不会只派 2 个 coder 写完代码就交付——会安排人 review、有人专门跑安全扫描、有人负责集成测试。Foreman 应该像真正的 tech lead 一样思考"这个项目需要哪些角色"，而不仅仅是"我要几个人写代码"。
-
-**当前 agent_pool 的能力支持**：
-- `role_type` 枚举已支持 `"worker" | "reviewer" | "specialist"`
-- `create_agent_for_task()` 可以生成任意 worker_prompt
-- `task_affinity` 可以标记 agent 的专长
-- 但 foreman 不知道应该创建这些角色，因为 guide 和模板都只提到 "创建 Worker actor"
-
-**需要**：
-1. **foreman guide 增加"团队组建"指引**——明确列出可选角色及适用场景：executor（执行）、reviewer（审查关键路径的代码质量和安全）、fixer（验证失败后专门修复）、integrator（跨模块集成测试）
-2. **plan.yaml 增加 `recommended_roles` 字段**——ralph suggest 根据 critical_flows/forbidden_flows 自动建议"建议为安全关键路径增加 reviewer agent"
-3. **Foreman 规划阶段主动评估**——"11 个任务中有 security tests 和 XSS 防护需求，应该创建一个 security-reviewer agent 专门审查安全实现"
-
-#### FL-42（评价系统需扩展为"评价+复盘+优化"闭环——含 E2E flow 步骤变更）
-
-当前 `foreman_rating` 字段和 `record_model_usage()` 函数存在但从未被调用。即使接通了评分，也只是一个数字——缺少复盘和基于复盘的 agent prompt 优化。
-
-**预期闭环**：
-
-```
-任务完成
-  → 自动记录 model usage（调用 record_model_usage）
-  → 触发 foreman 评分（1-5 分 + 文字评价）
-  → 触发复盘（retrospective）：
-      ① 对 agent prompt 的优化——"这个 worker 在处理 async 代码时犯了重复错误，应在 prompt 中增加 async 最佳实践提醒"
-      ② 对团队组成的反思——"如果当时多创建一个 reviewer agent 对 FTS5 实现做交叉检查，就不会出现 unicode61 假通过的问题"
-      ③ 将优化后的 prompt 写回 agent YAML（复用），将团队反思写入 foreman 知识库（下次参考）
-  → 下一轮 E2E 时 foreman 参考历史复盘决策
-```
-
-**E2E flow 步骤变更**（`flow_steps_e2e.py`）：
-
-当前 8 步（0-7）：code-verify → env-prepare → task-submit → monitor-wait → review → report-synthesize → improvement-register → cleanup
-
-改为 9 步（0-8），在 improvement-register 和 cleanup 之间插入 retrospective：
-
-```
-Step 7 (new): agent-retrospective — Agent 复盘与优化
-  指令：
-    1. Foreman 对每个 agent 评分（cccc model rate）并记录评价
-    2. 复盘 agent prompt 效果——哪些提示词帮助了任务完成、哪些导致了错误
-    3. 复盘团队组成——是否缺少 reviewer/fixer/auditor 角色、是否需要为下次创建新 agent
-    4. 将 prompt 优化建议写入 .ralph-flow/step-7-retrospective/
-    5. 将优化后的 agent prompt 写回 .cccc/agents/*.yaml
-  Check：
-    - retrospective 目录下有产出文件
-    - 至少覆盖 2 个 agent 的评价
-    - foreman_rating 已更新到 registry
-Step 8: cleanup（原 step 7）
-```
-
-同时 step 2 模板的"执行阶段"需更新：
-- "1. 创建 Worker actor（按需选择 runtime）" → 增加角色多样性指引和 registry 参考
-- 增加"不要传 --assignment-map，让 agent_pool 自动分配"的指引
-
-**需要**：
-1. **record_model_usage() 接入 workflow.task_reported_completed 事件**（代码存在未调用）
-2. **任务完成后自动触发 foreman 评分请求**（request_model_review 已实现，需接入事件）
-3. **flow_steps_e2e.py 新增 step 7 retrospective**——含 check 函数验证复盘产出
-4. **step 2 模板更新**——agent 角色指引 + runtime 选择 + 不传 assignment-map
-5. **优化后的 agent prompt 写回 .cccc/agents/*.yaml**——下次 create_or_reuse_agent 时直接复用
-
-#### FL-43（模型描述需从 description 自然语言升级为结构化 strengths/weaknesses）
-
-全局 registry（`~/.cccc/.cccc/models/registry.yaml`）中已有用户对模型的自然语言评价（description），但 `select_model_for_task()` 只读 `strengths` 字段（全部为空），导致评价信息完全浪费。
-
-**当前用户评价（已存在于 description 但未被系统使用）**：
-
-| 模型 | 用户评价 | 适用场景 |
-|------|---------|---------|
-| claude-opus-4-6 | 综合能力最强但偏贵，实现细节不如 gpt-5.4 | 方案讨论、复杂判断、指令遵循/工具调用、审美/前端 |
-| codex-gpt-5.4 | 综合能力强，逻辑/debug 能力强 | 方案制定、漏洞发现、高复杂度执行、代码审查 |
-| codex-gpt-5.3-codex | 比 5.4 弱但快 | 中等复杂度执行 |
-| gemini-3-flash-preview | 速度快成本低，基础能力尚可，前端审美不错 | 代码库检索、低复杂度多 agent 并发 |
-| gemini-3.1-pro-preview | 前端审美强 | UI 设计参考、前端审美问题 |
-
-**需要**：
-1. **将 description 中的评价提取为结构化 strengths/weaknesses**——可以手动填充，也可以让 LLM 从 description 自动提取
-2. **select_model_for_task() 同时参考 description**——当 strengths 为空时 fallback 到 description 关键词匹配
-3. **foreman 向 guide 注入模型选择参考**——把 registry 的模型对比表注入 foreman prompt，使其在创建 agent 时能做 informed decision
-4. **定期由用户更新 description**——模型能力随版本变化，description 是最灵活的更新方式
-
-### v41 E2E 新发现
-
-> 已完成（v45 代码修复 + v42 E2E 验证）：RO-108/RO-109/RO-110/RO-111/FL-27/FL-28 — 详见 full tracker 归档
+v53 引入 AgentFlow 引擎切换、acquire/release 协议、评价闭环等新架构。
+validate 目前没有检测以下不变量的规则：
+1. AF/legacy 引擎不可静默回退
+2. AF 补丁覆盖完整性
+3. VerificationGate 权威性（node_completed 不可绕过）
+4. explicit assignment 必须经过 acquire()
+5. prompt 变更只能通过 promotion
+6. trace parser 失败必须暴露为错误事件
+7. lease 释放覆盖所有终态路径
+已知局限：这些不变量需要在代码实现后逐步添加对应的 validate 规则。
 
 ---
 
-## 后续方向
+## v51 E2E 新发现
 
-### AgentFlow 整合（与 FL-38~43 大改关联）
+#### FL-63（WORKFLOW_EVALUATION test_stats_reliable 自动化判定缺失，P2）
 
-> 源码：`/Users/vfch/Downloads/agentflow-master`
-> 定位：多 agent 工作流编排框架（DAG 调度 + 可插拔 agent adapter + 多目标执行 + trace 收集 + agent 进化）
+foreman 写 `test_stats_reliable: true` 但实际未使用 pytest-randomly。CCCC 系统应自动检测
+是否有 randomized 插件标志，而非依赖 foreman 自述。FL-57 规则在 validate 阶段对 plan 检查，
+但 WORKFLOW_EVALUATION.md 的 test_stats_reliable 字段缺乏 runtime 校验。
 
-**CCCC 与 AgentFlow 核心概念对照：**
+#### FL-64（is_admin 注入边界未被 forbidden_flow 强制覆盖，P2）
 
-| CCCC 当前 | AgentFlow 对应 | 差距/整合点 |
-|-----------|---------------|------------|
-| Foreman（手动编排） | Orchestrator（async DAG 调度） | AF 的调度器更成熟：并发控制、retry backoff、取消/重跑、fanout/merge |
-| Worker（同质化 claude actor） | Agent Adapter（codex/claude/kimi + 自定义） | AF 的 adapter 模式天然支持多 runtime，CCCC 缺这层抽象 |
-| plan.yaml（ralph validate） | PipelineSpec（NodeSpec DAG） | 可共存：ralph 验证意图层，AF 验证执行层 |
-| assignment-map（静态映射） | 无（调度器直接按 DAG 分派） | AF 不需要预分配，节点到达时按 agent kind 路由 |
-| agent_pool（评分选模型，未激活） | ProviderConfig + model override | AF 每个 node 可独立指定 model/provider，更灵活 |
-| 无 | Fanout/Merge 模式 | AF 原生支持：一个任务展开为 N 个并行节点 + 合并 |
-| 无 | Jinja2 prompt 模板 + 上下文传递 | AF 节点可引用上游输出 `{{ nodes.plan.output }}`，CCCC 靠消息传递 |
-| 无 | Success Criteria（output_contains/regex/file_exists） | AF 节点自带验收条件，对应 CCCC 的 verification.checks |
-| 无 | Trace 收集 + NormalizedTraceEvent | AF 实时解析 agent stdout，CCCC 没有结构化 trace |
-| 无 | TunedAgentVersion（agent 进化） | AF 从历史 trace 训练优化 agent，对应 FL-42 的复盘→优化需求 |
-| 无 | Runner（local/ssh/ec2/ecs/container） | AF 支持远程执行，CCCC 仅本地 pty |
+plan forbidden_flows 声明 "MUST NOT accept role=admin or is_admin fields"，但 validate 和
+verification gate 均未检测实际测试是否覆盖了所有声明的注入向量。RV-29 的 validate 规则
+`W_AUTH_PRIVILEGED_ROLE_FIELD` 检测到了 identity surface，但不检查测试是否覆盖了所有声明的字段名。
 
-**整合策略：选择性合入（已确定）**
+#### FL-65（independently_reviewed 分类缺任务级映射，P3）
 
-优先保留 CCCC 自有架构和前述设计思路（foreman 决定 agent 角色 → agent_pool 建议模型 → foreman 根据评价判断 → 任务系统自动分发）。AF 作为优化方向参考，选择性合入功能模块，不做整体替换。
+WORKFLOW_EVALUATION.md result_breakdown 声明 independently_reviewed=2 但未标明具体哪两个任务。
+审计追溯困难。
 
-**选择性合入清单（按优先级）：**
+#### UX-23（WORKFLOW_EVALUATION 初始占位符后补充实质，P3）
 
-| 优先级 | AF 模块 | 合入目标 | 对应 FL |
-|--------|---------|---------|---------|
-| P1 | Agent Adapter 模式（`agents/base.py`, `agents/registry.py`） | 替换 CCCC 硬编码 pty runner，让 agent_pool 能按 adapter 路由到 codex/claude/gemini | FL-40 |
-| P1 | Trace 收集（`NormalizedTraceEvent` + agent 输出解析） | 给 CCCC 增加结构化 trace，支撑复盘系统和 foreman 对 agent 表现的评估 | FL-42 |
-| P2 | Success Criteria（`success.py`） | 与 CCCC verification.checks 对齐，统一验收标准定义 | FL-30 |
-| P2 | Iterative Cycle（`on_failure_restart` 回边） | 让 verification 失败的任务自动重试，减少 foreman override | FL-38 |
-| P3 | Jinja2 Prompt 模板（`context.py`） | 替换 CCCC 当前消息传递方式，支持 `{{ nodes.plan.output }}` 引用上游产出 | — |
-| P3 | Fanout/Merge 模式（`specs.py` fanout 展开） | 参考设计，增强 ralph suggest 的并行批次能力 | FL-39 |
-| 待评估 | TunedAgentVersion（agent 进化） | 从历史 trace 训练优化 agent prompt/配置，长期方向 | FL-42 |
-| 待评估 | Runner 抽象（local/ssh/ec2） | 远程执行能力，与 Modal 集成方案可能重叠 | — |
+WORKFLOW_EVALUATION.md 第一次生成时大部分章节为"待 foreman 补充"占位符（926B），foreman 后续
+补充为完整内容（5007B）。与 v50 UX-18b 类似但方向不同——补充过程成功了。
+
+#### RV-39（validate 不检测 plan 目标与实现状态码漂移，P3）
+
+T08 plan 目标声明 revoke 后返回 410 Gone，但实现为 404。validate 和 verification 均未检测
+此类规格与实现的漂移。（注：v53 Codex review 中 RV-39 编号已被使用，本条为 E2E 发现复验）
+
+---
+
+## 下一批任务
+
+### ~~FL-42~~（v53 代码实现完成：评价系统闭环）
+> v53 solve flow（2026-05-31）已实现：T1-T3（自动触发评分 + prompt 候选生成 + 集成测试）。
+> v51 E2E 确认 WORKFLOW_EVALUATION.md 自动生成 ✅。**待 AF 引擎启用后实战验证完整闭环。**
+
+### ~~MSE-1~6~~（v53 代码实现完成：模型选型与评价闭环重构，22 tasks）
+
+> v53 solve flow（2026-05-31）已实现全部 22 tasks：MSE-1/2（T4-T6 注册如实化+cost_tier）、
+> MSE-3（T7-T9 acquire/release）、MSE-4/5（T10-T12 trace+评分）、MSE-6（T13-T14 进化闭环）。
+> v51 E2E 确认未回归破坏现有功能（100 tests pass）。**待 AF 引擎启用后实战验证。**
+
+### ~~AgentFlow 整合~~（v53 代码实现完成：M0-M6）
+
+> v53 solve flow（2026-05-31）已实现：M0（T15-T16 ExecutionBundle+PlanCompiler）、M2（T17 LegacyExecutionEngine）、
+> M4/M5（T18-T20 AF patches+AFExecutionEngine+CCCCActorRunner）、全链路集成（T21-T22）。
+> v51 E2E 确认走 legacy 引擎路径正常。**待配置启用 AF 引擎后实战验证。**
+
+---
+
+## 后续改进
 
 ### Modal 集成（待调研）
 
