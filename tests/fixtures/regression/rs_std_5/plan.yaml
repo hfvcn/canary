@@ -1,0 +1,20 @@
+plan_scope:
+  - app
+tasks:
+  - id: T1
+    title: Check workflow evaluation remnants
+    role: leaf
+    claimed_paths:
+      - app/workflow_evaluation_check.py
+    goal_behavior: "Detect remaining foreman template text in WORKFLOW_EVALUATION.md"
+    acceptance_criteria: "Validate emits W_EVALUATION_PLACEHOLDER_REMAINING"
+    verification:
+      level: unit
+      command: "python -m pytest tests/test_workflow_evaluation.py -q"
+      checks:
+        - name: behavior
+          command: "python -m pytest tests/test_workflow_evaluation.py -q"
+      covers:
+        tasks: ["T1"]
+        paths:
+          - tests/test_workflow_evaluation.py

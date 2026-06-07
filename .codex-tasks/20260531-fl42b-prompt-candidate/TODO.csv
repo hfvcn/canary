@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing model review and prompt version context,DONE,Relevant code paths and constraints are identified,rg -n "request_model_review|agent_versions|OPTIMIZED_PROMPT" src/cccc tests,2026-05-31,0,request_model_review sends only; no sync reply channel exists
+2,Implement candidate creation and marker parsing,DONE,model_ops exposes create_prompt_candidate and parse_optimized_prompt,test -f src/cccc/daemon/ops/model_ops.py,2026-05-31,0,
+3,Add prompt writeback tests,DONE,tests/test_prompt_writeback.py covers requested behaviors,test -f tests/test_prompt_writeback.py,2026-05-31,0,
+4,Run target verification,DONE,Target pytest passes,python -m pytest tests/test_prompt_writeback.py -v,2026-05-31,0,8 passed

@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect AF dispatch and orchestrator entrypoints,DONE,T5 code paths and regression surfaces are mapped,rg -n "try_af_execution|process_batch_suggestion|_bridge_af_terminal_event|_af_runtime_reason" src/cccc/daemon/foreman tests,2026-06-06T00:00:00+08:00,0,
+2,Implement T5 dispatch guard behavior,DONE,Caller-thread registration dedupe strict mode and circuit breaker behavior are implemented,python -m pytest tests/agentflow/test_af_dispatch_guard.py -v,2026-06-06T00:00:00+08:00,0,
+3,Run targeted and regression pytest,DONE,T5 target test and listed regression tests pass,python -m pytest tests/test_af_fallback_observability.py tests/agentflow/test_apply_event_terminal_bridge.py tests/test_foreman_workflow.py -q,2026-06-06T00:00:00+08:00,0,

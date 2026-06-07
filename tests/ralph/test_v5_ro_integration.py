@@ -161,7 +161,13 @@ def test_finding_refs_validation() -> None:
             )
         ],
         finding_refs=[
-            FindingRef(id="F1", mitigation="use locks", enforced_by=["E_NO_LOCK"])
+            FindingRef(
+                id="F1",
+                mitigation="use locks",
+                enforced_by=["E_NO_LOCK"],
+                status="accepted",
+                status_reason="lock mitigation is tracked by review",
+            )
         ],
     )
 
@@ -179,7 +185,13 @@ def test_finding_refs_validation() -> None:
             )
         ],
         finding_refs=[
-            FindingRef(id="", mitigation="use locks", enforced_by=["E_NO_LOCK"])
+            FindingRef(
+                id="",
+                mitigation="use locks",
+                enforced_by=["E_NO_LOCK"],
+                status="accepted",
+                status_reason="lock mitigation is tracked by review",
+            )
         ],
     )
 
@@ -214,7 +226,15 @@ def test_combined_new_rules_no_interference() -> None:
                 test_created_by=["T2"],
             )
         ],
-        finding_refs=[FindingRef(id="", mitigation="use locks", enforced_by=["E_NO_LOCK"])],
+        finding_refs=[
+            FindingRef(
+                id="",
+                mitigation="use locks",
+                enforced_by=["E_NO_LOCK"],
+                status="accepted",
+                status_reason="lock mitigation is tracked by review",
+            )
+        ],
     )
 
     report = validate(plan)

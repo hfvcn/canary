@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read T8 specification and current implementation,DONE,Relevant symbols and tests are identified,python3 -m pytest --collect-only tests/test_foreman_workflow.py tests/test_workflow_test_stats_reliability.py,2026-05-31,0,
+2,Implement result classification,DONE,Summary emits result_breakdown and reliability follows overridden/assumption counts,python3 -m pytest tests/test_result_classification.py tests/test_workflow_test_stats_reliability.py,2026-05-31,0,
+3,Update/add tests,DONE,Classification categories and backward-compatible bool are covered,python3 -m pytest tests/test_result_classification.py tests/test_foreman_workflow.py tests/test_workflow_test_stats_reliability.py,2026-05-31,0,
+4,Run validation,DONE,Relevant pytest commands pass within 60 seconds,python3 -m pytest tests/test_result_classification.py tests/test_foreman_workflow.py tests/test_workflow_test_stats_reliability.py,2026-05-31,0,

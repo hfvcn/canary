@@ -11,6 +11,7 @@ from ...kernel.claimed_paths import (
     normalize_path as _normalize_path_fn,
     normalize_write_set as _normalize_write_set_fn,
 )
+from ...ralph.core import compute_estimated_parallelism
 from ...kernel.workflow_state_types import TaskState, WorkflowTaskStatus
 from .admission import (
     build_deferred_result as _build_deferred_result,
@@ -127,7 +128,7 @@ class AssignmentDeferralMixin:
 
         self.record_deferred_tasks(suggestion.workflow_id, deferred_tasks)
         suggestion.tasks = safe_tasks
-        suggestion.estimated_parallelism = len(safe_tasks)
+        suggestion.estimated_parallelism = compute_estimated_parallelism(safe_tasks)
         self._owner._log(
             f"[orchestrator] Allowing {len(safe_tasks)} tasks from batch "
             f"{suggestion.suggestion_id}; deferred {len(deferred_tasks)} due to single-writer conflicts"
@@ -202,7 +203,7 @@ class AssignmentDeferralMixin:
                 reason=EXTERNAL_PRESSURE_REASON,
             )
         suggestion.tasks = safe_tasks
-        suggestion.estimated_parallelism = len(safe_tasks)
+        suggestion.estimated_parallelism = compute_estimated_parallelism(safe_tasks)
         self._owner._log(
             f"[orchestrator] Allowing {len(safe_tasks)} tasks; "
             f"deferred {len(deferred_tasks)} due to cross-workflow pressure"

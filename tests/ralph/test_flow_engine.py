@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import dataclasses
 import hashlib
 import hmac
@@ -7,6 +8,8 @@ import json
 import subprocess
 import uuid
 from pathlib import Path
+
+import pytest
 
 import cccc.ralph.flow_engine as flow_engine_module
 from cccc.ralph.flow_engine import (
@@ -28,7 +31,7 @@ def test_start_creates_state(tmp_path: Path) -> None:
 
     assert (tmp_path / ".ralph-flow" / "state.json").is_file()
     assert (tmp_path / ".ralph-flow" / "step-1-understand").is_dir()
-    assert "Step 1/6" in instruction
+    assert "Step 1/7" in instruction
     assert engine.state is not None
     assert engine.state.current_step == 1
 
@@ -57,6 +60,72 @@ def test_solve_review_instruction_mentions_codex_bridge_parallel_and_skill() -> 
     assert "parallel" in instruction
 
 
+def test_secret_preflight_pass(tmp_path: Path, monkeypatch) -> None:
+    secret = "test-secret"
+    monkeypatch.setenv("CODEX_BRIDGE_SECRET", secret)
+    review_dir = tmp_path / ".ralph-flow" / "step-3-review"
+    review_dir.mkdir(parents=True)
+    _write_signed_codex_output(
+        review_dir / "review.json",
+        secret=secret,
+        agent_messages="x" * 250,
+    )
+    state = FlowState(
+        flow_type="solve",
+        workspace=str(tmp_path),
+        started_at="2026-05-24T00:00:00Z",
+        current_step=3,
+        params={},
+        steps_completed=[],
+        steps_failed={},
+    )
+
+    step = _build_solve_steps()[2]
+    assert step.check_fn is not None
+
+    result = step.check_fn(state)
+
+    assert result.passed
+    assert all(detail["passed"] for detail in result.details)
+
+
+def test_secret_preflight_fail(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("CODEX_BRIDGE_SECRET", raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".env").write_text("OTHER_KEY=value\n", encoding="utf-8")
+    state = FlowState(
+        flow_type="solve",
+        workspace=str(workspace),
+        started_at="2026-05-24T00:00:00Z",
+        current_step=3,
+        params={},
+        steps_completed=[],
+        steps_failed={},
+    )
+
+    step = _build_solve_steps()[2]
+    assert step.check_fn is not None
+
+    result = step.check_fn(state)
+
+    assert not result.passed
+    assert result.details == [
+        {
+            "check": "secret_preflight",
+            "passed": False,
+            "message": "CODEX_BRIDGE_SECRET not configured — export CODEX_BRIDGE_SECRET=xxx or add to .env",
+        }
+    ]
+
+
+def test_sandbox_write_in_step3() -> None:
+    instruction = _build_solve_steps()[2].instruction_text
+
+    assert "workspace-write" in instruction
+    assert "read-only" not in instruction
+
+
 def test_solve_gap_instruction_mentions_codex_findings_and_heading_requirement() -> None:
     steps = _build_solve_steps()
     instruction = steps[3].instruction_text
@@ -65,13 +134,23 @@ def test_solve_gap_instruction_mentions_codex_findings_and_heading_requirement()
     assert "`####`" in instruction
 
 
+def _write_understand_output(workspace: Path) -> None:
+    understand_dir = workspace / ".ralph-flow" / "step-1-understand"
+    understand_dir.mkdir(parents=True, exist_ok=True)
+    (understand_dir / "understand.md").write_text(
+        "原始症状：启动失败\n活跃路径假设：entrypoint 经过 daemon bootstrap\n待证明：behavior change 已生效\n",
+        encoding="utf-8",
+    )
+
+
 def test_next_advances_on_pass(tmp_path: Path) -> None:
     engine = FlowEngine(tmp_path)
     engine.start("solve")
+    _write_understand_output(tmp_path)
 
     instruction = engine.next()
 
-    assert "Step 2/6" in instruction
+    assert "Step 2/7" in instruction
     assert engine.state is not None
     assert engine.state.current_step == 2
     assert engine.state.steps_completed == [1]
@@ -80,6 +159,7 @@ def test_next_advances_on_pass(tmp_path: Path) -> None:
 def test_next_stays_on_fail(tmp_path: Path) -> None:
     engine = FlowEngine(tmp_path)
     engine.start("solve")
+    _write_understand_output(tmp_path)
     engine.next()
 
     instruction = engine.next()
@@ -89,7 +169,73 @@ def test_next_stays_on_fail(tmp_path: Path) -> None:
     assert state.current_step == 2
     assert state.steps_failed["2"]["attempts"] == 1
     assert "plan.yaml exists" in instruction
-    assert "Step 2/6" in instruction
+    assert "Step 2/7" in instruction
+
+
+def test_state_sig_roundtrip(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_SECRET", "test-secret")
+    engine = FlowEngine(tmp_path)
+
+    engine.start("solve", test_cmd="pytest")
+
+    payload = _read_state_json(tmp_path / ".ralph-flow" / "state.json")
+    state = engine.state
+    assert payload["_state_sig"]
+    assert state is not None
+    assert state._state_sig == payload["_state_sig"]
+
+
+def test_state_sig_tamper_current_step(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_SECRET", "test-secret")
+    engine = FlowEngine(tmp_path)
+    engine.start("solve")
+    state_path = tmp_path / ".ralph-flow" / "state.json"
+    payload = _read_state_json(state_path)
+    payload["current_step"] = 99
+    _write_state_json(state_path, payload)
+
+    with pytest.raises(ValueError, match="state.json integrity check failed"):
+        engine._load_state()
+
+
+def test_state_sig_tamper_params(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_SECRET", "test-secret")
+    engine = FlowEngine(tmp_path)
+    engine.start("solve", test_cmd="pytest")
+    state_path = tmp_path / ".ralph-flow" / "state.json"
+    payload = _read_state_json(state_path)
+    payload["params"]["test_cmd"] = "echo hacked"
+    _write_state_json(state_path, payload)
+
+    with pytest.raises(ValueError, match="state.json integrity check failed"):
+        engine._load_state()
+
+
+def test_state_sig_missing_backward_compat(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_SECRET", "test-secret")
+    engine = FlowEngine(tmp_path)
+    engine.start("solve")
+    state_path = tmp_path / ".ralph-flow" / "state.json"
+    payload = _read_state_json(state_path)
+    payload.pop("_state_sig")
+    _write_state_json(state_path, payload)
+
+    state = engine.state
+    assert state is not None
+    assert state._state_sig is None
+
+
+def test_state_sig_no_secret(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("CODEX_BRIDGE_SECRET", raising=False)
+    engine = FlowEngine(tmp_path)
+
+    engine.start("solve")
+
+    payload = _read_state_json(tmp_path / ".ralph-flow" / "state.json")
+    state = engine.state
+    assert payload["_state_sig"] is None
+    assert state is not None
+    assert state._state_sig is None
 
 
 def test_codex_validation_rejects_missing_sig(tmp_path: Path, monkeypatch) -> None:
@@ -111,6 +257,40 @@ def test_codex_validation_rejects_missing_sig(tmp_path: Path, monkeypatch) -> No
 
     assert not result.passed
     assert any(not detail["passed"] for detail in result.details)
+
+
+def test_check_regression_run_reports_non_importerror_import_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = FlowState(
+        flow_type="solve",
+        workspace=str(tmp_path),
+        started_at="2026-05-24T00:00:00Z",
+        current_step=7,
+        params={},
+        steps_completed=[],
+        steps_failed={},
+    )
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "regression_scenarios" and level == 1:
+            raise SyntaxError("broken module")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    result = flow_engine_module._check_regression_run(state)
+
+    assert result.passed is False
+    assert result.details == [
+        {
+            "check": "regression import",
+            "passed": False,
+            "message": "cannot import: broken module",
+        }
+    ]
 
 
 def test_codex_validation_accepts_valid_hmac_signature(tmp_path: Path, monkeypatch) -> None:
@@ -370,12 +550,219 @@ def test_gap_record_requires_capability_keywords(tmp_path: Path, monkeypatch) ->
     assert passed.passed
 
 
+def test_gap_record_accepts_main_path_keywords_with_evidence(tmp_path: Path) -> None:
+    tracker = _init_solve_tracker_repo(tmp_path)
+    review_dir = tmp_path / ".ralph-flow" / "step-3-review"
+    review_dir.mkdir(parents=True)
+    _write_review_output(review_dir / "review.json", "- refresh token misuse\n- contract drift\n")
+
+    tracker.write_text(
+        "base\nv41 代码修复\n#### FL-66\n"
+        "refresh token misuse remains on main path import chain because orchestrator uses "
+        "from cccc.ralph.flow_engine import FlowEngine before register 调用\n",
+        encoding="utf-8",
+    )
+
+    result = flow_engine_module._check_gap_record(_solve_gap_state(tmp_path))
+
+    assert result.passed
+    assert any(
+        detail["check"] == "main path integration evidence" and detail["passed"]
+        for detail in result.details
+    )
+
+
+def test_gap_record_requires_main_path_evidence_keywords(tmp_path: Path) -> None:
+    tracker = _init_solve_tracker_repo(tmp_path)
+    review_dir = tmp_path / ".ralph-flow" / "step-3-review"
+    review_dir.mkdir(parents=True)
+    _write_review_output(review_dir / "review.json", "- refresh token misuse\n- contract drift\n")
+
+    tracker.write_text(
+        "base\nv41 代码修复\n#### FL-66\n"
+        "refresh token misuse remains on main path and call path around the orchestrator branch\n",
+        encoding="utf-8",
+    )
+
+    result = flow_engine_module._check_gap_record(_solve_gap_state(tmp_path))
+
+    assert not result.passed
+    assert any(
+        detail["check"] == "main path integration evidence" and not detail["passed"]
+        for detail in result.details
+    )
+
+
+def test_gap_record_existing_capability_keywords_still_pass(tmp_path: Path) -> None:
+    tracker = _init_solve_tracker_repo(tmp_path)
+    review_dir = tmp_path / ".ralph-flow" / "step-3-review"
+    review_dir.mkdir(parents=True)
+    _write_review_output(review_dir / "review.json", "- refresh token misuse\n- contract drift\n")
+
+    tracker.write_text(
+        "base\nv41 代码修复\n#### FL-23\n"
+        "refresh token misuse needs detect warning rule coverage in tracker checks\n",
+        encoding="utf-8",
+    )
+
+    result = flow_engine_module._check_gap_record(_solve_gap_state(tmp_path))
+
+    assert result.passed
+    assert any(
+        detail["check"] == "tracker capability gap content" and detail["passed"]
+        for detail in result.details
+    )
+
+
+def test_gap_structure_complete_record_passes(tmp_path: Path) -> None:
+    tracker = _init_solve_tracker_repo(tmp_path)
+    review_dir = tmp_path / ".ralph-flow" / "step-3-review"
+    review_dir.mkdir(parents=True)
+    _write_review_output(review_dir / "review.json", "- refresh token misuse\n- contract drift\n")
+
+    tracker.write_text(
+        "base\nv41 代码修复\n#### FL-23\n"
+        "issue_id: FL-23\n"
+        "detection_type: validate\n"
+        "description: refresh token misuse needs validate rule coverage in tracker checks\n",
+        encoding="utf-8",
+    )
+
+    result = flow_engine_module._check_gap_record(_solve_gap_state(tmp_path))
+
+    assert result.passed
+    assert any(
+        detail["check"] == "tracker gap record structure"
+        and "issue_id, detection_type, and description" in detail["message"]
+        for detail in result.details
+    )
+
+
+def test_gap_structure_missing_issue_id_passes_with_suggestion(tmp_path: Path) -> None:
+    tracker = _init_solve_tracker_repo(tmp_path)
+    review_dir = tmp_path / ".ralph-flow" / "step-3-review"
+    review_dir.mkdir(parents=True)
+    _write_review_output(review_dir / "review.json", "- refresh token misuse\n- contract drift\n")
+
+    tracker.write_text(
+        "base\nv41 代码修复\n#### FL-23\n"
+        "detection_type: validate\n"
+        "description: refresh token misuse needs validate rule coverage in tracker checks\n",
+        encoding="utf-8",
+    )
+
+    result = flow_engine_module._check_gap_record(_solve_gap_state(tmp_path))
+
+    assert result.passed
+    assert any(
+        detail["check"] == "tracker gap record structure"
+        and "issue_id" in detail["message"]
+        for detail in result.details
+    )
+
+
+def test_gap_structure_without_capability_keywords_fails(tmp_path: Path) -> None:
+    tracker = _init_solve_tracker_repo(tmp_path)
+    review_dir = tmp_path / ".ralph-flow" / "step-3-review"
+    review_dir.mkdir(parents=True)
+    _write_review_output(review_dir / "review.json", "- refresh token misuse\n- contract drift\n")
+
+    tracker.write_text(
+        "base\nv41 代码修复\n#### FL-23\n"
+        "issue_id: FL-23\n"
+        "description: refresh token misuse remained after manual triage and follow-up notes\n",
+        encoding="utf-8",
+    )
+
+    result = flow_engine_module._check_gap_record(_solve_gap_state(tmp_path))
+
+    assert not result.passed
+    assert any(
+        detail["check"] == "tracker capability gap content" and not detail["passed"]
+        for detail in result.details
+    )
+    assert not any(detail["check"] == "tracker gap record structure" for detail in result.details)
+
+
+def test_archive_content_check_pass(tmp_path: Path) -> None:
+    tracker = _init_solve_tracker_repo(tmp_path)
+    review_dir = tmp_path / ".ralph-flow" / "step-3-review"
+    review_dir.mkdir(parents=True)
+    _write_review_output(review_dir / "review.json", "- refresh token misuse\n- contract drift\n")
+    tracker.write_text(
+        "> 日期：2026-05-24\n"
+        "> 已完成（v42 代码修复）：FL-19\n"
+        "---\n"
+        "#### FL-21\n"
+        "refresh token misuse needs validate rule coverage\n",
+        encoding="utf-8",
+    )
+
+    result = flow_engine_module._check_gap_record(_solve_gap_state(tmp_path))
+
+    assert result.passed
+    assert not any(
+        detail["check"] == "tracker archive content (advisory)" and not detail["passed"]
+        for detail in result.details
+    )
+
+
+def test_archive_content_check_fail(tmp_path: Path) -> None:
+    tracker = _init_solve_tracker_repo(tmp_path)
+    review_dir = tmp_path / ".ralph-flow" / "step-3-review"
+    review_dir.mkdir(parents=True)
+    _write_review_output(review_dir / "review.json", "- refresh token misuse\n- contract drift\n")
+    tracker.write_text(
+        "> 日期：2026-05-24\n"
+        "> 已完成（v42 代码修复）：FL-19\n"
+        "---\n"
+        "#### FL-19\n"
+        "resolved item still present in active tracker body\n"
+        "#### FL-21\n"
+        "refresh token misuse needs validate rule coverage\n",
+        encoding="utf-8",
+    )
+
+    result = flow_engine_module._check_gap_record(_solve_gap_state(tmp_path))
+
+    assert not result.passed
+    assert any(
+        detail["check"] == "short tracker archive blocking"
+        and not detail["passed"]
+        and detail["message"]
+        == "completed-but-not-archived: ['FL-19'] — archive these to full tracker before proceeding"
+        for detail in result.details
+    )
+    assert any(
+        detail["check"] == "tracker archive content (advisory)"
+        and not detail["passed"]
+        and detail["message"]
+        == "completed item FL-19 still has active section in tracker (source: header completed marker)"
+        for detail in result.details
+    )
+
+
+def test_archive_content_parse_completed_ids() -> None:
+    tracker_text = (
+        "> 日期：2026-05-24\n"
+        "> 已完成（v42 代码修复）：FL-19/RO-12a\n"
+        "> 已验证（v42 E2E 确认）：UX-7, AB-9B\n"
+        "---\n"
+        "#### QQ-77\n"
+        "已完成：QQ-77 should not be parsed from the body\n"
+    )
+
+    completed_ids = flow_engine_module._parse_completed_ids(tracker_text)
+
+    assert completed_ids == {"FL-19", "RO-12a", "UX-7", "AB-9B"}
+
+
 def test_completion_removes_flow_dir(tmp_path: Path) -> None:
     engine = FlowEngine(tmp_path)
     engine.start("solve")
     state = engine.state
     assert state is not None
-    engine._save_state(dataclasses.replace(state, current_step=7))
+    engine._save_state(dataclasses.replace(state, current_step=8))
 
     result = engine.next()
 
@@ -411,6 +798,14 @@ def _write_signed_codex_output(path: Path, secret: str, agent_messages: str) -> 
     payload["_sig"] = hmac.new(secret.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
     path.write_text(json.dumps(payload), encoding="utf-8")
     return session_id
+
+
+def _read_state_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_state_json(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def _write_review_output(path: Path, agent_messages: str) -> None:

@@ -9,6 +9,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from cccc.ralph.models import normalize_module
+
 
 # ---------------------------------------------------------------------------
 # PromptBudget — W3-10
@@ -336,6 +338,67 @@ def _should_include_verification_command(task: Any) -> bool:
     return bool(command)
 
 
+_PROMPT_UNSPECIFIED = "(unspecified)"
+_FAILURE_REPORT_TEMPLATE = (
+    "      status: blocked\n"
+    "      module: <module_id or task-level>\n"
+    "      reason: <one-line blocker>\n"
+    "      evidence: <command/output/path>\n"
+    "      needed: <missing input/decision/dependency>"
+)
+
+
+def _module_goal_text(module: Dict[str, Any]) -> str:
+    purpose = str(module.get("purpose", "") or "").strip()
+    description = str(module.get("description", "") or "").strip()
+    if purpose and description and purpose != description:
+        return f"{purpose} | {description}"
+    return purpose or description or _PROMPT_UNSPECIFIED
+
+
+def _build_module_narrowed_input(task: Any) -> str:
+    modules = getattr(task, "modules", None)
+    if not modules:
+        return ""
+
+    claimed_paths = list(getattr(task, "claimed_paths", None) or [])
+    allowed_paths = ", ".join(claimed_paths) if claimed_paths else "(none)"
+    lines = [
+        "模块收窄输入 / Module Narrowed Input:",
+        f"  允许修改路径: {allowed_paths}",
+        "  禁止修改路径: Do not modify files outside claimed_paths.",
+        "  失败上报格式:",
+        _FAILURE_REPORT_TEMPLATE,
+    ]
+
+    for raw_module in modules:
+        module = normalize_module(raw_module)
+        description = str(module.get("description", "") or "").strip()
+        heading = f"  [{module['id']}]"
+        if description:
+            heading += f" {description}"
+        lines.append(heading)
+        lines.append(f"    模块目标: {_module_goal_text(module)}")
+        lines.append("    接口:")
+        lines.append(f"      provides: {module.get('provides', [])}")
+        lines.append(f"      consumes: {module.get('consumes', [])}")
+        lines.append(f"    模拟输入: {module.get('mock_inputs', [])}")
+        # Blind verification (蓝图 1.3/3.2/4.3): the Worker is a black box and MUST
+        # NOT see the oracle (expected_outputs) or the acceptance/verify command
+        # (black_box_tests) — those are the hidden gate the module-acceptance engine
+        # runs independently. Rendering them would let the Worker teach-to-the-test,
+        # which is exactly what M3-3 narrowing is meant to prevent. This matches the
+        # existing invariant that mock_tests "must never be rendered to workers"
+        # (see _build_agent_mock_tests guard). Only mock_inputs + interface schema
+        # (development inputs) are shown.
+
+        depends_on = [str(dep).strip() for dep in module.get("internal_depends_on", []) if str(dep).strip()]
+        if depends_on:
+            lines.append(f"    内部依赖: {', '.join(depends_on)}")
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Task prompt assembly
 # ---------------------------------------------------------------------------
@@ -423,26 +486,12 @@ def build_task_prompt(
             text="\n".join(io_lines),
             mandatory=True,
         ))
-    # BP-2: Module decomposition — advisory structure for worker guidance
-    modules = getattr(task, "modules", None)
-    if modules:
-        mod_lines = ["Module Decomposition (recommended implementation structure):"]
-        for mod in modules:
-            mid = mod.get("id", "?") if isinstance(mod, dict) else getattr(mod, "id", "?")
-            desc = mod.get("description", "") if isinstance(mod, dict) else getattr(mod, "description", "")
-            inp = mod.get("input_spec", {}) if isinstance(mod, dict) else getattr(mod, "input_spec", {})
-            out = mod.get("output_spec", {}) if isinstance(mod, dict) else getattr(mod, "output_spec", {})
-            deps = mod.get("internal_depends_on", []) if isinstance(mod, dict) else getattr(mod, "internal_depends_on", [])
-            mod_lines.append(f"  [{mid}] {desc}")
-            if inp:
-                mod_lines.append(f"    Input:  {inp}")
-            if out:
-                mod_lines.append(f"    Output: {out}")
-            if deps:
-                mod_lines.append(f"    Depends on: {', '.join(deps)}")
+    # BP-2/BP-3: module structure narrowed into an explicit worker contract.
+    module_narrowed_input = _build_module_narrowed_input(task)
+    if module_narrowed_input:
         sections.append(_PromptSection(
             name="modules",
-            text="\n".join(mod_lines),
+            text=module_narrowed_input,
             mandatory=False,
         ))
     # Do-not-ignore issues — from task attribute or computed from issues list

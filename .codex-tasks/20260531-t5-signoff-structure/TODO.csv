@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect T5 spec and current rule wiring,DONE,T5 behavior and existing security wiring understood,sed -n '265,310p' plan.yaml,,0,
+2,Implement and register signoff structure rule,DONE,W_SIGNOFF_STRUCTURE_WEAK emitted only for specified weak structures,python -m pytest tests/ralph/test_signoff_structure.py -v,,0,
+3,Add focused T5 unit tests,DONE,All five acceptance scenarios are covered,python -m pytest tests/ralph/test_signoff_structure.py -v,,0,
+4,Run verification,DONE,Target tests pass within 60 seconds,python -m pytest tests/ralph/test_signoff_structure.py -v,,0,

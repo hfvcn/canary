@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current security validation and Plan test patterns,DONE,Current constructors and warning shape are known,rg and targeted reads complete,2026-05-31,0,
+2,Add W_SIGNOFF_STRUCTURE_WEAK to non-suppressible security set,DONE,security.py includes the code in _NON_SUPPRESSIBLE_WHEN_SECURITY,python - <<'PY'\nfrom cccc.ralph.validation_rules.security import _NON_SUPPRESSIBLE_WHEN_SECURITY\nassert 'W_SIGNOFF_STRUCTURE_WEAK' in _NON_SUPPRESSIBLE_WHEN_SECURITY\nPY,2026-05-31,0,
+3,Add focused signoff non-suppressible tests,DONE,tests/ralph/test_signoff_non_suppressible.py exists with requested assertions,test -f tests/ralph/test_signoff_non_suppressible.py,2026-05-31,0,
+4,Run requested pytest target,DONE,Specified pytest command passes,python -m pytest tests/ralph/test_signoff_non_suppressible.py -v,2026-05-31,0,Passed via 60s subprocess timeout wrapper.

@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm existing full-loop APIs,DONE,"Relevant function signatures and prior tests reviewed","rg -n \"def (aggregate_model_scores|record_model_usage|generate_tuned_candidate|promote_agent_version)|class TraceBridge\" src tests",2026-05-31,0,
+2,Add T21 integration test,DONE,"tests/test_evaluation_full_loop.py exists","test -f tests/test_evaluation_full_loop.py",2026-05-31,0,
+3,Run requested validation,DONE,"T21 integration test passes","python -m pytest tests/test_evaluation_full_loop.py -v",2026-05-31,0,

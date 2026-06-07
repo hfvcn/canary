@@ -8,11 +8,20 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
+import yaml
+
 from ...contracts.v1.agent import Agent, ModelCapability, ModelRegistry
+from ...contracts.v1.agent_lease import (
+    AgentAcquireRequest,
+    AgentLease,
+    AssignmentPolicy,
+)
 from ...contracts.v1.ralph_ipc import TaskRef
 from ..ops.agent_ops import (
     create_agent,
@@ -23,6 +32,7 @@ from ..ops.agent_ops import (
     select_model_for_task,
     build_agent_prompt,
 )
+from ..ops.model_selection import match_model_for_task
 
 
 # Default capability sets for different task types
@@ -31,6 +41,10 @@ DEFAULT_REVIEWER_CAPABILITIES = ["code_review", "memory_access"]
 LARGE_CONTEXT_WINDOW = 200_000
 MULTI_FILE_TASK_PATH_COUNT = 5
 FOREMAN_RATING_MULTIPLIER = 2
+COMPLEX_TASK_TYPES = {"architecture_design", "security_review", "complex_logic"}
+COST_TIER_BONUS = {"budget": 8, "standard": 4, "premium": 0}
+DEFAULT_COST_TIER_BONUS = 4
+SIMPLE_TASK_CAPABILITY_LIMIT = 2
 PATH_DOMAIN_AFFINITY_BONUS = 25
 PATH_DOMAIN_RELATED_BONUS = 10
 FRONTEND_PATH_SIGNALS = (
@@ -53,6 +67,10 @@ BACKEND_PATH_SIGNALS = (
     ".rs",
 )
 TESTING_PATH_SIGNALS = ("test", "spec")
+DEFAULT_AGENT_PROFILE_ROLE = "executor"
+REVIEWER_AGENT_PROFILE_ROLE = "reviewer"
+SECURITY_REVIEWER_AGENT_PROFILE_ROLE = "security-reviewer"
+SECURITY_REVIEW_PEER_RUNTIMES = frozenset({"claude"})
 logger = logging.getLogger(__name__)
 
 
@@ -99,6 +117,7 @@ class TaskAssignment:
         assignment_reason: Why this agent was chosen
         model_runtime: Agent CLI runtime (e.g., "claude", "gemini")
         model_id: Specific model identifier (e.g., "claude-sonnet-4")
+        model_key: Registry model key (e.g., "codex-gpt-5.4")
     """
 
     task: TaskRef
@@ -108,6 +127,7 @@ class TaskAssignment:
     assignment_reason: str = ""
     model_runtime: str = ""
     model_id: str = ""
+    model_key: str = ""
 
 
 class AgentPoolManager:
@@ -141,6 +161,9 @@ class AgentPoolManager:
 
         # Track active assignments (agent_id -> task_id)
         self._active_assignments: Dict[str, str] = {}
+        self._assignment_lock = threading.Lock()
+        self._active_leases: dict[str, AgentLease] = {}  # lease_id -> lease
+        self._task_leases: dict[str, AgentLease] = {}  # task_id -> lease
         self._last_assignment_warning: str = ""
 
     def get_model_registry(self) -> ModelRegistry:
@@ -151,6 +174,137 @@ class AgentPoolManager:
         """List all enabled agents that are currently available."""
         agents = list_agents(self.agents_dir, enabled_only=True)
         return [a for a in agents if a.id not in self._active_assignments]
+
+    def acquire(self, request: AgentAcquireRequest) -> AgentLease:
+        """Acquire an agent lease for task execution."""
+        policy = self._normalize_assignment_policy(request.assignment_policy)
+        task_id = getattr(request.task, "id", "")
+
+        if policy.mode == "explicit":
+            agent, reason, is_new_actor = self._acquire_explicit_agent(policy, task_id)
+        elif policy.mode == "role_pool":
+            agent, reason, is_new_actor = self._acquire_role_pool_agent(
+                request,
+                policy,
+                task_id,
+            )
+        else:
+            agent, reason, is_new_actor = self._acquire_auto_agent(request)
+
+        lease = self._build_lease(request, agent, reason, is_new_actor)
+        self._active_leases[lease.lease_id] = lease
+        self._task_leases[lease.task_id] = lease
+        return lease
+
+    def release(self, lease: AgentLease, outcome: str) -> None:
+        """Release a lease after task completion."""
+        self._active_leases.pop(lease.lease_id, None)
+        self._task_leases.pop(lease.task_id, None)
+        self.release_agent(lease.agent_id)
+        logger.info("Released lease %s with outcome=%s", lease.lease_id, outcome)
+
+    def mark_failed(self, lease: AgentLease, reason: str) -> None:
+        """Release a lease due to failure."""
+        self._active_leases.pop(lease.lease_id, None)
+        self._task_leases.pop(lease.task_id, None)
+        self.release_agent(lease.agent_id)
+        logger.info("Released failed lease %s: %s", lease.lease_id, reason)
+
+    def get_lease_by_task(self, task_id: str) -> AgentLease | None:
+        return self._task_leases.get(task_id)
+
+    def _normalize_assignment_policy(self, policy: object) -> AssignmentPolicy:
+        if isinstance(policy, AssignmentPolicy):
+            return policy
+        return AssignmentPolicy(mode="auto")
+
+    def _acquire_explicit_agent(
+        self,
+        policy: AssignmentPolicy,
+        task_id: str,
+    ) -> tuple[Agent, str, bool]:
+        agent = get_agent(policy.explicit_actor_id, self.agents_dir)
+        if agent is None:
+            raise ValueError(f"Explicit agent not found: {policy.explicit_actor_id}")
+        if not agent.enabled:
+            raise ValueError(f"Agent {policy.explicit_actor_id} is disabled")
+        if agent.id in self._active_assignments:
+            raise ValueError(f"Agent {policy.explicit_actor_id} is busy")
+        if not self.assign_agent(agent.id, task_id):
+            raise ValueError(f"Agent {policy.explicit_actor_id} is busy")
+        return agent, f"Explicit assignment: {policy.explicit_actor_id}", False
+
+    def _acquire_role_pool_agent(
+        self,
+        request: AgentAcquireRequest,
+        policy: AssignmentPolicy,
+        task_id: str,
+    ) -> tuple[Agent, str, bool]:
+        for evaluation in self.evaluate_for_task(request.task):
+            agent = evaluation.agent
+            if agent.role_type != policy.required_role:
+                continue
+            if not evaluation.is_suitable():
+                continue
+            if not self._has_required_capabilities(agent, policy):
+                continue
+            if not self.assign_agent(agent.id, task_id):
+                raise ValueError(f"Agent {agent.id} is busy")
+            return agent, f"Role pool selection for {policy.required_role}", False
+        raise ValueError("No suitable agent in role pool")
+
+    def _acquire_auto_agent(
+        self,
+        request: AgentAcquireRequest,
+    ) -> tuple[Agent, str, bool]:
+        result = self.create_or_reuse_agent(request.task)
+        if not result.agent_id:
+            raise ValueError(f"Failed to acquire agent: {result.assignment_reason}")
+
+        agent = get_agent(result.agent_id, self.agents_dir)
+        if agent is not None:
+            return agent, result.assignment_reason, result.is_new_agent
+
+        agent = Agent(
+            id=result.agent_id,
+            name=result.agent_name,
+            model_runtime=result.model_runtime or "codex",
+            model_id=result.model_id,
+            role_type="worker",
+        )
+        return agent, result.assignment_reason, result.is_new_agent
+
+    def _has_required_capabilities(
+        self,
+        agent: Agent,
+        policy: AssignmentPolicy,
+    ) -> bool:
+        return all(
+            capability in agent.capabilities
+            for capability in policy.required_capabilities
+        )
+
+    def _build_lease(
+        self,
+        request: AgentAcquireRequest,
+        agent: Agent,
+        assignment_reason: str,
+        is_new_actor: bool,
+    ) -> AgentLease:
+        task_id = getattr(request.task, "id", "")
+        return AgentLease(
+            lease_id=str(uuid.uuid4()),
+            agent_id=agent.id,
+            actor_id=agent.id,
+            model_runtime=agent.model_runtime,
+            model_id=agent.model_id,
+            model_key=agent.model_id,
+            is_new_actor=is_new_actor,
+            assignment_reason=assignment_reason,
+            task_id=task_id,
+            node_id=request.node_id,
+            attempt_id=request.attempt_id,
+        )
 
     def evaluate_for_task(
         self,
@@ -169,8 +323,14 @@ class AgentPoolManager:
         """
         agents = list_agents(self.agents_dir, enabled_only=True)
         evaluations: List[AgentEvaluation] = []
+        registry = self.get_model_registry()
 
         for agent in agents:
+            _, model = self._resolve_registry_model(registry, agent.model_id)
+            # FC-2 / T2-d: reuse-path candidates must honor the registry enabled gate.
+            # Unknown model bindings are still allowed; only explicit disabled models skip reuse.
+            if model and not model.enabled:
+                continue
             score, reasons = self._score_agent_for_task(agent, task)
             is_available = agent.id not in self._active_assignments
 
@@ -199,7 +359,9 @@ class AgentPoolManager:
         - Model weakness penalty: -15 points
         - Large context window bonus: +5 points
         - Model best_for match: +10 points
+        - Model description fallback: +1 point
         - Foreman rating bonus: floor(rating * 2) points
+        - Cost tier bonus for simple non-complex tasks: +0 to +8 points
 
         Args:
             agent: Agent to evaluate
@@ -297,9 +459,17 @@ class AgentPoolManager:
         score = 0
         reasons: List[str] = []
 
-        if task.type in model.strengths:
+        match = match_model_for_task(model, task.type)
+        if match and match.source == "strengths":
             score += 10
-            reasons.append(f"Model strength: {task.type}")
+            reasons.append(f"Model strength: {match.detail}")
+        elif match and match.source == "best_for":
+            score += 10
+            reasons.append(f"Model best_for match: {match.detail}")
+        elif match and match.source == "description":
+            score += 1
+            reasons.append(f"Model description match: {match.detail}")
+
         if task.type in model.weaknesses:
             score -= 15
             reasons.append(f"Model weakness: {task.type}")
@@ -309,15 +479,23 @@ class AgentPoolManager:
         ):
             score += 5
             reasons.append("Large context window for multi-file task")
-        if model.best_for and task.type.lower() in model.best_for.lower():
-            score += 10
-            reasons.append(f"Model best_for match: {model.best_for}")
         if model.foreman_rating is not None:
             rating_points = math.floor(model.foreman_rating * FOREMAN_RATING_MULTIPLIER)
             score += rating_points
             reasons.append(
                 f"Foreman rating: {model.foreman_rating:g}/5 (+{rating_points})"
             )
+        if model.cost_tier and task.type not in COMPLEX_TASK_TYPES:
+            required_caps = self._get_required_capabilities(task.type)
+            if len(required_caps) <= SIMPLE_TASK_CAPABILITY_LIMIT:
+                cost_bonus = COST_TIER_BONUS.get(
+                    model.cost_tier, DEFAULT_COST_TIER_BONUS
+                )
+                if cost_bonus > 0:
+                    score += cost_bonus
+                    reasons.append(
+                        f"Cost tier bonus: {model.cost_tier} (+{cost_bonus})"
+                    )
 
         return score, reasons
 
@@ -397,8 +575,14 @@ class AgentPoolManager:
                 continue
 
             peer_runtime = str(peer.get("runtime") or "").strip()
+            if task.type == "security_review" and peer_runtime not in SECURITY_REVIEW_PEER_RUNTIMES:
+                continue
+
             score = 0
             reasons: List[str] = []
+            if task.type == "security_review":
+                score += 50
+                reasons.append(f"Runtime {peer_runtime} supports security review")
 
             inferred_domain = self._infer_domain_from_paths(task.claimed_paths or [])
             if inferred_domain != "general" and peer_runtime:
@@ -437,6 +621,7 @@ class AgentPoolManager:
         *,
         agent_id: Optional[str] = None,
         agent_name: Optional[str] = None,
+        suggested_model_key: Optional[str] = None,
     ) -> Optional[Agent]:
         """Create a new agent tailored for a specific task.
 
@@ -444,28 +629,31 @@ class AgentPoolManager:
             task: Task the agent will handle
             agent_id: Optional custom agent ID
             agent_name: Optional custom agent name
+            suggested_model_key: Model key suggested by ralph (preferred if enabled)
 
         Returns:
             Created agent, or None if creation failed
         """
-        registry = self.get_model_registry()
         self._last_assignment_warning = ""
+        model_key, model = self.resolve_model_for_task(
+            task,
+            suggested_model_key=suggested_model_key,
+        )
 
-        # Select best model for task type
-        model_key = select_model_for_task(task.type, registry)
         if not model_key:
             self._last_assignment_warning = f"Warning: no registry model available for task type '{task.type}'"
             logger.warning(self._last_assignment_warning)
             return None
 
-        model = registry.get_model(model_key)
         if model is None:
             self._last_assignment_warning = f"Warning: registry key '{model_key}' not found for task type '{task.type}'"
             logger.warning(self._last_assignment_warning)
             return None
 
-        model_runtime = model.runtime
+        model_runtime = model.runtime or "codex"
         model_id = model.model_id or model_key
+        role_type = "worker"
+        profile_role = self._profile_role_for_agent(role_type)
 
         # Generate agent ID and name
         if not agent_id:
@@ -485,14 +673,43 @@ class AgentPoolManager:
             agents_dir=self.agents_dir,
             model_runtime=model_runtime,
             model_id=model_id,
-            role_type="worker",
+            role_type=role_type,
             capabilities=capabilities,
             task_affinity=[task.type],
             created_by="foreman",
-            prompt=self._generate_worker_prompt(task.type),
+            prompt=self._load_saved_worker_prompt(profile_role, model_runtime)
+            or self._generate_worker_prompt(task.type),
         )
 
         return agent
+
+    def resolve_model_for_task(
+        self,
+        task: TaskRef,
+        *,
+        suggested_model_key: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[ModelCapability]]:
+        registry = self.get_model_registry()
+        model_key: Optional[str] = None
+
+        if suggested_model_key:
+            suggested_model = registry.get_model(suggested_model_key)
+            if suggested_model and suggested_model.enabled:
+                model_key = suggested_model_key
+                logger.info("Using ralph-suggested model %s for task %s", model_key, task.id)
+            else:
+                logger.warning(
+                    "Ralph suggested model %s for task %s but it is %s; falling back to auto-select",
+                    suggested_model_key,
+                    task.id,
+                    "disabled" if suggested_model else "not found",
+                )
+
+        if not model_key:
+            model_key = select_model_for_task(task.type, registry)
+        if not model_key:
+            return None, None
+        return model_key, registry.get_model(model_key)
 
     def _generate_agent_id(self, model_runtime: str, task_type: str) -> str:
         """Generate a unique agent ID for a task-scoped worker."""
@@ -533,6 +750,26 @@ COMPLETION PROTOCOL (REQUIRED):
 - Use `cccc send --to @foreman` ONLY for progress updates or blockers, NOT for completion.
 """
 
+    def _profile_role_for_agent(self, role_type: str) -> str:
+        if role_type == "reviewer":
+            return REVIEWER_AGENT_PROFILE_ROLE
+        if role_type == "specialist":
+            return SECURITY_REVIEWER_AGENT_PROFILE_ROLE
+        return DEFAULT_AGENT_PROFILE_ROLE
+
+    def _load_saved_worker_prompt(self, role: str, runtime: str) -> Optional[str]:
+        profile_path = self.agents_dir.parent / "agent_profiles" / role / f"{runtime}.yaml"
+        if not profile_path.exists():
+            return None
+        data = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"Agent profile must contain a mapping: {profile_path}")
+        worker_prompt = str(data.get("worker_prompt") or "")
+        if not worker_prompt.strip():
+            raise ValueError(f"Agent profile is missing worker_prompt: {profile_path}")
+        logger.info("Using saved agent profile %s for runtime %s", role, runtime)
+        return worker_prompt
+
     def assign_agent(self, agent_id: str, task_id: str) -> bool:
         """Mark an agent as assigned to a task.
 
@@ -543,10 +780,7 @@ COMPLETION PROTOCOL (REQUIRED):
         Returns:
             True if assignment successful
         """
-        if agent_id in self._active_assignments:
-            return False
-        self._active_assignments[agent_id] = task_id
-        return True
+        return self._set_assignment_if_free(agent_id, task_id)
 
     def release_agent(self, agent_id: str) -> bool:
         """Release an agent from its current assignment.
@@ -557,10 +791,7 @@ COMPLETION PROTOCOL (REQUIRED):
         Returns:
             True if release successful
         """
-        if agent_id not in self._active_assignments:
-            return False
-        del self._active_assignments[agent_id]
-        return True
+        return self._clear_assignment(agent_id)
 
     def get_active_assignments(self) -> Dict[str, str]:
         """Get all active agent assignments.
@@ -568,7 +799,22 @@ COMPLETION PROTOCOL (REQUIRED):
         Returns:
             Dict mapping agent_id to task_id
         """
-        return dict(self._active_assignments)
+        with self._assignment_lock:
+            return dict(self._active_assignments)
+
+    def _set_assignment_if_free(self, agent_id: str, task_id: str) -> bool:
+        with self._assignment_lock:
+            if agent_id in self._active_assignments:
+                return False
+            self._active_assignments[agent_id] = task_id
+            return True
+
+    def _clear_assignment(self, agent_id: str) -> bool:
+        with self._assignment_lock:
+            if agent_id not in self._active_assignments:
+                return False
+            del self._active_assignments[agent_id]
+            return True
 
     def create_or_reuse_agent(
         self,
@@ -577,6 +823,7 @@ COMPLETION PROTOCOL (REQUIRED):
         min_score: int = 50,
         prefer_reuse: bool = True,
         busy_agent_ids: Optional[set] = None,
+        suggested_model_key: Optional[str] = None,
     ) -> TaskAssignment:
         """Find or create an agent for a task.
 
@@ -590,6 +837,7 @@ COMPLETION PROTOCOL (REQUIRED):
             min_score: Minimum score for existing agent reuse
             prefer_reuse: Whether to prefer reusing existing agents
             busy_agent_ids: Set of agent IDs currently busy (from engine/shadow state)
+            suggested_model_key: Model key suggested by ralph (preferred for new agents)
 
         Returns:
             TaskAssignment with the selected agent
@@ -611,8 +859,10 @@ COMPLETION PROTOCOL (REQUIRED):
                 reason = f"Reused group peer actor {assigned_agent.id}"
 
         if not assigned_agent:
-            # Create new agent
-            assigned_agent = self.create_agent_for_task(task)
+            # Create new agent, passing ralph's model suggestion
+            assigned_agent = self.create_agent_for_task(
+                task, suggested_model_key=suggested_model_key,
+            )
             is_new = True
             reason = self._last_assignment_warning or f"Created new agent for {task.type} task"
 
@@ -645,6 +895,10 @@ COMPLETION PROTOCOL (REQUIRED):
             assignment_reason=reason,
             model_runtime=assigned_agent.model_runtime,
             model_id=assigned_agent.model_id,
+            model_key=self._resolve_registry_model(
+                self.get_model_registry(),
+                assigned_agent.model_id,
+            )[0] or assigned_agent.model_id,
         )
 
     def _resolve_registry_model(

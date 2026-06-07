@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing AgentFlow package style,DONE,Relevant module and test style reviewed,sed -n '1,220p' src/cccc/agentflow/plan_compiler.py,2026-05-31,0,
+2,Implement af_patches module,DONE,src/cccc/agentflow/af_patches.py defines requested constants/classes/functions,test -f src/cccc/agentflow/af_patches.py,2026-05-31,0,
+3,Add af_patches unit tests,DONE,tests/agentflow/test_af_patches.py covers requested cases,test -f tests/agentflow/test_af_patches.py,2026-05-31,0,
+4,Run requested pytest,DONE,Targeted pytest passes,python -m pytest tests/agentflow/test_af_patches.py -v,2026-05-31,0,Passed via 60s timeout wrapper

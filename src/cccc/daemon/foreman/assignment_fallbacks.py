@@ -76,8 +76,8 @@ class AssignmentFallbackMixin:
         if pool is None:
             return
         for task_id, agent_id in self._engine_busy_agents().items():
-            if agent_id and agent_id not in pool._active_assignments:
-                pool._active_assignments[agent_id] = task_id
+            if agent_id:
+                pool._set_assignment_if_free(agent_id, task_id)
 
     def _engine_busy_agents(self) -> Dict[str, str]:
         engine_busy: dict[str, str] = {}

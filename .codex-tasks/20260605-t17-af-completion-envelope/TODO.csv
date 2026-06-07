@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,建立任务真相文件,DONE,"SPEC.md、TODO.csv、PROGRESS.md 已创建","test -f .codex-tasks/20260605-t17-af-completion-envelope/SPEC.md && test -f .codex-tasks/20260605-t17-af-completion-envelope/TODO.csv && test -f .codex-tasks/20260605-t17-af-completion-envelope/PROGRESS.md","2026-06-05 10:44",0,
+2,实现 AF completion envelope 与事件兼容,DONE,"workflow_orchestrator.py 已加入 helper 与 af.node_completed 映射","rg -n \"_convert_af_results_to_completion_events|af\\.node_completed\" src/cccc/daemon/foreman/workflow_orchestrator.py","2026-06-05 10:46",0,
+3,补充 AF 事件测试并验证,DONE,"新增 test_af_event_ 测试且 pytest 选择器通过","python -m pytest tests/test_foreman_workflow.py -v -k af_event","2026-06-05 10:47",0,

@@ -20,6 +20,7 @@ SCHEMA_FORMAT_KEY = "format"
 SCHEMA_PROPERTIES_KEY = "properties"
 SCHEMA_ITEMS_KEY = "items"
 SCHEMA_REQUIRED_KEY = "required"
+UNAMBIGUOUS_PROVIDER_KIND_COUNT = 1
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +143,39 @@ def _check_contract_verification_coverage(plan: Plan) -> List[ValidationIssue]:
 # 7. Contract <-> dependency alignment
 # ---------------------------------------------------------------------------
 
+def _check_consume_provider_unresolved(plan: Plan) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    providers_by_name = _provider_task_ids_by_contract_name(plan)
+
+    for task in plan.tasks:
+        dependency_ids = set(task.depends_on)
+        for contract in task.consumes:
+            if contract.from_task is not None:
+                continue
+            candidate_provider_ids = sorted(providers_by_name.get(contract.name, set()))
+            if not candidate_provider_ids:
+                continue
+            if len(candidate_provider_ids) == 1:
+                continue
+            dependency_provider_ids = [
+                task_id for task_id in candidate_provider_ids if task_id in dependency_ids
+            ]
+            if len(dependency_provider_ids) == 1:
+                continue
+            issues.append(ValidationIssue(
+                code="E_CONSUME_PROVIDER_UNRESOLVED",
+                severity="error",
+                message=f"task '{task.id}' consumes '{contract.name}' without a uniquely resolvable provider",
+                task_ids=[task.id],
+                evidence={
+                    "contract_name": contract.name,
+                    "candidate_provider_task_ids": candidate_provider_ids,
+                },
+            ))
+
+    return issues
+
+
 def _check_contract_dep_alignment(plan: Plan) -> List[ValidationIssue]:
     """Check that consumes edges align with depends_on edges."""
     issues: List[ValidationIssue] = []
@@ -180,9 +214,96 @@ def _check_contract_dep_alignment(plan: Plan) -> List[ValidationIssue]:
     return issues
 
 
+def _check_consumer_from_provides(plan: Plan) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    provides_by_task = _provided_contract_names_by_task(plan)
+    task_ids = set(provides_by_task)
+
+    for task in plan.tasks:
+        for contract in task.consumes:
+            if contract.from_task is None or contract.from_task not in task_ids:
+                continue
+            provided_names = provides_by_task[contract.from_task]
+            if contract.name in provided_names:
+                continue
+            issues.append(ValidationIssue(
+                code="E_CONSUMER_FROM_NOT_PROVIDER",
+                severity="error",
+                message=(
+                    f"task '{task.id}' consumes '{contract.name}' from "
+                    f"'{contract.from_task}' which does not provide it"
+                ),
+                task_ids=[task.id],
+                evidence={
+                    "contract_name": contract.name,
+                    "from_task": contract.from_task,
+                    "from_task_provides": sorted(provided_names),
+                },
+            ))
+
+    return issues
+
+
+def _check_contract_kind_mismatch(plan: Plan) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    providers: Dict[str, List[Tuple[str, Contract]]] = {}
+
+    for task in plan.tasks:
+        for contract in task.provides:
+            providers.setdefault(contract.name, []).append((task.id, contract))
+
+    for task in plan.tasks:
+        for contract in task.consumes:
+            provider_matches = _find_matching_providers(contract, providers)
+            if not provider_matches:
+                continue
+
+            provider_kinds = {provider.kind for _, provider in provider_matches}
+            if len(provider_kinds) != UNAMBIGUOUS_PROVIDER_KIND_COUNT:
+                continue
+
+            provider_kind = next(iter(provider_kinds))
+            if provider_kind == contract.kind:
+                continue
+
+            provider_task_ids = [task_id for task_id, _ in provider_matches]
+            issues.append(ValidationIssue(
+                code="E_CONTRACT_KIND_MISMATCH",
+                severity="error",
+                message=(
+                    f"task '{task.id}' consumes '{contract.name}' as kind "
+                    f"'{contract.kind}' but providers declare kind '{provider_kind}'"
+                ),
+                task_ids=[task.id, *provider_task_ids],
+                evidence={
+                    "contract_name": contract.name,
+                    "consumer_kind": contract.kind,
+                    "provider_kind": provider_kind,
+                    "provider_task_ids": provider_task_ids,
+                },
+            ))
+
+    return issues
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _provider_task_ids_by_contract_name(plan: Plan) -> Dict[str, Set[str]]:
+    providers: Dict[str, Set[str]] = {}
+    for task in plan.tasks:
+        for contract in task.provides:
+            providers.setdefault(contract.name, set()).add(task.id)
+    return providers
+
+
+def _provided_contract_names_by_task(plan: Plan) -> Dict[str, Set[str]]:
+    return {
+        task.id: {contract.name for contract in task.provides}
+        for task in plan.tasks
+    }
+
 
 def _find_matching_providers(
     consumer: Contract,

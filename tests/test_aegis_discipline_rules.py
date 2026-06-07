@@ -7,8 +7,10 @@ from typing import Any
 import pytest
 
 from cccc.ralph.models import Plan, ValidationIssue
+from cccc.ralph.validation_rules import discipline_security
 from cccc.ralph.validation_rules.discipline import (
     _DISCIPLINE_RULES,
+    check_rule_registration_completeness,
     collect_discipline_issues,
 )
 
@@ -17,6 +19,7 @@ RETIREMENT_CODE = "E_AEGIS_RETIREMENT_TRACK_MISSING"
 REPAIR_CODE = "W_AEGIS_FIX_NO_REPAIR_TRACK"
 TDD_CODE = "W_AEGIS_TDD_NO_TEST_PATH"
 BASELINE_CODE = "W_AEGIS_COMPLEX_MISSING_BASELINE"
+UNREGISTERED_RULE_CODE = "W_DISCIPLINE_RULE_UNREGISTERED"
 TEST_FILE = "tests/test_aegis_discipline_rules.py"
 ENTRYPOINT = "src/app/startup.py"
 
@@ -31,6 +34,56 @@ def test_ad3_rules_are_registered() -> None:
         "_check_tdd_test_path",
         "_check_complex_baseline",
     } <= registered
+
+
+def test_rule_registration_all_registered() -> None:
+    assert check_rule_registration_completeness() == []
+
+
+def test_rule_registration_detects_unregistered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _check_mock_rule(plan: Plan) -> list[ValidationIssue]:
+        return []
+
+    monkeypatch.setattr(
+        discipline_security,
+        "_check_mock_rule",
+        _check_mock_rule,
+        raising=False,
+    )
+
+    issues = check_rule_registration_completeness()
+
+    assert [issue.code for issue in issues] == [UNREGISTERED_RULE_CODE]
+    assert issues[0].evidence == {
+        "module": "discipline_security",
+        "rule": "_check_mock_rule",
+    }
+
+
+def test_rule_registration_runs_via_validator_not_collect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cccc.ralph.validator import validate
+
+    def _check_mock_rule(plan: Plan) -> list[ValidationIssue]:
+        return []
+
+    monkeypatch.setattr(
+        discipline_security,
+        "_check_mock_rule",
+        _check_mock_rule,
+        raising=False,
+    )
+
+    plan = _plan(_task())
+
+    assert UNREGISTERED_RULE_CODE not in _codes(collect_discipline_issues(plan))
+    assert [
+        issue.code for issue in validate(plan).warnings
+        if issue.code == UNREGISTERED_RULE_CODE
+    ] == [UNREGISTERED_RULE_CODE]
 
 
 def test_unfilled_content_reports_error() -> None:

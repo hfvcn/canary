@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Review T1 spec and existing rule wiring,DONE,Target files and execution semantics confirmed,rg -n "_resolve_verification_specs|_unwrap_command|_check_verification_shallow_checks" src/cccc/ralph,2026-06-07T00:00:00,0,Confirmed checks-vs-top-command semantics and wrapper stripping.
+2,Implement rule and registration,DONE,New rule constant/helpers/check are wired in coverage/__init__/validator,python -m pytest tests/ralph/test_verification_main_path.py -v,2026-06-07T00:00:00,0,Added constant helpers rule and validator registration.
+3,Add focused regression tests,DONE,All T1 acceptance scenarios are covered in new test module,python -m pytest tests/ralph/test_verification_main_path.py -v,2026-06-07T00:00:00,0,Added 13 targeted validate_with_project tests.
+4,Run requested regressions and validate plan,DONE,Requested commands complete and results are captured,ralph validate plan.yaml --no-agent,2026-06-07T00:00:00,1,Initial regression hit validator.py size gate; fixed by removing blank lines and reran all commands cleanly.

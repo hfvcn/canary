@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,审阅目标实现与现有测试,DONE,定位到 3 个缺陷对应实现与测试断言,rg -n "_extract_section_content|_check_cleanup|_global_assertions_detail" src/cccc/ralph/flow_steps_e2e.py tests/ralph/test_flow_e2e_gates.py tests/ralph/test_flow_e2e.py tests/ralph/test_evaluation_placeholder.py,2026-06-07T00:00:00,0,已定位目标函数与相关断言
+2,实现 3 个修复并补齐必要测试,DONE,代码与测试覆盖精确 heading 匹配 actor envelope 解析及 group ledger JSONL 解析,test -f src/cccc/ralph/flow_steps_e2e.py,2026-06-07T00:00:00,0,已完成实现与测试适配
+3,运行指定 pytest 回归,DONE,指定 3 组测试全部通过,python -m pytest tests/ralph/test_flow_e2e_gates.py tests/ralph/test_flow_e2e.py tests/ralph/test_evaluation_placeholder.py -v --tb=short,2026-06-07T00:00:00,1,首次失败因测试夹具仍写 events.jsonl；修正为 group ledger.jsonl 后通过

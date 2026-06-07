@@ -74,6 +74,20 @@ class TestGroupSpaceOps(unittest.TestCase):
         attach, _ = self._call("attach", {"group_id": group_id, "path": path, "by": "user"})
         self.assertTrue(attach.ok, getattr(attach, "error", None))
 
+    def _wait_for_generate_workers(self, *, timeout: float = 2.0) -> None:
+        from cccc.daemon.space import group_space_ops
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with group_space_ops._GENERATE_LANES_LOCK:
+                if not any(
+                    int(lane.active) > 0 or bool(lane.pending)
+                    for lane in group_space_ops._GENERATE_LANES.values()
+                ):
+                    return
+            time.sleep(0.05)
+        self.fail("timed out waiting for async generate workers")
+
     def test_status_defaults_to_unbound(self) -> None:
         _, cleanup = self._with_home()
         try:
@@ -873,6 +887,7 @@ class TestGroupSpaceOps(unittest.TestCase):
             self.assertTrue(generated.ok, getattr(generated, "error", None))
             gen_result = generated.result if isinstance(generated.result, dict) else {}
             self.assertEqual(str(gen_result.get("kind") or ""), "slide_deck")
+            self._wait_for_generate_workers()
         finally:
             temp_ctx.cleanup()
             cleanup_stub()
@@ -1055,8 +1070,7 @@ class TestGroupSpaceOps(unittest.TestCase):
                 details = getattr(third.error, "details", {}) if third.error else {}
                 self.assertEqual(str((details or {}).get("lane") or ""), "generate")
 
-                # Let async workers finish before patch exits.
-                time.sleep(2.5)
+                self._wait_for_generate_workers(timeout=3.0)
         finally:
             cleanup_stub()
             cleanup()
@@ -1131,6 +1145,7 @@ class TestGroupSpaceOps(unittest.TestCase):
                     break
                 time.sleep(0.1)
             self.assertTrue(found, "expected async generate completion notify in inbox")
+            self._wait_for_generate_workers()
         finally:
             cleanup_stub()
             cleanup()
@@ -1185,8 +1200,7 @@ class TestGroupSpaceOps(unittest.TestCase):
                 self.assertEqual(str(result.get("status") or ""), "pending")
                 self.assertFalse(bool(result.get("queued")))
                 self.assertLess(elapsed, 1.0, f"expected async return, elapsed={elapsed:.3f}s")
-                # Let background worker consume patched provider fns before exiting patch scope.
-                time.sleep(2.3)
+                self._wait_for_generate_workers(timeout=3.0)
         finally:
             cleanup_stub()
             cleanup()

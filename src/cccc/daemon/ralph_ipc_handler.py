@@ -988,6 +988,7 @@ def handle_ralph_task_event(args: Dict[str, Any]) -> DaemonResponse:
     # ARCH-6: Extract assignment_id/actor_run_id from payload or args
     assignment_id = str(payload.get("assignment_id") or args.get("assignment_id") or "").strip()
     actor_run_id = str(payload.get("actor_run_id") or args.get("actor_run_id") or "").strip()
+    attempt_id = str(payload.get("attempt_id") or args.get("attempt_id") or "").strip()
 
     if event_type == "completed":
         override_stale_digest = bool(args.get("override_stale_digest", False))
@@ -1006,6 +1007,7 @@ def handle_ralph_task_event(args: Dict[str, Any]) -> DaemonResponse:
                 actor_run_id=actor_run_id,
                 override_stale_digest=override_stale_digest,
                 force_complete=force_complete,
+                attempt_id=attempt_id,
             )
         )
     if event_type == "failed":
@@ -1020,6 +1022,7 @@ def handle_ralph_task_event(args: Dict[str, Any]) -> DaemonResponse:
                 daemon_request_fn=None,
                 assignment_id=assignment_id,
                 actor_run_id=actor_run_id,
+                attempt_id=attempt_id,
             )
         )
     return _error("invalid_task_event", f"Unsupported task event: {event_type}")

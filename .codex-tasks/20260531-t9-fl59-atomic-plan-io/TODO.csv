@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read T9 specification and current implementation,DONE,"Relevant behavior and existing tests understood","rg and sed complete",2026-05-31T08:53:06Z,0,
+2,Implement atomic save and insertion fallback,DONE,"save_plan_state uses validated same-dir temp file and os.replace; invalid surgical output falls back","python -m pytest tests/ralph/test_plan_io_atomic.py",2026-05-31T08:57:10Z,0,
+3,Add focused regression tests,DONE,"Four requested scenarios covered in tests/ralph/test_plan_io_atomic.py","python -m pytest tests/ralph/test_plan_io_atomic.py",2026-05-31T08:57:10Z,0,
+4,Run verification and summarize,DONE,"Focused tests pass or failures are reported with cause","python -m pytest tests/ralph/test_plan_io_atomic.py",2026-05-31T08:57:10Z,0,

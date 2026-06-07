@@ -17,6 +17,7 @@ from cccc.daemon.foreman.agent_pool import (
     AgentEvaluation,
     TaskAssignment,
 )
+from cccc.daemon.foreman.assignment_actor_registration import ActorAddResult
 from cccc.daemon.foreman.workflow import (
     receive_ready_batch,
     evaluate_agent_pool,
@@ -56,6 +57,7 @@ def temp_project_dir():
                     strengths=["backend", "complex_logic"],
                     weaknesses=["realtime_info"],
                     context_window="200k",
+                    description="综合能力强，通用任务处理",
                 ),
                 "gemini-pro": ModelCapability(
                     runtime="gemini",
@@ -209,6 +211,49 @@ def _register_running_task(
         attempt_id=attempt_id,
     )
     orchestrator.engine.report_worker_started(task.id, agent_id)
+
+
+def test_workflow_evaluation_sections(tmp_path, monkeypatch):
+    from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+
+    project_root = _prepare_project_root(tmp_path)
+    orchestrator = WorkflowOrchestrator(
+        project_root=project_root,
+        group_id="test-group",
+    )
+    monkeypatch.setattr(orchestrator, "_collect_actual_test_count", lambda: "12")
+
+    orchestrator._write_workflow_evaluation(
+        workflow_id="wf-eval",
+        completed_count=3,
+        failed_count=1,
+        total=4,
+        summary="summary",
+    )
+
+    content = (project_root / "WORKFLOW_EVALUATION.md").read_text(encoding="utf-8")
+    retro_dimensions = (
+        "runtime 选择",
+        "codex-claude 分工",
+        "agent 数量",
+        "安全审查",
+        "review 证据",
+        "Foreman 自评",
+        "rating 读写",
+        "prompt 改进",
+    )
+
+    assert "## 评分摘要" in content
+    assert "## 任务执行明细" in content
+    assert "## 交叉验证" in content
+    assert "## 正面反馈" in content
+    assert "## 负面反馈" in content
+    assert "## 手工干预记录" in content
+    assert "## Worker 可靠性" in content
+    assert "## 评分 + 改进建议" in content
+    for heading in retro_dimensions:
+        assert f"## {heading}" in content
+    assert "(待 foreman 补充)" in content
 
 
 class TestReceiveReadyBatch:
@@ -572,7 +617,7 @@ class TestWorkflowOrchestratorDaemonBridge:
 
         result = orchestrator._add_actor_via_daemon(assignment)
 
-        assert result is True
+        assert result == ActorAddResult(ok=True)
         assert len(dispatched_requests) == 1
         req = dispatched_requests[0]
         assert req.op == "actor_add"
@@ -600,13 +645,19 @@ class TestWorkflowOrchestratorDaemonBridge:
             agent_name="Test Agent",
         )
 
-        assert orchestrator._add_actor_via_daemon(assignment) is False
+        assert orchestrator._add_actor_via_daemon(assignment) == ActorAddResult(ok=False)
 
     def test_start_assigned_agents_registers_actors(self, temp_project_dir, sample_suggestion, monkeypatch):
         """Should register agents as group actors via daemon when processing batch."""
         from cccc.contracts.v1 import DaemonResponse
-        from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+        from cccc.daemon.foreman.workflow_orchestrator import (
+            AF_ENGINE_ENABLED_ENV_VAR,
+            WorkflowOrchestrator,
+        )
 
+        # This test exercises the legacy assignment-controller registration path;
+        # AF is default-on, so disable it explicitly to keep testing legacy dispatch.
+        monkeypatch.setenv(AF_ENGINE_ENABLED_ENV_VAR, "0")
         monkeypatch.setenv("CCCC_HOME", tempfile.mkdtemp())
         group_id = _create_group_with_foreman("lead")
         added_actors = []
@@ -629,6 +680,253 @@ class TestWorkflowOrchestratorDaemonBridge:
 
         # Each approved task should have had actor_add dispatched
         assert len(added_actors) == len(result.approved_tasks)
+
+    def test_af_branch_legacy_path_unchanged(self, temp_project_dir, sample_suggestion, monkeypatch):
+        """AF disabled should keep the legacy assignment-controller path unchanged."""
+        from cccc.agentflow.af_engine import AFExecutionEngine
+        from cccc.daemon.foreman.workflow_orchestrator import (
+            AF_ENGINE_ENABLED_ENV_VAR,
+            WorkflowOrchestrator,
+        )
+
+        monkeypatch.setenv(AF_ENGINE_ENABLED_ENV_VAR, "0")
+        monkeypatch.setattr(AFExecutionEngine, "is_available", staticmethod(lambda: False))
+
+        orchestrator = WorkflowOrchestrator(
+            project_root=temp_project_dir,
+            group_id="test-group",
+        )
+        sentinel = SimpleNamespace(parallel_count=0, marker="legacy")
+        controller_calls = []
+        compile_calls = []
+
+        def fake_process_batch_suggestion(suggestion, *, auto_start_agents=True, allowed_existing_task_ids=None):
+            controller_calls.append((suggestion, auto_start_agents))
+            return sentinel
+
+        monkeypatch.setattr(
+            orchestrator._assignment_controller,
+            "process_batch_suggestion",
+            fake_process_batch_suggestion,
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "_try_af_execution",
+            lambda suggestion: compile_calls.append(suggestion),
+        )
+
+        result = orchestrator.process_batch_suggestion(
+            sample_suggestion,
+            auto_start_agents=True,
+        )
+
+        assert result is sentinel
+        assert controller_calls == [(sample_suggestion, True)]
+        assert compile_calls == []
+
+    def test_af_branch_af_compiles_bundle(self, temp_project_dir, sample_suggestion, monkeypatch):
+        """AF compile path produces correct bundle structure from task refs."""
+        from cccc.agentflow.af_engine import AFExecutionEngine
+        from cccc.agentflow.plan_compiler import PlanCompiler
+        from cccc.daemon.foreman.af_gateway_bridge import task_ref_to_plan_task, plan_execution_engine
+
+        monkeypatch.setattr(AFExecutionEngine, "is_available", staticmethod(lambda: True))
+
+        compiler = PlanCompiler()
+        task_dicts = [task_ref_to_plan_task(t) for t in sample_suggestion.tasks]
+        bundle = compiler.compile(
+            {"tasks": task_dicts, "execution_engine": plan_execution_engine(sample_suggestion)},
+            workflow_id=sample_suggestion.workflow_id,
+            group_id="test-group",
+        )
+
+        assert bundle.workflow_id == sample_suggestion.workflow_id
+        assert [n["id"] for n in bundle.pipeline["nodes"]] == [t.id for t in sample_suggestion.tasks]
+
+    def test_af_branch_preserves_registration(self, temp_project_dir, sample_suggestion, monkeypatch):
+        """AF branch should preserve controller-driven registration and status tracking."""
+        from cccc.agentflow.af_engine import AFExecutionEngine
+        from cccc.daemon.foreman.workflow_orchestrator import (
+            AF_ENGINE_ENABLED_ENV_VAR,
+            WorkflowOrchestrator,
+        )
+        from cccc.kernel.workflow_state_types import WorkflowTaskStatus
+
+        monkeypatch.setenv(AF_ENGINE_ENABLED_ENV_VAR, "1")
+        monkeypatch.setattr(AFExecutionEngine, "is_available", staticmethod(lambda: True))
+
+        orchestrator = WorkflowOrchestrator(
+            project_root=temp_project_dir,
+            group_id="test-group",
+        )
+
+        monkeypatch.setattr(
+            "cccc.agentflow.plan_compiler.PlanCompiler.compile",
+            lambda self, plan, workflow_id, group_id: SimpleNamespace(
+                pipeline={"nodes": [{"id": task["id"]} for task in plan["tasks"]]}
+            ),
+        )
+        monkeypatch.setattr(orchestrator, "_start_assigned_agents", lambda result: None)
+
+        result = orchestrator.process_batch_suggestion(
+            sample_suggestion,
+            auto_start_agents=True,
+        )
+
+        workflow_tasks = orchestrator._active_workflows[sample_suggestion.workflow_id]["tasks"]
+        approved_ids = {task.id for task in result.approved_tasks}
+
+        assert approved_ids
+        for task in sample_suggestion.tasks:
+            state = orchestrator.engine.get_task(task.id)
+            assert state is not None
+            assert state.workflow_id == sample_suggestion.workflow_id
+            tracked = workflow_tasks[task.id]
+            assert tracked["task_ref"].id == task.id
+            if task.id in approved_ids:
+                assert state.batch_id == sample_suggestion.suggestion_id
+                assert state.status == WorkflowTaskStatus.ASSIGNED
+                assert tracked["status"] == "pending"
+                assert tracked["agent_id"]
+
+    def test_af_event_converts_results_to_events(self, temp_project_dir):
+        """AF engine results should convert into completion envelopes per node."""
+        from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+
+        orchestrator = WorkflowOrchestrator(
+            project_root=temp_project_dir,
+            group_id="test-group",
+        )
+        events = orchestrator._convert_af_results_to_completion_events(
+            {
+                "T-af-1": {
+                    "status": "completed",
+                    "engine": "af",
+                    "attempt_id": "attempt-af-1",
+                    "agent_id": "worker-af-1",
+                    "changed_files": ["src/af_one.py"],
+                    "exit_code": 0,
+                    "interim_statuses": ["assigned", "running", "verifying"],
+                    "failure_category": "",
+                    "verification_pending": True,
+                }
+            },
+            workflow_id="wf-af-events",
+        )
+
+        assert len(events) == 1
+        assert events[0]["kind"] == "af.node_completed"
+        assert events[0]["workflow_id"] == "wf-af-events"
+        assert events[0]["task_id"] == "T-af-1"
+        assert events[0]["data"]["status"] == "completed"
+        assert events[0]["data"]["engine"] == "af"
+        assert events[0]["data"]["changed_files"] == ["src/af_one.py"]
+
+    def test_af_event_envelope_contains_required_fields(self, temp_project_dir):
+        """Completion envelope should always include attempt, agent, and evidence fields."""
+        from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+
+        orchestrator = WorkflowOrchestrator(
+            project_root=temp_project_dir,
+            group_id="test-group",
+        )
+        event = orchestrator._convert_af_results_to_completion_events(
+            {
+                "T-af-2": {
+                    "attempt_id": "attempt-af-2",
+                    "agent_id": "worker-af-2",
+                    "interim_statuses": ["assigned", "running"],
+                }
+            },
+            workflow_id="wf-af-required",
+        )[0]
+
+        data = event["data"]
+        evidence = data["evidence"]
+
+        assert data["attempt_id"] == "attempt-af-2"
+        assert data["agent_id"] == "worker-af-2"
+        assert "changed_files" in data
+        assert evidence == {
+            "exit_code": 0,
+            "interim_statuses": ["assigned", "running"],
+            "failure_category": "",
+            "verification_pending": True,
+            "self_test": None,
+        }
+
+    def test_af_event_node_completed_maps_to_task_reported(self, temp_project_dir, monkeypatch):
+        """af.node_completed should normalize into the standard completion flow."""
+        from cccc.contracts.v1.ralph_ipc import VerificationResult
+        from cccc.daemon.foreman.workflow_orchestrator import WorkflowOrchestrator
+        from cccc.kernel.workflow_state import WorkflowTaskStatus
+
+        orchestrator = WorkflowOrchestrator(
+            project_root=temp_project_dir,
+            group_id="test-group",
+        )
+        monkeypatch.setattr(orchestrator.reporter, "on_task_completed", lambda *args, **kwargs: True)
+
+        task = TaskRef(id="T-af-map", title="AF mapped task", type="backend")
+        _register_running_task(
+            orchestrator,
+            task,
+            workflow_id="wf-af-map",
+            agent_id="worker-af-map",
+            attempt_id="attempt-af-map",
+        )
+        monkeypatch.setattr(
+            orchestrator.ralph,
+            "verify_completion",
+            lambda *args, **kwargs: VerificationResult(
+                verification_id="ver-af-map",
+                workflow_id="wf-af-map",
+                task_id=task.id,
+                overall_outcome="passed",
+                checks=[],
+                summary="ok",
+            ),
+        )
+
+        result = orchestrator.apply_task_event(
+            {
+                "kind": "af.node_completed",
+                "workflow_id": "wf-af-map",
+                "task_id": task.id,
+                "data": {
+                    "status": "completed",
+                    "engine": "af",
+                    "attempt_id": "attempt-af-map",
+                    "agent_id": "worker-af-map",
+                    "changed_files": ["src/af_map.py"],
+                    "evidence": {
+                        "exit_code": 0,
+                        "interim_statuses": ["assigned", "running", "verifying"],
+                        "failure_category": "",
+                        "verification_pending": True,
+                        "self_test": {
+                            "outcome": "passed",
+                            "attempt_id": "attempt-af-map",
+                            "ran_at": "2026-06-08T00:00:00Z",
+                        },
+                    },
+                },
+            }
+        )
+
+        state = orchestrator.engine.get_task(task.id)
+        reported = _read_ledger_events(
+            orchestrator.group.ledger_path,
+            kind="workflow.task_reported_completed",
+        )
+
+        assert result["accepted"] is True
+        assert result["event_type"] == "completed"
+        assert result["verification_outcome"] == "passed"
+        assert state is not None
+        assert state.status == WorkflowTaskStatus.COMPLETED
+        assert len(reported) == 1
+        assert reported[0]["data"]["task_id"] == task.id
 
     def test_build_task_prompt_uses_ralph_worker_contract(self, temp_project_dir):
         """Worker assignment prompt should reflect the foreman/worker contract."""
@@ -2038,8 +2336,8 @@ class TestMonitorIntegration:
             )
 
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("file_overstepping" in msg for msg in warning_messages), (
-            f"Expected file_overstepping alert in warnings, got: {warning_messages}"
+        assert any("W_WORKER_EXCEEDED_SCOPE" in msg for msg in warning_messages), (
+            f"Expected W_WORKER_EXCEEDED_SCOPE alert in warnings, got: {warning_messages}"
         )
 
     def test_monitor_no_crash_on_error(self, temp_project_dir, monkeypatch):

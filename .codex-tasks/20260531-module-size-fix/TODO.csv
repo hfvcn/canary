@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Extract shared non-suppressible security helper,DONE,validator.py and cli.py both use validation_rules helper,python -m pytest tests/ralph/test_validation_security_suppress.py -q,2026-05-31,0,
+2,Compact workflow_orchestrator soft-budget overage,DONE,workflow_orchestrator.py is below 2500 lines,python -m pytest tests/test_module_split.py -q,2026-05-31,0,
+3,Run requested verification and import checks,DONE,requested pytest subset passes and imports succeed,python -m pytest tests/test_module_split.py tests/ralph/test_validation_security_suppress.py tests/test_stall_actor_idle.py tests/test_task_context_retry_audit.py -q && python -c "import cccc.ralph.validator, cccc.ralph.cli",2026-05-31,0,18 passed in 1.26s; import check exit 0

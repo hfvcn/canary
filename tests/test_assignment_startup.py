@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from cccc.contracts.v1 import DaemonError, DaemonResponse
 from cccc.contracts.v1.ralph_ipc import TaskRef
 from cccc.daemon.foreman.agent_pool import TaskAssignment
+from cccc.daemon.foreman.assignment_actor_registration import ActorAddResult
 from cccc.daemon.foreman.assignment_constants import ORCHESTRATOR_SERVICE_ACTOR
 from cccc.daemon.foreman.assignment_startup import AssignmentStartupMixin
 
@@ -25,7 +26,12 @@ def _assignment() -> TaskAssignment:
     )
 
 
-def _owner(*, restart_response: DaemonResponse | None = None, legacy_response: DaemonResponse | None = None) -> tuple[SimpleNamespace, list]:
+def _owner(
+    *,
+    actor_add_result: ActorAddResult | None = None,
+    restart_response: DaemonResponse | None = None,
+    legacy_response: DaemonResponse | None = None,
+) -> tuple[SimpleNamespace, list]:
     requests = []
 
     def daemon_request(req):
@@ -34,7 +40,9 @@ def _owner(*, restart_response: DaemonResponse | None = None, legacy_response: D
 
     owner = SimpleNamespace(
         group_id="group-1",
-        _add_actor_via_daemon=MagicMock(return_value=True),
+        _add_actor_via_daemon=MagicMock(
+            return_value=actor_add_result if actor_add_result is not None else ActorAddResult(ok=True)
+        ),
         _daemon_request_fn=MagicMock(side_effect=daemon_request),
         _start_actor_fn=MagicMock(return_value=legacy_response or DaemonResponse(ok=True, result={})),
         _log=MagicMock(),
@@ -89,3 +97,31 @@ def test_restart_failed_falls_back_to_legacy() -> None:
     assert [req.op for req in requests] == ["actor_restart"]
     owner._start_actor_fn.assert_called_once()
     assert owner._start_actor_fn.call_args.args[:2] == ("group-1", "agent-1")
+
+
+def test_actor_add_running_false_triggers_restart() -> None:
+    owner, requests = _owner(actor_add_result=ActorAddResult(ok=True, running=False))
+    startup = _Harness(owner)
+
+    assert startup._start_actor_for_assignment(_assignment()) is True
+
+    assert [req.op for req in requests] == ["actor_restart"]
+    owner._start_actor_fn.assert_not_called()
+
+
+def test_actor_add_start_error_logs_warning() -> None:
+    owner, requests = _owner(
+        actor_add_result=ActorAddResult(ok=True, running=True, start_error="spawn reported init failure")
+    )
+    startup = _Harness(owner)
+
+    with patch("cccc.daemon.foreman.assignment_startup.logger.warning") as warning:
+        assert startup._start_actor_for_assignment(_assignment()) is True
+
+    assert requests == []
+    owner._start_actor_fn.assert_not_called()
+    warning.assert_called_once_with(
+        "W_ACTOR_START_ERROR: actor %s start error: %s",
+        "agent-1",
+        "spawn reported init failure",
+    )

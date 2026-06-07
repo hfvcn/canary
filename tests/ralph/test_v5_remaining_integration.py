@@ -23,6 +23,7 @@ from cccc.daemon.foreman.workflow_monitor import (
     check_completer_mismatch,
     check_silent_agent,
     MonitorAlert,
+    WORKER_EXCEEDED_SCOPE_CODE,
 )
 
 
@@ -211,13 +212,13 @@ class TestMonitorIntegration:
         alert = check_file_overstepping(task_id, changed_files, claimed_paths)
 
         assert alert is not None, "Expected an alert for out-of-scope file"
-        assert alert.alert_type == "file_overstepping"
+        assert alert.alert_type == WORKER_EXCEEDED_SCOPE_CODE
         assert alert.severity == "error"
         assert alert.task_id == task_id
-        assert "src/cccc/daemon/foreman/ralph_service.py" in alert.evidence["overstepping_files"]
-        # In-scope files should NOT appear in overstepping list
-        assert "src/cccc/daemon/actors/actor_ops.py" not in alert.evidence["overstepping_files"]
-        assert "tests/test_actors.py" not in alert.evidence["overstepping_files"]
+        assert "src/cccc/daemon/foreman/ralph_service.py" in alert.evidence["exceeded_files"]
+        # In-scope files should NOT appear in exceeded list
+        assert "src/cccc/daemon/actors/actor_ops.py" not in alert.evidence["exceeded_files"]
+        assert "tests/test_actors.py" not in alert.evidence["exceeded_files"]
 
     def test_no_alert_when_all_files_in_scope(self) -> None:
         """No alert when every changed file falls within claimed paths.

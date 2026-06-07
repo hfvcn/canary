@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
+
+import yaml
 
 from ...contracts.v1 import DaemonError, DaemonResponse
 from ...kernel.actors import add_actor, find_actor, generate_actor_id, get_effective_role, remove_actor
@@ -10,14 +15,107 @@ from ...kernel.group import load_group
 from ...kernel.inbox import set_cursor
 from ...kernel.ledger import append_event
 from ...kernel.permissions import require_actor_permission
+from ...kernel.prompt_files import resolve_active_scope_root
 from ...kernel.runtime import get_runtime_command_with_flags
 from ...util.conv import coerce_bool
+from ..foreman.assignment_batches import MODEL_SELECTION_DECISION_EVENT_KIND
+from ..ops.agent_ops import DEFAULT_MODELS_REGISTRY_PATH, load_model_registry, select_model_for_task
 from .actor_profile_runtime import actor_profile_ref, apply_profile_link_to_actor
 from .actor_profile_store import ProfileResolver, get_actor_profile_by_ref, normalize_actor_profile_ref
+
+LOGGER = logging.getLogger("cccc.daemon.actors")
+DEFAULT_RUNTIME = "codex"
+MODEL_REGISTRY_RELATIVE_PATH = Path(DEFAULT_MODELS_REGISTRY_PATH)
+
+
+@dataclass(frozen=True)
+class ManualSelectionDecision:
+    chosen_runtime: str
+    chosen_model_key: str
+    suggested_runtime: str
+    suggested_model_key: str
+    reason: str
 
 
 def _error(code: str, message: str, *, details: Optional[Dict[str, Any]] = None) -> DaemonResponse:
     return DaemonResponse(ok=False, error=DaemonError(code=code, message=message, details=(details or {})))
+
+
+def resolve_manual_actor_add_selection(group: Any) -> ManualSelectionDecision:
+    root = resolve_active_scope_root(group)
+    registry_path = None if root is None else root / MODEL_REGISTRY_RELATIVE_PATH
+    return resolve_manual_actor_add_selection_for_registry(registry_path)
+
+
+def resolve_manual_actor_add_selection_for_registry(registry_path: Optional[Path]) -> ManualSelectionDecision:
+    if registry_path is None or not registry_path.exists():
+        return _warning_decision("no_registry", registry_path, "registry missing for manual actor add")
+
+    try:
+        raw = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return _warning_decision("registry_load_failed", registry_path, f"failed to read registry: {exc}")
+
+    if raw is not None and not isinstance(raw, dict):
+        return _warning_decision("registry_load_failed", registry_path, "registry root must be a mapping")
+
+    registry = load_model_registry(registry_path)
+    suggested_model_key = select_model_for_task("general", registry)
+    if not suggested_model_key:
+        return _warning_decision("no_candidate", registry_path, "no enabled model matched task type 'general'")
+
+    model = registry.models.get(suggested_model_key)
+    if model is None:
+        return _warning_decision("no_candidate", registry_path, f"selected model '{suggested_model_key}' missing from registry")
+
+    suggested_runtime = str(model.runtime or "").strip()
+    if not suggested_runtime:
+        return _warning_decision("no_candidate", registry_path, f"selected model '{suggested_model_key}' has no runtime")
+
+    return ManualSelectionDecision(
+        chosen_runtime=suggested_runtime,
+        chosen_model_key=suggested_model_key,
+        suggested_runtime=suggested_runtime,
+        suggested_model_key=suggested_model_key,
+        reason="model_selection",
+    )
+
+
+def append_manual_actor_add_selection_event(
+    group: Any,
+    *,
+    actor_id: str,
+    by: str,
+    decision: ManualSelectionDecision,
+) -> Dict[str, Any]:
+    return append_event(
+        group.ledger_path,
+        kind=MODEL_SELECTION_DECISION_EVENT_KIND,
+        group_id=group.group_id,
+        scope_key="",
+        by=by,
+        data={
+            "actor_id": actor_id,
+            "chosen_runtime": decision.chosen_runtime,
+            "chosen_model_key": decision.chosen_model_key,
+            "suggested_runtime": decision.suggested_runtime,
+            "suggested_model_key": decision.suggested_model_key,
+            "reason": decision.reason,
+            "by": by,
+        },
+    )
+
+
+def _warning_decision(reason: str, registry_path: Optional[Path], message: str) -> ManualSelectionDecision:
+    location = str(registry_path) if registry_path is not None else "<no-scope-root>"
+    LOGGER.warning("Manual actor-add model selection fallback (%s): %s [path=%s]", reason, message, location)
+    return ManualSelectionDecision(
+        chosen_runtime=DEFAULT_RUNTIME,
+        chosen_model_key="",
+        suggested_runtime="",
+        suggested_model_key="",
+        reason=reason,
+    )
 
 
 def handle_actor_add(
@@ -42,7 +140,8 @@ def handle_actor_add(
     title = str(args.get("title") or "").strip()
     submit = str(args.get("submit") or "").strip()
     requested_runner = str(args.get("runner") or "").strip()
-    runtime = str(args.get("runtime") or "codex").strip()
+    requested_runtime = str(args.get("runtime") or "").strip()
+    runtime = requested_runtime or DEFAULT_RUNTIME
     by = str(args.get("by") or "user").strip()
     command_raw = args.get("command")
     env_raw = args.get("env")
@@ -62,6 +161,7 @@ def handle_actor_add(
     if group is None:
         return _error("group_not_found", f"group not found: {group_id}")
     before_foreman = foreman_id(group)
+    selection_decision: Optional[ManualSelectionDecision] = None
 
     try:
         require_actor_permission(group, by=by, action="actor.add")
@@ -79,6 +179,10 @@ def handle_actor_add(
                 env_private_set[private_key] = private_value
             if len(env_private_set) > private_env_max_keys:
                 raise ValueError("too many env_private keys")
+
+        if by == "user" and not profile_id and not requested_runtime:
+            selection_decision = resolve_manual_actor_add_selection(group)
+            runtime = selection_decision.chosen_runtime
 
         linked_profile: Optional[Dict[str, Any]] = None
         linked_profile_id = ""
@@ -257,6 +361,14 @@ def handle_actor_add(
                 raise RuntimeError("failed to store env_private")
     except Exception as e:
         return _error("actor_add_failed", str(e))
+
+    if selection_decision is not None:
+        append_manual_actor_add_selection_event(
+            group,
+            actor_id=str(actor.get("id") or actor_id).strip() or actor_id,
+            by=by,
+            decision=selection_decision,
+        )
 
     event = append_event(
         group.ledger_path,

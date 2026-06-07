@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,记录任务范围与验证命令,DONE,"SPEC.md/TODO.csv/PROGRESS.md 已填写且当前任务边界明确","test -f .codex-tasks/20260605-t7-rv51-af-bypass-structural/SPEC.md && test -f .codex-tasks/20260605-t7-rv51-af-bypass-structural/TODO.csv && test -f .codex-tasks/20260605-t7-rv51-af-bypass-structural/PROGRESS.md","2026-06-05 13:53 CST",0,已记录任务边界与验证命令
+2,实现 gate/promotion 结构化证据规则,DONE,"coverage.py 与 agentflow_invariants.py 完成结构化增强且复用逻辑","python -m pytest tests/ralph/test_af_bypass_structural.py -k 'depends_on or consumes or authority' -q","2026-06-05 13:55 CST",0,helper 与 consumes.kind 约束已落地
+3,新增回归测试并执行指定 pytest,DONE,"tests/ralph/test_af_bypass_structural.py 存在且 pytest 全通过","pytest tests/ralph/test_af_bypass_structural.py -v","2026-06-05 13:55 CST",0,6 个结构化测试全部通过

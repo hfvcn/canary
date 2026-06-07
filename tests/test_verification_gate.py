@@ -9,6 +9,7 @@ from cccc.daemon.foreman.verification_gate import (
     SHALLOW_CHECK_FAILURE,
     process_completed_event,
 )
+from cccc.daemon.foreman.workflow_monitor import WORKER_EXCEEDED_SCOPE_CODE
 from cccc.kernel.workflow_state import TaskState, WorkflowTaskStatus
 
 
@@ -161,12 +162,58 @@ def test_shallow_check_force_passed_unchanged(tmp_path: Path) -> None:
     assert callbacks["failed"] == []
 
 
+def test_exceeded_scope_warning(tmp_path: Path) -> None:
+    service = _StaticRalphService(_verification("passed", "worker verification passed"))
+
+    engine, callbacks, result = _run_completed_event(
+        tmp_path,
+        _task_ref([]),
+        service,
+        payload=_payload(changed_files=["src/outside_scope.py"]),
+    )
+
+    assert result["verification_outcome"] == "passed"
+    assert len(callbacks["completed"]) == 1
+    assert engine.warnings == [
+        {
+            "task_id": TASK_ID,
+            "warning_type": WORKER_EXCEEDED_SCOPE_CODE,
+            "message": (
+                f"Task {TASK_ID!r} modified 1 file(s) outside claimed scope: "
+                "['src/outside_scope.py']"
+            ),
+            "evidence": {
+                "exceeded_files": ["src/outside_scope.py"],
+                "claimed_paths": ["src/cccc/daemon/foreman/verification_gate.py"],
+            },
+        }
+    ]
+
+
+def test_process_completed_event_forwards_self_test_from_payload_evidence(tmp_path: Path) -> None:
+    self_test = {
+        "outcome": "passed",
+        "attempt_id": "attempt-self-test",
+        "ran_at": "2026-06-08T00:00:00Z",
+    }
+    engine, _callbacks, result = _run_completed_event(
+        tmp_path,
+        _task_ref([]),
+        _StaticRalphService(_verification("passed", "worker verification passed")),
+        payload=_payload(self_test=self_test),
+    )
+
+    assert result["verification_outcome"] == "passed"
+    assert engine.completion["evidence"]["self_test"] == self_test
+
+
 def _run_completed_event(
     project_root: Path,
     task: TaskRef,
     ralph_service: Any,
     *,
     hook_ctx: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> tuple[_Engine, dict[str, list[dict[str, Any]]], dict[str, Any]]:
     engine = _Engine(project_root)
     callbacks: dict[str, list[dict[str, Any]]] = {
@@ -180,7 +227,7 @@ def _run_completed_event(
         ralph_service=ralph_service,
         task_id=TASK_ID,
         state=_state(task),
-        payload=_payload(),
+        payload=payload or _payload(),
         agent_id=AGENT_ID,
         hook_ctx=hook_ctx or {},
         result={"accepted": True},
@@ -213,14 +260,22 @@ def _task_ref(checks: list[dict[str, Any]]) -> TaskRef:
     )
 
 
-def _payload() -> dict[str, Any]:
-    return {
+def _payload(
+    *,
+    changed_files: list[str] | None = None,
+    self_test: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
         "agent_id": AGENT_ID,
-        "changed_files": [],
+        "changed_files": changed_files or [],
         "duration_seconds": 1,
         "evidence_summary": "worker verification passed",
         "idempotency_key": "complete-T5",
+        "evidence": {},
     }
+    if self_test is not None:
+        payload["evidence"] = {"self_test": self_test}
+    return payload
 
 
 def _verification(outcome: str, summary: str) -> VerificationResult:

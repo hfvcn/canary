@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,阅读现有实现与测试模式,DONE,定位 coverage/security/models/相关测试,rg -n "forbidden_flow|_check_forbidden_flows|VerificationCovers|_task_has_check_token" src tests,,0,已确认 helper/模式/入口位置
+2,实现 forbidden_flow 字段覆盖规则,DONE,coverage.py 包含新函数且接入主流程,rg -n "_check_forbidden_flow_field_coverage|_extract_forbidden_flow_fields|_verification_text_surfaces" src/cccc/ralph/validation_rules/coverage.py,,0,已对齐 evidence.covering_task_ids 与 mock_tests surfaces
+3,新增回归测试,DONE,测试文件包含 4 个场景,rg -n "W_FORBIDDEN_FLOW_FIELD_UNCOVERED|is_admin" tests/test_forbidden_flow_field.py,,0,新增 tests/test_forbidden_flow_field.py
+4,运行目标测试,DONE,目标测试通过,pytest -q tests/test_forbidden_flow_field.py,,0,tests/test_forbidden_flow_field.py + tests/ralph/test_validation_test_creator_failed.py 共 10 passed

@@ -8,10 +8,13 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from ...contracts.v1.ralph_ipc import ReadyBatchSuggestion, RestartSuggestion, TaskRef
+from ...kernel.ledger import append_event
 from ...kernel.workflow_state_types import WorkflowTaskStatus
+from ..ops.agent_ops import get_agent
 from .agent_pool import TaskAssignment
 from .assignment_constants import (
     FORBIDDEN_FLOWS_KEY,
+    ORCHESTRATOR_SERVICE_ACTOR,
     PROMPT_ISSUES_KEY,
     RECOMMENDED_TESTS_KEY,
     TASK_STATUS_PENDING,
@@ -35,6 +38,9 @@ _BATCHABLE_TASK_STATUSES = {
     WorkflowTaskStatus.READY,
     WorkflowTaskStatus.DEFERRED,
 }
+MODEL_SELECTION_DECISION_EVENT_KIND = "model.selection_decision"
+MODEL_SELECTOR_BYPASS_EVENT_KIND = "model.selector_bypass"
+EXPLICIT_ASSIGNMENT_REASON = "foreman_explicit"
 
 
 def _reject_incomplete_tasks(task_refs: List[TaskRef]) -> None:
@@ -106,6 +112,7 @@ class AssignmentBatchMixin:
             return pressure_result
 
         result = self._evaluate_batch(suggestion)
+        self._append_pool_model_selection_events(suggestion, result)
         workflow_data["batches"].append(batch_id)
         result = self._apply_authorized_fallback(suggestion, result)
         result.skipped_task_ids = list(skipped_task_ids)
@@ -226,14 +233,46 @@ class AssignmentBatchMixin:
             actor_id = suggestion.assignments.get(task.id, "")
             if not actor_id:
                 continue
-            explicit_assignments.append(
-                TaskAssignment(
-                    task=task,
-                    agent_id=actor_id,
-                    agent_name=actor_id,
-                    assignment_reason="foreman_explicit",
-                )
+            actor_meta = self._resolve_explicit_actor_metadata(actor_id)
+            suggested_model_key, suggested_runtime, suggested_model_id = self._resolve_task_model_suggestion(
+                task,
+                suggestion,
             )
+            assignment = TaskAssignment(
+                task=task,
+                agent_id=actor_id,
+                agent_name=actor_meta["name"] or actor_id,
+                assignment_reason=EXPLICIT_ASSIGNMENT_REASON,
+                model_runtime=actor_meta["runtime"] or suggested_runtime,
+                model_id=self._resolve_explicit_model_id(
+                    actor_meta["runtime"],
+                    actor_meta["model_id"],
+                    suggested_runtime,
+                    suggested_model_id,
+                ),
+                model_key=self._resolve_explicit_model_key(
+                    actor_meta["runtime"],
+                    actor_meta["model_key"],
+                    suggested_runtime,
+                    suggested_model_key,
+                ),
+            )
+            self._append_model_selection_decision_event(
+                task_id=task.id,
+                chosen_runtime=assignment.model_runtime,
+                chosen_model_key=assignment.model_key,
+                suggested_runtime=suggested_runtime,
+                suggested_model_key=suggested_model_key,
+                reason=assignment.assignment_reason or EXPLICIT_ASSIGNMENT_REASON,
+            )
+            self._warn_on_explicit_runtime_override(
+                actor_id,
+                actor_meta["runtime"],
+                suggested_runtime,
+                task.id,
+                assignment.assignment_reason or EXPLICIT_ASSIGNMENT_REASON,
+            )
+            explicit_assignments.append(assignment)
         return BatchEvaluationResult(
             suggestion=suggestion,
             decision="approved",
@@ -242,6 +281,169 @@ class AssignmentBatchMixin:
             approved_tasks=list(suggestion.tasks),
             rejected_tasks=[],
         )
+
+    def _append_pool_model_selection_events(
+        self,
+        suggestion: ReadyBatchSuggestion,
+        result: BatchEvaluationResult,
+    ) -> None:
+        if suggestion.assignments:
+            return
+        for assignment in result.assignments:
+            if not assignment.agent_id:
+                continue
+            suggested_model_key, suggested_runtime, _ = self._resolve_task_model_suggestion(
+                assignment.task,
+                suggestion,
+            )
+            self._append_model_selection_decision_event(
+                task_id=assignment.task.id,
+                chosen_runtime=assignment.model_runtime,
+                chosen_model_key=assignment.model_key,
+                suggested_runtime=suggested_runtime,
+                suggested_model_key=suggested_model_key,
+                reason=assignment.assignment_reason,
+            )
+
+    def _resolve_explicit_actor_metadata(self, actor_id: str) -> Dict[str, str]:
+        for actor in self.load_enabled_peer_actors():
+            if str(actor.get("id") or "").strip() != actor_id:
+                continue
+            return {
+                "name": str(actor.get("title") or actor_id),
+                "runtime": str(actor.get("runtime") or "").strip(),
+                "model_id": str(actor.get("model_id") or "").strip(),
+                "model_key": "",
+            }
+
+        pool_manager = self._owner.foreman.pool_manager
+        agent = get_agent(actor_id, pool_manager.agents_dir)
+        if agent is None:
+            return {"name": actor_id, "runtime": "", "model_id": "", "model_key": ""}
+
+        model_key, _ = pool_manager._resolve_registry_model(  # noqa: SLF001
+            pool_manager.get_model_registry(),
+            agent.model_id,
+        )
+        return {
+            "name": agent.name or actor_id,
+            "runtime": agent.model_runtime,
+            "model_id": agent.model_id,
+            "model_key": model_key or "",
+        }
+
+    def _resolve_task_model_suggestion(
+        self,
+        task: TaskRef,
+        suggestion: ReadyBatchSuggestion,
+    ) -> tuple[str, str, str]:
+        pool_manager = self._owner.foreman.pool_manager
+        model_key, model = pool_manager.resolve_model_for_task(
+            task,
+            suggested_model_key=suggestion.task_model_suggestions.get(task.id),
+        )
+        if not model_key or model is None:
+            return "", "", ""
+        return model_key, model.runtime, model.model_id or model_key
+
+    def _append_model_selection_decision_event(
+        self,
+        *,
+        task_id: str,
+        chosen_runtime: str,
+        chosen_model_key: str,
+        suggested_runtime: str,
+        suggested_model_key: str,
+        reason: str,
+    ) -> None:
+        self._append_group_ledger_event(
+            kind=MODEL_SELECTION_DECISION_EVENT_KIND,
+            data={
+                "task_id": task_id,
+                "chosen_runtime": chosen_runtime,
+                "chosen_model_key": chosen_model_key,
+                "suggested_runtime": suggested_runtime,
+                "suggested_model_key": suggested_model_key,
+                "reason": reason,
+            },
+            warning_message=f"Failed to append {MODEL_SELECTION_DECISION_EVENT_KIND} for task {task_id}",
+        )
+
+    def _warn_on_explicit_runtime_override(
+        self,
+        actor_id: str,
+        actual_runtime: str,
+        suggested_runtime: str,
+        task_id: str,
+        reason: str,
+    ) -> None:
+        if actual_runtime and suggested_runtime and actual_runtime != suggested_runtime:
+            logger.warning(
+                "Actor %s uses runtime %s but pool suggests %s for task %s",
+                actor_id,
+                actual_runtime,
+                suggested_runtime,
+                task_id,
+            )
+            self._append_group_ledger_event(
+                kind=MODEL_SELECTOR_BYPASS_EVENT_KIND,
+                data={
+                    "actor_id": actor_id,
+                    "task_id": task_id,
+                    "actual_runtime": actual_runtime,
+                    "suggested_runtime": suggested_runtime,
+                    "reason": reason,
+                },
+                warning_message=f"Failed to append {MODEL_SELECTOR_BYPASS_EVENT_KIND} for task {task_id}",
+            )
+
+    def _append_group_ledger_event(
+        self,
+        *,
+        kind: str,
+        data: Dict[str, Any],
+        warning_message: str,
+    ) -> None:
+        try:
+            append_event(
+                self._owner.group.ledger_path,
+                kind=kind,
+                group_id=self._owner.group.group_id,
+                scope_key=self._group_scope_key(),
+                by=ORCHESTRATOR_SERVICE_ACTOR,
+                data=data,
+            )
+        except Exception:
+            logger.warning(warning_message, exc_info=True)
+
+    def _group_scope_key(self) -> str:
+        return str(self._owner.group.doc.get("active_scope_key") or "").strip()
+
+    @staticmethod
+    def _resolve_explicit_model_id(
+        actual_runtime: str,
+        actual_model_id: str,
+        suggested_runtime: str,
+        suggested_model_id: str,
+    ) -> str:
+        if actual_model_id:
+            return actual_model_id
+        if not actual_runtime or actual_runtime == suggested_runtime:
+            return suggested_model_id
+        return ""
+
+    @staticmethod
+    def _resolve_explicit_model_key(
+        actual_runtime: str,
+        actual_model_key: str,
+        suggested_runtime: str,
+        suggested_model_key: str,
+    ) -> str:
+        if actual_model_key:
+            return actual_model_key
+        if not actual_runtime or actual_runtime == suggested_runtime:
+            return suggested_model_key
+        return ""
 
     def _apply_authorized_fallback(
         self,
@@ -298,6 +500,7 @@ class AssignmentBatchMixin:
             "is_new_agent": assignment.is_new_agent,
             "model_runtime": assignment.model_runtime or "",
             "model_id": assignment.model_id or "",
+            "model_key": assignment.model_key or "",
         }
 
     def _build_approved_assignments(
@@ -435,7 +638,7 @@ class AssignmentBatchMixin:
         if kwargs.get(FORBIDDEN_FLOWS_KEY):
             suggestion.forbidden_flows = list(kwargs[FORBIDDEN_FLOWS_KEY])
         suggestion.fallback_allowed = bool(kwargs.get("fallback_allowed", False))
-        self.process_batch_suggestion(
+        self._owner.process_batch_suggestion(
             suggestion,
             auto_start_agents=bool(kwargs.get("auto_start_agents", True)),
             allowed_existing_task_ids=allowed_existing_task_ids,

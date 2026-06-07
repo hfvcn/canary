@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm existing validation and model shape,DONE,Relevant source and model fields are read,python -m pytest tests/ralph/test_signoff_structure.py -v,2026-05-31,0,
+2,Implement signoff path-aware validation,DONE,Code matches requested behavior and existing tests remain compatible,python -m pytest tests/ralph/test_signoff_structure.py -v,2026-05-31,0,
+3,Add requested tests,DONE,All five requested test cases are present,python -m pytest tests/ralph/test_signoff_structure.py -v,2026-05-31,0,
+4,Run verification,DONE,Target pytest command passes,python -m pytest tests/ralph/test_signoff_structure.py -v,2026-05-31,0,Final run passed after aligning JSON path tests

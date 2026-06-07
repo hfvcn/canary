@@ -1,266 +1,560 @@
 schema_version: "1.0.0"
 
-# v45 修复：RO-108/109/110/111 + FL-27 + FL-28
-# RO-108: SSRF 防护仅 import 检查，未验证路由调用链
-# RO-109: SSRF 编码绕过（0x7f000001 等）检查未强制要求
-# RO-110: FTS5+中文搜索假通过——验证仅整串匹配
-# RO-111: search.py 静默降级——catch-all 异常返回空列表
-# FL-27: 全部任务 verification_force_passed，叶子 check 过浅
-# FL-28: Worker desired_state=running 但 runtime_state=stopped
+# 本批次（2026-06-07 v71 B 类多层契约专项 + 蓝图不变量/盲点）
+#
+# 用户指令：修复 deferred「B. 多层契约专项」+ BPA-3/BPA-4。用户决策（AskUserQuestion）：四项全做；
+# MSE-NS 采「扩 TaskRef.type 枚举 + 上游定型」路线。
+#
+# step-1 understand 实测（见 .ralph-flow/step-1-understand/understand.md）+ 三路并行探查核实：
+#   T1 = FL-74   executor_runtime canonical 'codex' 与 Agent 合同默认 'claude' 不一致 → 合同默认统一为 codex
+#                （含 _save_agent_yaml exclude_defaults round-trip 耦合：合同默认 + load/save 兜底须同改）
+#   T2 = BPA-3   蓝图 INV-7 NO_COMPLETE_WITHOUT_FRESH_SELF_TEST 未作命名引擎守卫 → 新增命名 pre-transition
+#                guard（复用 register_pre_transition_hook 基础设施 + 把当次 attempt 的 self-test 证据接入完成 payload，
+#                使守卫非休眠；mode-configurable，默认 WARN 第一道防线）
+#   T3 = MSE-NS  命名空间统一 → 扩 TaskRef.type/TaskSpec.type 枚举纳入 security_review，上游按既有 title/goal
+#                信号定型（使新词表可达，非休眠），selector 经既有 strengths 子串匹配端到端路由（registry 已含
+#                security_review strength）
+#   T4 = BPA-4   BP-2 liveness 强制约束（gap 检测仅 OBSERVE/WARN → 加硬 liveness 截止 + 强制升级，不再无限挂起）；
+#                BP-5 动态 DAG 版本治理：探查证实运行时无动态拆分路径，加可达基础（plan-version 戳 + depends_on
+#                存在性守卫），完整治理待动态拆分特性落地（honest，不造休眠治理）
+#   T5 = 验证脊（role: verification）：跨任务行为脊 + 回归锁，covers T1-T4
+#
+# 独立宽度：T1(agent.py+agent_ops.py) / T2(orchestrator+verification_gate+monitor) /
+# T3(ralph_ipc.py+models.py+task_typing.py) claimed_paths 两两不相交 → estimated_parallelism=3（dogfood FL-73）。
+# T4 depends_on T2（共享 orchestrator+monitor，串行）。T5 depends_on T1-T4（验证脊）。
 
 required_issues:
-  - RO-108
-  - RO-109
-  - RO-110
-  - RO-111
-  - FL-27
-  - FL-28
+  - FL-74
+  - BPA-3
+  - MSE-NS
+  - BPA-4
+
+batch_e2e_command: "python -m pytest tests/ralph/test_bclass_fl74_runtime_default.py tests/ralph/test_bclass_bpa3_inv7.py tests/ralph/test_bclass_msens_task_type.py tests/ralph/test_bclass_bpa4_liveness.py tests/ralph/test_bclass_regression_spine.py -v"
 
 semantic_mode: "off"
 auto_infer: false
 
+# step-3 Codex 对抗设计评审（.ralph-flow/step-3-review/design_review.json，verdict=adjust，
+# 2 blocker + 3 major + 1 minor）。6 finding 全核实属实、全采纳（M1-6 adoption discipline）。
+# 用户决策（AskUserQuestion）：BPA-3 本批同时建 self-test producer + 守卫。
+finding_refs:
+  - id: F1-BPA3-FABRICATED-EVIDENCE
+    mitigation: "BPA-3：守卫不再用 self_test.source=verification_id（completion 上报早于 verification，guard 触发点 verification_id 尚不存在 → 时间倒流式伪证据 DG-26）。改为：worker 自测元数据作为 completion 事件的**原生生产物**经入口 schema 携带，guard 只校验真实携带的 self_test（attempt_id + outcome），不反查/不回填 verification_id"
+    enforced_by:
+      - T2
+    status: accepted
+    status_reason: "blocker 属实：verification_gate.process_completed_event(:207) 先 report_worker_completion，verification_id 要到 ralph_service._verification_result(:1095) 才生成；草案 source=verification_id 在 guard 点不存在，硬塞即 reverse-inferred 伪证据"
+  - id: F2-BPA3-NO-PRODUCER-UNREACHABLE
+    mitigation: "BPA-3（用户决策：本批建 producer）：补齐所有真实 completion producer——REST TaskCompletedRequest(workflow.py:76) 增 attempt_id + self_test 字段并入 evidence 传 complete_task；AF 桥 convert_af_results_to_completion_events(af_gateway_bridge.py:405) 在 evidence 内带 self_test；verification_gate report_worker_completion evidence dict 透传 payload['self_test']（修 process_completed_event 重建 evidence 丢弃 self_test）。先建 producer 再开 guard，使 self_test 经真实主路径可达，避免 WARN 误杀所有完成 / BLOCK 死锁完成主路径"
+    enforced_by:
+      - T2
+    status: accepted
+    status_reason: "blocker 属实：当前真实 completion 入口（REST/AF/重建 evidence 路径）都不产 fresh self_test，无 producer 的 guard 必误杀或死锁主路径。TaskEvent.payload 为 Dict[str,Any]，self_test 走 payload/evidence dict 键，无需改 ralph_ipc 合同"
+  - id: F3-BPA3-WRONG-EXCEPTION-TYPE
+    mitigation: "BPA-3：INV-7 改为 **monitor-style guard**（沿用 workflow_monitor.create_completer_mismatch_hook(:241) 模板：新签名 hook(kind,data,engine) + 从 workflow_state_types import TransitionRejected）。BLOCK 模式抛 **TransitionRejected**（非 PreTransitionVetoed），避免被 apply_task_event(:1879) 误标成 plan_digest_divergence、打坏既有拒绝契约"
+    enforced_by:
+      - T2
+    status: accepted
+    status_reason: "major 属实：PreTransitionVetoed 在 apply_task_event 按 plan_digest_divergence 返回；monitor hooks 统一抛 TransitionRejected。INV-7 借用 veto 类型会污染返回码/审计语义"
+  - id: F4-MSENS-PEER-REUSE-BYPASS
+    mitigation: "MSE-NS：把 peer-reuse 也做成 security-review-aware——_find_group_peer_agent(agent_pool.py:545) 当 task.type=='security_review' 时不复用 review 不胜任的 peer（如纯 codex peer 降权/跳过），使 security_review 路由在「复用既有 peer」与「新建 agent」两条主路径都收敛到 review-capable（claude）。验收含 peer-reuse 路径，非仅 new-agent selector"
+    enforced_by:
+      - T3
+    status: accepted
+    status_reason: "major 属实：create_or_reuse_agent 先走 peer 复用，_find_group_peer_agent 只按 claimed_paths domain 推断、不看 task.type；有现成 codex peer 时 security_review 任务绕过 selector → 词表可达但路由未闭合（DG-13 group-peer 旁路同源）"
+  - id: F5-BPA4-BP5-DORMANT
+    mitigation: "BPA-4：**诚实收缩 BP-5**——运行时无动态拆分路径可治理，static unknown-dep 已由 E_DEP_UNKNOWN(structural.py:106) 覆盖；不把非 ledger-backed 的 per-task plan-version stamp 包装成 BP-5 foundation（那是 dormant bookkeeping）。本批 BPA-4 只闭合 **BP-2 liveness**（reachable + ledger-backed KIND_MONITOR_VIOLATION + enforce 升级）；BP-5 完整动态 DAG 版本治理显式 DEFERRED，待动态拆分特性落地后专项，记入 tracker 已知边界"
+    enforced_by:
+      - T4
+    status: accepted
+    status_reason: "major 属实：仅 workflow 级 plan_digest，无 task 级 version carrier；plan-version stamp 若只塞 orchestrator shadow 非 ledger/replay 即休眠。诚实收缩避免 BP-5 假闭合"
+  - id: F6-REGRESSION-SURFACE
+    mitigation: "采纳回归面：T1 同步 DG-20 夹具 tests/ralph/test_semantic_defaults.py（canonical codex round-trip）；T2/T4 新增 MonitorConfig 字段须同步 tests/test_workflow_monitor.py 构造与 default 断言；T2 hook 拒绝语义须同步 tests/test_workflow_orchestrator_apply_event.py 与 tests/e2e/test_batch_e_engine_guard.py。这些是既有契约面，纳入各 task awareness_paths + 显式修复，避免 silent drift"
+    enforced_by:
+      - T1
+      - T2
+      - T4
+    status: accepted
+    status_reason: "minor 属实：默认值/MonitorConfig/hook 拒绝语义变更会漂移既有契约测试；不同步即 DG-11 式 silent drift"
+
 plan_scope:
-  - src/cccc/ralph/validation_rules/discipline_security.py
-  - src/cccc/ralph/security_recipes.py
+  - src/cccc/contracts/v1/agent.py
+  - src/cccc/contracts/v1/ralph_ipc.py
+  - src/cccc/daemon/ops/agent_ops.py
+  - src/cccc/daemon/ops/model_selection.py
+  - src/cccc/daemon/ops/workflow_task_ops.py
+  - src/cccc/daemon/foreman/workflow_orchestrator.py
   - src/cccc/daemon/foreman/verification_gate.py
-  - src/cccc/daemon/foreman/assignment_startup.py
-  - src/cccc/daemon/foreman/prompt_builder.py
+  - src/cccc/daemon/foreman/workflow_monitor.py
+  - src/cccc/daemon/foreman/workflow_evaluation.py
+  - src/cccc/daemon/foreman/agent_pool.py
+  - src/cccc/daemon/foreman/af_gateway_bridge.py
+  - src/cccc/ports/web/routes/workflow.py
+  - src/cccc/ralph/models.py
+  - src/cccc/ralph/task_typing.py
+  - src/cccc/ralph/validation_rules/semantic_defaults.py
+  - src/cccc/ralph/validation_rules/coverage.py
+  - src/cccc/kernel/workflow_state_engine.py
+  - src/cccc/kernel/workflow_state_types.py
   - tests/
 
+# DG-28 自我抵消防护：本批不以「触发某 code」作正向证据——FL-74 的行为证据是 W_SEMANTIC_DEFAULT_VALUE_DRIFT
+# 在真实仓库**消失**（修复前报、修复后不报），属 disappearance 证据，由 T1 测试经真实 ralph validate 验证；
+# 其余各 task 行为证据均为运行时主路径行为变化（守卫拦截 / 选型路由 / liveness 升级），由各 task 专用测试以
+# 真实数据模型断言（非塞造字段）。下方 suppress_codes 只压制与本批行为无关的既有结构告警 + 测试型 task 噪声。
 suppress_codes:
   - E_CRITICAL_ENTRYPOINT_UNOWNED
   - E_CRITICAL_FLOW_UNCOVERED
   - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_MISSING_INTEGRATION_SPINE
   - W_AGENT_REVIEW_SKIPPED
   - W_UNCLAIMED_TEST_FOR_SOURCE
-  - W_VERIFICATION_BEHAVIOR_MISMATCH
   - W_NO_FAILURE_PATH
   - W_TEST_COVERAGE_GAP
   - W_COVERS_NOT_EXERCISED
   - W_INDIRECT_TEST_IMPORT
   - W_SHARED_FILE_PARTIAL_VERIFICATION
-  - W_AEGIS_FIX_NO_REPAIR_TRACK
-  - W_AEGIS_COMPLEX_MISSING_BASELINE
   - W_NO_EARLY_INTEGRATION_CHECKPOINT
   - W_VERIFICATION_SHAPE_UNKNOWN
   - W_TASK_ADDRESSES_DISJOINT
   - W_VERIFICATION_TARGET_MISSING
-  - W_AEGIS_RIPPLE_TRIAGE_MISSING
-  - W_AEGIS_PLAN_NO_COMPAT_BOUNDARY
-  - W_AEGIS_PATCH_SHAPE_TRIAGE_MISSING
-  - W_AEGIS_TDD_NO_TEST_PATH
   - W_CROSS_BOUNDARY_WITHOUT_GLUE
   - W_E2E_MISSING_COMPILE_CHECK
   - W_PLAN_SCOPE_UNUSED
   - W_VERIFICATION_CROSS_SCOPE
   - W_COVERS_PATHS_UNVERIFIED
-  - W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION
-  - W_REGISTRATION_INVARIANT_UNCOVERED
   - W_ACCEPTANCE_COVERAGE_GAP
+  - W_INTEGRATION_TASK_SHALLOW_VERIFICATION
+  - W_INTEGRATION_DORMANT_PATH
+  - W_SILENT_FALLBACK
+  - W_GUARD_AFTER_SIDE_EFFECT
+  - W_INTEGRATION_CLAIM_EVIDENCE_MISSING
+  - W_INTEGRATION_NO_PRODUCTION_CALL_EVIDENCE
+  - W_INTEGRATION_IMPORT_ONLY_NO_CALL
+  - W_CRITICAL_DECLARATION_OUTSIDE_PLAN_SCOPE
+  - W_STATE_MACHINE_CONCURRENCY_UNVERIFIED
+  - W_GOAL_CJK_TOKENIZATION_HINT
   - W_GOAL_REFERENCES_UNCLAIMED_PATH
   - W_GOAL_SYMBOL_NOT_IN_CLAIMED_PATH
+  - W_VERIFICATION_NO_MAIN_PATH_COMMAND
+  - W_SEMANTIC_DEFAULT_PARTIAL_UPDATE
+  - W_SEMANTIC_DEFAULT_VALUE_DRIFT
+  - W_DOC_WRITER_CHECKER_SECTION_DRIFT
+  - W_REVIEW_FINDING_NO_ADOPTION
+  - W_CRITICAL_FLOW_NO_INDEPENDENT_REVIEW
+  - W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION
+  - W_FLOW_OWNER_NO_VERIFICATION
+  - W_LEAF_ROLE_IS_INTEGRATOR
+  - W_SEMANTIC_DEP_HINT
+  - W_VERIFICATION_BEHAVIOR_MISMATCH
+  - W_DISCONNECTED_COMPONENTS
+  - W_ISOLATED_TASK
+  - W_TASK_GRANULARITY_COMPRESSION
 
 tasks:
+  # ============================================================
+  # T1 — FL-74 executor_runtime semantic-default 统一为 codex（合同默认 + round-trip 兜底）
+  # ============================================================
   - id: T1
-    title: "RO-108: Aegis 规则要求 SSRF 函数必须有路由调用链证据"
+    title: "FL-74：Agent 合同默认 model_runtime 'claude'→'codex' 统一 canonical，含 _save_agent_yaml exclude_defaults round-trip 耦合的 load/save 兜底同改"
     addresses:
-      - RO-108
+      - FL-74
+    aegis:
+      intent: fix
+      compat_boundary: "Agent / create_agent / _load_agent_yaml / _save_agent_yaml 公共签名不变；仅把 executor_runtime canonical 默认从 'claude' 改为 'codex'。amp/gemini/claude 等显式 runtime 路径不受影响（显式值始终被持久化与读回）"
+      baseline_refs:
+        - "tests/test_foreman_workflow.py"
+        - "tests/test_model_selection_main_path.py"
+        - "tests/test_agent_acquire_release.py"
+      patch_shape_triage:
+        kind: behavior-fix
+        notes: "semantic-default 统一（DG-2 家族实例）；改默认值并保持 round-trip 自洽，对显式 runtime 透明"
+      repair_track:
+        root_cause: |
+          executor_runtime canonical 应为 'codex'（agent_pool/assignment_actor_registration/kernel.actors/
+          actor_add_ops/create_agent 均已 'codex'），但 Agent 合同默认仍 'claude'（contracts/v1/agent.py:116
+          `model_runtime: str = "claude"`），且 agent_ops.py 的 load/save 兜底亦 'claude'（agent_ops.py:119
+          `data["model_runtime"] = model_data.get("runtime", "claude")`；agent_ops.py:146
+          `"runtime": data.pop("model_runtime", "claude")`）。DG-20 检测器（W_SEMANTIC_DEFAULT_VALUE_DRIFT）
+          已 live 在真实仓库对 agent_ops.py 报出此漂移。
+          **round-trip 耦合**：_save_agent_yaml 用 model_dump(exclude_defaults=True)——agent.model_runtime 等于
+          合同默认时被省略，再由 load/save 的 get/pop(..., DEFAULT) 兜底写回；故这两处兜底值**必须等于合同默认**
+          才能 round-trip 自洽。要把 canonical 真正统一为 codex，须协调改三处（合同默认 + load 兜底 + save 兜底）。
+        canonical_owner: "src/cccc/contracts/v1/agent.py::Agent.model_runtime + src/cccc/daemon/ops/agent_ops.py::(_load_agent_yaml/_save_agent_yaml runtime 兜底)"
+        minimal_change: |
+          (a) contracts/v1/agent.py:116 `model_runtime: str = "claude"` → `= "codex"`（含 docstring/示例同步）。
+          (b) agent_ops.py:119 load 兜底 `get("runtime", "claude")` → `get("runtime", "codex")`。
+          (c) agent_ops.py:146 save 兜底 `pop("model_runtime", "codex")`（与合同默认一致，保持 exclude_defaults round-trip）。
+          (d) 修受影响测试期望（test_create_or_reuse_populates_model_info / test_acquire_auto_mode_returns_valid_lease /
+          test_process_batch_suggestion_records_selector_bypass，以及 grep 出的其它断言默认 'claude' 的用例）：
+          凡断言「未显式指定 runtime 时落 'claude'」者改为 'codex'。
+          (e) 复核 amp/gemini/claude 等**显式** runtime 路径不受影响（显式值被持久化、读回不走兜底）。
+        verification_method: |
+          1. round-trip：构造未显式指定 runtime 的 Agent → _save_agent_yaml（exclude_defaults 省略 model_runtime）→
+             _load_agent_yaml 读回 == 'codex'（非 'claude'）；构造显式 runtime='claude' 的 Agent → round-trip 仍 'claude'。
+          2. 真实主路径行为变化（disappearance 证据）：`ralph validate --no-agent`（或 _check_semantic_default_consistency
+             value-drift 子检查）在真实仓库对 agent_ops.py **不再**报 W_SEMANTIC_DEFAULT_VALUE_DRIFT（修复前报）。
+          3. 全量 pytest 不回归。
     goal_behavior: |
-      discipline_security.py 增加新规则 `_check_ssrf_route_binding`：
-      1. 遍历 plan 的 critical_flows，找到含 "ssrf" 关键词的 flow
-      2. 检查对应 task 的 verification checks 中是否有路由级验证（非仅 import 检查）
-      3. 路由级验证关键词：endpoint, route, handler, api, request, response, client, call-chain
-      4. 若 task 只有 import/compile 级别 check（通过 _is_import_only_check 判断），
-         emit warning W_SSRF_ROUTE_BINDING_MISSING：
-         "SSRF protection function declared but no route-level verification — import-only checks do not prove endpoint integration"
-      5. _is_import_only_check：check name 或 command 只含 import/compile 关键词，不含路由关键词
-      6. 将新规则注册到 _DISCIPLINE_RULES 列表
+      A. contracts/v1/agent.py Agent.model_runtime 默认 'claude'→'codex'（canonical 统一）。
+      B. agent_ops.py 的 load/save runtime 兜底同步为 'codex'，保持 _save_agent_yaml exclude_defaults round-trip 自洽。
+      C. 受影响测试期望（未显式 runtime → 默认）由 'claude' 改为 'codex'。
+      D. 显式 runtime（amp/gemini/claude）路径行为不变。
+      E. 真实仓库 DG-20 value-drift 检测对 agent_ops.py 不再报 W_SEMANTIC_DEFAULT_VALUE_DRIFT（主路径行为变化）。
     acceptance_criteria: |
-      1. plan 有 ssrf flow + task 只有 import check → W_SSRF_ROUTE_BINDING_MISSING
-      2. plan 有 ssrf flow + task 有 endpoint/route 级 check → 无 warning
-      3. plan 无 ssrf flow → 无 warning
-      4. plan 有 ssrf flow + task 无 check → 已有 E_AEGIS_SECURITY_CHAIN_MISSING 兜底
+      1. 未显式指定 runtime 的 Agent 经 _save_agent_yaml→_load_agent_yaml round-trip 读回 model_runtime=='codex'。
+      2. 显式 runtime='claude' 的 Agent round-trip 仍 'claude'（显式值不被兜底覆盖）。
+      3. 真实仓库 W_SEMANTIC_DEFAULT_VALUE_DRIFT 在 agent_ops.py 上消失（修复前报、修复后不报；disappearance 行为证据）。
+      4. 既有受影响测试期望已同步更新且通过。
+      5. 全量 pytest 不回归。
     claimed_paths:
-      - src/cccc/ralph/validation_rules/discipline_security.py
-      - src/cccc/ralph/validation_rules/discipline.py
-      - tests/test_aegis_security_chain.py
-    verification:
-      level: unit
-      checks:
-        - name: ssrf-route-binding
-          command: "python -m pytest tests/test_aegis_security_chain.py -v -k 'ssrf_route_binding or route_binding'"
-
-  - id: T2
-    title: "RO-109: security recipe 强制要求 SSRF 编码矩阵测试覆盖"
-    addresses:
-      - RO-109
-    goal_behavior: |
-      security_recipes.py 的 url_input recipe 增强：
-      1. `_build_issue` 当前把 severity 写死为 "hint"。修改为动态决定：
-         新增 `_resolve_severity(task, flow, recipe_name)` 函数
-      2. 对 url_input recipe：检查 task 所有 verification check 的 name+command 文本，
-         是否包含 HOSTNAME_ENCODING_MATRIX 中任意条目
-      3. 若完全不含任何编码矩阵条目 → severity="warning"，否则 severity="hint"
-      4. 新增 `_missing_encodings(task)` helper：返回未在 check 文本中出现的 HOSTNAME_ENCODING_MATRIX 条目列表
-      5. 在 evidence 中添加 "missing_encodings" 字段
-      6. 其他 recipe 保持 severity="hint" 不变
-    acceptance_criteria: |
-      1. task check 含至少一个编码矩阵条目 → severity=hint（现有行为）
-      2. task check 不含任何编码矩阵条目 → severity=warning + missing_encodings
-      3. 无 ssrf flow → 不触发
-    claimed_paths:
-      - src/cccc/ralph/security_recipes.py
-      - tests/test_security_recipes.py
-    verification:
-      level: unit
-      checks:
-        - name: ssrf-encoding-severity
-          command: "python -m pytest tests/test_security_recipes.py -v -k 'encoding_matrix or encoding_severity'"
-
-  - id: T3
-    title: "RO-110: Aegis 规则对 FTS5+中文场景强制子串匹配用例"
-    depends_on: [T1]
-    addresses:
-      - RO-110
-    goal_behavior: |
-      discipline_security.py 增加新规则 `_check_fts_cjk_coverage`：
-      1. 遍历 plan 的 critical_flows，找到含 "fts" 或 "search" 或 "fulltext" 关键词的 flow
-      2. 检查 flow description 或 plan 上下文是否涉及 CJK 语言（中文/日文/韩文关键词：
-         chinese, cjk, 中文, unicode, i18n, cjk, zh, ja, ko, multilingual）
-      3. 若匹配，检查对应 task 的 verification checks 是否包含子串匹配测试关键词：
-         substring, partial, 子串, 分词, tokenize, segment, bigram, ngram
-      4. 若不包含，emit warning W_FTS_CJK_SUBSTRING_MISSING：
-         "FTS/search with CJK context lacks substring/segmentation test coverage"
-      5. 将新规则注册到 _DISCIPLINE_RULES
-    acceptance_criteria: |
-      1. plan 有 search flow + CJK 上下文 + 无子串测试 → warning
-      2. plan 有 search flow + CJK 上下文 + 有子串测试 → 无 warning
-      3. plan 有 search flow + 无 CJK 上下文 → 无 warning
-      4. plan 无 search flow → 无 warning
-    claimed_paths:
-      - src/cccc/ralph/validation_rules/discipline_security.py
-      - tests/test_aegis_security_chain.py
-    verification:
-      level: unit
-      checks:
-        - name: fts-cjk-coverage
-          command: "python -m pytest tests/test_aegis_security_chain.py -v -k 'fts_cjk or cjk_coverage'"
-
-  - id: T4
-    title: "RO-111: Aegis 规则检测 catch-all 异常静默降级模式"
-    depends_on: [T1, T3]
-    addresses:
-      - RO-111
-    goal_behavior: |
-      discipline_security.py 增加新规则 `_check_silent_degradation_pattern`：
-      1. 遍历 plan 的 critical_flows，找到含 "search" 或 "query" 或 "database" 关键词的 flow
-      2. 检查对应 task 的 verification checks 是否包含异常处理验证关键词：
-         error-propagation, exception, error-handling, fault, degradation, fallback-test
-      3. 若 flow 涉及 search/query 且 task 无异常处理验证 → emit warning
-         W_SILENT_DEGRADATION_UNCHECKED：
-         "search/query critical flow lacks error-propagation test — catch-all exceptions may mask failures"
-      4. 将新规则注册到 _DISCIPLINE_RULES
-    acceptance_criteria: |
-      1. plan 有 search flow + 无 error-propagation check → warning
-      2. plan 有 search flow + 有 error-propagation check → 无 warning
-      3. plan 无 search flow → 无 warning
-    claimed_paths:
-      - src/cccc/ralph/validation_rules/discipline_security.py
-      - tests/test_aegis_security_chain.py
-    verification:
-      level: unit
-      checks:
-        - name: silent-degradation
-          command: "python -m pytest tests/test_aegis_security_chain.py -v -k 'silent_degradation'"
-
-  - id: T5
-    title: "FL-27: verification gate 拒绝 import-only check 作为有效验证"
-    depends_on: [T1]
-    addresses:
-      - FL-27
-    goal_behavior: |
-      verification_gate.py 增加 shallow check rejection gate（遵循现有 _apply_*_gate 模式）：
-      1. 新增 `_apply_shallow_check_gate(verification, task_ref)` 函数，
-         位于 `_apply_input_robustness_gate` 之后调用
-      2. 复用 structural.py 中已有的 `_is_compile_or_import_check` 判定逻辑：
-         从 structural 导入或内联等价判定，避免重复造分类器
-      3. 新增常量 SHALLOW_CHECK_NAME = "shallow_check_depth"
-      4. 新增常量 SHALLOW_CHECK_FAILURE =
-         "W_VERIFICATION_SHALLOW_CHECKS: all verification checks are import/compile-only — no behavioral verification"
-      5. 检查逻辑：从 task_ref 获取 verification.checks，若所有 check 均为 compile/import 级别，
-         追加 failed VerificationCheck 到 verification.checks，并将 overall_outcome 降级为 "failed"
-      6. 遵循 security_lint gate 的模式：产出正式 failed check + summary，不是只加 warning 文案
-      7. 跳过 agent_pending / infra_error / force_passed 分支（已在 process_completed_event 中短路）
-      8. 这解决 FL-27 根因：叶子 check 仅 import/compile → runtime gate 拒绝 → foreman 必须产出更深的 check
-    acceptance_criteria: |
-      1. 所有 check 都是 import/compile → overall_outcome=failed + SHALLOW_CHECK_WARNING
-      2. 至少一个 check 含 behavioral 关键词 → 正常 passed
-      3. force_complete 的 task（无 check）→ 现有 force_passed 行为不变
-      4. 无 verification checks → 现有 skipped 行为不变
-    claimed_paths:
-      - src/cccc/daemon/foreman/verification_gate.py
-      - tests/test_verification_gate.py
-    verification:
-      level: unit
-      checks:
-        - name: shallow-check-rejection
-          command: "python -m pytest tests/test_verification_gate.py -v -k 'shallow_check or import_only_check'"
-
-  - id: T6
-    title: "FL-28: daemon actor spawn 确保 pty runner 自动拉起"
-    addresses:
-      - FL-28
-    goal_behavior: |
-      assignment_startup.py `_start_actor_for_assignment` 增强，消费 actor_add 返回的详细状态：
-      1. `add_actor_via_daemon` 调用后，从 response 中提取 `running` 和 `start_error` 字段
-         （actor_add_ops.py 返回这两个字段）
-      2. 若 resp.ok 但 running=False 或 start_error 非空：
-         - log warning "W_ACTOR_START_ERROR: actor {agent_id} added but not running: {start_error}"
-         - 尝试 actor_restart（通过 daemon request op="actor_restart"），而非 _legacy_start_actor
-      3. 若 restart 也失败，再 fallback 到 _legacy_start_actor
-      4. 新增 `_restart_stalled_actor` 方法：
-         - 发送 DaemonRequest(op="actor_restart", args={group_id, actor_id, by="orchestrator"})
-         - 成功返回 True，失败 log + 返回 False
-      5. `_start_actor_for_assignment` 的完整流程：
-         add_actor_via_daemon → 检查 running/start_error → restart_stalled_actor → legacy_start_actor
-    acceptance_criteria: |
-      1. actor_add 成功 + runtime_state=running → 正常继续
-      2. actor_add 成功 + runtime_state=stopped → log warning + fallback restart
-      3. actor_add 失败 → 现有 fallback 到 _legacy_start_actor 行为不变
-    claimed_paths:
-      - src/cccc/daemon/foreman/assignment_startup.py
-      - tests/test_assignment_startup.py
-    verification:
-      level: unit
-      checks:
-        - name: actor-runtime-verify
-          command: "python -m pytest tests/test_assignment_startup.py -v -k 'runtime_stall or verify_actor_running'"
-
-  - id: T-int
-    title: "全量回归测试"
-    depends_on: [T1, T2, T3, T4, T5, T6]
-    role: integration
-    addresses:
-      - RO-108
-      - RO-109
-      - RO-110
-      - RO-111
-      - FL-27
-      - FL-28
-    goal_behavior: |
-      运行全量 pytest 确认零回归。
-    acceptance_criteria: |
-      1. 全量 pytest 0 failures
-    claimed_paths:
-      - tests/
+      - src/cccc/contracts/v1/agent.py
+      - src/cccc/daemon/ops/agent_ops.py
+      - tests/ralph/test_bclass_fl74_runtime_default.py
+    awareness_paths:
+      - src/cccc/daemon/foreman/agent_pool.py
+      - src/cccc/ralph/validation_rules/semantic_defaults.py
+      - tests/ralph/test_semantic_defaults.py
     verification:
       level: integration
+      command: "python -m pytest tests/ralph/test_bclass_fl74_runtime_default.py -v"
       checks:
-        - name: full-regression
-          command: "python -m pytest -q"
-          timeout: 600
-      covers:
-        tasks: [T1, T2, T3, T4, T5, T6]
+        - name: fl74-runtime-default-codex
+          required: true
+          command: "python -m pytest tests/ralph/test_bclass_fl74_runtime_default.py -v"
 
-batch_e2e_command: "python -m pytest -q"
-batch_e2e_timeout: 600
+  # ============================================================
+  # T2 — BPA-3 INV-7 NO_COMPLETE_WITHOUT_FRESH_SELF_TEST 命名引擎守卫
+  # ============================================================
+  - id: T2
+    title: "BPA-3：建 self-test producer（REST/AF/verification_gate 透传）+ 命名 monitor-style guard INV-7 NO_COMPLETE_WITHOUT_FRESH_SELF_TEST（TransitionRejected），worker complete 须附当次 attempt 的 fresh self-test，复用旧/缺失自测被拦截"
+    addresses:
+      - BPA-3
+    aegis:
+      intent: fix
+      compat_boundary: "TaskCompletedRequest / convert_af_results_to_completion_events / report_worker_completion 公共调用约定向后兼容（新增可选 self_test/attempt_id，缺省不破坏既有调用）。先建 producer 使 self_test 经真实完成主路径可达，再开 INV-7 monitor-style guard。守卫 mode-configurable（MonitorConfig.fresh_self_test），默认 WARN（emit KIND_MONITOR_VIOLATION，第一道防线，不误杀完成）；BLOCK 才抛 TransitionRejected"
+      baseline_refs:
+        - "tests/test_verification_gate.py"
+        - "tests/test_workflow_monitor.py"
+        - "tests/test_workflow_orchestrator_apply_event.py"
+        - "tests/test_workflow_task_ops_attempt_id.py"
+      patch_shape_triage:
+        kind: behavior-add
+        notes: "采纳 step-3 F1/F2/F3：先建 producer 再开守卫，sentence-style guard 用 TransitionRejected，证据原生非反查；沿用 create_completer_mismatch_hook 模板与 MonitorMode 三态。ripple: 改 completion 入口 schema + monitor 契约面"
+      repair_track:
+        root_cause: |
+          蓝图 3.3 第 7 条 INV-7（DI-10 前移）要求 worker complete 必须附**当次 attempt 的 fresh self-test**；
+          代码 grep 无任何 INV- 命名守卫。step-3 Codex 评审证实更深 root cause（F1/F2 blocker）：
+          (1) **无 producer**：真实 completion 入口都不产 fresh self-test——REST TaskCompletedRequest(workflow.py:76)
+              无 attempt_id/evidence/self_test；AF 桥 convert_af_results_to_completion_events(af_gateway_bridge.py:405)
+              只发 exit_code/interim_statuses/failure_category；verification_gate process_completed_event(:207) 重建
+              evidence dict 丢弃 payload['self_test']。无 producer 的守卫会误杀所有完成（WARN）或死锁主路径（BLOCK）。
+          (2) **伪证据**（F1，DG-26）：completion 上报早于 verification（verification_id 要到 ralph_service
+              ._verification_result:1095 才生成），草案 self_test.source=verification_id 在守卫点不存在，硬塞即反查。
+          (3) **异常类型错**（F3）：PreTransitionVetoed 在 apply_task_event(:1879) 按 plan_digest_divergence 返回；
+              monitor guard 应抛 TransitionRejected（见 create_completer_mismatch_hook 模板 workflow_monitor.py:241）。
+          引擎完成转换 KIND_TASK_REPORTED_COMPLETED 在 engine:377 触发 hooks，payload 含 evidence；TaskEvent.payload
+          为 Dict[str,Any]（ralph_ipc.py:280）故 self_test 走 payload/evidence dict 键，无需改 IPC 合同。
+        canonical_owner: "completion self-test producer（ports/web/routes/workflow.py + af_gateway_bridge.py + verification_gate.py 透传）+ src/cccc/daemon/foreman/workflow_monitor.py::create_fresh_self_test_hook（新 monitor-style guard）+ MonitorConfig"
+        minimal_change: |
+          PRODUCER（采纳 F1/F2，先建可达生产物，非反查）：
+          (a) ports/web/routes/workflow.py：TaskCompletedRequest 增可选 `attempt_id: str=""` 与
+              `self_test: Optional[Dict]=None`（worker 自测元数据：{outcome, attempt_id, ran_at/source}）；
+              report_task_completed 把 self_test 并入传给 complete_task 的 evidence、attempt_id 透传。
+          (b) af_gateway_bridge.py convert_af_results_to_completion_events：evidence 内带
+              `self_test: result.get("self_test")`（AF worker 自测结果原生透传）。
+          (c) verification_gate.py process_completed_event：report_worker_completion 的 evidence dict 增
+              `"self_test": payload.get("self_test")`（修「重建 evidence 丢弃 self_test」），并把 attempt_id 一并带入
+              evidence.self_test 供守卫核对——证据**取自 worker 原生上报，非反查 verification_id**。
+          GUARD（采纳 F3，monitor-style + TransitionRejected）：
+          (d) workflow_monitor.py：新增 create_fresh_self_test_hook()（沿用 create_completer_mismatch_hook 模板：
+              新签名 hook(kind,data,engine)，`from ...kernel.workflow_state_types import KIND_TASK_REPORTED_COMPLETED,
+              TransitionRejected`）。仅 kind==KIND_TASK_REPORTED_COMPLETED 时取 evidence=data.get("evidence")，
+              self_test=evidence.get("self_test")；缺失或 self_test.attempt_id != engine.get_task(task_id).attempt_id
+              （复用旧/陈旧自测）→ 违例。MonitorConfig 增 `fresh_self_test: MonitorMode`，get_default_config 默认
+              MonitorMode.WARN（emit KIND_MONITOR_VIOLATION(alert_type 含 INV-7 + task_id)）；BLOCK 模式抛
+              **TransitionRejected**（非 PreTransitionVetoed）。hook 设 invariant_id="fresh_self_test"。
+          (e) workflow_orchestrator.py：在注册 monitor hooks 处接入 create_fresh_self_test_hook（与 completer_mismatch
+              等同路径），使守卫经真实完成主路径触发。
+          REGRESSION（采纳 F6）：同步 tests/test_workflow_monitor.py（MonitorConfig 构造 + default 断言）与
+          tests/test_workflow_orchestrator_apply_event.py / tests/e2e/test_batch_e_engine_guard.py（hook 拒绝语义）。
+        verification_method: |
+          1. PRODUCER 可达：完成事件经 REST report_task_completed（或 AF 桥）携带 self_test → 经 complete_task →
+             process_completed_event → report_worker_completion evidence 内**真实出现** self_test（端到端 producer 链）。
+          2. fresh：evidence.self_test.attempt_id == engine.get_task(task_id).attempt_id → 守卫放行（无 violation）。
+          3. stale/复用：self_test.attempt_id != 当次 attempt → WARN emit KIND_MONITOR_VIOLATION(INV-7)；
+             BLOCK 抛 TransitionRejected（非 PreTransitionVetoed，断言返回码/审计语义非 plan_digest_divergence）。
+          4. 缺 self_test → 同 stale 违例（但因 producer 已建，正常完成默认携带 → WARN 不误杀真实完成）。
+          5. 守卫经 KIND_TASK_REPORTED_COMPLETED 主路径真实触发（断言注册 + 触发，非死代码）。
+          6. self_test 取自 worker 原生上报（不反查 verification_id）。既有 monitor/apply_event/verification_gate 测试同步更新且不回归；全量 pytest 不回归。
+    goal_behavior: |
+      A. PRODUCER：TaskCompletedRequest（REST）+ AF 桥 + verification_gate 透传，使 worker 当次 attempt 的 self-test
+         （outcome + attempt_id，原生上报非反查）经真实完成主路径进入 completion evidence。
+      B. GUARD：新增 monitor-style create_fresh_self_test_hook（hook(kind,data,engine)），KIND_TASK_REPORTED_COMPLETED
+         校验 evidence.self_test 存在且 attempt_id == 当次 attempt（fresh），否则违例。
+      C. MonitorConfig.fresh_self_test 三态（OBSERVE/WARN/BLOCK），默认 WARN emit KIND_MONITOR_VIOLATION；
+         BLOCK 抛 **TransitionRejected**（非 PreTransitionVetoed）。
+      D. 守卫接入 orchestrator monitor hook 注册路径，经真实完成主路径触发（reachable，非休眠；producer 已建故 WARN 不误杀）。
+      E. 同步既有 MonitorConfig / apply_event / verification_gate 契约测试（F6）。
+    acceptance_criteria: |
+      1. PRODUCER：完成事件携带 self_test → 端到端 producer 链使 report_worker_completion evidence 真实含 self_test（可达，非休眠）。
+      2. fresh（self_test.attempt_id == 当次 attempt）→ 守卫放行，无 violation。
+      3. stale/复用（attempt_id 不匹配）→ WARN emit KIND_MONITOR_VIOLATION(INV-7)；BLOCK 抛 TransitionRejected。
+      4. 缺 self_test → 同 stale 违例；正常完成默认携带 self_test → WARN 不误杀真实完成。
+      5. 守卫在 KIND_TASK_REPORTED_COMPLETED 主路径被真实调用（断言注册 + 触发，非死代码）。
+      6. self_test 来源为 worker 原生上报（不反查 verification_id）。
+      7. 既有 test_workflow_monitor / test_workflow_orchestrator_apply_event / verification_gate 测试同步更新且不回归；全量 pytest 不回归。
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/verification_gate.py
+      - src/cccc/daemon/foreman/workflow_monitor.py
+      - src/cccc/daemon/foreman/af_gateway_bridge.py
+      - src/cccc/ports/web/routes/workflow.py
+      - tests/ralph/test_bclass_bpa3_inv7.py
+    awareness_paths:
+      - src/cccc/kernel/workflow_state_engine.py
+      - src/cccc/kernel/workflow_state_types.py
+      - src/cccc/daemon/ops/workflow_task_ops.py
+      - tests/test_workflow_monitor.py
+      - tests/test_workflow_orchestrator_apply_event.py
+      - tests/ralph/test_bclass_bpa4_liveness.py
+      - tests/ralph/test_bclass_regression_spine.py
+    verification:
+      level: integration
+      command: "python -m pytest tests/ralph/test_bclass_bpa3_inv7.py -v"
+      checks:
+        - name: bpa3-inv7-fresh-self-test
+          required: true
+          command: "python -m pytest tests/ralph/test_bclass_bpa3_inv7.py -v"
+
+  # ============================================================
+  # T3 — MSE-NS 命名空间统一：扩 TaskRef.type 枚举 + 上游定型 + 可达 selector 路由
+  # ============================================================
+  - id: T3
+    title: "MSE-NS：扩 TaskRef.type/TaskSpec.type 枚举纳入 security_review，上游按既有 title/goal 信号定型，使统一词表经生产主路径可达（非休眠），selector 经既有 strengths 子串匹配端到端路由"
+    addresses:
+      - MSE-NS
+    aegis:
+      intent: fix
+      compat_boundary: "TaskRef.type/TaskSpec.type 由 Literal['frontend','backend','general'] **扩充**（向后兼容：三个旧值仍合法、默认仍 general）纳入 security_review。new-agent selector（select_model_for_task/match_model_for_task）零改动——registry 已含 security_review strength，子串匹配天然路由。采纳 step-3 F4：peer-reuse 路径 _find_group_peer_agent 增 task.type==security_review 感知（review 不胜任的 peer 降权/跳过），使两条主路径都收敛到 review-capable。上游定型仅在 type 为默认 general 且有强 security 信号时改写，不影响显式 typed 任务"
+      baseline_refs:
+        - "tests/test_ralph_ipc.py"
+        - "tests/test_model_selection_main_path.py"
+      patch_shape_triage:
+        kind: behavior-add
+        notes: "契约枚举扩充 + 上游定型 producer，使既有 selector 词表可达（闭合 DG-25 休眠词表）"
+      repair_track:
+        root_cause: |
+          DG-25/MSE-NS：model registry strengths 已含 'security_review'（claude/claude-sonnet 声明），select_model_for_task
+          经 match_model_for_task 子串匹配本可路由，但生产 selector 调用点（agent_pool.py:702 / af_gateway_bridge.py:464）
+          拿到的 task.type 仅 Literal['frontend','backend','general']（ralph_ipc.py:110 / models.py:249），**根本产不出
+          security_review** → 安全审查任务被当 general 路由，统一词表是休眠词表。且无上游逻辑把已有信号
+          （coverage.py:1884 _is_security_review_task 的 title/goal token；role/verification_mode）映射到 TaskSpec.type。
+          step-3 Codex F4（major）进一步证实：即便上游产出 security_review，**路由也未全闭合**——
+          AgentPoolManager.create_or_reuse_agent 先走 peer 复用，_find_group_peer_agent(agent_pool.py:545) 只按
+          claimed_paths domain 推断、**完全不看 task.type**；有现成 codex peer 时 security_review 任务仍绕过 selector
+          （与 DG-13 group-peer 旁路同源）。仅新建 agent 才进 resolve_model_for_task→select_model_for_task。
+        canonical_owner: "src/cccc/contracts/v1/ralph_ipc.py::TaskRef.type + src/cccc/ralph/models.py::TaskSpec.type/to_task_ref + src/cccc/ralph/task_typing.py（新 producer）+ src/cccc/daemon/foreman/agent_pool.py::_find_group_peer_agent（peer-reuse 路由感知）"
+        minimal_change: |
+          (a) ralph_ipc.py:110 TaskRef.type Literal 扩充加 'security_review'（保留 frontend/backend/general，默认 general）。
+          (b) models.py:249 TaskSpec.type Literal 同步扩充。
+          (c) 新增 src/cccc/ralph/task_typing.py：`infer_task_type(title, goal_behavior, explicit_type)`——
+              当 explicit_type 为默认 'general' 且 title/goal 命中 security-review token（与 coverage.py 既有 token 集一致：
+              'security review'/'security-review'/'安全审查'/'independent security review'）→ 返回 'security_review'，
+              否则原样返回 explicit_type。token 常量集中此模块（单一来源，避免 DG-29 tautology / 两处漂移）。
+          (d) models.py TaskSpec.to_task_ref（:330）调用 infer_task_type，使 TaskRef.type 在 IPC 投影时定型
+              （上游 producer：plan 里 title 含安全审查的任务 → security_review）。
+          (e) new-agent selector 零改动：security_review task.type → select_model_for_task → match_model_for_task 在
+              model.strengths 子串命中 'security_review'（claude 声明）→ 路由到 claude（符合 claude=审查 的模型定位）。
+          (f) 采纳 F4：peer-reuse 路由感知——_find_group_peer_agent(agent_pool.py:545) 当 task.type=='security_review'
+              时对 review 不胜任的 peer（如纯 codex peer / runtime 不匹配 review）降权或跳过，使「复用既有 peer」也
+              收敛到 review-capable（claude）peer；无合适 review peer → 不复用（回落 new-agent selector 选 claude）。
+              不改既有非 security_review 任务的 peer 评分。
+        verification_method: |
+          1. 契约：TaskRef(type='security_review') / TaskSpec(type='security_review') 通过 pydantic 校验（枚举已扩）；
+             旧值 frontend/backend/general 仍合法（向后兼容）。
+          2. 上游定型可达：infer_task_type('independent security review', ..., 'general')=='security_review'；
+             无信号的 'general' 任务保持 'general'；显式 'backend' 不被改写。
+          3. 端到端路由 new-agent（主路径可达，闭合休眠词表）：title 含安全审查的 TaskSpec → to_task_ref().type==
+             'security_review' → select_model_for_task('security_review', registry) 返回 claude 系 model_key。
+          4. 端到端路由 peer-reuse（采纳 F4）：存在纯 codex peer 时，security_review 任务**不**复用该 codex peer
+             （降权/跳过）；存在 claude review peer 时优先复用；非 security_review 任务 peer 评分不变。
+          5. 既有 test_ralph_ipc / 选型主路径 / agent_pool peer 测试不回归；全量 pytest 不回归。
+    goal_behavior: |
+      A. TaskRef.type / TaskSpec.type Literal 扩充纳入 'security_review'（向后兼容，默认仍 general）。
+      B. 新增 ralph/task_typing.py infer_task_type：default-general + security token → 'security_review'（token 单一来源）。
+      C. TaskSpec.to_task_ref 经 infer_task_type 定型，使统一词表由上游生产可达（非休眠）。
+      D. new-agent selector 零改动经既有 strengths 子串匹配把 security_review 端到端路由到 claude 系 model。
+      E. 采纳 F4：peer-reuse 路径 _find_group_peer_agent 对 security_review 任务避开 review 不胜任 peer，
+         使复用路径也收敛到 review-capable（routing 全闭合，非仅 new-agent）。
+    acceptance_criteria: |
+      1. TaskRef/TaskSpec 接受 type='security_review'，旧三值仍合法（向后兼容）。
+      2. infer_task_type：'general' + 安全审查 title/goal → 'security_review'；无信号 general 不变；显式 backend 不被改写。
+      3. 端到端 new-agent：安全审查 TaskSpec → to_task_ref().type=='security_review' → select_model_for_task 返回 claude 系 key（词表可达，非休眠）。
+      4. 端到端 peer-reuse（F4）：纯 codex peer 存在时 security_review 任务不复用之（降权/跳过）；claude review peer 优先；非 security_review peer 评分不变。
+      5. 既有 IPC/选型主路径/agent_pool peer 测试不回归；全量 pytest 不回归。
+    claimed_paths:
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - src/cccc/ralph/models.py
+      - src/cccc/ralph/task_typing.py
+      - src/cccc/daemon/foreman/agent_pool.py
+      - tests/ralph/test_bclass_msens_task_type.py
+    awareness_paths:
+      - src/cccc/daemon/ops/agent_ops.py
+      - src/cccc/daemon/ops/model_selection.py
+      - src/cccc/ralph/validation_rules/coverage.py
+    verification:
+      level: integration
+      command: "python -m pytest tests/ralph/test_bclass_msens_task_type.py -v"
+      checks:
+        - name: msens-task-type-reachable
+          required: true
+          command: "python -m pytest tests/ralph/test_bclass_msens_task_type.py -v"
+
+  # ============================================================
+  # T4 — BPA-4 BP-2 liveness 强制约束（BP-5 诚实收缩 DEFERRED，depends_on T2：共享 orchestrator+monitor）
+  # ============================================================
+  - id: T4
+    title: "BPA-4 / BP-2：liveness 强制约束——stalled 任务超硬截止且无 Foreman 动作 → ledger-backed liveness violation + enforce 强制升级，不再无限挂起；BP-5（动态 DAG 版本治理）经 step-3 F5 诚实收缩为 DEFERRED（运行时无动态拆分路径可治理，不造休眠治理）"
+    addresses:
+      - BPA-4
+    depends_on:
+      - T2
+    aegis:
+      intent: fix
+      compat_boundary: "stall 检测既有 OBSERVE/WARN + 可选 auto_reassign 行为不变；新增一条硬 liveness 截止 + 强制升级（mode-configurable，默认 WARN emit ledger-backed KIND_MONITOR_VIOLATION，可升 enforce）。BP-5 本批不落地任何代码（诚实 DEFERRED，见 F5），不引入非 ledger-backed 的 plan-version stamp 伪基础"
+      baseline_refs:
+        - "tests/test_stall_actor_idle.py"
+        - "tests/test_stall_auto_reassign.py"
+        - "tests/test_workflow_monitor.py"
+      patch_shape_triage:
+        kind: behavior-add
+        notes: "把 liveness 从纯检测升级为 ledger-backed 强制约束（第一道防线 WARN，可 enforce）；采纳 F5 不造 BP-5 休眠治理"
+      repair_track:
+        root_cause: |
+          BP-2：gap 检测（workflow_monitor.check_silent_agent:50 / check_progress_stall:80）仅产 MonitorAlert，
+          orchestrator 默认 OBSERVE/WARN（仅 log + ledger KIND_MONITOR_VIOLATION），auto_reassign 仅在 flag 开时触发；
+          若 Foreman 不响应（_notify_foreman_task_update fire-and-forget，失败仅 log），任务无限挂在 ASSIGNED/RUNNING——
+          **无任何硬 liveness 强制约束**。
+          BP-5（采纳 step-3 F5，诚实收缩）：探查证实**运行时无动态拆分路径**（无 KIND_TASK_SPLIT / 无注册后改写
+          depends_on/claimed_paths 的代码）；task.depends_on/claimed_paths 在 register_task 时冻结。且静态 unknown-dep
+          已由 E_DEP_UNKNOWN(structural.py:106) 覆盖。原草案「per-task plan-version stamp foundation」若只塞 orchestrator
+          shadow（非 ledger-backed / replay 消费）即 dormant bookkeeping，是 BP-5 假闭合 → **本批不做 BP-5 任何代码**，
+          显式 DEFERRED 待动态拆分特性落地后专项（记入 tracker 已知边界）。
+        canonical_owner: "src/cccc/daemon/foreman/workflow_monitor.py::check_liveness_deadline + MonitorConfig.liveness + src/cccc/daemon/foreman/workflow_orchestrator.py::（stall 巡检循环接入 liveness 升级）"
+        minimal_change: |
+          BP-2（唯一落地项，可达 + ledger-backed 强制）：
+          (a) workflow_monitor.py 增 check_liveness_deadline(task, now, deadline_s)：task 处 ASSIGNED/RUNNING 且自
+              assigned/last-progress 起超 deadline_s（> 既有 stall timeout，硬截止）→ 产 liveness MonitorAlert。
+          (b) MonitorConfig 增 `liveness: MonitorMode`，默认 WARN（emit ledger-backed KIND_MONITOR_VIOLATION
+              (alert_type=liveness,task_id)，第一道防线）；enforce 模式（BLOCK）强制升级：标记 forced-reassign /
+              emit 强制 liveness 终态事件，使 workflow 不再无限挂起（区别于既有「仅 fire-and-forget 通知 Foreman」）。
+          (c) 接入 orchestrator 既有 stall 巡检循环（ASSIGNED 巡检 ~1354 / _check_running_task_stall ~1417），
+              使 liveness 检测**经真实巡检主路径触发**（reachable，非死代码）。
+          (d) 采纳 F6：同步 tests/test_workflow_monitor.py 的 MonitorConfig 构造 + default 断言。
+          BP-5：**本批不落地**（F5 诚实 DEFERRED，无运行时动态拆分可治理；不引入 dormant plan-version stamp）。
+        verification_method: |
+          BP-2：任务超硬 liveness 截止且无状态推进 → WARN emit ledger KIND_MONITOR_VIOLATION(liveness)；enforce 模式 →
+          强制升级（任务脱离无限挂起：标 forced-reassign / liveness 终态），断言不再停留原 stuck 态；未超截止 → 无 violation。
+          liveness 检测经 orchestrator 真实 stall 巡检循环触发（断言调用，非死代码）。
+          既有 stall/auto_reassign/MonitorConfig 测试同步更新且不回归；全量 pytest 不回归。
+    goal_behavior: |
+      A. BP-2：新增硬 liveness 截止检测（check_liveness_deadline）+ MonitorConfig.liveness 三态；超截止无推进 → WARN
+         emit ledger-backed liveness violation，enforce 模式强制升级使 workflow 脱离无限挂起。
+      B. liveness 检测接入 orchestrator 既有 stall 巡检主路径（reachable，非死代码）。
+      C. 同步既有 MonitorConfig 契约测试（F6）。
+      D. BP-5 诚实 DEFERRED（F5）：不落地任何 BP-5 代码，避免 dormant 治理；记入 tracker 已知边界。
+    acceptance_criteria: |
+      1. BP-2：任务超硬 liveness 截止且无状态推进 → WARN emit ledger KIND_MONITOR_VIOLATION(liveness)；enforce → 强制升级，
+         断言任务不再无限停留原 stuck 态。未超截止 → 无 violation（正向不误报）。
+      2. liveness 检测经 orchestrator stall 巡检主路径真实触发（断言调用，非死代码）。
+      3. 既有 stall/silent_agent/auto_reassign/MonitorConfig 测试同步更新且不回归。
+      4. BP-5 不在本批落地代码（DEFERRED），无 dormant plan-version stamp。
+      5. 全量 pytest 不回归。
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/daemon/foreman/workflow_monitor.py
+      - tests/ralph/test_bclass_bpa4_liveness.py
+    awareness_paths:
+      - src/cccc/kernel/workflow_state_engine.py
+      - src/cccc/daemon/foreman/verification_gate.py
+      - tests/test_workflow_monitor.py
+      - tests/ralph/test_bclass_regression_spine.py
+    verification:
+      level: integration
+      command: "python -m pytest tests/ralph/test_bclass_bpa4_liveness.py -v"
+      checks:
+        - name: bpa4-liveness-gate
+          required: true
+          command: "python -m pytest tests/ralph/test_bclass_bpa4_liveness.py -v"
+
+  # ============================================================
+  # T5 — 验证脊 + 回归锁（role: verification，covers T1-T4）
+  # ============================================================
+  - id: T5
+    title: "B 类批次验证脊：跨任务行为脊 + 回归锁，复核 FL-74/BPA-3/MSE-NS/BPA-4 主路径行为证据"
+    role: verification
+    addresses:
+      - FL-74
+      - BPA-3
+      - MSE-NS
+      - BPA-4
+    depends_on:
+      - T1
+      - T2
+      - T3
+      - T4
+    aegis:
+      intent: test
+      compat_boundary: "纯测试新增，不改源；固化四项行为变化的主路径正反锁"
+      baseline_refs:
+        - "tests/test_model_selection_main_path.py"
+        - "tests/test_verification_gate.py"
+      patch_shape_triage:
+        kind: test-only
+        notes: "跨任务回归脊，无源改动"
+      repair_track:
+        root_cause: |
+          四项均属高 blast-radius 多层契约/引擎变更；除各 task 自带行为测试外，需一条跨任务脊固化主路径行为
+          不被后续回归侵蚀，并复核「reachable 非休眠」「非塞造证据」两条本批贯穿纪律。
+        canonical_owner: "tests/ralph/test_bclass_regression_spine.py（新，verification）"
+        minimal_change: |
+          新增 tests/ralph/test_bclass_regression_spine.py：
+          - FL-74：round-trip 默认 codex 锁 + 真实仓库 W_SEMANTIC_DEFAULT_VALUE_DRIFT 在 agent_ops.py 消失复核。
+          - BPA-3：INV-7 守卫确实注册并经 KIND_TASK_REPORTED_COMPLETED 触发；fresh→放行 / stale→violation 正反锁。
+          - MSE-NS：安全审查 TaskSpec → to_task_ref().type=='security_review' → select_model_for_task 返回 claude 系 key
+            （端到端可达脊，防词表回退休眠）。
+          - BPA-4：liveness 检测经 stall 巡检主路径触发；超截止 violation / 未超不报正反锁。
+        verification_method: "四项各至少一组主路径正反断言；MSE-NS 端到端从 TaskSpec→selector；FL-74 经真实 validate；均走真实数据模型不塞造字段"
+    goal_behavior: |
+      A. 跨任务行为脊固化 FL-74/BPA-3/MSE-NS/BPA-4 的主路径行为正反锁。
+      B. 复核「reachable 非休眠」「证据取自真实来源非塞造」纪律。
+    acceptance_criteria: |
+      1. FL-74：round-trip 默认 codex + 真实仓库 drift 消失复核通过。
+      2. BPA-3：INV-7 守卫注册 + 触发 + fresh/stale 正反锁通过。
+      3. MSE-NS：TaskSpec→to_task_ref→selector 端到端到 claude 系 key 通过。
+      4. BPA-4：liveness 经 stall 巡检触发 + 超截止/未超正反锁通过。
+      5. 全量 pytest 不回归。
+    claimed_paths:
+      - tests/ralph/test_bclass_regression_spine.py
+    awareness_paths:
+      - src/cccc/contracts/v1/agent.py
+      - src/cccc/contracts/v1/ralph_ipc.py
+      - src/cccc/daemon/foreman/workflow_orchestrator.py
+      - src/cccc/ralph/models.py
+    verification:
+      level: integration
+      command: "python -m pytest tests/ralph/test_bclass_regression_spine.py -v"
+      covers:
+        tasks:
+          - T1
+          - T2
+          - T3
+          - T4
+      checks:
+        - name: bclass-regression-spine
+          required: true
+          command: "python -m pytest tests/ralph/test_bclass_regression_spine.py -v"
+        - name: bclass-batch-spine
+          required: true
+          command: "python -m pytest tests/ralph/test_bclass_fl74_runtime_default.py tests/ralph/test_bclass_bpa3_inv7.py tests/ralph/test_bclass_msens_task_type.py tests/ralph/test_bclass_bpa4_liveness.py -v"

@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect workflow evaluation and related tests,DONE,Relevant helpers and existing coverage are understood,rg -n "workflow_evaluation|_extract_forbidden_flow_fields|GAP_CAPABILITY_KEYWORDS" src/cccc tests,2026-06-05,0,Confirmed target symbols exist and found existing unit coverage to mirror
+2,Add v56 flow evaluation integration test,DONE,tests/ralph/test_v56_flow_evaluation_integration.py exists with the requested 5 cases,test -f tests/ralph/test_v56_flow_evaluation_integration.py,2026-06-05,0,Added the requested five integration scenarios in a single Ralph test module
+3,Run target pytest,DONE,Target pytest command passes,python -m pytest tests/ralph/test_v56_flow_evaluation_integration.py -v,2026-06-05,0,5 passed in 0.92s

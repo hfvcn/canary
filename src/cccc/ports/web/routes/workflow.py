@@ -78,9 +78,11 @@ class TaskCompletedRequest(BaseModel):
     agent_id: str
     assignment_id: str = ""
     actor_run_id: str = ""
+    attempt_id: str = ""
     idempotency_key: str = ""
     duration_seconds: int = 0
     changed_files: List[str] = []
+    self_test: Optional[Dict[str, Any]] = None
     workflow_id: Optional[str] = None
 
 
@@ -229,7 +231,22 @@ def create_routers(ctx: RouteContext) -> list[APIRouter]:
         runtime_ctx = await resolve_group_runtime_context(ctx, group_id)
         try:
             workflow_id = str(req.workflow_id or "").strip() or str(_require_task_state(group_id, runtime_ctx["project_root"], req.task_id).workflow_id or "").strip()
-            result = complete_task(group_id, req.task_id, req.agent_id, req.changed_files or [], {}, workflow_id, runtime_ctx["project_root"], None, assignment_id=req.assignment_id, actor_run_id=req.actor_run_id)
+            evidence: Dict[str, Any] = {}
+            if req.self_test is not None:
+                evidence["self_test"] = dict(req.self_test)
+            result = complete_task(
+                group_id,
+                req.task_id,
+                req.agent_id,
+                req.changed_files or [],
+                evidence,
+                workflow_id,
+                runtime_ctx["project_root"],
+                None,
+                assignment_id=req.assignment_id,
+                actor_run_id=req.actor_run_id,
+                attempt_id=req.attempt_id,
+            )
         except Exception as exc:
             result = {"ok": False, "result": {}, "error": {"message": str(exc)}}
         return _format_workflow_op(result, error_code="task_event_error", error_prefix="Failed to process task event", event_type="completed")

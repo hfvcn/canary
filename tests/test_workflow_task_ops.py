@@ -30,6 +30,7 @@ FUNCTION_SIGNATURES = {
         "daemon_request_fn",
         "assignment_id",
         "actor_run_id",
+        "attempt_id",
     ],
     "retry_task": [
         "group_id",

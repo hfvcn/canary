@@ -50,19 +50,16 @@ def cmd_actor_add(args: argparse.Namespace) -> int:
     by = str(args.by or "user").strip()
     submit = str(args.submit or "enter").strip() or "enter"
     runner = str(getattr(args, "runner", "") or "pty").strip() or "pty"
-    runtime = str(getattr(args, "runtime", "") or "codex").strip() or "codex"
+    requested_runtime = str(getattr(args, "runtime", "") or "").strip()
+    runtime = requested_runtime
     command: list[str] = []
     if args.command:
         try:
             command = shlex.split(str(args.command), posix=(os.name != "nt"))
         except Exception:
             command = [str(args.command)]
-    
-    # Auto-set command based on runtime if not provided
-    if not command:
-        from ..kernel.runtime import get_runtime_command_with_flags
-        command = get_runtime_command_with_flags(runtime)
-    if runtime == "custom" and not command:
+
+    if requested_runtime == "custom" and not command:
         _print_json({
             "ok": False,
             "error": {"code": "missing_command", "message": "custom runtime requires a command (PTY runner)"},
@@ -99,7 +96,7 @@ def cmd_actor_add(args: argparse.Namespace) -> int:
                     "title": title,
                     "submit": submit,
                     "runner": runner,
-                    "runtime": runtime,
+                    "runtime": runtime or None,
                     "by": by,
                     "command": command,
                     "env": env,
@@ -112,6 +109,27 @@ def cmd_actor_add(args: argparse.Namespace) -> int:
         if resp.get("ok"):
             _print_json(resp)
             return 0
+
+    selection_event = None
+    if not runtime and by == "user":
+        from ..daemon.actors.actor_add_ops import (
+            append_manual_actor_add_selection_event,
+            resolve_manual_actor_add_selection_for_registry,
+        )
+        from .model_cmds import _resolve_registry_path
+
+        selection_decision = resolve_manual_actor_add_selection_for_registry(_resolve_registry_path(""))
+        runtime = selection_decision.chosen_runtime
+    else:
+        selection_decision = None
+
+    if not runtime:
+        runtime = "codex"
+
+    if not command:
+        from ..kernel.runtime import get_runtime_command_with_flags
+
+        command = get_runtime_command_with_flags(runtime)
 
     try:
         require_actor_permission(group, by=by, action="actor.add")
@@ -134,12 +152,22 @@ def cmd_actor_add(args: argparse.Namespace) -> int:
             runner=runner,  # type: ignore
             runtime=runtime,  # type: ignore
         )
+        if selection_decision is not None:
+            selection_event = append_manual_actor_add_selection_event(
+                group,
+                actor_id=str(actor.get("id") or actor_id).strip() or actor_id,
+                by=by,
+                decision=selection_decision,
+            )
     except Exception as e:
         _print_json({"ok": False, "error": {"code": "actor_add_failed", "message": str(e)}})
         return 2
     ev = append_event(group.ledger_path, kind="actor.add", group_id=group.group_id, scope_key="", by=by, data={"actor": actor})
     start_ev = append_event(group.ledger_path, kind="actor.start", group_id=group.group_id, scope_key="", by=by, data={"actor_id": actor_id, "runner": runner, "runner_effective": None})
-    _print_json({"ok": True, "result": {"actor": actor, "event": ev, "start_event": start_ev, "running": True}})
+    result = {"actor": actor, "event": ev, "start_event": start_ev, "running": True}
+    if selection_event is not None:
+        result["model_selection_event"] = selection_event
+    _print_json({"ok": True, "result": result})
     return 0
 
 def cmd_actor_remove(args: argparse.Namespace) -> int:

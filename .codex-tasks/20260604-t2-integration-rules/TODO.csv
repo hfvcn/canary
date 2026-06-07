@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,核对 T2 相关注册点,DONE,确认三条规则在 __init__.py 与 validator.py 完整注册,rg -n "_check_(integration_claim_evidence|forbidden_flow_field_coverage|status_code_drift)|get_all_rules|__all__|_collect_structural_issues" src/cccc/ralph/validation_rules/__init__.py src/cccc/ralph/validator.py,2026-06-04T00:00:00,0,已完成静态核对
+2,补齐 validate 接口集成测试,DONE,三个测试文件至少覆盖 validate\(\) 触发路径,python -m pytest tests/test_integration_call_evidence.py tests/test_forbidden_flow_field.py tests/test_status_code_drift.py -v,2026-06-04T00:00:00,0,已在三个测试文件补充 validate\(\) 路径断言
+3,运行定向测试并修复失败,DONE,请求中的三项测试全部通过,python -m pytest tests/test_integration_call_evidence.py tests/test_forbidden_flow_field.py tests/test_status_code_drift.py -v,2026-06-04T00:00:00,0,18 passed in 1.06s
+4,运行 ralph 回归并汇总,DONE,tests/ralph/ 全绿,python -m pytest tests/ralph/ -q,2026-06-04T00:00:00,0,763 passed in 11.77s

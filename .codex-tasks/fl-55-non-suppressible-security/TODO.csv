@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read FL-55 spec and existing suppression paths,DONE,"Spec and relevant code/tests understood","rg -n 'FL-55|_NON_SUPPRESSIBLE_WHEN_SECURITY|suppress_codes|suppress_instances' plan.yaml src/cccc/ralph/validation_rules tests/ralph",2026-05-31T16:55:00+08:00,0,
+2,Implement code and docs changes,DONE,"Security set and guide table include both independent verification warning codes","rg -n 'W_CRITICAL_FLOW_WORKER_ONLY_VERIFICATION|W_CRITICAL_FLOW_NO_INDEPENDENT_REVIEW' src/cccc/ralph/validation_rules/security.py docs/foreman-capability-guide.md",2026-05-31T16:58:00+08:00,0,
+3,Add focused regression tests,DONE,"New test file covers security/non-security and both suppression paths","test -f tests/ralph/test_non_suppressible_security.py",2026-05-31T17:01:00+08:00,0,
+4,Run validation,DONE,"Target pytest passes within 60 seconds","python subprocess timeout=60 -> pytest -q tests/ralph/test_non_suppressible_security.py",2026-05-31T17:04:00+08:00,1,"Initial timeout command unavailable on this host; reran with Python subprocess timeout."

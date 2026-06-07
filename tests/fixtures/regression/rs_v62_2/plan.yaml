@@ -1,0 +1,18 @@
+plan_scope:
+  - src/cccc/daemon/foreman/workflow_evaluation_io.py
+tasks:
+  - id: T1
+    title: Recheck observable fallback on workflow_evaluation_io
+    role: integration
+    claimed_paths:
+      - src/cccc/daemon/foreman/workflow_evaluation_io.py
+    goal_behavior: "workflow_evaluation_io fallback remains observable"
+    acceptance_criteria: "Validate does not emit W_SILENT_FALLBACK for workflow_evaluation_io"
+    verification:
+      level: integration
+      command: "python -m pytest tests/ralph/test_observable_fallback.py -q"
+      checks:
+        - name: behavior
+          command: "python -m pytest tests/ralph/test_observable_fallback.py -q"
+      covers:
+        tasks: ["T1"]

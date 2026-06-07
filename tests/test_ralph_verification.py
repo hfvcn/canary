@@ -1432,18 +1432,26 @@ def test_finding_refs_valid() -> None:
             "id": "F-1",
             "mitigation": "Add coverage",
             "enforced_by": ["ralph:rule-1", "monitor:job-1"],
+            "status": "accepted",
+            "status_reason": "covered by verification rule",
         }],
     })
 
     codes = [issue.code for issue in report.warnings + report.hints]
     assert "W_FINDING_REF_INCOMPLETE" not in codes
     assert "W_FINDING_REF_UNKNOWN_ENFORCER" not in codes
+    assert "W_REVIEW_FINDING_NO_ADOPTION" not in codes
 
 
 def test_finding_refs_missing_id() -> None:
     report = _validate_plan({
         "tasks": [_make_validation_task()],
-        "finding_refs": [{"id": "", "mitigation": "Add coverage"}],
+        "finding_refs": [{
+            "id": "",
+            "mitigation": "Add coverage",
+            "status": "accepted",
+            "status_reason": "tracked by reviewer",
+        }],
     })
 
     assert [issue.code for issue in report.warnings] == ["W_FINDING_REF_INCOMPLETE"]
@@ -1453,7 +1461,12 @@ def test_finding_refs_missing_id() -> None:
 def test_finding_refs_missing_mitigation() -> None:
     report = _validate_plan({
         "tasks": [_make_validation_task()],
-        "finding_refs": [{"id": "F-1", "mitigation": ""}],
+        "finding_refs": [{
+            "id": "F-1",
+            "mitigation": "",
+            "status": "accepted",
+            "status_reason": "tracked by reviewer",
+        }],
     })
 
     assert [issue.code for issue in report.warnings] == ["W_FINDING_REF_INCOMPLETE"]
@@ -1467,6 +1480,8 @@ def test_finding_refs_unknown_enforcer() -> None:
             "id": "F-1",
             "mitigation": "Add coverage",
             "enforced_by": ["X_UNKNOWN"],
+            "status": "accepted",
+            "status_reason": "tracking the invalid enforcer separately",
         }],
     })
 
@@ -1481,10 +1496,14 @@ def test_finding_refs_valid_enforcer() -> None:
             "id": "F-1",
             "mitigation": "Add coverage",
             "enforced_by": ["E_CRITICAL_FLOW_UNCOVERED"],
+            "status": "accepted",
+            "status_reason": "covered by critical flow validation",
         }],
     })
 
-    assert [issue.code for issue in report.hints] == []
+    codes = [issue.code for issue in report.warnings + report.hints]
+    assert "W_FINDING_REF_UNKNOWN_ENFORCER" not in codes
+    assert "W_REVIEW_FINDING_NO_ADOPTION" not in codes
 
 
 def test_finding_refs_optional() -> None:

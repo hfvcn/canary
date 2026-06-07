@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm current behavior and T5 scope,DONE,"Target helpers and acceptance criteria are identified","rg -n \"T5|_randomization_verified|_workflow_evaluation_test_stats\" plan.yaml src/cccc/daemon/foreman/workflow_evaluation.py",2026-06-04T00:00:00,0,"Read plan.yaml, workflow_evaluation.py, and existing randomization tests"
+2,Implement test_output-based randomization fallback,DONE,"New helper exists and default behavior remains unchanged","python -m pytest tests/test_workflow_eval_randomization.py -v",2026-06-04T00:00:00,0,"Added output-marker detection and optional test_output passthrough"
+3,Add focused tests and run verification,DONE,"T5 scenarios pass under pytest","python -m pytest tests/test_workflow_eval_randomization.py tests/test_randomization_check.py tests/test_workflow_test_stats_reliability.py -v",2026-06-04T00:00:00,0,"12 tests passed"

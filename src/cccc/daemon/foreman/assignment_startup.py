@@ -11,6 +11,7 @@ from ...contracts.v1.ralph_ipc import TaskRef
 from ...kernel.workflow_state import WorkflowTaskStatus
 from ..ops.agent_ops import get_agent
 from .agent_pool import TaskAssignment
+from .assignment_actor_registration import ActorAddResult
 from .assignment_constants import (
     FORBIDDEN_FLOWS_KEY,
     ORCHESTRATOR_SERVICE_ACTOR,
@@ -19,11 +20,10 @@ from .assignment_constants import (
     TASK_STATUS_PENDING,
     TASK_STATUS_RUNNING,
 )
+from .assignment_leases import AssignmentLeaseAcquireContext, acquire_assignment_lease
 from .workflow import BatchEvaluationResult
 
-
 logger = logging.getLogger("cccc.daemon.foreman.assignment_controller")
-
 
 @dataclass
 class AssignmentStartContext:
@@ -31,13 +31,11 @@ class AssignmentStartContext:
     agent_id: str
     tracked_task: Optional[Dict[str, Any]]
 
-
 @dataclass(frozen=True)
 class AssignmentPromptProjection:
     issues: List[Any]
     recommended_tests: List[str]
     forbidden_flows: List[Any]
-
 
 class AssignmentStartupMixin:
     """Starts assigned agents and delivers task prompts."""
@@ -64,10 +62,13 @@ class AssignmentStartupMixin:
         agent_id = assignment.agent_id
         self._owner._log(f"[orchestrator] Starting agent {agent_id} for task {task.id}")
         self._owner._task_to_agent[task.id] = agent_id
-        model_id = assignment.model_id or "claude-sonnet-4-20250514"
-        model_key = model_id if "-" in model_id else f"claude-{model_id}"
+        model_key = assignment.model_key or assignment.model_id or "claude-sonnet-4-20250514"
         self._owner._task_to_model[task.id] = model_key
-        return AssignmentStartContext(task=task, agent_id=agent_id, tracked_task=self._mark_tracked_assigned(task.id))
+        acquire_assignment_lease(AssignmentLeaseAcquireContext(self._owner, task, agent_id, model_key))
+        tracked_task = self._mark_tracked_assigned(task.id)
+        if tracked_task is not None:
+            tracked_task["model_key"] = model_key
+        return AssignmentStartContext(task=task, agent_id=agent_id, tracked_task=tracked_task)
 
     def _mark_tracked_assigned(self, task_id: str) -> Optional[Dict[str, Any]]:
         for workflow_data in self._owner._active_workflows.values():
@@ -78,14 +79,28 @@ class AssignmentStartupMixin:
         return None
 
     def _start_actor_for_assignment(self, assignment: TaskAssignment) -> bool:
-        started = self._owner._add_actor_via_daemon(assignment)
-        if started and self._check_actor_actually_running(assignment):
+        result = self._owner._add_actor_via_daemon(assignment)
+        self._log_actor_start_error(assignment, result)
+        if result.ok and result.running is True:
             return True
-        if started and self._restart_stalled_actor(assignment):
+        if result.ok and result.running is False and self._restart_stalled_actor(assignment):
+            return True
+        if result.ok and self._check_actor_actually_running(assignment):
+            return True
+        if result.ok and self._restart_stalled_actor(assignment):
             return True
         if not self._owner._start_actor_fn:
-            return started
+            return result.ok
         return self._legacy_start_actor(assignment)
+
+    @staticmethod
+    def _log_actor_start_error(assignment: TaskAssignment, result: ActorAddResult) -> None:
+        if result.start_error:
+            logger.warning(
+                "W_ACTOR_START_ERROR: actor %s start error: %s",
+                assignment.agent_id,
+                result.start_error,
+            )
 
     def _restart_stalled_actor(self, assignment: TaskAssignment) -> bool:
         """Attempt to restart an actor that was added but not running."""

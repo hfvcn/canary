@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm contracts and T16 requirements,DONE,ExecutionBundle and AssignmentPolicy fields confirmed,test -f src/cccc/contracts/v1/execution_bundle.py && test -f src/cccc/contracts/v1/agent_lease.py,2026-05-31,0,
+2,Implement PlanCompiler package,DONE,agentflow package and plan_compiler.py exist,test -f src/cccc/agentflow/plan_compiler.py && test -f src/cccc/agentflow/__init__.py,2026-05-31,0,
+3,Add PlanCompiler tests,DONE,tests/agentflow/test_plan_compiler.py covers requested cases,test -f tests/agentflow/test_plan_compiler.py && test -f tests/agentflow/__init__.py,2026-05-31,0,
+4,Run targeted pytest,DONE,targeted pytest passes,python -m pytest tests/agentflow/test_plan_compiler.py -v,2026-05-31,0,9 passed

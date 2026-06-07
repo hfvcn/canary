@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,确认受影响契约与现有断言,DONE,"已识别 serialization 与 meta.task 兼容点","rg -n \"VerificationSpec\\(|CCCCNodeMeta\\(|meta\\.task\" src tests",2026-06-05T00:00:00,0,"已读取 execution_bundle.py、plan_compiler.py、相关测试"
+2,实现契约字段与 TaskRef adapter,DONE,"ExecutionBundle/PlanCompiler 代码完成并满足新字段需求","python -m pytest tests/agentflow/test_plan_compiler.py -v",2026-06-05T00:00:00,0,"使用 dataclass adapter 保留 asdict 递归序列化"
+3,补充并更新测试,DONE,"PlanCompiler 覆盖字段、task_id、属性访问、序列化断言齐备","python -m pytest tests/agentflow/test_plan_compiler.py -v",2026-06-05T00:00:00,0,"现有 test_plan_compiler.py 已存在，将在其上追加/调整"
+4,运行指定验证命令,DONE,"指定 pytest 命令 exit 0","python -m pytest tests/agentflow/test_plan_compiler.py -v",2026-06-05T00:00:00,0,"额外运行 tests/test_execution_bundle.py -v 也通过"

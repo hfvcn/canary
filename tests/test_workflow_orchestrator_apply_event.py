@@ -27,7 +27,7 @@ def test_orchestrator_completed_event_auto_transitions_assigned_task(
         return VerificationResult(verification_id="ver-assigned-auto", workflow_id=workflow_id, task_id=task_id, overall_outcome="passed", checks=[], summary="ok")
 
     monkeypatch.setattr(orch.ralph, "verify_completion", fake_verify_completion)
-    result = orch.apply_task_event(TaskEvent(event_type="completed", task_id="T1", idempotency_key="idem-assigned-auto", payload={"agent_id": "a1", "workflow_id": workflow_id, "duration_seconds": 0, "changed_files": []}))
+    result = orch.apply_task_event(TaskEvent(event_type="completed", task_id="T1", idempotency_key="idem-assigned-auto", payload={"agent_id": "a1", "workflow_id": workflow_id, "duration_seconds": 0, "changed_files": [], "self_test": {"outcome": "passed", "attempt_id": "", "ran_at": "2026-06-08T00:00:00Z"}}))
 
     assert result["accepted"] is True
     assert result["verification_outcome"] == "passed"
@@ -99,7 +99,7 @@ def test_orchestrator_hook_transition_rejected_returns_accepted_false(
     hook.invariant_id = "completer_mismatch"
     orch.engine.register_pre_transition_hook(hook)
     orch.engine.set_monitor_mode("completer_mismatch", MonitorMode.BLOCK)
-    result = orch.apply_task_event(TaskEvent(event_type="completed", task_id="T1", idempotency_key="idem-hook-reject", payload={"agent_id": "a1", "workflow_id": workflow_id, "duration_seconds": 0, "changed_files": []}))
+    result = orch.apply_task_event(TaskEvent(event_type="completed", task_id="T1", idempotency_key="idem-hook-reject", payload={"agent_id": "a1", "workflow_id": workflow_id, "duration_seconds": 0, "changed_files": [], "self_test": {"outcome": "passed", "attempt_id": "", "ran_at": "2026-06-08T00:00:00Z"}}))
 
     assert result["accepted"] is False
     assert result["code"] == "hook_error:completer_mismatch"

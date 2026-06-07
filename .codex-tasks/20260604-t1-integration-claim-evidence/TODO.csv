@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing rule and tests,DONE,Target insertion points and drift are understood,n/a,2026-06-04T00:00:00,0,Existing branch already had a draft rule
+2,Align coverage rule with requested heuristic,DONE,Rule emits the specified warning evidence,python -m pytest tests/test_integration_call_evidence.py -q,2026-06-04T00:00:00,0,Aligned evidence payloads and test-path heuristic
+3,Run targeted unit verification,DONE,All requested acceptance tests pass,python -m pytest tests/test_integration_call_evidence.py -q,2026-06-04T00:00:00,0,Passed targeted pytest suites

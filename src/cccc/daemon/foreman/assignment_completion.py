@@ -6,7 +6,15 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from ...contracts.v1.ralph_ipc import VerificationResult
+from ..ops.model_ops import (
+    MODEL_REVIEW_SAMPLE_THRESHOLD,
+    load_model_registry,
+    record_task_terminal_trace,
+    request_model_review,
+    should_trigger_review,
+)
 from .assignment_constants import TASK_STATUS_COMPLETED
+from .assignment_leases import release_assignment_lease
 from .workflow_monitor import check_completer_mismatch, check_file_overstepping, check_unauthorized_subagent
 
 
@@ -30,13 +38,17 @@ class AssignmentCompletionMixin:
         self._mark_task_completed(wf_id, task_id, duration_seconds, changed_files)
         self._run_post_hoc_plan_check(task_id, wf_id)
         self._owner.foreman.release_completed_task(task_id, agent_id)
-        self._record_completion_model_usage(task_id, duration_seconds, changed_files)
+        model_key = self._record_completion_model_usage(task_id, duration_seconds, changed_files)
+        self._record_completion_trace(task_id, duration_seconds, verification, workflow_id=wf_id)
+        release_assignment_lease(self._owner, task_id)
+        self._request_completion_model_review(model_key)
         success = self._report_task_completed(task_id, agent_id, duration_seconds, changed_files, verification)
-        self._owner._check_batch_completion(wf_id)
+        batch_completion_status = self._owner._check_batch_completion(wf_id)
         self._owner._resuggest_ready_tasks(wf_id)
         self._notify_task_completed(task_id, agent_id, duration_seconds, changed_files, verification)
         self._run_completion_monitors(wf_id, task_id, agent_id, changed_files)
-        self._owner._check_workflow_completion_after_terminal(task_id)
+        if batch_completion_status != "blocked":
+            self._owner._check_workflow_completion_after_terminal(task_id)
         return success
 
     def _find_workflow_for_task(self, task_id: str) -> Optional[str]:
@@ -72,12 +84,57 @@ class AssignmentCompletionMixin:
         task_id: str,
         duration_seconds: int,
         changed_files: List[str],
-    ) -> None:
+    ) -> Optional[str]:
         model_key = self._owner._task_to_model.get(task_id)
         if not model_key:
-            return
+            return None
         self._owner._record_model_usage(model_key, task_id, duration_seconds, changed_files)
         del self._owner._task_to_model[task_id]
+        return model_key
+
+    def _record_completion_trace(
+        self,
+        task_id: str,
+        duration_seconds: int,
+        verification: Optional[VerificationResult],
+        *,
+        workflow_id: Optional[str],
+    ) -> None:
+        outcome = "overridden" if verification and verification.overall_outcome == "force_passed" else "passed"
+        try:
+            record_task_terminal_trace(
+                self._owner,
+                task_id,
+                outcome=outcome,
+                duration_seconds=duration_seconds,
+                workflow_id=str(workflow_id or ""),
+            )
+        except Exception as exc:
+            logger.warning("Failed to record task trace for %s: %s", task_id, exc, exc_info=True)
+
+    def _request_completion_model_review(self, model_key: Optional[str]) -> None:
+        if not model_key:
+            return
+        try:
+            registry_path = self._owner.project_root / ".cccc" / "models" / "registry.yaml"
+            registry = load_model_registry(registry_path)
+            model = registry.get_model(model_key)
+            if model is None:
+                return
+            sample_count = int(model.foreman_sample_count or 0)
+            review_tag = f"reviewed_at_sample:{sample_count}"
+            if sample_count < MODEL_REVIEW_SAMPLE_THRESHOLD or review_tag in list(model.tags or []):
+                return
+            if not should_trigger_review(model_key, registry_path):
+                return
+            request_model_review(
+                model_key,
+                registry_path,
+                self._owner._group_id,
+                self._owner._send_foreman_message,
+            )
+        except Exception as exc:
+            logger.warning("Failed to request model review for %s: %s", model_key, exc, exc_info=True)
 
     def _report_task_completed(
         self,

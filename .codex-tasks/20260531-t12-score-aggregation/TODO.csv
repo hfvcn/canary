@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect model registry and trace bridge APIs,DONE,Existing APIs and test patterns identified,rg -n "TraceBridge|load_model_registry|foreman_sample_count" src tests,,0,
+2,Implement aggregate_model_scores,DONE,Function updates known registry models from trace counts,python -m pytest tests/test_score_aggregation.py -v,,0,
+3,Add focused score aggregation tests,DONE,Requested six cases are covered,python -m pytest tests/test_score_aggregation.py -v,,0,
+4,Run target verification,DONE,Target pytest passes,python -m pytest tests/test_score_aggregation.py -v,,0,

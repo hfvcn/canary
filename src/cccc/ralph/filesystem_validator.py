@@ -60,6 +60,12 @@ _TRIVIAL_COMMANDS = {"true", ":", "echo", "printf"}
 _SPLITTABLE_SHELL_OPERATORS = ("&&", ";")
 _UNSPLITTABLE_SHELL_OPERATORS = ("2>>", "2>", "||", ">>", "|", ">", "<", "&")
 _ALL_SHELL_OPERATORS = _SPLITTABLE_SHELL_OPERATORS + _UNSPLITTABLE_SHELL_OPERATORS
+_SHELL_PUNCTUATION_CHARS = "();|&<>"
+_SIMPLE_SHELL_LAUNCHERS = frozenset({"bash", "sh"})
+_SIMPLE_SHELL_FLAG_CHARS = frozenset({"c", "i", "l"})
+_COMPLEX_SHELL_START_TOKENS = frozenset({"if", "for", "while", "until", "case"})
+_COMPLEX_SHELL_BLOCK_TOKENS = frozenset({"then", "fi", "elif", "else", "do", "done", "esac"})
+_MIN_SUBSHELL_TOKENS = 3
 _INDIRECT_IMPORT_FOLD_SAMPLE_COUNT = 5
 _INDIRECT_IMPORT_FOLD_THRESHOLD = 10
 _PYTEST_FLAGS_WITH_VALUE = {
@@ -182,6 +188,152 @@ def _has_unsplittable_shell_operator(cmd: str) -> bool:
         operator in _UNSPLITTABLE_SHELL_OPERATORS
         for _, operator in _iter_shell_operators(cmd)
     )
+
+
+def _normalize_unquoted_newlines(command: str) -> str:
+    in_single = False
+    in_double = False
+    escaped = False
+    normalized: List[str] = []
+    for char in command:
+        if escaped:
+            normalized.append(char)
+            escaped = False
+            continue
+        if char == "\\" and not in_single:
+            normalized.append(char)
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            normalized.append(char)
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            normalized.append(char)
+            in_double = not in_double
+            continue
+        if char == "\n" and not in_single and not in_double:
+            normalized.append(" ; ")
+            continue
+        normalized.append(char)
+    return "".join(normalized)
+
+
+def _shell_command_tokens(command: str) -> Optional[List[str]]:
+    lexer = shlex.shlex(
+        _normalize_unquoted_newlines(command),
+        posix=True,
+        punctuation_chars=_SHELL_PUNCTUATION_CHARS,
+    )
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _strip_command_wrappers(tokens: list[str]) -> list[str]:
+    index = 0
+    while index < len(tokens):
+        base = _command_base(tokens[index])
+        if base == "env":
+            index += 1
+            while index < len(tokens):
+                token = tokens[index]
+                if "=" in token and not token.startswith("-"):
+                    index += 1
+                    continue
+                if token in ("-u", "--unset", "-S", "--split-string") and index + 1 < len(tokens):
+                    index += 2
+                    continue
+                if token.startswith("-"):
+                    index += 1
+                    continue
+                break
+            continue
+        if base in {"timeout", "gtimeout"}:
+            index += 1
+            while index < len(tokens) and tokens[index].startswith("-"):
+                if tokens[index] in ("-s", "--signal", "-k", "--kill-after") and index + 1 < len(tokens):
+                    index += 2
+                    continue
+                index += 1
+            if index < len(tokens) and not tokens[index].startswith("-"):
+                index += 1
+            continue
+        if base in {"uv", "poetry", "pipenv"} and index + 1 < len(tokens) and tokens[index + 1] == "run":
+            index += 2
+            continue
+        break
+    return tokens[index:]
+
+
+def _strip_outer_subshell_tokens(tokens: list[str]) -> Optional[list[str]]:
+    if len(tokens) < _MIN_SUBSHELL_TOKENS:
+        return None
+    first_token = tokens[0]
+    last_token = tokens[-1]
+    if not first_token.startswith("(") or not last_token.endswith(")"):
+        return None
+    inner_tokens: List[str] = []
+    leading = first_token[1:]
+    trailing = last_token[:-1]
+    if leading:
+        inner_tokens.append(leading)
+    inner_tokens.extend(tokens[1:-1])
+    if trailing:
+        inner_tokens.append(trailing)
+    return inner_tokens or None
+
+
+def _simple_shell_script_index(tokens: list[str]) -> Optional[int]:
+    if not tokens or _command_base(tokens[0]) not in _SIMPLE_SHELL_LAUNCHERS:
+        return None
+    index = 1
+    has_command_flag = False
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-c":
+            has_command_flag = True
+            index += 1
+            break
+        if not token.startswith("-") or token == "-":
+            return None
+        flag_chars = token[1:]
+        if any(char not in _SIMPLE_SHELL_FLAG_CHARS for char in flag_chars):
+            return None
+        if "c" in flag_chars:
+            has_command_flag = True
+            index += 1
+            break
+        index += 1
+    if not has_command_flag or index >= len(tokens):
+        return None
+    return index
+
+
+def _has_complex_shell_syntax(script: str) -> bool:
+    if "$(" in script or "`" in script or "<<" in script:
+        return True
+    if _has_unsplittable_shell_operator(script):
+        return True
+    tokens = _shell_command_tokens(script)
+    if not tokens:
+        return True
+    if tokens[0] in _COMPLEX_SHELL_START_TOKENS:
+        return True
+    return any(token in _COMPLEX_SHELL_BLOCK_TOKENS for token in tokens)
+
+
+def _unwrap_simple_shell_launcher(tokens: list[str]) -> Optional[list[str]]:
+    script_index = _simple_shell_script_index(tokens)
+    if script_index is None or script_index != len(tokens) - 1:
+        return None
+    script = tokens[script_index]
+    if _has_complex_shell_syntax(script):
+        return None
+    return _shell_command_tokens(script)
 
 
 def _check_test_coverage_gaps(
@@ -652,40 +804,23 @@ def _check_verification_command(
 
 
 def _unwrap_command(tokens: list[str]) -> list[str]:
-    """Strip semantic-preserving wrappers like env/timeout/uv run."""
-    index = 0
-    while index < len(tokens):
-        base = _command_base(tokens[index])
-        if base == "env":
-            index += 1
-            while index < len(tokens):
-                token = tokens[index]
-                if "=" in token and not token.startswith("-"):
-                    index += 1
-                    continue
-                if token in ("-u", "--unset", "-S", "--split-string") and index + 1 < len(tokens):
-                    index += 2
-                    continue
-                if token.startswith("-"):
-                    index += 1
-                    continue
-                break
+    """Strip simple wrappers and launcher shells when the inner command is safe to resolve."""
+    current = list(tokens)
+    while current:
+        stripped = _strip_command_wrappers(current)
+        if stripped != current:
+            current = stripped
             continue
-        if base in {"timeout", "gtimeout"}:
-            index += 1
-            while index < len(tokens) and tokens[index].startswith("-"):
-                if tokens[index] in ("-s", "--signal", "-k", "--kill-after") and index + 1 < len(tokens):
-                    index += 2
-                    continue
-                index += 1
-            if index < len(tokens) and not tokens[index].startswith("-"):
-                index += 1
+        subshell_tokens = _strip_outer_subshell_tokens(current)
+        if subshell_tokens is not None:
+            current = subshell_tokens
             continue
-        if base in {"uv", "poetry", "pipenv"} and index + 1 < len(tokens) and tokens[index + 1] == "run":
-            index += 2
+        shell_tokens = _unwrap_simple_shell_launcher(current)
+        if shell_tokens is not None and shell_tokens != current:
+            current = shell_tokens
             continue
-        break
-    return tokens[index:]
+        return current
+    return current
 
 
 def _is_python_pycompile(tokens: list[str]) -> bool:

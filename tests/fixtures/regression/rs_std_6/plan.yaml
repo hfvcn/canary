@@ -1,0 +1,18 @@
+plan_scope:
+  - app
+tasks:
+  - id: T1
+    title: E2E verification without compile check
+    role: leaf
+    claimed_paths:
+      - app/feature.py
+    goal_behavior: "Add feature module with e2e verification"
+    acceptance_criteria: "Feature passes e2e tests"
+    verification:
+      level: e2e
+      command: "python -m pytest tests/test_feature.py -q"
+      checks:
+        - name: behavior
+          command: "python -m pytest tests/test_feature.py -q"
+      covers:
+        tasks: ["T1"]

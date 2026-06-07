@@ -12,7 +12,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
@@ -129,6 +129,32 @@ class _LedgerTaskRuntime:
     status: str
     claimed_paths: tuple[str, ...]
     workflow_id: str
+    blocking_failure: bool = False
+
+
+def compute_parallelizable_task_ids(tasks: List[TaskSpec]) -> List[str]:
+    """Return a stable greedy subset whose claimed_paths are pairwise disjoint.
+
+    The caller is responsible for passing the candidate set it cares about
+    (for example, ready/frontier tasks after dependency filtering). This helper
+    only reasons about claimed_paths conflicts.
+    """
+    selected_ids: List[str] = []
+    selected_write_sets: List[List[str]] = []
+    for task in tasks:
+        task_write_set = _normalize_write_set(getattr(task, "claimed_paths", []) or [])
+        if _conflicts_with_any(task_write_set, selected_write_sets):
+            continue
+        selected_ids.append(str(getattr(task, "id", "") or ""))
+        selected_write_sets.append(task_write_set)
+    return selected_ids
+
+
+def compute_estimated_parallelism(tasks: List[TaskSpec]) -> int:
+    """Return the greedy claimed_paths-independent width for a candidate set."""
+    if len(tasks) <= 1:
+        return 1
+    return max(1, len(compute_parallelizable_task_ids(tasks)))
 
 
 def _unlock_score(task_id: str, task_map: Dict[str, TaskSpec], state: PlanState) -> int:
@@ -311,6 +337,7 @@ def _apply_registered_event(
         _paths_from_task_data(task_data, task_map[task_id]),
         str(data.get("workflow_id") or "").strip(),
     )
+    _set_ledger_blocking_failure(statuses, task_id, False)
 
 
 def _apply_batch_registered_event(
@@ -387,6 +414,7 @@ def _apply_single_task_event(
         task_map[task_id].claimed_paths,
         str(data.get("workflow_id") or "").strip(),
     )
+    _apply_ledger_failure_marker(statuses, task_id, kind)
 
 
 def _status_for_single_task_event(kind: str) -> str:
@@ -418,11 +446,41 @@ def _set_ledger_status(
     claimed_paths: List[str],
     workflow_id: str,
 ) -> None:
+    previous = statuses.get(task_id)
     statuses[task_id] = _LedgerTaskRuntime(
         status=status,
         claimed_paths=tuple(_normalize_write_set(claimed_paths)),
         workflow_id=workflow_id,
+        blocking_failure=previous.blocking_failure if previous else False,
     )
+
+
+def _apply_ledger_failure_marker(
+    statuses: Dict[str, _LedgerTaskRuntime],
+    task_id: str,
+    kind: str,
+) -> None:
+    if kind in {
+        _KIND_TASK_FAILED,
+        _KIND_VERIFICATION_FAILED,
+        _KIND_VERIFICATION_SKIPPED_BLOCKED,
+        _KIND_TASK_DEFERRED,
+        _KIND_TASK_CANCELLED,
+        _KIND_TASK_BLOCKED,
+    }:
+        _set_ledger_blocking_failure(statuses, task_id, True)
+    elif kind in {_KIND_VERIFICATION_PASSED, _KIND_FOREMAN_OVERRIDE, _KIND_RETRY_REQUESTED}:
+        _set_ledger_blocking_failure(statuses, task_id, False)
+
+
+def _set_ledger_blocking_failure(
+    statuses: Dict[str, _LedgerTaskRuntime],
+    task_id: str,
+    blocking_failure: bool,
+) -> None:
+    state = statuses.get(task_id)
+    if state is not None:
+        statuses[task_id] = replace(state, blocking_failure=blocking_failure)
 
 
 def _event_workflow_matches(data: Dict[str, Any], workflow_id: str) -> bool:
@@ -474,6 +532,10 @@ def _plan_state_from_ledger_statuses(
     failed = sorted(
         task_id for task_id, state in statuses.items()
         if state.status in _LEDGER_FAILED_STATUSES
+        or (
+            state.blocking_failure
+            and state.status not in _LEDGER_DONE_STATUSES
+        )
     )
     running = [
         RunningTask(task_id=task_id, claimed_paths=list(state.claimed_paths))

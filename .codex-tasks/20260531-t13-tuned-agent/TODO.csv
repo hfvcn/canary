@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing contract and agent ops patterns,DONE,Relevant patterns and insertion point identified,rg tuned_agent src tests && sed -n '1,140p' src/cccc/daemon/ops/agent_ops.py,2026-05-31,0,
+2,Implement TunedAgentVersion contract and candidate generation,DONE,Contract file exists and agent_ops exposes generate_tuned_candidate,python -m py_compile src/cccc/contracts/v1/tuned_agent.py src/cccc/daemon/ops/agent_ops.py,2026-05-31,0,
+3,Add focused tuned-agent tests,DONE,tests/test_tuned_agent.py covers requested behaviors,python -m pytest tests/test_tuned_agent.py -v,2026-05-31,0,
+4,Run final verification,DONE,Target pytest passes,python -m pytest tests/test_tuned_agent.py -v,2026-05-31,0,

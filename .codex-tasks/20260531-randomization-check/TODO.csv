@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read T7 specification and current workflow summary logic,DONE,T7 spec and target functions understood,rg -n "T7|_test_stats_reliable|_workflow_evaluation_test_summary_lines" plan.yaml src/cccc/daemon/foreman/workflow_orchestrator.py,2026-05-31,0,
+2,Implement randomization verification in workflow_orchestrator.py,DONE,Randomized checks without capability emit randomization_verified false and make stats unreliable,python -m pytest tests/test_randomization_check.py -v,2026-05-31,0,
+3,Add focused randomization tests,DONE,Four T7 acceptance cases covered,python -m pytest tests/test_randomization_check.py -v,2026-05-31,0,
+4,Run validation,DONE,T7 target test command passes,python -m pytest tests/test_randomization_check.py -v,2026-05-31,0,

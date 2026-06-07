@@ -39,6 +39,7 @@ from .validation_rules.structural import (
     _check_goal_cjk_tokenization_hint,
     _check_goal_mentions_unclaimed_path,
     _check_goal_symbol_in_claimed_paths,
+    _check_workflow_evaluation_placeholder,
 )
 
 # Import all check functions from the validation_rules subpackage (RO-31)
@@ -47,6 +48,7 @@ from .validation_rules import (
     _check_covers_graph,
     _check_field_completeness,
     _check_claimed_path_incomplete,
+    _check_task_paths_outside_plan_scope,
     _check_implicit_serialization,
     _check_shared_file_verification,
     _check_integration_spine,
@@ -55,8 +57,15 @@ from .validation_rules import (
     _check_e2e_compile_check,
     _check_verification_strength,
     _check_verification_no_checks,
+    _check_verification_non_gating,
     _check_verification_shallow_checks,
+    _check_verification_main_path_command,
     _check_integration_task_shallow_verification,
+    _check_integration_claim_evidence,
+    _check_integration_call_evidence,
+    _check_active_path_reachability,
+    _check_observable_fallback,
+    _check_guard_ordering,
     _check_dead_verification_command,
     _check_covers_not_exercised,
     _check_failure_path,
@@ -68,40 +77,63 @@ from .validation_rules import (
     _check_flow_segment_ownership,
     _check_critical_flow_levels,
     _check_critical_flow_worker_only_verification,
+    _check_critical_flow_independent_review,
+    _check_security_reviewer_assignment_issues,
     _check_issue_coverage,
     _check_task_addresses_disjoint,
     _check_mock_tests_completeness,
     _check_forbidden_flows,
+    _check_forbidden_flow_field_coverage,
+    _check_status_code_drift,
+    _check_status_code_implementation_drift,
     _check_finding_refs,
     _check_suppress_flows,
     _check_covers_unknown_flow,
     _check_state_unknown_task_ref,
+    _check_state_task_status_conflict,
+    _check_running_task_claims,
+    _check_af_verification_gate_bypass,
     _check_duplicate_ids,
+    _check_flow_test_created_by_unknown,
+    _check_flow_id_cross_namespace,
     _check_critical_flow_no_entrypoints,
+    _check_critical_declaration_outside_scope,
     _check_suppress_unused,
     _check_plan_scope_unused,
+    _check_claimed_test_not_exercised,
+    _check_full_regression_override_risk,
     _has_issue_codes,
     _check_batch_e2e_command,
-    _check_module_consistency,
+    _check_agentflow_invariants,
+    _check_module_consistency, _check_module_structure, _check_semantic_default_consistency,
+    _check_task_granularity,
+    _check_doc_writer_checker_parity,
+    _check_module_dep_cycle,
     _check_contracts,
     _check_contract_verification_coverage,
+    _check_consume_provider_unresolved,
     _check_contract_dep_alignment,
+    _check_consumer_from_provides,
+    _check_contract_kind_mismatch,
     _check_cross_task_io_contracts,
+    _non_suppressible_codes,
+    check_rule_registration_completeness,
     collect_discipline_issues,
+    _check_auth_boundary_type_safety,
+    _check_rbac_flow_auth_coverage,
+    _check_rbac_write_endpoint_coverage,
+    _check_identity_surface_privilege,
+    _check_reviewer_signoff,
+    _check_signoff_structure,
+    _check_state_machine_concurrency_safety_issues,
+    _check_security_critical_flow_suppressed,
     _check_security_recipes,
 )
 # Re-export internal helpers used by tests (backward compatibility)
 from .validation_rules.coverage import _check_acceptance_coverage, _covered_flow_summary  # noqa: F401
 
-
-# ---------------------------------------------------------------------------
-# Daemon-friendly model scan cache keyed by (path, st_size, st_mtime_ns)
-# ---------------------------------------------------------------------------
-
 _extra_forbid_cache: Dict[Tuple[str, int, int], List[str]] = {}
 _extra_forbid_path_to_key: Dict[str, Tuple[str, int, int]] = {}
-
-
 def _stat_key(path: Path) -> Tuple[str, int, int]:
     """Return a cache key tuple ``(str(path), st_size, st_mtime_ns)``."""
     st = path.stat()
@@ -144,7 +176,6 @@ def clear_extra_forbid_cache() -> None:
     _extra_forbid_path_to_key.clear()
 
 
-# Ordered levels for comparison
 _LEVEL_ORDER: Dict[str, int] = {
     "compile": 0,
     "unit": 1,
@@ -153,7 +184,6 @@ _LEVEL_ORDER: Dict[str, int] = {
     "e2e": 4,
 }
 FATAL_STRUCTURAL_CODES = {"E_DUPLICATE_TASK_ID", "E_DEP_UNKNOWN", "E_DEP_SELF", "E_DEP_CYCLE"}
-# Severity rank for deterministic ordering: error (0) sorts before warning (1) before hint (2)
 _SEVERITY_RANK: Dict[str, int] = {"error": 0, "warning": 1, "hint": 2}
 SCHEMA_TYPE_KEY = "type"
 SCHEMA_FORMAT_KEY = "format"
@@ -167,23 +197,11 @@ _STORE_THEN_USE_PATTERN = "store_then_use"
 _TEMPORAL_BUILTIN_TOKENS = ("logging", "logger", "getLogger", "audit")
 _TEMPORAL_PATH_HINTS = ("audit", "logging", "logger", "log")
 _UNUSED_PROVIDER_HINT_CODE = "W_PROVIDER_UNUSED"
-
-
 def _issue_sort_key(issue: ValidationIssue) -> tuple:
-    """Deterministic four-part sort key for ValidationIssue.
-
-    Key = (severity_rank asc [error first], code asc,
-           tuple(sorted(task_ids)) asc,
-           canonical_evidence_json asc).
-
-    Using sorted(task_ids) prevents flapping when multi-task issues swap order.
-    Using json.dumps(sort_keys=True) prevents flapping from dict iteration order.
-    """
+    # (severity_rank, code, sorted_task_ids, canonical_evidence) — deterministic, no flapping
     severity_rank = _SEVERITY_RANK.get(issue.severity, 9)
     sorted_task_ids = tuple(sorted(issue.task_ids))
-    canonical_evidence = json.dumps(
-        issue.evidence, sort_keys=True, ensure_ascii=False,
-    )
+    canonical_evidence = json.dumps(issue.evidence, sort_keys=True, ensure_ascii=False)
     return (severity_rank, issue.code, sorted_task_ids, canonical_evidence)
 
 
@@ -191,10 +209,10 @@ def _sort_issues(issues: List[ValidationIssue]) -> List[ValidationIssue]:
     """Return a new list of issues sorted by the deterministic sort key."""
     return sorted(issues, key=_issue_sort_key)
 
-
 def _apply_suppression(
     issues: List[ValidationIssue],
     suppress_codes: List[str],
+    non_suppressible_codes: Set[str] | None = None,
 ) -> "tuple[List[ValidationIssue], List[ValidationIssue]]":
     """Split issues into (kept_issues, suppressed_as_hints).
 
@@ -205,6 +223,8 @@ def _apply_suppression(
     kept: List[ValidationIssue] = []
     suppressed: List[ValidationIssue] = []
     suppress_set = set(suppress_codes)
+    if non_suppressible_codes:
+        suppress_set.difference_update(non_suppressible_codes)
     for issue in issues:
         if issue.code in suppress_set:
             suppressed.append(ValidationIssue(
@@ -218,8 +238,11 @@ def _apply_suppression(
             kept.append(issue)
     return kept, suppressed
 
-
-def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
+def _collect_structural_issues(
+    plan: Plan,
+    *,
+    project_root: Path | None = None,
+) -> List[ValidationIssue]:
     """Run all structural checks and return the raw issue list (no suppression)."""
     issues: List[ValidationIssue] = []
 
@@ -229,12 +252,20 @@ def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
     issues.extend(covers_issues)
     issues.extend(_check_field_completeness(plan))
     issues.extend(_check_claimed_path_incomplete(plan))
+    issues.extend(_check_task_paths_outside_plan_scope(plan))
     issues.extend(_check_goal_mentions_unclaimed_path(plan))
     issues.extend(_check_goal_cjk_tokenization_hint(plan))
     issues.extend(_check_verification_strength(plan))
     issues.extend(_check_verification_no_checks(plan))
+    issues.extend(_check_verification_non_gating(plan))
     issues.extend(_check_verification_shallow_checks(plan))
+    issues.extend(_check_verification_main_path_command(plan))
     issues.extend(_check_integration_task_shallow_verification(plan))
+    issues.extend(_check_integration_claim_evidence(plan))
+    issues.extend(_check_integration_call_evidence(plan, project_root=project_root))
+    issues.extend(_check_active_path_reachability(plan, project_root=project_root))
+    issues.extend(_check_observable_fallback(plan, project_root=project_root))
+    issues.extend(_check_guard_ordering(plan, project_root=project_root))
     issues.extend(_check_dead_verification_command(plan))
     issues.extend(_check_covers_not_exercised(plan))
     issues.extend(check_inline_assertions(plan))
@@ -251,36 +282,75 @@ def _collect_structural_issues(plan: Plan) -> List[ValidationIssue]:
     )
     issues.extend(_check_provides_not_consumed(plan))
     issues.extend(_check_contract_verification_coverage(plan))
+    issues.extend(_check_consume_provider_unresolved(plan))
     issues.extend(_check_contract_dep_alignment(plan))
+    issues.extend(_check_consumer_from_provides(plan))
+    issues.extend(_check_contract_kind_mismatch(plan))
     issues.extend(_check_critical_coverage(plan))
     issues.extend(_check_flow_segment_ownership(plan))
     issues.extend(_check_critical_flow_levels(plan))
     issues.extend(_check_critical_flow_worker_only_verification(plan))
+    issues.extend(_check_critical_flow_independent_review(plan))
+    issues.extend(_check_security_reviewer_assignment_issues(plan))
     issues.extend(_check_forbidden_flows(plan))
+    issues.extend(_check_forbidden_flow_field_coverage(plan, project_root=project_root))
+    issues.extend(_check_status_code_drift(plan))
+    issues.extend(
+        _check_status_code_implementation_drift(
+            plan,
+            project_root=project_root,
+        )
+    )
     issues.extend(_check_suppress_flows(plan))
+    issues.extend(_check_security_critical_flow_suppressed(plan))
     issues.extend(_check_finding_refs(plan))
     issues.extend(_check_issue_coverage(plan))
     issues.extend(_check_task_addresses_disjoint(plan))
     issues.extend(_check_mock_tests_completeness(plan))
+    issues.extend(_check_claimed_test_not_exercised(plan))
+    issues.extend(_check_full_regression_override_risk(plan))
     issues.extend(_check_implicit_serialization(plan))
-    issues.extend(_check_shared_file_verification(plan))
+    issues.extend(_check_shared_file_verification(plan)); issues.extend(_check_semantic_default_consistency(plan, project_root=project_root))
+    issues.extend(_check_module_structure(plan, project_root=project_root)); issues.extend(_check_task_granularity(plan, project_root=project_root))
+    issues.extend(_check_doc_writer_checker_parity(plan, project_root=project_root))
     issues.extend(_check_integration_spine(plan))
     issues.extend(_check_role_constraints(plan))
     if not _has_issue_codes(graph_issues, FATAL_STRUCTURAL_CODES):
         issues.extend(_check_early_integration_checkpoint(plan))
     issues.extend(_check_e2e_compile_check(plan))
 
-    # Completeness rules (CMP bundle)
     issues.extend(_check_covers_unknown_flow(plan))
     issues.extend(_check_state_unknown_task_ref(plan))
+    issues.extend(_check_state_task_status_conflict(plan))
+    issues.extend(_check_running_task_claims(plan))
+    issues.extend(_check_af_verification_gate_bypass(plan))
     issues.extend(_check_duplicate_ids(plan))
+    issues.extend(_check_flow_test_created_by_unknown(plan))
+    issues.extend(_check_flow_id_cross_namespace(plan))
     issues.extend(_check_critical_flow_no_entrypoints(plan))
+    issues.extend(_check_critical_declaration_outside_scope(plan))
     issues.extend(_check_plan_scope_unused(plan))
     issues.extend(_check_batch_e2e_command(plan))
+    issues.extend(_check_agentflow_invariants(plan))
     issues.extend(_check_cross_task_io_contracts(plan))
     issues.extend(_check_module_consistency(plan))
+    issues.extend(_check_module_dep_cycle(plan))
     issues.extend(collect_discipline_issues(plan))
+    issues.extend(check_rule_registration_completeness())
+    issues.extend(_check_rbac_flow_auth_coverage(plan))
+    issues.extend(_check_rbac_write_endpoint_coverage(plan))
+    issues.extend(_check_auth_boundary_type_safety(plan))
+    issues.extend(_check_identity_surface_privilege(plan))
+    issues.extend(_check_reviewer_signoff(plan))
+    issues.extend(_check_signoff_structure(plan))
+    issues.extend(_check_state_machine_concurrency_safety_issues(plan))
     issues.extend(_check_security_recipes(plan))
+    issues.extend(
+        _check_workflow_evaluation_placeholder(
+            plan,
+            project_root=project_root,
+        )
+    )
 
     # CMP-5: H_SUPPRESS_UNUSED runs last — needs the full issue code set
     all_issue_codes = {i.code for i in issues}
@@ -363,7 +433,11 @@ def validate(plan: Plan) -> ValidationReport:
     issues.extend(_check_suppress_leases(plan))
 
     # Apply suppression before bucketing
-    kept_issues, suppressed_hints = _apply_suppression(issues, plan.effective_suppress_codes)
+    kept_issues, suppressed_hints = _apply_suppression(
+        issues,
+        plan.effective_suppress_codes,
+        _non_suppressible_codes(plan),
+    )
 
     # W4: classify finding metadata
     for issue in kept_issues:
@@ -391,15 +465,16 @@ def validate_with_project(
 ) -> ValidationReport:
     """Run structural validation, then filesystem checks when the task graph is usable."""
     # Check for fatal structural issues before attempting filesystem validation
-    structural_issues = _collect_structural_issues(plan)
+    structural_issues = _collect_structural_issues(plan, project_root=project_root)
 
     # W8b: suppress-lease checks (always run)
     structural_issues.extend(_check_suppress_leases(plan))
-
     fatal_structural = {i.code for i in structural_issues if i.severity == "error"}
     if fatal_structural & FATAL_STRUCTURAL_CODES:
         kept_issues, suppressed_hints = _apply_suppression(
-            structural_issues, plan.effective_suppress_codes,
+            structural_issues,
+            plan.effective_suppress_codes,
+            _non_suppressible_codes(plan),
         )
         for issue in kept_issues:
             classify_issue_metadata(issue)
@@ -439,7 +514,9 @@ def validate_with_project(
 
     # Apply suppression after combining structural + filesystem issues
     kept_issues, suppressed_hints = _apply_suppression(
-        all_issues, plan.effective_suppress_codes,
+        all_issues,
+        plan.effective_suppress_codes,
+        _non_suppressible_codes(plan),
     )
 
     # W4: classify finding metadata

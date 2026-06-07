@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate CI build workflow,DONE,CI build workflow and trigger scope identified,test -f .github/workflows/ci.yml,2026-06-02T00:00:00+08:00,0,CI Build auto triggers found in .github/workflows/ci.yml
+2,Disable automatic CI build trigger,DONE,CI Build no longer runs on push or pull_request,! rg -n '^(  )?(push|pull_request):' .github/workflows/ci.yml,2026-06-02T00:00:00+08:00,0,Removed automatic CI Build triggers
+3,Validate workflow syntax,DONE,Workflow YAML parses and trigger state is verified,"python -c ""import yaml; yaml.safe_load(open('.github/workflows/ci.yml', encoding='utf-8')); print('ok')""",2026-06-02T00:00:00+08:00,0,YAML parse returned ok

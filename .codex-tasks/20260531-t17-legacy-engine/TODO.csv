@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect T17 contracts and test style,DONE,Relevant source and tests identified,rg plus file reads,2026-05-31,0,
+2,Implement legacy engine,DONE,src/cccc/agentflow/legacy_engine.py exists and matches contract,python -m py_compile src/cccc/agentflow/legacy_engine.py,2026-05-31,0,
+3,Add legacy engine tests,DONE,tests/agentflow/test_legacy_engine.py covers requested cases,python -m pytest tests/agentflow/test_legacy_engine.py -v,2026-05-31,0,
+4,Run requested verification,DONE,Requested pytest command passes,python -m pytest tests/agentflow/test_legacy_engine.py -v,2026-05-31,0,6 passed in 0.83s with 60s subprocess timeout

@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read T3 spec and existing validation structure,DONE,"Relevant plan and current rule/registration patterns are understood","rg -n \"T3|CONTRACT_KIND|_find_matching_providers|get_all_rules\" plan.yaml tests cccc 2>/dev/null",2026-05-31 17:05 CST,0,
+2,Implement and register rule,DONE,"Rule emits only for single-kind provider mismatch and is wired into all rule registries","python3 -m compileall cccc",2026-05-31 17:05 CST,0,"validated with python3 subprocess timeout because timeout command is unavailable"
+3,Add focused tests,DONE,"New tests cover mismatch match no-provider skip and ambiguous provider skip","timeout 60 python3 -m pytest tests/ralph/test_validation_contract_kind.py",2026-05-31 17:05 CST,0,"used python3 subprocess timeout wrapper"
+4,Run final validation,DONE,"Focused validation test command passes","timeout 60 python3 -m pytest tests/ralph/test_validation_contract_kind.py",2026-05-31 17:05 CST,0,"7 focused tests plus 18 adjacent validation tests passed"

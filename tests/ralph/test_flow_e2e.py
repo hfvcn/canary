@@ -14,9 +14,38 @@ from cccc.ralph.flow_steps_e2e import (
     _check_env_prepare,
     _check_improvement_register,
     _check_report_synthesize,
+    _check_workflow_evaluation,
 )
 
 TEST_CODEX_SECRET = "test-secret"
+
+
+def _archive_bundle(
+    *,
+    issue_id: str,
+    original_symptom: str,
+    observed_behavior: str,
+    archive_decision: str,
+) -> str:
+    fields = {
+        "issue_id": issue_id,
+        "original_symptom": original_symptom,
+        "claimed_fix": f"migrated {issue_id} into the full tracker archive bundle",
+        "changed_paths": "todo/issues-ralph.md, todo/issues-ralph-full.md",
+        "active_entrypoint": "ralph flow step-6 improvement register",
+        "active_path_trace": "short tracker diff -> full tracker archive paragraph",
+        "runtime_conditions": "pytest temp repo with tracker migration inputs",
+        "verification_commands": "python -m pytest tests/ralph -q",
+        "expected_behavior": f"{issue_id} archive paragraph stays complete after tracker migration",
+        "observed_behavior": observed_behavior,
+        "fallback_behavior": f"{issue_id} stays archived in the full tracker until new evidence reopens it",
+        "evidence_locations": f"todo/issues-ralph-full.md#{issue_id.lower()}",
+        "regression_test": "ralph flow e2e archive fixture regression",
+        "archive_decision": archive_decision,
+    }
+    lines = [f"#### {issue_id}"]
+    lines.extend(f"{field}: {value}" for field, value in fields.items())
+    return "\n".join(lines) + "\n"
 
 
 def test_e2e_flow_starts(tmp_path: Path) -> None:
@@ -26,7 +55,7 @@ def test_e2e_flow_starts(tmp_path: Path) -> None:
 
     assert (tmp_path / ".ralph-flow" / "state.json").is_file()
     assert (tmp_path / ".ralph-flow" / "step-0-code-verify").is_dir()
-    assert "Step 0/8" in instruction
+    assert "Step 0/9" in instruction
     assert E2E_STEPS[1].instruction_text == "Step-1 checks workspace and copies docs from cccc_root if needed."
     assert engine.state is not None
     assert engine.state.flow_type == "e2e"
@@ -71,7 +100,7 @@ def test_e2e_codex_review_requires_two_files(tmp_path: Path, monkeypatch) -> Non
     assert state is not None
     review_dir = tmp_path / ".ralph-flow" / "step-4-review"
     evaluation = tmp_path / "WORKFLOW_EVALUATION.md"
-    evaluation.write_text("x" * 501, encoding="utf-8")
+    evaluation.write_text(_workflow_evaluation_sample(), encoding="utf-8")
     _write_codex_output(review_dir / "one.json")
 
     one_file_result = E2E_STEPS[4].check_fn(state)
@@ -85,6 +114,53 @@ def test_e2e_codex_review_requires_two_files(tmp_path: Path, monkeypatch) -> Non
 
     assert two_file_result is not None
     assert two_file_result.passed
+
+
+def test_secret_preflight_fail(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".env").write_text("OTHER_SETTING=1\n", encoding="utf-8")
+    monkeypatch.delenv("CODEX_BRIDGE_SECRET", raising=False)
+    state = FlowState(
+        flow_type="e2e",
+        workspace=str(workspace),
+        started_at="2026-01-01T00:00:00+00:00",
+        current_step=4,
+        params={},
+        steps_completed=[],
+        steps_failed={},
+    )
+
+    result = E2E_STEPS[4].check_fn(state)
+
+    assert result is not None
+    assert not result.passed
+    assert result.details == [
+        {
+            "check": "secret_preflight",
+            "passed": False,
+            "message": "CODEX_BRIDGE_SECRET not configured — export CODEX_BRIDGE_SECRET=xxx or add to .env",
+        }
+    ]
+
+
+def test_step2_requires_non_executor_role() -> None:
+    instruction = E2E_STEPS[2].instruction_text
+
+    assert "非执行者" in instruction
+    assert "reviewer" in instruction
+
+
+def test_workflow_evaluation_missing_sections(tmp_path: Path) -> None:
+    evaluation = tmp_path / "WORKFLOW_EVALUATION.md"
+    evaluation.write_text(_workflow_evaluation_sample(omit_headings=("负面反馈", "Worker 可靠性")), encoding="utf-8")
+
+    details = _check_workflow_evaluation(tmp_path)
+    primary = details[0]
+
+    assert not primary["passed"]
+    assert "负面反馈" in primary["message"]
+    assert "Worker" in primary["message"]
 
 
 def test_check_report_synthesize_requires_review_references(tmp_path: Path) -> None:
@@ -216,7 +292,15 @@ def test_check_improvement_register_detects_tracker_additions(tmp_path: Path) ->
     assert not only_short_result.passed
 
     tracker_full_path.write_text(
-        "> 日期：2026-05-17\n> 已完成（v37 修复）：FL-6\n---\n| FL-6 | archived evidence |\n",
+        "> 日期：2026-05-17\n"
+        "> 已完成（v37 修复）：FL-6\n"
+        "---\n"
+        + _archive_bundle(
+            issue_id="FL-6",
+            original_symptom="legacy short detail",
+            observed_behavior="行为已确认：归档段落已同步，主路径调用确认",
+            archive_decision="archived",
+        ),
         encoding="utf-8",
     )
 
@@ -254,7 +338,15 @@ def test_check_improvement_register_requires_version_marker(tmp_path: Path) -> N
         encoding="utf-8",
     )
     tracker_full_path.write_text(
-        "> 日期：2026-05-17\n> 已完成（修复）：FL-6\n---\n| FL-6 | archived evidence |\n",
+        "> 日期：2026-05-17\n"
+        "> 已完成（修复）：FL-6\n"
+        "---\n"
+        + _archive_bundle(
+            issue_id="FL-6",
+            original_symptom="legacy short detail",
+            observed_behavior="行为已确认：归档段落已同步，主路径调用确认",
+            archive_decision="archived",
+        ),
         encoding="utf-8",
     )
     no_marker_result = _check_improvement_register(state)
@@ -266,7 +358,15 @@ def test_check_improvement_register_requires_version_marker(tmp_path: Path) -> N
         encoding="utf-8",
     )
     tracker_full_path.write_text(
-        "> 日期：2026-05-17\n> 已完成（v37 修复）：FL-6\n---\n| FL-6 | archived evidence |\n",
+        "> 日期：2026-05-17\n"
+        "> 已完成（v37 修复）：FL-6\n"
+        "---\n"
+        + _archive_bundle(
+            issue_id="FL-6",
+            original_symptom="legacy short detail",
+            observed_behavior="行为已确认：归档段落已同步，主路径调用确认",
+            archive_decision="archived",
+        ),
         encoding="utf-8",
     )
     marker_result = _check_improvement_register(state)
@@ -287,7 +387,15 @@ def test_check_improvement_register_requires_version_marker(tmp_path: Path) -> N
         encoding="utf-8",
     )
     tracker_full_path.write_text(
-        "> 日期：2026-05-17\n> 已完成（v36 修复）：FL-6\n---\n| FL-6 | archived evidence |\n",
+        "> 日期：2026-05-17\n"
+        "> 已完成（v36 修复）：FL-6\n"
+        "---\n"
+        + _archive_bundle(
+            issue_id="FL-6",
+            original_symptom="legacy short detail",
+            observed_behavior="行为已确认：归档段落已同步，主路径调用确认",
+            archive_decision="archived",
+        ),
         encoding="utf-8",
     )
     missing_version_result = _check_improvement_register(version_state)
@@ -330,7 +438,13 @@ def test_check_improvement_register_requires_short_deletions_for_completed_items
         encoding="utf-8",
     )
     tracker_full_path.write_text(
-        "> 日期：2026-05-17\n> 已完成（v37 修复）：RL-26\n---\n| RL-26 | archived evidence |\n",
+        "> 日期：2026-05-17\n> 已完成（v37 修复）：RL-26\n---\n"
+        + _archive_bundle(
+            issue_id="RL-26",
+            original_symptom="old short detail",
+            observed_behavior="行为已确认：归档段落已同步，主路径调用确认",
+            archive_decision="archived",
+        ),
         encoding="utf-8",
     )
     state = FlowState(
@@ -411,6 +525,47 @@ def _git(repo: Path, *args: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
+def _workflow_evaluation_sample(*, omit_headings: tuple[str, ...] = ()) -> str:
+    lines = [
+        "# Workflow Evaluation — wf-test",
+        "",
+        "## 评分摘要",
+        "",
+        "- Total tasks: 6",
+        "- Completed: 5",
+        "- Failed: 1",
+        "- Completion rate: 83%",
+        "- test_count_actual: 128",
+        "",
+        "## 任务执行明细",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        "| Workflow ID | wf-test |",
+        "| Total tasks dispatched | 6 |",
+        "| Tasks completed successfully | 5 |",
+        "| Tasks failed | 1 |",
+        "| Overall completion rate | 83% |",
+        "| test_count_actual | 128 |",
+        "",
+        "## 交叉验证",
+        "",
+        "Foreman 汇总了 worker 回执、验证结果和人工观察，确认主流程闭环成立，但仍有一次失败重试和一次显式人工确认。",
+    ]
+    sections = (
+        ("正面反馈", "批次拆分清晰，Foreman 的状态汇总让问题定位很快，验证输出与任务上下文可以互相印证，减少了重复沟通。"),
+        ("负面反馈", "失败重试时上下文继承仍然偏弱，部分 worker 需要额外提醒才能引用前次验证结论，导致一次人工追问。"),
+        ("手工干预记录", "发生 1 次人工干预：在验证失败后由 foreman 明确要求补跑缺失检查，并手动确认 changed files 与任务目标一致。"),
+        ("Worker 可靠性", "大多数 worker 能按要求回传 changed files 与验证证据，但对边界条件的自检还不稳定，可靠性评价为中上。"),
+        ("评分 + 改进建议", "综合评分 7/10。建议强化失败重试提示、补足关键流独立审查角色，并要求评估文档固定输出结构化章节。"),
+    )
+    for heading, body in sections:
+        if heading in omit_headings:
+            continue
+        lines.extend(["", f"## {heading}", "", body])
+    return "\n".join(lines) + "\n"
+
+
 def _run_archive_advisory_case(repo: Path, short_body: str):
     tracker_short = Path("todo/issues-ralph.md")
     tracker_full = Path("todo/issues-ralph-full.md")
@@ -434,7 +589,19 @@ def _run_archive_advisory_case(repo: Path, short_body: str):
         encoding="utf-8",
     )
     tracker_full_path.write_text(
-        f"{baseline_header}{completed_header}---\n| FL-6 | archived evidence |\n| RL-26 | archived evidence |\n",
+        f"{baseline_header}{completed_header}---\n"
+        + _archive_bundle(
+            issue_id="FL-6",
+            original_symptom="old short detail",
+            observed_behavior="行为已确认：归档段落已同步，主路径调用确认",
+            archive_decision="archived",
+        )
+        + _archive_bundle(
+            issue_id="RL-26",
+            original_symptom="old short detail",
+            observed_behavior="行为已确认：归档段落已同步，主路径调用确认",
+            archive_decision="archived",
+        ),
         encoding="utf-8",
     )
     state = FlowState(

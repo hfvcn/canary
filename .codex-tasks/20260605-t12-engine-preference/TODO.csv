@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read affected code and existing tests,DONE,Target code paths and neighboring tests reviewed,"rg -n \"class Plan|ExecutionBundle|ReadyBatchSuggestion|_try_af_execution|_check_silent_legacy_fallback\" src/cccc tests",2026-06-05,0,
+2,Implement engine preference propagation across models and runtime,DONE,Requested fields and propagation logic exist,"rg -n \"execution_engine|engine_preference|cannot execute legacy-preference\" src/cccc",2026-06-05,0,
+3,Add targeted tests for compiler AF engine and invariant warning,DONE,New targeted test file covers requested scenarios,test -f tests/agentflow/test_engine_preference.py,2026-06-05,0,
+4,Run requested pytest,DONE,Targeted pytest passes,"pytest tests/agentflow/test_engine_preference.py -v",2026-06-05,0,4 passed in 1.00s

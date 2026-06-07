@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect assignment startup completion contracts and tests,DONE,Relevant existing APIs and test patterns identified,python -m pytest --collect-only tests/test_assignment_startup.py -q,2026-05-31,0,
+2,Implement acquire and release integration,DONE,Startup stores leases and completion releases them without workflow.py changes,python -m pytest tests/test_assignment_lease_flow.py -q,2026-05-31,0,
+3,Add focused lease flow tests,DONE,New tests cover acquire release and fallback behavior,python -m pytest tests/test_assignment_lease_flow.py -q,2026-05-31,0,
+4,Run requested verification,DONE,Requested pytest command passes,python -m pytest tests/test_assignment_lease_flow.py tests/test_assignment_startup.py -v,2026-05-31,0,

@@ -36,6 +36,7 @@ class ModelCapability(BaseModel):
         foreman_notes: Notes from Foreman about the model's performance
         foreman_sample_count: Number of workflows the rating is based on
         last_rated_at: Timestamp of last Foreman rating
+        cost_tier: Relative model cost tier for scoring
 
     Example:
         ModelCapability(
@@ -64,6 +65,7 @@ class ModelCapability(BaseModel):
     # Visibility control
     enabled: bool = True  # Whether to show in model picker (for hiding unused models)
     is_custom: bool = False  # Whether this is a user-added custom model
+    cost_tier: Optional[str] = None  # "budget" | "standard" | "premium"
 
     # Foreman rating fields (only populated when user requests evaluation)
     foreman_rating: Optional[float] = None  # Rating from 1-5
@@ -84,7 +86,7 @@ class Agent(BaseModel):
         id: Unique identifier for the agent (e.g., "claude-backend-dev")
         name: Human-readable display name
         created_by: Who created this agent (usually "foreman")
-        model_runtime: Agent CLI runtime (e.g., "claude", "gemini")
+        model_runtime: Agent CLI runtime (e.g., "codex", "claude", "gemini")
         model_id: Specific model identifier (e.g., "claude-sonnet-4")
         role_type: Agent's responsibility level (worker/reviewer/specialist)
         capabilities: List of capability IDs this agent has access to
@@ -111,7 +113,7 @@ class Agent(BaseModel):
     id: str
     name: str = ""
     created_by: str = "foreman"
-    model_runtime: str = "claude"  # Agent CLI runtime
+    model_runtime: str = "codex"  # Agent CLI runtime
     model_id: str = ""  # Specific model identifier
     role_type: AgentRoleType = "worker"
     capabilities: List[str] = Field(default_factory=list)

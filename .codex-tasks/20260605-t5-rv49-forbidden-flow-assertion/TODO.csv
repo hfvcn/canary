@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,梳理 forbidden flow 现有测试文件扫描逻辑,DONE,确认 _check_forbidden_flow_field_coverage 与 _untested_forbidden_flow_fields 的接入点,"rg -n \"_check_forbidden_flow_field_coverage|_untested_forbidden_flow_fields|W_FORBIDDEN_FLOW_FIELD\" src/cccc/ralph/validation_rules/coverage.py tests -S",2026-06-05 13:35,0,已确认现有逻辑仅按字段出现与否做二元判断
+2,实现三态字段断言检测,DONE,coverage.py 新增 helper 与 ASSERTION_MISSING 分支,"rg -n \"_has_field_negative_assertion|W_FORBIDDEN_FLOW_FIELD_ASSERTION_MISSING|assertion_missing_fields\" src/cccc/ralph/validation_rules/coverage.py",2026-06-05 13:41,0,已新增负向断言 helper 与 unseen/seen/asserted 三态分发
+3,新增定向测试,DONE,new test file 覆盖 5 个场景,"rg -n \"ASSERTION_MISSING|project_root|403|pytest.raises\" tests/ralph/test_forbidden_flow_assertion.py",2026-06-05 13:43,0,已新增 tests/ralph/test_forbidden_flow_assertion.py
+4,运行目标测试,DONE,目标 pytest 通过,"pytest tests/ralph/test_forbidden_flow_assertion.py -v",2026-06-05 13:46,0,目标测试 5 passed；补跑相关回归 10 passed

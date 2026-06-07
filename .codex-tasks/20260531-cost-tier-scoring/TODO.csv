@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing contract registry scoring and tests,DONE,Relevant code paths and test patterns identified,rg/sed inspections,2026-05-31,0,
+2,Implement cost_tier field and registry values,DONE,ModelCapability and enabled registry entries include cost_tier,pytest target after full implementation,2026-05-31,0,
+3,Implement cost-aware scoring,DONE,Simple non-complex tasks score budget/standard bonuses and premium none,pytest target after full implementation,2026-05-31,0,
+4,Add focused cost tier tests,DONE,Tests cover requested six scenarios,python -m pytest tests/test_cost_tier_scoring.py -v,2026-05-31,0,
+5,Run verification and finalize,DONE,Requested pytest command passes,python -m pytest tests/test_cost_tier_scoring.py -v,2026-05-31,1,"Initial validation exposed TaskRef type construction constraint; fixed fixture and reran successfully."

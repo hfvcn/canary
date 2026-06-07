@@ -1,0 +1,65 @@
+schema_version: "1.0"
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - W_PLAN_SCOPE_UNUSED
+  - W_SEMANTIC_DEFAULT_VALUE_DRIFT
+  - W_SILENT_FALLBACK
+  - W_TEST_COVERAGE_GAP
+  - W_UNCLAIMED_TEST_FOR_SOURCE
+tasks:
+  - id: T-M3-PILOT-BAD
+    title: M3 pilot broken case
+    role: leaf
+    claimed_paths:
+      - src/cccc/ralph/module_acceptance.py
+    goal_behavior: |
+      A. Produce a module output.
+      B. Break the downstream module contract and proof path.
+    acceptance_criteria: The bad module fixture should surface module structure warnings.
+    verification:
+      level: unit
+      command: 'python -c "print(''task-pass'')"'
+      checks:
+        - name: pilot-task-check
+          command: 'python -c "print(''task-pass'')"'
+    modules:
+      - id: module-source
+        description: Produce the shared payload for downstream use.
+        purpose: Emit the shared payload used by the sink module.
+        interface:
+          provides:
+            - name: shared-output
+              value: pilot-shared
+        mock_inputs:
+          - name: seed
+            value: pilot-seed
+        expected_outputs:
+          - name: shared-output
+            value: pilot-shared
+        black_box_tests:
+          - command: 'python -c "print(''pilot-shared'')"'
+        integration_contract:
+          upstream: []
+          downstream:
+            - module-sink
+      - id: module-sink
+        description: Consume the shared payload and emit the final result.
+        purpose: Transform the shared payload into the final observable output.
+        interface:
+          consumes:
+            - name: shared-output
+              value: pilot-shared
+          provides:
+            - name: final-output
+              value: pilot-final
+        mock_inputs:
+          - name: shared-output
+            value: pilot-shared
+        expected_outputs:
+          - name: final-output
+            value: pilot-final
+        integration_contract:
+          upstream:
+            - module-missing
+          downstream: []

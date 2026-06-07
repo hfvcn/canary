@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import pytest
 
+from cccc.contracts.v1.ralph_ipc import TaskRef
 from cccc.daemon.foreman.workflow_monitor import (
     MonitorAlert,
     MonitorConfig,
     MonitorMode,
+    WORKER_EXCEEDED_SCOPE_CODE,
+    check_liveness_deadline,
     check_completer_mismatch,
     check_file_overstepping,
     check_path_deviation,
@@ -18,6 +21,7 @@ from cccc.daemon.foreman.workflow_monitor import (
     check_unauthorized_subagent,
     get_default_config,
 )
+from cccc.kernel.workflow_state import TaskState, WorkflowTaskStatus
 
 
 # ---------------------------------------------------------------------------
@@ -26,6 +30,24 @@ from cccc.daemon.foreman.workflow_monitor import (
 
 def _now() -> float:
     return 1_000_000.0  # fixed epoch for deterministic tests
+
+
+def _task_state(
+    *,
+    task_id: str = "t-live",
+    status: WorkflowTaskStatus,
+    assigned_at: float | None = None,
+    started_at: float | None = None,
+    last_heartbeat: float | None = None,
+) -> TaskState:
+    return TaskState(
+        task=TaskRef(id=task_id, title=f"Task {task_id}"),
+        workflow_id="wf-monitor",
+        status=status,
+        assigned_at=assigned_at,
+        started_at=started_at,
+        last_heartbeat=last_heartbeat,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +120,44 @@ class TestCheckSilentAgent:
         assert result is None
 
 
+class TestCheckLivenessDeadline:
+    def test_assigned_task_alerts_only_after_strict_deadline(self):
+        now = _now()
+        task = _task_state(
+            status=WorkflowTaskStatus.ASSIGNED,
+            assigned_at=now - 301,
+        )
+
+        result = check_liveness_deadline(task, now=now, deadline_s=300)
+
+        assert result is not None
+        assert result.alert_type == "liveness"
+        assert result.task_id == "t-live"
+        assert result.evidence["status"] == WorkflowTaskStatus.ASSIGNED.value
+
+    def test_running_task_uses_last_heartbeat_reference(self):
+        now = _now()
+        task = _task_state(
+            status=WorkflowTaskStatus.RUNNING,
+            assigned_at=now - 600,
+            started_at=now - 500,
+            last_heartbeat=now - 100,
+        )
+
+        result = check_liveness_deadline(task, now=now, deadline_s=300)
+
+        assert result is None
+
+    def test_non_active_task_never_alerts(self):
+        now = _now()
+        task = _task_state(
+            status=WorkflowTaskStatus.FAILED,
+            assigned_at=now - 1_000,
+        )
+
+        assert check_liveness_deadline(task, now=now, deadline_s=300) is None
+
+
 # ---------------------------------------------------------------------------
 # TestCheckCompleterMismatch
 # ---------------------------------------------------------------------------
@@ -162,9 +222,9 @@ class TestCheckFileOverstepping:
             claimed_paths=["src/foo"],
         )
         assert result is not None
-        assert result.alert_type == "file_overstepping"
+        assert result.alert_type == WORKER_EXCEEDED_SCOPE_CODE
         assert result.severity == "error"
-        assert "src/other/module.py" in result.evidence["overstepping_files"]
+        assert "src/other/module.py" in result.evidence["exceeded_files"]
 
     def test_partial_overstepping(self):
         # One file within scope, one outside
@@ -174,7 +234,7 @@ class TestCheckFileOverstepping:
             claimed_paths=["src/foo"],
         )
         assert result is not None
-        assert result.evidence["overstepping_files"] == ["src/other/bad.py"]
+        assert result.evidence["exceeded_files"] == ["src/other/bad.py"]
 
     def test_directory_claim_covers_children(self):
         result = check_file_overstepping(
@@ -341,17 +401,23 @@ class TestMonitorConfig:
             unauthorized_subagent=MonitorMode.OBSERVE,
             completer_mismatch=MonitorMode.WARN,
             file_overstepping=MonitorMode.BLOCK,
+            fresh_self_test=MonitorMode.WARN,
+            liveness=MonitorMode.WARN,
         )
         assert config.silent_agent == MonitorMode.WARN
         assert config.path_deviation == MonitorMode.BLOCK
+        assert config.fresh_self_test == MonitorMode.WARN
+        assert config.liveness == MonitorMode.WARN
 
-    def test_get_default_config_returns_all_observe(self):
+    def test_get_default_config_returns_expected_defaults(self):
         config = get_default_config()
         assert config.silent_agent == MonitorMode.OBSERVE
         assert config.path_deviation == MonitorMode.OBSERVE
         assert config.unauthorized_subagent == MonitorMode.OBSERVE
         assert config.completer_mismatch == MonitorMode.OBSERVE
         assert config.file_overstepping == MonitorMode.OBSERVE
+        assert config.fresh_self_test == MonitorMode.WARN
+        assert config.liveness == MonitorMode.WARN
 
 
 class TestMonitorAlertMode:

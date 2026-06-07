@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,确认调用链与现有测试覆盖,DONE,已识别所有需透传 project_root 的函数与调用点,rg -n "_workflow_evaluation_test_stats|_workflow_evaluation_test_summary_lines|_workflow_evaluation_test_metric_rows" src/cccc/daemon/foreman/workflow_evaluation.py src/cccc/daemon/foreman/workflow_orchestrator.py,2026-06-05,0,
+2,实现 pytest-randomly 自动检测与可靠性判定,DONE,插件声明存在但未验证随机化时 reliable=false,python -m pytest tests/test_workflow_evaluation_randomly.py -v,2026-06-05,0,
+3,新增并通过定向测试,DONE,四个场景测试全部通过,python -m pytest tests/test_workflow_evaluation_randomly.py -v,2026-06-05,0,补跑相关现有测试文件也通过

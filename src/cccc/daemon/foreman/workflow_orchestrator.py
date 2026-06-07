@@ -23,9 +23,10 @@ Usage:
 from __future__ import annotations
 
 import hashlib
-import json as _json
+import json
 import logging
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -35,9 +36,11 @@ from ...kernel.actors import find_foreman
 from ...kernel.group import Group, load_group
 from ...kernel.workflow_state import WorkflowEngine, WorkflowTaskStatus
 from ...kernel.workflow_state_types import (
+    KIND_FOREMAN_OVERRIDE,
     KIND_PLAN_DIGEST_DIVERGENCE,
     KIND_PLAN_DIGEST_DIVERGENCE_POST_HOC,
     KIND_TASK_DEFERRED,
+    KIND_TASK_FAILED,
     PreTransitionVetoed,
     TaskState,
     TransitionRejected,
@@ -47,31 +50,54 @@ from ...contracts.v1.ralph_ipc import (
     BatchDecision,
     ReadyBatchSuggestion,
     RestartSuggestion,
+    TaskEvent,
     TaskRef,
     VerificationResult,
 )
+from ...ralph.core import compute_estimated_parallelism
 from ...ralph.agent import build_error_envelope
 from ...ralph import plan_io
 from ...ralph.plan_io import compute_structural_plan_digest
 from .context_store import ContextStore, TaskContext
 from .workflow import ForemanWorkflow, BatchEvaluationResult
 from .progress_report import ProgressReporter, FeishuSender
+from .feishu_adapter_wrapper import FeishuAdapterWrapper
 from .agent_pool import TaskAssignment
-from .assignment_controller import AssignmentController
+from .assignment_controller import ActorAddResult, AssignmentController
 from .workflow_projection import WorkflowProjection
 from .workflow_monitor import (
+    WORKER_EXCEEDED_SCOPE_CODE,
     check_file_overstepping,
+    check_liveness_deadline,
     check_path_deviation,
     check_completer_mismatch,
     check_progress_stall,
     check_silent_agent,
     check_unauthorized_subagent,
+    create_fresh_self_test_hook,
     MonitorAlert,
     MonitorConfig,
     MonitorMode,
     get_default_config,
 )
-
+from . import workflow_evaluation as _workflow_eval
+from . import workflow_evaluation_io as _workflow_eval_io
+from .workflow_evaluation import (
+    _format_task_classification_table,
+    _workflow_evaluation_result_breakdown_detail,
+)
+from .af_gateway_bridge import ActorGatewayBridge
+from .af_dispatch_mixin import (
+    AFDispatchMixin,
+    AF_ENGINE_ENABLED_ENV_VAR,
+    AF_EXECUTION_UNAVAILABLE_EVENT_KIND,
+    AF_FALLBACK_EVENT_KIND,
+    AF_MAX_ATTEMPTS_EXCEEDED_EVENT_KIND,
+    AF_MAX_ATTEMPTS_PER_TASK,
+    AF_RUNTIME_NOT_READY_EVENT_KIND,
+    AF_STRICT_ENV_VAR,
+    LEGACY_EXECUTION_ENGINE,
+)
 
 logger = logging.getLogger("cccc.daemon.foreman.orchestrator")
 
@@ -84,17 +110,42 @@ TASK_STATUS_VERIFICATION_INFRA_ERROR = "verification_infra_error"
 _COMPLETED_STATUSES = {TASK_STATUS_COMPLETED, TASK_STATUS_COMPLETED_BY_OVERRIDE}
 _TERMINAL_STATUSES = {TASK_STATUS_COMPLETED, TASK_STATUS_COMPLETED_BY_OVERRIDE, _WTS.CANCELLED.value, "archived"}
 TASK_STATUS_DEFERRED = _WTS.DEFERRED.value
+BATCH_E2E_FAILED_CODE = "E_BATCH_E2E_FAILED"
+BATCH_E2E_PASSED_EVENT_KIND = "batch.e2e_passed"
+BATCH_E2E_FAILED_EVENT_KIND = "batch.e2e_failed"
+BATCH_E2E_STATUS_NONE = "none"
+BATCH_E2E_STATUS_PASS = "pass"
+BATCH_E2E_STATUS_BLOCKED = "blocked"
 SINGLE_WRITER_REASON = "single_writer_active"
 EXTERNAL_PRESSURE_REASON = "external_workflow_pressure"
 CROSS_WORKFLOW_ACTIVE_WINDOW_SECONDS = 300
 CODEX_STALL_THRESHOLD_SECONDS = 1800
+LIVENESS_DEADLINE_EXTRA_SECONDS = 1
+LIVENESS_ENFORCED_STATUS = "liveness_enforced"
 ORCHESTRATOR_SERVICE_ACTOR = "service:workflow_orchestrator"
 COMPLETER_MISMATCH_BLOCKED_REASON = "completer_mismatch_blocked"
 AUTO_DISPATCH_BATCH_SUFFIX = "-auto"
 MANUAL_ASSIGN_BATCH_PREFIX = "manual-send"
 PYTEST_COLLECTION_COMMAND = ["pytest", "--co", "-q"]
 PYTEST_COLLECTION_TIMEOUT_SECONDS = 60
-TEST_COUNT_COLLECTION_FAILED = "N/A (collection failed)"
+TEST_COUNT_COLLECTION_FAILED = _workflow_eval.TEST_COUNT_COLLECTION_FAILED
+TEST_COUNT_UNRELIABLE_TEXT = _workflow_eval.TEST_COUNT_UNRELIABLE_TEXT
+WORKFLOW_EVALUATION_PLACEHOLDER = _workflow_eval.WORKFLOW_EVALUATION_PLACEHOLDER
+WORKFLOW_EVALUATION_REQUIRED_SECTIONS = _workflow_eval.WORKFLOW_EVALUATION_REQUIRED_SECTIONS
+RANDOMIZED_CHECK_NAME_MARKERS = _workflow_eval.RANDOMIZED_CHECK_NAME_MARKERS
+RANDOMIZATION_CAPABILITY_MARKERS = _workflow_eval.RANDOMIZATION_CAPABILITY_MARKERS
+RESULT_PASSED = _workflow_eval.RESULT_PASSED
+RESULT_OVERRIDDEN = _workflow_eval.RESULT_OVERRIDDEN
+RESULT_ASSUMPTION_BASED = _workflow_eval.RESULT_ASSUMPTION_BASED
+RESULT_INDEPENDENTLY_REVIEWED = _workflow_eval.RESULT_INDEPENDENTLY_REVIEWED
+RESULT_CLASSIFICATIONS = _workflow_eval.RESULT_CLASSIFICATIONS
+INDEPENDENT_REVIEW_MODES = _workflow_eval.INDEPENDENT_REVIEW_MODES
+INDEPENDENT_REVIEW_ROLES = _workflow_eval.INDEPENDENT_REVIEW_ROLES
+INDEPENDENT_REVIEW_TEXT_TOKENS = _workflow_eval.INDEPENDENT_REVIEW_TEXT_TOKENS
+WORKFLOW_EVALUATION_INCOMPLETE_EVENT_KIND = "workflow.evaluation_incomplete"
+WORKFLOW_EVALUATION_NO_FRICTION_TEXT = _workflow_eval.WORKFLOW_EVALUATION_NO_FRICTION_TEXT
+_check_randomization_capability = _workflow_eval._check_randomization_capability
+
 
 from .verification_gate import (  # noqa: E402
     auto_start_assigned_task_for_completion as _vg_auto_start,
@@ -102,10 +153,6 @@ from .verification_gate import (  # noqa: E402
     process_failed_event as _vg_process_failed,
     COMPLETER_MISMATCH_BLOCKED_REASON as _VG_COMPLETER_MISMATCH,
 )
-
-# ---------------------------------------------------------------------------
-# PromptBudget — W3-10 (extracted to prompt_builder.py, re-exported here)
-# ---------------------------------------------------------------------------
 
 from .prompt_builder import (  # noqa: E402
     DEFAULT_PROMPT_TOKEN_BUDGET,
@@ -132,51 +179,7 @@ from .prompt_builder import (  # noqa: E402
     extract_evidence_summary as _pb_extract_evidence_summary,
 )
 
-
-class FeishuAdapterWrapper:
-    """Wrapper to make FeishuAdapter compatible with FeishuSender protocol."""
-
-    def __init__(
-        self,
-        adapter: Any,
-        *,
-        log_fn: Optional[Callable[[str], None]] = None,
-    ):
-        self._adapter = adapter
-        self._log = log_fn or (lambda msg: None)
-
-    def send_card(self, chat_id: str, card: Dict[str, Any]) -> bool:
-        """Send a card message via Feishu adapter."""
-        if not self._adapter:
-            self._log("[feishu] No adapter configured")
-            return False
-
-        try:
-            # Convert card to text if adapter doesn't support cards directly
-            if hasattr(self._adapter, 'send_card'):
-                return self._adapter.send_card(chat_id, card)
-
-            # Fallback: send as interactive message
-            import json
-            card_json = json.dumps(card, ensure_ascii=False)
-
-            # Use send_message with card style
-            if hasattr(self._adapter, '_api'):
-                body = {
-                    "receive_id": chat_id,
-                    "msg_type": "interactive",
-                    "content": card_json,
-                }
-                resp = self._adapter._api("POST", "/im/v1/messages?receive_id_type=chat_id", body)
-                return resp.get("code") == 0
-
-            return False
-        except Exception as e:
-            self._log(f"[feishu] Send card error: {e}")
-            return False
-
-
-class WorkflowOrchestrator:
+class WorkflowOrchestrator(AFDispatchMixin):
     """Main orchestrator connecting Ralph, Foreman, and Progress Reporting."""
 
     def __init__(
@@ -207,6 +210,7 @@ class WorkflowOrchestrator:
         """
         self.project_root = project_root
         self.group_id = group_id
+        self._group_id = group_id
         self._log = log_fn or (lambda msg: logger.info(msg))
 
         # Initialize Foreman workflow
@@ -242,10 +246,16 @@ class WorkflowOrchestrator:
         self._start_actor_fn = start_actor_fn
         self._stop_actor_fn = stop_actor_fn
         self._send_message_fn = send_message_fn
+        self._send_foreman_message = send_message_fn
         self._daemon_request_fn = daemon_request_fn
 
         # Derived workflow metadata cache; engine/ledger remains the state source.
         self._active_workflows: Dict[str, Dict[str, Any]] = {}
+        self._af_active_gateways: Dict[str, ActorGatewayBridge] = {}
+        self._af_gateways_lock = threading.Lock()
+        self._af_dispatch_lock = threading.Lock()
+        self._af_inflight: set[tuple[str, str, str]] = set()
+        self._af_attempt_budget: Dict[tuple[str, str], int] = {}
         self._task_to_agent: Dict[str, str] = {}
         self._task_to_model: Dict[str, str] = {}  # task_id -> model_key
         self._projection = WorkflowProjection(self)
@@ -255,14 +265,10 @@ class WorkflowOrchestrator:
 
         # Register plan digest freshness guard hook
         self.engine.register_pre_transition_hook(self._create_plan_digest_freshness_hook())
-
-    # ------------------------------------------------------------------
-    # Plan digest freshness guard
-    # ------------------------------------------------------------------
+        self.engine.register_pre_transition_hook(create_fresh_self_test_hook())
 
     @staticmethod
     def _compute_file_digest(path: Path) -> str:
-        """Compute sha256 hex digest of a file's contents."""
         try:
             return hashlib.sha256(path.read_bytes()).hexdigest()
         except (OSError, ValueError):
@@ -402,6 +408,8 @@ class WorkflowOrchestrator:
     ) -> Dict[str, Any]:
         workflow = self._active_workflows.get(workflow_id)
         if workflow is not None:
+            workflow.setdefault("batch_e2e_status", BATCH_E2E_STATUS_NONE)
+            workflow.setdefault("batch_e2e_exempted", False)
             if started_at and not workflow.get("started_at"):
                 workflow["started_at"] = started_at
             if auto_process is not None:
@@ -421,6 +429,8 @@ class WorkflowOrchestrator:
             "batches": [],
             "tasks": {},
             "synced_batches": set(),
+            "batch_e2e_status": BATCH_E2E_STATUS_NONE,
+            "batch_e2e_exempted": False,
             "auto_process": bool(auto_process) if auto_process is not None else False,
             "auto_start_agents": bool(auto_start_agents) if auto_start_agents is not None else True,
             "auto_dispatch": bool(auto_dispatch) if auto_dispatch is not None else False,
@@ -558,17 +568,58 @@ class WorkflowOrchestrator:
         suggestion: ReadyBatchSuggestion,
         *,
         auto_start_agents: bool = True,
+        allowed_existing_task_ids: set[str] | None = None,
     ) -> BatchEvaluationResult:
-        """Process a batch suggestion through the full workflow."""
+        """Process a batch suggestion through the full workflow.
+
+        Registration/tracking always goes through the controller (legacy path).
+        If AF engine is enabled, AF handles execution after registration.
+        On AF pre-dispatch failure, legacy execution proceeds as fallback.
+        """
+        workflow_id = getattr(suggestion, "workflow_id", "")
+        gate = self._af_gate_decision(auto_start_agents)
+        run_with_af = self._should_run_af_execution(auto_start_agents)
+        if run_with_af:
+            gate = {"run_with_af": True, "fail_closed": False, "reason": "", "runtime_not_ready": False}
+        report_af_fallback = self._af_fallback_reporter(workflow_id)
+        if not run_with_af and gate["reason"]:
+            if gate["runtime_not_ready"]:
+                self._emit_af_event(
+                    kind=AF_RUNTIME_NOT_READY_EVENT_KIND,
+                    workflow_id=workflow_id,
+                    reason=gate["reason"],
+                )
+            if gate["fail_closed"]:
+                self._emit_af_event(
+                    kind=AF_EXECUTION_UNAVAILABLE_EVENT_KIND,
+                    workflow_id=workflow_id,
+                    reason=gate["reason"],
+                    level=logging.ERROR,
+                )
+            else:
+                report_af_fallback(gate["reason"])
         result = self._assignment_controller.process_batch_suggestion(
             suggestion,
-            auto_start_agents=auto_start_agents,
+            auto_start_agents=auto_start_agents and not run_with_af and not gate["fail_closed"],
+            allowed_existing_task_ids=allowed_existing_task_ids,
         )
         logger.info(
-            "[dispatch] batch processed: %d tasks, parallel=%s",
+            "[dispatch] batch processed: %d tasks, parallel=%s, engine=%s",
             len(suggestion.tasks),
             getattr(result, "parallel_count", "N/A"),
+            self._execution_engine_tag,
         )
+        if run_with_af:
+            fallback_state = {"requested": False}
+
+            def _report_fallback(reason: str) -> None:
+                fallback_state["requested"] = True
+                report_af_fallback(reason)
+
+            af_dispatched = self._try_af_execution(suggestion, on_fallback=_report_fallback)
+            if not af_dispatched and result.approved_tasks and fallback_state["requested"]:
+                self._assignment_controller._warn_on_contract_signature_sources(result)
+                self._start_assigned_agents(result)
         return result
 
     def register_and_suggest(
@@ -624,10 +675,6 @@ class WorkflowOrchestrator:
             auto_start_agents=auto_start_agents,
         )
 
-    # ------------------------------------------------------------------
-    # Cross-workflow pressure
-    # ------------------------------------------------------------------
-
     def _get_active_external_tasks(
         self,
         exclude_workflow_id: str,
@@ -658,7 +705,7 @@ class WorkflowOrchestrator:
         """Load the persisted worker prompt for an assigned agent."""
         return self._assignment_controller.load_worker_prompt(agent_id)
 
-    def _add_actor_via_daemon(self, assignment: TaskAssignment) -> bool:
+    def _add_actor_via_daemon(self, assignment: TaskAssignment) -> ActorAddResult:
         """Register a foreman agent as a real group actor via daemon actor_add."""
         return self._assignment_controller.add_actor_via_daemon(assignment)
 
@@ -829,10 +876,18 @@ class WorkflowOrchestrator:
         workflow_id = str(state.workflow_id or "")
         tracked = self._tracked_task_data(tid)
         self.engine.foreman_override_task(tid, why, evidence)
+        self._record_task_decision_audit(
+            task_id=tid,
+            task=state.task,
+            action="override",
+            reason=why,
+        )
         if tracked is not None:
             tracked["status"] = TASK_STATUS_COMPLETED_BY_OVERRIDE
             tracked["override_reason"] = why
             tracked["override_evidence"] = evidence
+        from ..ops.model_ops import record_task_terminal_trace
+        record_task_terminal_trace(self, tid, outcome="overridden", workflow_id=workflow_id)
         agent_released = self._release_agent_for_task(tid, tracked)
         self._resuggest_ready_tasks(workflow_id)
         self._check_workflow_completion_after_terminal(tid)
@@ -882,6 +937,13 @@ class WorkflowOrchestrator:
             for path in (changed_files or [])
             if str(path or "").strip()
         ]
+        self._record_task_decision_audit(
+            task_id=tid,
+            task=state.task,
+            action="retry-verifier",
+            reason="rerun deferred verification",
+            changed_files=files,
+        )
         verification = self.ralph.verify_completion(
             tid,
             files,
@@ -992,6 +1054,7 @@ class WorkflowOrchestrator:
         if not suggestion or not suggestion.tasks:
             return
 
+        self._populate_model_suggestions(suggestion)
         ready_ids = [t.id for t in suggestion.tasks]
         planned_assignments = self._format_planned_dispatch_assignments(suggestion)
         self._log(
@@ -1048,18 +1111,19 @@ class WorkflowOrchestrator:
                         "suggestion_id": f"{suggestion.suggestion_id}{AUTO_DISPATCH_BATCH_SUFFIX}",
                         "tasks": mapped_tasks,
                         "assignments": mapped,
-                        "estimated_parallelism": len(mapped_tasks),
+                        "estimated_parallelism": compute_estimated_parallelism(mapped_tasks),
                     }
                 ),
                 auto_start_agents=workflow_data.get("auto_start_agents", True),
             )
         if skipped_ids:
+            skipped_tasks = [task for task in suggestion.tasks if task.id in skipped_ids]
             skipped_suggestion = suggestion.model_copy(
                 update={
                     "suggestion_id": f"{suggestion.suggestion_id}_auto_fallback",
-                    "tasks": [task for task in suggestion.tasks if task.id in skipped_ids],
+                    "tasks": skipped_tasks,
                     "assignments": {},
-                    "estimated_parallelism": len(skipped_ids),
+                    "estimated_parallelism": compute_estimated_parallelism(skipped_tasks),
                 }
             )
             self._log(f"[DAG gating] auto_dispatch fallback: dispatching unmapped tasks {skipped_ids}")
@@ -1184,6 +1248,8 @@ class WorkflowOrchestrator:
                 td["error_message"] = error_message
                 failed_task = td
                 break
+        from ..ops.model_ops import record_task_terminal_trace
+        record_task_terminal_trace(self, task_id, outcome="failed")
         self._release_agent_for_task(task_id, failed_task)
 
         success = self.reporter.on_task_failed(
@@ -1268,7 +1334,12 @@ class WorkflowOrchestrator:
 
     ASSIGNED_STALL_THRESHOLD_SECONDS = 600
 
-    def check_stalled_tasks(self, threshold_seconds: int = 300) -> List[str]:
+    def check_stalled_tasks(
+        self,
+        threshold_seconds: int = 300,
+        *,
+        actor_idle_provider: Optional[Callable[[str], Optional[float]]] = None,
+    ) -> List[str]:
         """Return task IDs whose last heartbeat exceeds the threshold.
 
         Checks both RUNNING and ASSIGNED tasks. ASSIGNED tasks use a
@@ -1283,12 +1354,20 @@ class WorkflowOrchestrator:
                 threshold=threshold,
                 now=now,
                 stalled=stalled,
+                actor_idle_provider=actor_idle_provider,
             )
         for task in self.engine.list_tasks(status=WorkflowTaskStatus.ASSIGNED):
             effective = self._effective_stall_threshold(task, threshold)
             assigned_threshold = max(effective, self.ASSIGNED_STALL_THRESHOLD_SECONDS)
             ref_time = getattr(task, "assigned_at", None)
             if ref_time is None:
+                continue
+            if self._handle_liveness_deadline(
+                task=task,
+                stall_threshold=assigned_threshold,
+                stalled=stalled,
+                now=now,
+            ):
                 continue
             if now - ref_time > assigned_threshold:
                 self._handle_stalled_task(
@@ -1302,9 +1381,7 @@ class WorkflowOrchestrator:
 
     @staticmethod
     def _stalled_task_reference_time(task: TaskState) -> Optional[float]:
-        if task.last_heartbeat is not None:
-            return task.last_heartbeat
-        return getattr(task, "assigned_at", None) or getattr(task, "started_at", None)
+        return task.last_heartbeat if task.last_heartbeat is not None else getattr(task, "assigned_at", None) or getattr(task, "started_at", None)
 
     @staticmethod
     def _build_progress_stall_fields(
@@ -1349,6 +1426,46 @@ class WorkflowOrchestrator:
             pass
         return default_threshold
 
+    @staticmethod
+    def _liveness_deadline_seconds(stall_threshold: int) -> int:
+        return max(int(stall_threshold) + LIVENESS_DEADLINE_EXTRA_SECONDS, LIVENESS_DEADLINE_EXTRA_SECONDS)
+
+    def _handle_liveness_deadline(
+        self,
+        *,
+        task: TaskState,
+        stall_threshold: int,
+        stalled: List[str],
+        now: float,
+    ) -> bool:
+        alert = check_liveness_deadline(
+            task,
+            now=now,
+            deadline_s=float(self._liveness_deadline_seconds(stall_threshold)),
+        )
+        if alert is None:
+            return False
+        mode = self._monitor_mode("liveness")
+        alert.mode = mode
+        self._record_monitor_alert(alert)
+        if mode != MonitorMode.BLOCK:
+            return False
+        stalled.append(task.task.id)
+        self._notify_foreman_task_update(
+            task_id=task.task.id,
+            new_status=LIVENESS_ENFORCED_STATUS,
+            summary=f"{alert.message} forced-reassign requested",
+        )
+        self.retry_task(task.task.id)
+        return True
+
+    def _monitor_mode(self, invariant_id: str) -> MonitorMode:
+        config = self.engine.get_monitor_config()
+        if config is None or not hasattr(config, invariant_id):
+            return MonitorMode.OBSERVE
+        mode = getattr(config, invariant_id)
+        return mode if isinstance(mode, MonitorMode) else MonitorMode(str(mode))
+
     def _check_running_task_stall(
         self,
         *,
@@ -1356,17 +1473,33 @@ class WorkflowOrchestrator:
         threshold: int,
         now: float,
         stalled: List[str],
+        actor_idle_provider: Optional[Callable[[str], Optional[float]]] = None,
     ) -> None:
         threshold = self._effective_stall_threshold(task, threshold)
         last_beat = self._stalled_task_reference_time(task)
         if last_beat is None:
             return
-        if now - last_beat > threshold:
+        actor_idle_seconds = self._actor_idle_seconds(task, actor_idle_provider)
+        if actor_idle_seconds is not None and actor_idle_seconds < threshold:
+            return
+        if self._handle_liveness_deadline(
+            task=task,
+            stall_threshold=threshold,
+            stalled=stalled,
+            now=now,
+        ):
+            return
+        reference_time = self._stall_reference_time(
+            last_beat=last_beat,
+            now=now,
+            actor_idle_seconds=actor_idle_seconds,
+        )
+        if now - reference_time > threshold:
             self._handle_stalled_task(
                 task=task,
                 threshold=threshold,
                 now=now,
-                last_beat=last_beat,
+                last_beat=reference_time,
                 stalled=stalled,
             )
             return
@@ -1381,10 +1514,42 @@ class WorkflowOrchestrator:
             task=task,
             threshold=threshold,
             now=now,
-            last_beat=task.last_heartbeat or last_beat,
+            last_beat=task.last_heartbeat or reference_time,
             stalled=stalled,
             alert=alert,
         )
+
+    @staticmethod
+    def _stall_reference_time(
+        *,
+        last_beat: float,
+        now: float,
+        actor_idle_seconds: Optional[float],
+    ) -> float:
+        if actor_idle_seconds is None:
+            return last_beat
+        return max(last_beat, now - actor_idle_seconds)
+
+    @staticmethod
+    def _actor_idle_seconds(
+        task: TaskState,
+        actor_idle_provider: Optional[Callable[[str], Optional[float]]],
+    ) -> Optional[float]:
+        if actor_idle_provider is None:
+            return None
+        actor_id = str(task.agent_id or "").strip()
+        if not actor_id:
+            return None
+        try:
+            idle_seconds = actor_idle_provider(actor_id)
+        except Exception:
+            return None
+        if idle_seconds is None:
+            return None
+        try:
+            return max(float(idle_seconds), 0.0)
+        except (TypeError, ValueError):
+            return None
 
     def _progress_stall_alert(
         self,
@@ -1679,6 +1844,55 @@ class WorkflowOrchestrator:
         except Exception as e:
             self._log(f"[orchestrator] Failed to save task context for {task_id}: {e}")
 
+    def _record_task_decision_audit(
+        self,
+        *,
+        task_id: str,
+        task: TaskRef,
+        action: str,
+        reason: str,
+        changed_files: Optional[List[str]] = None,
+    ) -> None:
+        if self._context_store is None:
+            return
+        existing = self._context_store.load(task_id) or TaskContext()
+        context = TaskContext(
+            goal=existing.goal or str(getattr(task, "goal_behavior", "") or task.title or "").strip(),
+            completed_steps=list(existing.completed_steps),
+            decisions=[
+                *existing.decisions,
+                self._format_task_decision_audit(action=action, task_id=task_id, reason=reason),
+            ],
+            unresolved=list(existing.unresolved),
+            next_steps=list(existing.next_steps),
+            iteration=existing.iteration,
+            last_error=existing.last_error,
+            changed_files=self._decision_changed_files(existing.changed_files, changed_files),
+            updated_at=existing.updated_at,
+        )
+        try:
+            self._context_store.save(task_id, context)
+        except Exception as e:
+            self._log(f"[orchestrator] Failed to record task decision for {task_id}: {e}")
+
+    @staticmethod
+    def _format_task_decision_audit(
+        *,
+        action: str,
+        task_id: str,
+        reason: str,
+    ) -> str:
+        summary = str(reason or "").strip() or "no reason provided"
+        return f"{action}: task={task_id}; reason={summary}"
+
+    @staticmethod
+    def _decision_changed_files(
+        existing_files: List[str],
+        changed_files: Optional[List[str]],
+    ) -> List[str]:
+        source = changed_files if changed_files else existing_files
+        return [str(path).strip() for path in source if str(path).strip()]
+
     def _emit_ralph_internal_error(
         self,
         *,
@@ -1727,21 +1941,26 @@ class WorkflowOrchestrator:
         Internal failures are caught and emitted as ``workflow.ralph_internal_error``
         ledger events with stable stage + internal_error_code + exception_type fields.
         """
+        event_obj = self._coerce_task_event(event) if isinstance(event, dict) else event
         try:
-            return self._apply_task_event_inner(event, override_stale_digest=override_stale_digest, force_complete=force_complete)
+            return self._apply_task_event_inner(
+                event_obj,
+                override_stale_digest=override_stale_digest,
+                force_complete=force_complete,
+            )
         except PreTransitionVetoed as exc:
             return {
                 "accepted": False,
-                "task_id": str(getattr(event, "task_id", "") or ""),
-                "event_type": str(getattr(event, "event_type", "") or ""),
+                "task_id": str(getattr(event_obj, "task_id", "") or ""),
+                "event_type": str(getattr(event_obj, "event_type", "") or ""),
                 "reason": f"plan_digest_divergence: {exc}",
                 "code": exc.code,
             }
         except TransitionRejected as exc:
             return {
                 "accepted": False,
-                "task_id": str(getattr(event, "task_id", "") or ""),
-                "event_type": str(getattr(event, "event_type", "") or ""),
+                "task_id": str(getattr(event_obj, "task_id", "") or ""),
+                "event_type": str(getattr(event_obj, "event_type", "") or ""),
                 "reason": f"{exc.alert_type}: {exc.message}",
                 "code": exc.alert_type,
             }
@@ -1749,12 +1968,14 @@ class WorkflowOrchestrator:
             self._emit_ralph_internal_error(
                 stage="completion",
                 exception=exc,
-                extra={"task_id": str(getattr(event, "task_id", "") or "")},
+                extra={"task_id": str(getattr(event_obj, "task_id", "") or "")},
             )
             raise
 
     def _apply_task_event_inner(self, event, *, override_stale_digest: bool = False, force_complete: bool = False) -> Dict[str, Any]:
         """Core apply_task_event logic (unwrapped)."""
+        if isinstance(event, (dict, TaskEvent)):
+            event = self._coerce_task_event(event)
         payload = event.payload or {}
         task_id = str(getattr(event, "task_id", "") or "").strip()
         event_type = str(getattr(event, "event_type", "") or "").strip()
@@ -1786,7 +2007,7 @@ class WorkflowOrchestrator:
         if event_type == "completed":
             # Inject the idempotency_key into the payload for the gate helper
             payload["idempotency_key"] = str(getattr(event, "idempotency_key", "") or "").strip()
-            return _vg_process_completed(
+            result_data = _vg_process_completed(
                 engine=self.engine,
                 ralph_service=self.ralph,
                 task_id=task_id,
@@ -1802,9 +2023,11 @@ class WorkflowOrchestrator:
                 save_context_fn=self._save_task_context,
                 auto_start_fn=self._auto_start_assigned_task_for_completion,
             )
+            self._bridge_af_terminal_event(event_type, payload)
+            return result_data
 
         if event_type == "failed":
-            return _vg_process_failed(
+            result_data = _vg_process_failed(
                 engine=self.engine,
                 task_id=task_id,
                 state=state,
@@ -1815,6 +2038,8 @@ class WorkflowOrchestrator:
                 on_task_failed_fn=self.on_task_failed,
                 save_context_fn=self._save_task_context,
             )
+            self._bridge_af_terminal_event(event_type, payload)
+            return result_data
 
         result["accepted"] = False
         result["reason"] = "unknown_event_type"
@@ -1858,11 +2083,18 @@ class WorkflowOrchestrator:
         state = self.engine.get_task(tid)
         if state is None:
             raise ValueError(f"task not found: {tid}")
+        decision_reason = self._retry_task_decision_reason(state)
         if state.status == WorkflowTaskStatus.ASSIGNED:
             self.engine.report_worker_started(tid, state.agent_id or "unknown")
-            self.engine.fail_task(tid, "assigned but never started - retry requested")
+            self.engine.fail_task(tid, decision_reason)
         elif state.status == WorkflowTaskStatus.RUNNING:
-            self.engine.fail_task(tid, "stalled - auto-retry requested")
+            self.engine.fail_task(tid, decision_reason)
+        self._record_task_decision_audit(
+            task_id=tid,
+            task=state.task,
+            action="retry-task",
+            reason=decision_reason,
+        )
         self.engine.retry_after_verification(tid)
         self._reset_retry_shadow_task(state.workflow_id, tid)
         assigned_to = self._persist_retry_assignment(state.workflow_id, tid, assign_agent_id)
@@ -1874,6 +2106,14 @@ class WorkflowOrchestrator:
             "workflow_id": state.workflow_id,
             "assigned_to": assigned_to,
         }
+
+    @staticmethod
+    def _retry_task_decision_reason(state: TaskState) -> str:
+        if state.status == WorkflowTaskStatus.ASSIGNED:
+            return "assigned but never started - retry requested"
+        if state.status == WorkflowTaskStatus.RUNNING:
+            return "stalled - auto-retry requested"
+        return "verification retry requested"
 
     def manual_assign_task(self, task_id: str, agent_id: str) -> None:
         tid = str(task_id or "").strip()
@@ -2058,62 +2298,159 @@ class WorkflowOrchestrator:
             return
         self.engine.record_verification_result(task_id, verification)
 
-    def _check_batch_completion(self, workflow_id: Optional[str]) -> None:
+    def _check_batch_completion(self, workflow_id: Optional[str]) -> str:
         """Check if current batch is complete and run batch-level post-checks."""
         state = self.reporter.get_state()
         if not state:
-            return
+            self._set_workflow_batch_e2e_status(workflow_id, BATCH_E2E_STATUS_NONE)
+            return BATCH_E2E_STATUS_NONE
 
         batch_tasks = state.get_current_batch_tasks()
         pending = sum(1 for t in batch_tasks if t.status.value in ("pending", "running"))
 
-        if pending == 0 and batch_tasks:
-            completed = sum(1 for t in batch_tasks if t.status.value == "completed")
-            failed = sum(1 for t in batch_tasks if t.status.value == "failed")
-            self._log(
-                f"[orchestrator] Batch complete: {completed} passed, {failed} failed "
-                f"out of {len(batch_tasks)} tasks"
-            )
-            self.reporter.on_batch_completed()
-            self._run_batch_e2e_if_configured(workflow_id)
+        if pending != 0 or not batch_tasks:
+            self._set_workflow_batch_e2e_status(workflow_id, BATCH_E2E_STATUS_NONE)
+            return BATCH_E2E_STATUS_NONE
 
-    def _run_batch_e2e_if_configured(self, workflow_id: Optional[str]) -> None:
-        """BP-5: Run batch E2E command in background thread (non-blocking)."""
+        completed = sum(1 for t in batch_tasks if t.status.value == "completed")
+        failed = sum(1 for t in batch_tasks if t.status.value == "failed")
+        self._log(
+            f"[orchestrator] Batch complete: {completed} passed, {failed} failed "
+            f"out of {len(batch_tasks)} tasks"
+        )
+        batch_e2e_status = self._run_batch_e2e_if_configured(workflow_id)
+        if batch_e2e_status == BATCH_E2E_STATUS_BLOCKED:
+            self._log(f"[orchestrator] Batch E2E blocked workflow {workflow_id or ''}")
+            return BATCH_E2E_STATUS_BLOCKED
+        self.reporter.on_batch_completed()
+        return batch_e2e_status
+
+    def _load_workflow_plan(self, workflow_id: Optional[str]) -> Any | None:
         if not workflow_id:
-            return
+            return None
         wf_meta = self.engine.get_workflow_meta(workflow_id)
         if not wf_meta or not wf_meta.plan_path:
-            return
+            return None
         try:
-            from ...ralph.plan_io import load_plan
-            plan = load_plan(Path(wf_meta.plan_path))
+            return plan_io.load_plan(Path(wf_meta.plan_path))
         except Exception:
-            return
-        batch_e2e_command = plan.batch_e2e_command
+            return None
+
+    def _set_workflow_batch_e2e_status(
+        self,
+        workflow_id: Optional[str],
+        status: str,
+        *,
+        exempted: bool = False,
+    ) -> None:
+        if workflow_id and workflow_id in self._active_workflows:
+            self._active_workflows[workflow_id]["batch_e2e_status"] = status
+            self._active_workflows[workflow_id]["batch_e2e_exempted"] = exempted
+        state = self.reporter.get_state()
+        if state and state.workflow_id == str(workflow_id or ""):
+            state.batch_e2e_status = status
+            state.batch_e2e_exempted = exempted
+
+    def _append_batch_e2e_event(
+        self,
+        *,
+        kind: str,
+        workflow_id: str,
+        command: str,
+        exit_code: int,
+        stderr: str = "",
+    ) -> None:
+        try:
+            from ...kernel.ledger import append_event
+
+            scope_key = str(self.group.doc.get("active_scope_key") or "").strip()
+            data = {
+                "workflow_id": workflow_id,
+                "command": command,
+                "exit_code": exit_code,
+            }
+            if kind == BATCH_E2E_FAILED_EVENT_KIND:
+                data["code"] = BATCH_E2E_FAILED_CODE
+            if stderr:
+                data["stderr"] = stderr
+            append_event(
+                self.group.ledger_path,
+                kind=kind,
+                group_id=self.group.group_id,
+                scope_key=scope_key,
+                by="orchestrator",
+                data=data,
+            )
+        except Exception:
+            logger.debug("Failed to emit batch E2E event kind=%s", kind, exc_info=True)
+
+    @staticmethod
+    def _has_managed_batch_e2e_exemption(plan: Any) -> bool:
+        for suppress in list(getattr(plan, "suppress_instances", []) or []):
+            if str(getattr(suppress, "code", "") or "").strip() != BATCH_E2E_FAILED_CODE:
+                continue
+            if bool(getattr(suppress, "is_managed", lambda: False)()):
+                return True
+        return False
+
+    def _run_batch_e2e_if_configured(self, workflow_id: Optional[str]) -> str:
+        """BP-5: Run batch E2E command synchronously and gate workflow completion."""
+        plan = self._load_workflow_plan(workflow_id)
+        if plan is None:
+            self._set_workflow_batch_e2e_status(workflow_id, BATCH_E2E_STATUS_NONE)
+            return BATCH_E2E_STATUS_NONE
+        batch_e2e_command = str(getattr(plan, "batch_e2e_command", "") or "").strip()
         if not batch_e2e_command:
-            return
+            self._set_workflow_batch_e2e_status(workflow_id, BATCH_E2E_STATUS_NONE)
+            return BATCH_E2E_STATUS_NONE
         timeout = plan.batch_e2e_timeout or 300
-        import threading
-        def _run() -> None:
-            try:
-                result = self.ralph.verify_batch_e2e(batch_e2e_command, timeout=timeout)
-                if result.get("success"):
-                    self._log(f"[orchestrator] Batch E2E passed for workflow {workflow_id}")
-                else:
-                    self._log(
-                        f"[orchestrator] Batch E2E failed for workflow {workflow_id}: "
-                        f"exit={result.get('exit_code')} stderr={result.get('stderr', '')[:200]}"
-                    )
-            except Exception:
-                logger.debug("Batch E2E check failed", exc_info=True)
-        threading.Thread(target=_run, daemon=True).start()
+        result = self.ralph.verify_batch_e2e(batch_e2e_command, timeout=timeout)
+        exit_code = int(result.get("exit_code", 0) or 0)
+        stderr = str(result.get("stderr", "") or "")
+        if result.get("success"):
+            self._append_batch_e2e_event(
+                kind=BATCH_E2E_PASSED_EVENT_KIND,
+                workflow_id=str(workflow_id or ""),
+                command=batch_e2e_command,
+                exit_code=exit_code,
+                stderr=stderr,
+            )
+            self._set_workflow_batch_e2e_status(workflow_id, BATCH_E2E_STATUS_PASS)
+            self._log(f"[orchestrator] Batch E2E passed for workflow {workflow_id}")
+            return BATCH_E2E_STATUS_PASS
+
+        self._append_batch_e2e_event(
+            kind=BATCH_E2E_FAILED_EVENT_KIND,
+            workflow_id=str(workflow_id or ""),
+            command=batch_e2e_command,
+            exit_code=exit_code,
+            stderr=stderr,
+        )
+        if self._has_managed_batch_e2e_exemption(plan):
+            self._set_workflow_batch_e2e_status(
+                workflow_id,
+                BATCH_E2E_STATUS_PASS,
+                exempted=True,
+            )
+            self._log(
+                f"[orchestrator] Batch E2E failed for workflow {workflow_id} but managed "
+                f"suppress_instance allows advance: exit={exit_code} stderr={stderr[:200]}"
+            )
+            return BATCH_E2E_STATUS_PASS
+
+        self._set_workflow_batch_e2e_status(workflow_id, BATCH_E2E_STATUS_BLOCKED)
+        self._log(
+            f"[orchestrator] Batch E2E failed for workflow {workflow_id}: "
+            f"exit={exit_code} stderr={stderr[:200]}"
+        )
+        return BATCH_E2E_STATUS_BLOCKED
 
     def complete_workflow(
         self,
         workflow_id: str,
         *,
         summary: str = "",
-    ) -> bool:
+    ) -> bool | Dict[str, Any]:
         """Mark workflow as complete."""
         self._log(f"[orchestrator] Completing workflow {workflow_id}")
 
@@ -2123,6 +2460,31 @@ class WorkflowOrchestrator:
         completed_count = sum(1 for t in tasks.values() if t.get("status") in _COMPLETED_STATUSES)
         failed_count = sum(1 for t in tasks.values() if t.get("status") in {"failed", "cancelled", "archived"})
         total = len(tasks)
+
+        # Auto-generate WORKFLOW_EVALUATION.md (UX-13)
+        self._write_workflow_evaluation(
+            workflow_id=workflow_id,
+            completed_count=completed_count,
+            failed_count=failed_count,
+            total=total,
+            summary=summary,
+        )
+        empty_sections = _workflow_eval_io.workflow_evaluation_empty_sections(
+            self.project_root,
+            logger=logger,
+        )
+        if empty_sections:
+            _workflow_eval_io.emit_workflow_evaluation_incomplete(
+                group=self.group,
+                workflow_id=workflow_id,
+                empty_sections=empty_sections,
+                logger=logger,
+                event_kind=WORKFLOW_EVALUATION_INCOMPLETE_EVENT_KIND,
+            )
+            return _workflow_eval_io.workflow_evaluation_pending_result(
+                workflow_id,
+                empty_sections,
+            )
 
         # Emit ledger event (RO-77)
         try:
@@ -2136,13 +2498,12 @@ class WorkflowOrchestrator:
         except Exception:
             logger.debug("Failed to emit workflow terminal event", exc_info=True)
 
-        # Auto-generate WORKFLOW_EVALUATION.md (UX-13)
-        self._write_workflow_evaluation(
-            workflow_id=workflow_id,
-            completed_count=completed_count,
-            failed_count=failed_count,
-            total=total,
-            summary=summary,
+        from ..ops.model_ops import request_model_reviews_for_keys
+        request_model_reviews_for_keys(
+            [str(task.get("model_key") or "") for task in tasks.values()],
+            self.project_root / ".cccc" / "models" / "registry.yaml",
+            self._group_id,
+            self._send_foreman_message,
         )
 
         # Clean up
@@ -2150,6 +2511,22 @@ class WorkflowOrchestrator:
 
         # Report completion
         return self.reporter.on_workflow_completed(summary=summary)
+
+    @staticmethod
+    def _extract_friction_events(ledger_lines: list[str]) -> list[str]:
+        return _workflow_eval_io.extract_friction_events(
+            ledger_lines,
+            scope_warning_code=WORKER_EXCEEDED_SCOPE_CODE,
+        )
+
+    def _workflow_evaluation_feedback_lines(self, workflow_id: str) -> list[str]:
+        return _workflow_eval_io.workflow_evaluation_feedback_lines(
+            ledger_path=self.group.ledger_path,
+            workflow_id=workflow_id,
+            scope_warning_code=WORKER_EXCEEDED_SCOPE_CODE,
+            required_sections=WORKFLOW_EVALUATION_REQUIRED_SECTIONS,
+            no_friction_text=WORKFLOW_EVALUATION_NO_FRICTION_TEXT,
+        )
 
     def _write_workflow_evaluation(
         self,
@@ -2160,48 +2537,27 @@ class WorkflowOrchestrator:
         total: int,
         summary: str,
     ) -> None:
-        if self.project_root is None:
-            return
-        try:
-            eval_path = self.project_root / "WORKFLOW_EVALUATION.md"
-            if eval_path.exists():
-                return
-            rate = completed_count / max(total, 1) * 100
-            test_count_actual = self._collect_actual_test_count()
-            lines = [
-                f"# Workflow Evaluation — {workflow_id}",
-                "",
-                "## 评分摘要",
-                "",
-                f"- Total tasks: {total}",
-                f"- Completed: {completed_count}",
-                f"- Failed: {failed_count}",
-                f"- Completion rate: {rate:.0f}%",
-                f"- test_count_actual: {test_count_actual}",
-                "",
-                "## 任务执行明细",
-                "",
-                f"| Metric | Value |",
-                f"|--------|-------|",
-                f"| Workflow ID | {workflow_id} |",
-                f"| Total tasks dispatched | {total} |",
-                f"| Tasks completed successfully | {completed_count} |",
-                f"| Tasks failed | {failed_count} |",
-                f"| Overall completion rate | {rate:.0f}% |",
-                f"| test_count_actual | {test_count_actual} |",
-                "",
-                "## 交叉验证",
-                "",
-                summary or "(no summary provided)",
-                "",
-                "## 改进建议",
-                "",
-                "- (auto-generated stub — expand with detailed evaluation)",
-                "",
-            ]
-            eval_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        except Exception:
-            logger.debug("Failed to write WORKFLOW_EVALUATION.md", exc_info=True)
+        _workflow_eval_io.write_workflow_evaluation(
+            project_root=self.project_root,
+            active_workflows=self._active_workflows,
+            ledger_path=self.group.ledger_path,
+            engine=self.engine,
+            workflow_id=workflow_id,
+            completed_count=completed_count,
+            failed_count=failed_count,
+            total=total,
+            summary=summary,
+            completed_statuses=_COMPLETED_STATUSES,
+            test_count_actual=self._collect_actual_test_count(),
+            execution_engine_tag=self._execution_engine_tag,
+            scope_warning_code=WORKER_EXCEEDED_SCOPE_CODE,
+            logger=logger,
+        )
+
+    _test_count_collection_reliable = staticmethod(
+        _workflow_eval._test_count_collection_reliable
+    )
+    _test_stats_reliable = staticmethod(_workflow_eval._test_stats_reliable)
 
     def _collect_actual_test_count(self) -> str:
         if self.project_root is None:

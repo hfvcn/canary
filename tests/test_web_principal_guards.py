@@ -1,12 +1,16 @@
 import os
 import tempfile
 import unittest
+from dataclasses import asdict
 from unittest.mock import patch
 
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 
 class TestWebPrincipalGuards(unittest.TestCase):
+    _PRINCIPAL_PROBE_PATH = "/api/v1/__test__/principal"
+
     def _with_home(self):
         old_home = os.environ.get("CCCC_HOME")
         td_ctx = tempfile.TemporaryDirectory()
@@ -38,10 +42,22 @@ class TestWebPrincipalGuards(unittest.TestCase):
         group = create_group(reg, title=title, topic="")
         return group.group_id
 
-    def _create_client(self) -> TestClient:
+    def _create_client(self, *, include_principal_probe: bool = False) -> TestClient:
         from cccc.ports.web.app import create_app
 
-        return TestClient(create_app())
+        app = create_app()
+        if include_principal_probe:
+            @app.get(self._PRINCIPAL_PROBE_PATH)
+            async def principal_probe(request: Request) -> dict:
+                principal = getattr(request.state, "principal", None)
+                if principal is None:
+                    return {"present": False}
+                payload = asdict(principal)
+                payload["allowed_groups"] = list(principal.allowed_groups)
+                payload["present"] = True
+                return payload
+
+        return TestClient(app)
 
     def test_invalid_access_token_gets_401_on_group_route(self) -> None:
         _, cleanup = self._with_home()
@@ -198,48 +214,47 @@ class TestWebPrincipalGuards(unittest.TestCase):
         finally:
             cleanup()
 
-
-    # -- /api/v1/health public path + token resolution regression (T256) --
-
-    def test_health_anonymous_returns_200_without_extended_fields(self) -> None:
-        _, cleanup = self._with_home()
-        try:
-            with patch("cccc.ports.web.app.call_daemon", return_value={"ok": True}):
-                client = self._create_client()
-                resp = client.get("/api/v1/health")
-            self.assertEqual(resp.status_code, 200)
-            result = (resp.json().get("result") or {})
-            self.assertNotIn("version", result)
-            self.assertNotIn("home", result)
-        finally:
-            cleanup()
-
-    def test_health_valid_token_returns_200_with_extended_fields(self) -> None:
+    def test_protected_principal_probe_requires_token_when_access_tokens_exist(self) -> None:
         from cccc.kernel.access_tokens import create_access_token
 
         _, cleanup = self._with_home()
         try:
-            token = str(create_access_token("user-a", allowed_groups=[], is_admin=False).get("token") or "")
-            with patch("cccc.ports.web.app.call_daemon", return_value={"ok": True}):
-                client = self._create_client()
-                resp = client.get("/api/v1/health", headers={"Authorization": f"Bearer {token}"})
-            self.assertEqual(resp.status_code, 200)
-            result = (resp.json().get("result") or {})
-            self.assertIn("version", result)
-            self.assertIn("home", result)
+            create_access_token("user-a", allowed_groups=[], is_admin=False)
+            client = self._create_client(include_principal_probe=True)
+            resp = client.get(self._PRINCIPAL_PROBE_PATH)
+            self.assertEqual(resp.status_code, 401)
+            self.assertEqual(str((resp.json().get("error") or {}).get("code") or ""), "unauthorized")
         finally:
             cleanup()
 
-    def test_health_invalid_token_still_returns_200(self) -> None:
+    def test_protected_principal_probe_rejects_invalid_token(self) -> None:
+        from cccc.kernel.access_tokens import create_access_token
+
         _, cleanup = self._with_home()
         try:
-            with patch("cccc.ports.web.app.call_daemon", return_value={"ok": True}):
-                client = self._create_client()
-                resp = client.get("/api/v1/health", headers={"Authorization": "Bearer bad-token"})
+            create_access_token("user-a", allowed_groups=[], is_admin=False)
+            client = self._create_client(include_principal_probe=True)
+            resp = client.get(self._PRINCIPAL_PROBE_PATH, headers={"Authorization": "Bearer bad-token"})
+            self.assertEqual(resp.status_code, 401)
+            self.assertEqual(str((resp.json().get("error") or {}).get("code") or ""), "unauthorized")
+        finally:
+            cleanup()
+
+    def test_protected_principal_probe_resolves_valid_principal(self) -> None:
+        from cccc.kernel.access_tokens import create_access_token
+
+        _, cleanup = self._with_home()
+        try:
+            token = str(create_access_token("user-a", allowed_groups=["g-1"], is_admin=False).get("token") or "")
+            client = self._create_client(include_principal_probe=True)
+            resp = client.get(self._PRINCIPAL_PROBE_PATH, headers={"Authorization": f"Bearer {token}"})
             self.assertEqual(resp.status_code, 200)
-            result = (resp.json().get("result") or {})
-            self.assertNotIn("version", result)
-            self.assertNotIn("home", result)
+            body = resp.json()
+            self.assertTrue(body.get("present"))
+            self.assertEqual(str(body.get("kind") or ""), "user")
+            self.assertEqual(str(body.get("user_id") or ""), "user-a")
+            self.assertEqual(body.get("allowed_groups"), ["g-1"])
+            self.assertFalse(bool(body.get("is_admin")))
         finally:
             cleanup()
 

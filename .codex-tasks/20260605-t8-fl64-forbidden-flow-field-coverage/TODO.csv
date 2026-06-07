@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,梳理 forbidden flow 现状与增量范围,DONE,确认 coverage.py 调用点与现有测试边界,"rg -n \"_check_forbidden_flow_field_coverage|_extract_forbidden_flow_fields|W_FORBIDDEN_FLOW_FIELD\" src tests",2026-06-05 10:30,0,已确认为 20260604 任务的增量扩展
+2,实现字段提取与测试文件分层覆盖,DONE,coverage.py 支持 project_root 文件扫描与新 warning,"rg -n \"W_FORBIDDEN_FLOW_FIELD_UNTESTED|_untested_forbidden_flow_fields|role=admin|is_\" src/cccc/ralph/validation_rules/coverage.py",2026-06-05 10:48,0,已扩展字段提取并新增测试文件内容扫描
+3,新增定向测试,DONE,新测试文件覆盖 5 个场景,"rg -n \"W_FORBIDDEN_FLOW_FIELD_UNTESTED|role=admin|is_admin|no_forbidden_flows\" tests/ralph/test_forbidden_flow_field_coverage.py",2026-06-05 10:50,0,新增 tests/ralph/test_forbidden_flow_field_coverage.py
+4,运行目标测试,DONE,目标 pytest 通过,"python -m pytest tests/ralph/test_forbidden_flow_field_coverage.py -v",2026-06-05 10:54,0,按要求命令 5 passed；补跑旧回归 tests/test_forbidden_flow_field.py 亦通过

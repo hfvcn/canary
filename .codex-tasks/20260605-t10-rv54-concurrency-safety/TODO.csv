@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,确认 security 规则结构与接入点,DONE,已确认 helper 签名模式和 validator 接入点,rg -n "_check_auth_boundary_type_safety|_check_security_recipes|_check_security_reviewer_assignment" src/cccc/ralph/validation_rules src/cccc/ralph/validator.py,2026-06-05,0,
+2,实现状态机并发安全规则并接入验证流程,DONE,新增规则常量/helper/issue wrapper 并由 validator 执行,python -m pytest tests/ralph/test_concurrency_safety.py -v,2026-06-05,0,实现下沉到独立模块并由 security.py 保留入口
+3,补充测试并完成定向验证,DONE,四个场景通过且目标告警码行为正确,python -m pytest tests/ralph/test_concurrency_safety.py -v,2026-06-05,0,pytest 定向文件 4 passed in 1.08s

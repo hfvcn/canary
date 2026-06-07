@@ -81,17 +81,20 @@ def test_empty_evidence_challenge_fails() -> None:
     assert AEGIS_EVIDENCE_MISSING_ERROR in gate_check.details["errors"]
 
 
-def test_empty_evidence_ralph_passes_with_warning() -> None:
+def test_empty_evidence_ralph_fails_with_missing_error() -> None:
     verification, callbacks = _run_completed_event(
         verification_mode="ralph",
         evidence_summary="completed",
         aegis={"intent": "fix"},
     )
 
-    assert verification.overall_outcome == "passed"
-    assert callbacks["completed"]
-    assert not callbacks["failed"]
-    assert AEGIS_EVIDENCE_MISSING_ERROR in verification.warnings
+    assert verification.overall_outcome == "failed"
+    assert callbacks["failed"]
+    assert not callbacks["completed"]
+    gate_check = verification.checks[-1]
+    assert gate_check.outcome == "failed"
+    assert AEGIS_EVIDENCE_MISSING_ERROR in gate_check.details["errors"]
+    assert AEGIS_EVIDENCE_MISSING_ERROR not in verification.warnings
 
 
 def test_good_evidence_passes() -> None:

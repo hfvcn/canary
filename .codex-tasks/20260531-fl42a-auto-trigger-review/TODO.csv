@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing plan and registry completion flow,DONE,Relevant functions and data shape identified,rg/sed inspection,2026-05-31T00:00:00Z,0,
+2,Implement model_ops review threshold helpers,DONE,Threshold constant and helper behavior match requested semantics,python -m pytest tests/test_evaluation_auto_trigger.py -v,2026-05-31T00:00:00Z,0,
+3,Implement assignment completion auto-trigger,DONE,Completion calls review with correct args and never blocks on request failure,python -m pytest tests/test_evaluation_auto_trigger.py -v,2026-05-31T00:00:00Z,0,
+4,Add focused tests and run verification,DONE,All requested tests pass,python -m pytest tests/test_evaluation_auto_trigger.py -v,2026-05-31T00:00:00Z,0,

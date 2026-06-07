@@ -2844,7 +2844,7 @@ class TestSuspiciousDuration:
         )
 
         svc = self._make_service(tmp_path)
-        result = svc._run_verification_check(command="pytest tests/", expected_exit_code=0)
+        result = svc._run_verification_check(command="custom-check", expected_exit_code=0)
 
         assert result.outcome == "passed"
         assert result.details.get("suspicious_duration") is True
@@ -2866,7 +2866,7 @@ class TestSuspiciousDuration:
         )
 
         svc = self._make_service(tmp_path)
-        result = svc._run_verification_check(command="pytest tests/", expected_exit_code=0)
+        result = svc._run_verification_check(command="custom-check", expected_exit_code=0)
 
         assert result.outcome == "passed"
         assert result.details.get("suspicious_duration") is None
@@ -2888,7 +2888,7 @@ class TestSuspiciousDuration:
         )
 
         svc = self._make_service(tmp_path)
-        result = svc._run_verification_check(command="pytest tests/", expected_exit_code=0)
+        result = svc._run_verification_check(command="custom-check", expected_exit_code=0)
 
         assert result.details.get("suspicious_duration") is None
 

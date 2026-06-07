@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm contracts and requirements,DONE,AgentLease and AttemptLink fields align with T11,test -f src/cccc/contracts/v1/attempt_link.py && test -f src/cccc/contracts/v1/agent_lease.py,2026-05-31,0,
+2,Implement TraceBridge,DONE,trace_bridge.py records appends reads and filters attempts,python -m py_compile src/cccc/daemon/ops/trace_bridge.py,2026-05-31,0,
+3,Add unit tests,DONE,test_trace_bridge.py covers all requested cases,test -f tests/test_trace_bridge.py,2026-05-31,0,
+4,Run requested pytest,DONE,TraceBridge tests pass,python -m pytest tests/test_trace_bridge.py -v,2026-05-31,0,8 passed in 0.82s

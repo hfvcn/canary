@@ -205,6 +205,7 @@ def test_ipc_handler_delegates_to_canonical() -> None:
         actor_run_id="",
         override_stale_digest=False,
         force_complete=False,
+        attempt_id="",
     )
 
 

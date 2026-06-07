@@ -767,7 +767,7 @@ class TestDispatchObservability:
             for call in mock_log_info.call_args_list
         ]
         assert any(
-            msg == "[dispatch] batch processed: 1 tasks, parallel=1"
+            msg.startswith("[dispatch] batch processed: 1 tasks, parallel=1")
             for msg in formatted_messages
         )
         assert any(

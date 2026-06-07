@@ -14,6 +14,9 @@ import subprocess
 import typing
 import uuid
 
+from .core import compute_estimated_parallelism
+from .plan_io import load_plan
+
 SUCCESS_EXIT_CODE = 0
 MIN_CODEX_MESSAGE_LENGTH = 200
 MIN_GUIDE_OUTPUT_BYTES = 1024
@@ -25,6 +28,8 @@ CODEX_SIGNATURE_FIELDS = ("SESSION_ID", "success", "agent_messages")
 BRIDGE_VERIFY_TIMEOUT_SECONDS = 30
 CODEX_EXECUTION_MAX_LAG_SECONDS = 3600  # 1 hour - normal Codex completes in 5-30 min
 TRACKER_HEADING_PREFIX = "#### "
+TRACKER_SECTION_SEPARATOR = "---"
+TRACKER_COMPLETION_KEYWORDS = ("已完成", "已验证")
 REVIEW_ISSUE_RE = re.compile(r"[A-Z]{1,4}-\d+[A-Za-z]?")
 REVIEW_CODE_RE = re.compile(r"`([^`]{3,80})`")
 REVIEW_BULLET_RE = re.compile(r"^\s*(?:[-*#>]+|\d+[.)])\s*(.+?)\s*$")
@@ -81,8 +86,49 @@ GAP_CAPABILITY_KEYWORDS = frozenset(
         "hint",
         "告警",
         "规则",
+        "import chain",
+        "call path",
+        "main path",
+        "orchestrator call",
+        "entrypoint import",
+        "被调用",
+        "主路径",
+        "调用链",
     }
 )
+_GAP_RECORD_REQUIRED_FIELDS = ["issue_id", "detection_type", "description"]
+_GAP_RECORD_FIELD_RE = re.compile(
+    r"^\s*(issue_id|detection_type|description)\s*:\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+_GAP_RECORD_ISSUE_ID_RE = re.compile(r"^(?:RV-\d+|FL-\d+|UX-\d+|RV-AF-\d+)$")
+_GAP_RECORD_DETECTION_TYPE_RE = re.compile(
+    r"^(?:validate|flow|runtime|detection|rule|check)$",
+    re.IGNORECASE,
+)
+MAIN_PATH_KEYWORDS = frozenset(
+    {
+        "main path",
+        "主路径",
+        "import chain",
+        "call path",
+        "调用链",
+    }
+)
+MAIN_PATH_EVIDENCE_KEYWORDS = frozenset(
+    {
+        "import",
+        "from ",
+        "调用",
+        "引用",
+        "注册",
+        "register",
+    }
+)
+DEFAULT_TRACKER_PATH = "todo/问题清单-v5-ralph.md"
+DEFERRAL_ISSUE_RE = re.compile(r"[A-Z]{1,4}(?:-[A-Z]{1,4})?-\d+[A-Za-z]?")
+DEFERRAL_SECTION_KEYWORDS = ("已知局限", "不在本次范围")
+MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}\s+")
 
 
 CODEX_BRIDGE_SEARCH_PATHS = (
@@ -122,6 +168,7 @@ class FlowState:
     steps_completed: list[int]
     steps_failed: dict[str, dict]
     version: str | None = None
+    _state_sig: str | None = None
 
 @dataclasses.dataclass
 class CheckResult:
@@ -200,7 +247,8 @@ def _resolve_codex_bridge_secret(file_path: pathlib.Path) -> str:
     secret = os.environ.get("CODEX_BRIDGE_SECRET", "").strip()
     if secret:
         return secret
-    for parent in (file_path.parent, *file_path.parents):
+    search_root = file_path if file_path.is_dir() else file_path.parent
+    for parent in (search_root, *search_root.parents):
         env_file = parent / ".env"
         if env_file.is_file():
             try:
@@ -215,6 +263,16 @@ def _resolve_codex_bridge_secret(file_path: pathlib.Path) -> str:
                 pass
             break
     return ""
+
+
+def _compute_state_sig(state_dict: dict) -> str | None:
+    secret = _resolve_codex_bridge_secret(pathlib.Path(state_dict.get("workspace", ".")))
+    if not secret:
+        return None
+    payload = dict(state_dict)
+    payload.pop("_state_sig", None)
+    raw_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hmac.new(secret.encode("utf-8"), raw_payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def _validate_codex_authenticity(file_path: pathlib.Path, data: dict) -> dict:
@@ -410,16 +468,109 @@ def _check_plan(state: FlowState) -> CheckResult:
         str(workspace),
     ]
     process_check = _run_process_check(command, workspace, "ralph validate")
-    return CheckResult(process_check.passed, [exists, *process_check.details])
+    behavior_detail = _check_plan_behavior_verification(plan_path)
+    details = [exists, *process_check.details, behavior_detail, *_check_deferral_p0_blockers(state)]
+    return CheckResult(_details_passed(details), details)
+
+
+def _check_plan_behavior_verification(plan_path: pathlib.Path) -> dict:
+    from .validation_rules.coverage import _is_main_path_command
+
+    try:
+        plan = load_plan(plan_path)
+    except Exception as exc:
+        return _detail("plan behavior verification", False, f"unable to inspect plan.yaml: {exc}")
+    if str(plan.batch_e2e_command or "").strip():
+        return _detail("plan behavior verification", True, "batch_e2e_command present")
+    commands = _plan_verification_commands(plan)
+    if not commands:
+        return _detail("plan behavior verification", True, "no verification commands to inspect; defer to validate")
+    if any(_is_main_path_command(command) for command in commands):
+        return _detail("plan behavior verification", True, "main-path verification command present")
+    if all(_is_pytest_only_command(command) for command in commands):
+        return _detail("plan behavior verification", False, "plan 只挂 pytest，缺主路径行为验证（M5-1）")
+    return _detail(
+        "plan behavior verification",
+        False,
+        "missing main-path behavior verification command (need cccc/ralph or grep ... .log)",
+    )
+
+
+def _plan_verification_commands(plan: typing.Any) -> tuple[str, ...]:
+    commands: list[str] = []
+    for task in plan.tasks:
+        verification = task.verification
+        if verification is None:
+            continue
+        top_command = verification.command.strip()
+        if top_command:
+            commands.append(top_command)
+        for check in verification.checks:
+            check_command = check.command.strip()
+            if check_command:
+                commands.append(check_command)
+    return tuple(commands)
+
+
+def _is_pytest_only_command(command: str) -> bool:
+    stripped = command.strip()
+    if not stripped:
+        return False
+    patterns = (
+        r"^pytest(?:\s|$)",
+        r"^python(?:3(?:\.\d+)?)?\s+-m\s+pytest(?:\s|$)",
+        r"^uv\s+run\s+pytest(?:\s|$)",
+        r"^poetry\s+run\s+pytest(?:\s|$)",
+        r"^pipenv\s+run\s+pytest(?:\s|$)",
+    )
+    return any(re.match(pattern, stripped, re.IGNORECASE) for pattern in patterns)
+
+
+def _check_understand(state: FlowState) -> CheckResult:
+    understand_dir = _flow_dir(state) / "step-1-understand"
+    dir_detail = _detail("understand directory", understand_dir.is_dir(), str(understand_dir))
+    if not understand_dir.is_dir():
+        return CheckResult(False, [dir_detail])
+    texts: list[str] = []
+    for file_path in sorted(understand_dir.glob("*.md")):
+        if not file_path.is_file():
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            return CheckResult(False, [dir_detail, _detail("understand markdown", False, f"{file_path}: {exc}")])
+        if content:
+            texts.append(content)
+    markdown_detail = _detail("understand markdown", bool(texts), f"{len(texts)} non-empty *.md files")
+    if not texts:
+        return CheckResult(False, [dir_detail, markdown_detail])
+    details = [dir_detail, markdown_detail, *_understand_concept_details("\n".join(texts))]
+    return CheckResult(_details_passed(details), details)
+
+
+def _understand_concept_details(text: str) -> list[dict]:
+    normalized_text = text.lower()
+    concepts = (
+        ("原始症状", ("原始症状", "症状", "symptom", "reproduce", "复现")),
+        ("活跃路径假设", ("活跃路径", "active path", "active-path", "主路径假设", "入口假设", "entrypoint")),
+        ("需证明的行为变化", ("行为变化", "行为证据", "behavior change", "behavior", "需要证明", "待证明")),
+    )
+    details: list[dict] = []
+    for label, synonyms in concepts:
+        matched = next((token for token in synonyms if token.lower() in normalized_text), "")
+        message = f"matched: {matched}" if matched else f"missing concept: {label}"
+        details.append(_detail(f"understand {label}", bool(matched), message))
+    return details
 
 def _check_gap_record(state: FlowState) -> CheckResult:
     tracker = state.params.get("tracker")
     if not tracker:
         return CheckResult(True, [_detail("tracker parameter", True, "not provided; step skipped")])
+    tracker_root = _gap_record_tracker_root(state)
     try:
         result = subprocess.run(
             ["git", "diff", "--", str(tracker)],
-            cwd=state.workspace,
+            cwd=tracker_root,
             capture_output=True,
             text=True,
         )
@@ -427,21 +578,132 @@ def _check_gap_record(state: FlowState) -> CheckResult:
         return CheckResult(False, [_detail("git diff tracker", False, str(exc))])
     if result.returncode != SUCCESS_EXIT_CODE:
         return CheckResult(False, [_detail("git diff tracker", False, _process_message(result))])
-    has_additions = _diff_has_additions(result.stdout)
-    has_new_heading = _diff_has_new_tracker_heading(result.stdout)
-    has_capability_keywords = _diff_has_capability_keywords(result.stdout)
-    added_text = "\n".join(_diff_added_contents(result.stdout))
+    details = _gap_record_details(state, result.stdout)
+    from . import flow_improvement_check
+
+    blocking_details = _gap_record_blocking_details(
+        flow_improvement_check,
+        tracker_root,
+        str(tracker),
+    )
+    base_details = [*details, *blocking_details]
+    advisory_details = _gap_record_advisory_details(pathlib.Path(tracker_root), str(tracker))
+    deferral_details = _gap_record_deferral_advisory_details(
+        state,
+        flow_improvement_check,
+        tracker_root,
+        str(tracker),
+    )
+    return CheckResult(_details_passed(base_details), [*base_details, *advisory_details, *deferral_details])
+
+
+def _gap_record_tracker_root(state: FlowState) -> str:
+    return str(state.params.get("cccc_root", state.workspace))
+
+
+def _check_deferral_p0_blockers(state: FlowState) -> list[dict]:
+    from . import deferral_ledger, flow_improvement_check
+
+    tracker_root = _gap_record_tracker_root(state)
+    tracker = str(state.params.get("tracker", DEFAULT_TRACKER_PATH))
+    ledger_path = pathlib.Path(tracker_root) / deferral_ledger.DEFAULT_LEDGER_PATH
+    blockers = deferral_ledger.escalated_blockers(
+        ledger_path,
+        _deferral_evidence_bundle_checker(flow_improvement_check, tracker_root, tracker),
+    )
+    if not blockers:
+        return []
+    blocker_list = ", ".join(blockers)
+    return [_detail("deferral P0 blocker", False, f"escalated deferrals missing evidence bundle: {blocker_list}")]
+
+
+def _deferral_evidence_bundle_checker(
+    flow_improvement_check: typing.Any,
+    tracker_root: str,
+    tracker: str,
+) -> typing.Callable[[str], bool]:
+    tracker_full = tracker.replace("-ralph.md", "-ralph-full.md")
+    try:
+        current_full = flow_improvement_check._read_worktree_tracker_text(tracker_root, tracker_full)
+    except OSError:
+        current_full = None
+
+    def has_bundle(issue_id: str) -> bool:
+        if current_full is None:
+            return False
+        details = flow_improvement_check._check_archive_evidence_bundle(current_full, {issue_id})
+        return bool(details) and _details_passed(details)
+
+    return has_bundle
+
+
+def _gap_record_blocking_details(
+    flow_improvement_check: typing.Any,
+    tracker_root: str,
+    tracker: str,
+) -> list[dict]:
+    try:
+        tracker_text = flow_improvement_check._read_worktree_tracker_text(tracker_root, tracker)
+    except OSError as exc:
+        return [_detail("short tracker blocking checks", False, f"unable to read tracker: {exc}")]
+    details = flow_improvement_check._check_short_tracker_strikethrough(tracker_text)
+    details.extend(flow_improvement_check._check_short_tracker_completed_summaries(tracker_text))
+    details.extend(flow_improvement_check._check_short_tracker_archive_advisory(tracker_root, tracker))
+    return details
+
+
+def _gap_record_deferral_advisory_details(
+    state: FlowState,
+    flow_improvement_check: typing.Any,
+    tracker_root: str,
+    tracker: str,
+) -> list[dict]:
+    version = _state_version(state)
+    if not version:
+        return []
+    from . import deferral_ledger
+
+    try:
+        tracker_text = flow_improvement_check._read_worktree_tracker_text(tracker_root, tracker)
+        ledger_path = pathlib.Path(tracker_root) / deferral_ledger.DEFAULT_LEDGER_PATH
+        deferral_ledger.begin_round(ledger_path, version, _tracker_deferral_issue_ids(tracker_text))
+    except Exception as exc:
+        return [_detail("deferral ledger record (advisory)", False, str(exc))]
+    return []
+
+
+def _state_version(state: FlowState) -> str:
+    values = [getattr(state, "version", None), state.params.get("version")]
+    return next((str(value).strip() for value in values if str(value or "").strip()), "")
+
+
+def _tracker_deferral_issue_ids(tracker_text: str) -> set[str]:
+    issue_ids: set[str] = set()
+    in_deferral_section = False
+    for line in tracker_text.splitlines():
+        stripped = line.strip()
+        if MARKDOWN_HEADING_RE.match(stripped):
+            in_deferral_section = any(keyword in stripped for keyword in DEFERRAL_SECTION_KEYWORDS)
+            continue
+        if in_deferral_section:
+            issue_ids.update(DEFERRAL_ISSUE_RE.findall(stripped))
+    return issue_ids
+
+
+def _gap_record_details(state: FlowState, diff_text: str) -> list[dict]:
+    added_text = "\n".join(_diff_added_contents(diff_text))
+    has_capability_keywords = _diff_has_capability_keywords(diff_text)
     details = [
         _detail(
             "tracker additions",
-            has_additions,
-            "tracker diff has additions" if has_additions else "tracker diff has no additions",
+            _diff_has_additions(diff_text),
+            "tracker diff has additions" if _diff_has_additions(diff_text) else "tracker diff has no additions",
         ),
         _detail(
             "tracker new findings",
-            has_new_heading,
+            _diff_has_new_tracker_heading(diff_text),
             "tracker additions include new #### headings"
-            if has_new_heading
+            if _diff_has_new_tracker_heading(diff_text)
             else "tracker additions must include at least one new #### heading",
         ),
         review_keyword_reference_detail(
@@ -458,7 +720,46 @@ def _check_gap_record(state: FlowState) -> CheckResult:
             "not one-time plan corrections",
         ),
     ]
-    return CheckResult(_details_passed(details), details)
+    if has_capability_keywords:
+        details.append(_gap_record_structure_detail(diff_text))
+    details.append(_main_path_integration_detail(added_text.lower()))
+    return details
+
+
+def _gap_record_structure_detail(diff_text: str) -> dict:
+    all_present, missing_fields = _validate_gap_record_structure(diff_text)
+    if all_present:
+        message = "tracker additions include issue_id, detection_type, and description fields"
+    else:
+        missing_list = ", ".join(missing_fields)
+        message = f"improvement suggested: add structured gap fields: {missing_list}"
+    return _detail("tracker gap record structure", True, message)
+
+
+def _gap_record_advisory_details(workspace: pathlib.Path, tracker: str) -> list[dict]:
+    tracker_path = _resolve_workspace_path(workspace, tracker)
+    try:
+        tracker_text = tracker_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [_detail("tracker archive content (advisory)", False, f"unable to read tracker: {exc}")]
+    return _archive_content_details(
+        _parse_completed_ids(tracker_text),
+        _find_active_sections(tracker_text),
+    )
+
+
+def _main_path_integration_detail(added_text_lower: str) -> dict:
+    has_main_path_keywords = any(keyword in added_text_lower for keyword in MAIN_PATH_KEYWORDS)
+    has_evidence_keywords = any(
+        keyword in added_text_lower for keyword in MAIN_PATH_EVIDENCE_KEYWORDS
+    )
+    passed = not has_main_path_keywords or has_evidence_keywords
+    message = (
+        "gap record includes integration evidence"
+        if passed
+        else "gap record describes main path issue but lacks specific import/call evidence"
+    )
+    return _detail("main path integration evidence", passed, message)
 
 def _check_verify(state: FlowState) -> CheckResult:
     command = str(state.params.get("test_cmd") or DEFAULT_TEST_COMMAND).strip()
@@ -532,6 +833,112 @@ def _check_diff_source_correlation(state: FlowState) -> list[dict]:
     ]
 
 
+def _frontier_tasks_for_parallelism(plan: typing.Any) -> list[typing.Any]:
+    done = set(getattr(getattr(plan, "state", None), "completed_task_ids", []) or [])
+    running = {
+        str(getattr(task, "task_id", "") or "")
+        for task in getattr(getattr(plan, "state", None), "running_tasks", []) or []
+    }
+    failed = set(getattr(getattr(plan, "state", None), "failed_task_ids", []) or [])
+    frontier: list[typing.Any] = []
+    for task in getattr(plan, "tasks", []) or []:
+        task_id = str(getattr(task, "id", "") or "")
+        if task_id in done or task_id in running or task_id in failed:
+            continue
+        depends_on = getattr(task, "depends_on", []) or []
+        if all(dep in done for dep in depends_on):
+            frontier.append(task)
+    return frontier
+
+
+def _count_successful_codex_output_stems(step_dir: pathlib.Path) -> int:
+    successful_stems: set[str] = set()
+    for json_file in sorted(step_dir.glob("*.json")):
+        try:
+            data = json.loads(json_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and data.get("success") is True:
+            successful_stems.add(json_file.stem)
+    return len(successful_stems)
+
+
+def _parallelism_gate_detail(state: FlowState, step_dir: pathlib.Path) -> dict:
+    sidecar_path = step_dir / "parallelism_constraint.txt"
+    if sidecar_path.is_file():
+        try:
+            sidecar_text = sidecar_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            return _detail("parallelism gate", False, f"unable to read parallelism constraint: {exc}")
+        if sidecar_text:
+            return _detail(
+                "parallelism gate",
+                True,
+                "parallelism constraint recorded in parallelism_constraint.txt; coarse proxy bypassed "
+                "(first-line, gameable evidence only; strict task_id matching deferred to DG-21)",
+            )
+
+    plan_path = pathlib.Path(state.workspace) / "plan.yaml"
+    if not plan_path.is_file():
+        return _detail("parallelism gate", False, f"plan.yaml missing: {plan_path}")
+    try:
+        plan = load_plan(plan_path)
+    except Exception as exc:
+        return _detail("parallelism gate", False, f"plan.yaml unreadable: {exc}")
+
+    frontier_tasks = _frontier_tasks_for_parallelism(plan)
+    estimated_parallelism = compute_estimated_parallelism(frontier_tasks)
+    observed_parallelism = _count_successful_codex_output_stems(step_dir)
+    required_parallelism = min(estimated_parallelism, 2)
+    if estimated_parallelism < 2 or observed_parallelism >= required_parallelism:
+        return _detail(
+            "parallelism gate",
+            True,
+            "parallelism evidence satisfied: "
+            f"E={estimated_parallelism}, D={observed_parallelism} "
+            "(D counts distinct success=true JSON stems only; coarse, gameable first-line proxy; "
+            "strict task_id matching deferred to DG-21)",
+        )
+    return _detail(
+        "parallelism gate",
+        False,
+        "parallelism evidence missing: "
+        f"E={estimated_parallelism}, D={observed_parallelism}, need D>={required_parallelism}; "
+        "fan out Codex execution or write a non-empty step-5-execute/parallelism_constraint.txt "
+        "(D counts distinct success=true JSON stems only; coarse, gameable first-line proxy; "
+        "strict task_id matching deferred to DG-21)",
+    )
+
+
+def _batch_e2e_advisory(state: FlowState) -> list[dict]:
+    plan_path = pathlib.Path(state.workspace) / "plan.yaml"
+    if not plan_path.is_file():
+        return []
+    try:
+        plan = load_plan(plan_path)
+    except Exception:
+        return []
+    if str(plan.batch_e2e_command or "").strip():
+        return [
+            _detail(
+                "batch_e2e_command (advisory)",
+                True,
+                f"plan declares batch_e2e_command: {plan.batch_e2e_command}",
+            )
+        ]
+    commands = _plan_verification_commands(plan)
+    if commands and all(_is_pytest_only_command(cmd) for cmd in commands):
+        return [
+            _detail(
+                "batch_e2e_command (advisory)",
+                True,
+                "plan has no batch_e2e_command and all task verifications are pure pytest — "
+                "consider adding an integration-level batch_e2e_command",
+            )
+        ]
+    return []
+
+
 def _check_execute_and_verify(state: FlowState) -> CheckResult:
     step_dir = _flow_dir(state) / "step-5-execute"
     codex_result = validate_codex_output(step_dir)
@@ -540,9 +947,22 @@ def _check_execute_and_verify(state: FlowState) -> CheckResult:
     mtime_details = _check_codex_mtime_lag(step_dir)
     diff_details = _check_diff_source_correlation(state)
     verify_result = _check_verify(state)
+    parallelism_detail = _parallelism_gate_detail(state, step_dir)
+    parallelism_result = CheckResult(
+        _details_passed([parallelism_detail]),
+        [parallelism_detail],
+    )
+    batch_advisory = _batch_e2e_advisory(state)
     return CheckResult(
-        verify_result.passed,
-        [*codex_result.details, *mtime_details, *diff_details, *verify_result.details],
+        verify_result.passed and parallelism_result.passed,
+        [
+            *codex_result.details,
+            *mtime_details,
+            *diff_details,
+            *verify_result.details,
+            *parallelism_result.details,
+            *batch_advisory,
+        ],
     )
 
 def _check_guide(state: FlowState) -> CheckResult:
@@ -600,6 +1020,69 @@ def _guide_error_message(exc: BaseException) -> str:
 def _codex_step(step_dir_name: str) -> typing.Callable[[FlowState], CheckResult]:
     return lambda state: validate_codex_output(_flow_dir(state) / step_dir_name)
 
+
+def _check_finding_adoption(state: FlowState) -> list[dict]:
+    plan_path = pathlib.Path(state.workspace) / "plan.yaml"
+    if not plan_path.is_file():
+        return [_detail("finding adoption", True, "no plan.yaml; skipped")]
+    try:
+        plan = load_plan(plan_path)
+    except Exception:
+        return [_detail("finding adoption", True, "plan.yaml unreadable; skipped")]
+
+    if not plan.finding_refs:
+        return [_detail("finding adoption", True, "no finding_refs in plan; compatible")]
+
+    valid_statuses = {"accepted", "rejected", "deferred", "partially-accepted"}
+    problems: list[str] = []
+    skipped_legacy_refs = 0
+    adopted_refs = 0
+    for ref in plan.finding_refs:
+        ref_id = ref.id or "unknown"
+        status = ref.status.strip()
+        reason = ref.status_reason
+        if not status:
+            skipped_legacy_refs += 1
+            continue
+        adopted_refs += 1
+        if status not in valid_statuses:
+            problems.append(f"{ref_id}: invalid status '{status}'")
+        elif not reason.strip():
+            problems.append(f"{ref_id}: missing status_reason")
+
+    if problems:
+        return [_detail("finding adoption", False, f"unadopted findings: {'; '.join(problems)}")]
+    if skipped_legacy_refs:
+        return [
+            _detail(
+                "finding adoption",
+                True,
+                "legacy finding_refs without status skipped for compatibility: "
+                f"{skipped_legacy_refs}; explicit adoptions checked: {adopted_refs}",
+            )
+        ]
+    return [_detail("finding adoption", True, f"{len(plan.finding_refs)} findings all adopted")]
+
+
+def _check_review_step(state: FlowState) -> CheckResult:
+    secret = _resolve_codex_bridge_secret(pathlib.Path(state.workspace))
+    if not secret:
+        return CheckResult(
+            False,
+            [
+                _detail(
+                    "secret_preflight",
+                    False,
+                    "CODEX_BRIDGE_SECRET not configured — export CODEX_BRIDGE_SECRET=xxx or add to .env",
+                )
+            ],
+        )
+    codex_result = _codex_step("step-3-review")(state)
+    adoption_details = _check_finding_adoption(state)
+    all_details = [*codex_result.details, *adoption_details]
+    return CheckResult(_details_passed(all_details), all_details)
+
+
 def _make_step(
     number: int,
     name: str,
@@ -612,19 +1095,31 @@ def _make_step(
 def _build_solve_steps() -> list[StepSpec]:
     bridge = _resolve_codex_bridge()
     return [
-        _make_step(1, "understand", "Understand the problem", "Read code, docs, and issue context. Identify root cause and likely files.", None),
-        _make_step(2, "plan", "Create and validate plan.yaml", "Create plan.yaml. Run ralph validate yourself to iterate, then ralph flow next to confirm.", _check_plan),
+        _make_step(
+            1,
+            "understand",
+            "Understand the problem",
+            "Read code, docs, and issue context. Identify root cause and likely files.",
+            _check_understand,
+        ),
+        _make_step(
+            2,
+            "plan",
+            "Create and validate plan.yaml",
+            "Create plan.yaml. Ensure CODEX_BRIDGE_SECRET is configured (export or .env). Run ralph validate yourself to iterate, then ralph flow next to confirm.",
+            _check_plan,
+        ),
         _make_step(
             3,
             "review",
             "Collect Codex review output",
             (
                 f"Save review JSON under .ralph-flow/step-3-review/.\n"
-                f"Command: python {bridge} --cd {{workspace}} --sandbox read-only --PROMPT '<review-prompt>'\n"
+                f"Command: python {bridge} --cd {{workspace}} --sandbox workspace-write --PROMPT '<review-prompt>'\n"
                 f"Redirect stdout to .ralph-flow/step-3-review/<name>.json.\n"
                 f"If you need multiple reviews, start them with run_in_background so they execute in parallel."
             ),
-            _codex_step("step-3-review"),
+            _check_review_step,
         ),
         _make_step(
             4,
@@ -639,9 +1134,10 @@ def _build_solve_steps() -> list[StepSpec]:
                 "   These are temporary issues already fixed in the plan — they will not produce system improvements.\n"
                 "3. Each new finding entry (#### heading) must describe a validate/detection capability deficiency.\n"
                 "   The description should reference validation concepts (validate, detect, check, rule, coverage, etc).\n"
-                "4. Archive resolved items by moving them from the short tracker to the full version/archive.\n"
-                "5. Add at least one real `####` finding entry, not just a version marker line.\n"
-                "6. Include a version marker line (for example v{N}) so git diff can detect current-session adds."
+                "4. 新增模块是否被主路径调用——仅通过测试覆盖不等于集成到主路径，需要验证 import chain 或 function call 从主入口到新模块的完整链路。组件级测试通过≠系统集成。\n"
+                "5. Archive resolved items by moving them from the short tracker to the full version/archive.\n"
+                "6. Add at least one real `####` finding entry, not just a version marker line.\n"
+                "7. Include a version marker line (for example v{N}) so git diff can detect current-session adds."
             ),
             _check_gap_record,
         ),
@@ -659,7 +1155,30 @@ def _build_solve_steps() -> list[StepSpec]:
             _check_execute_and_verify,
         ),
         _make_step(6, "guide", "Generate capability guide", "Auto-generates schema/rules/CLI sections and incrementally updates runtime sections via git diff. Review any warnings for manual sections.", _check_guide),
+        _make_step(7, "regression-run", "Run regression scenarios", "Run ralph regression run to verify no known defects have regressed.", _check_regression_run),
     ]
+
+
+def _check_regression_run(state: FlowState) -> CheckResult:
+    try:
+        from .regression_scenarios import run_scenarios
+    except Exception as exc:
+        return CheckResult(False, [_detail("regression import", False, f"cannot import: {exc}")])
+    workspace = pathlib.Path(state.workspace)
+    try:
+        result = run_scenarios(workspace=workspace)
+    except Exception as exc:
+        return CheckResult(False, [_detail("regression run", False, f"regression run failed: {exc}")])
+    details: list[dict] = []
+    for bundle in result["bundles"]:
+        scenario_id = bundle["scenario_id"]
+        passed = bundle["pass"]
+        if passed:
+            details.append(_detail(scenario_id, True, "passed"))
+        else:
+            analysis = "; ".join(bundle.get("logs", {}).get("analysis", [])) or "failed"
+            details.append(_detail(scenario_id, False, analysis))
+    return CheckResult(result["overall_pass"], details)
 
 class FlowEngine:
     def __init__(self, workspace: pathlib.Path):
@@ -719,11 +1238,20 @@ class FlowEngine:
     def state(self) -> FlowState | None:
         return self._load_state() if self._state_path.exists() else None
     def _load_state(self) -> FlowState:
-        return FlowState(**json.loads(self._state_path.read_text(encoding="utf-8")))
+        payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+        state = FlowState(**payload)
+        if state._state_sig is None:
+            return state
+        expected_sig = _compute_state_sig(payload)
+        if expected_sig is None or not hmac.compare_digest(state._state_sig, expected_sig):
+            raise ValueError("state.json integrity check failed — possible tampering")
+        return state
     def _save_state(self, state: FlowState) -> None:
         self._flow_dir.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(dataclasses.asdict(state), indent=2, ensure_ascii=False)
-        self._state_path.write_text(payload + "\n", encoding="utf-8")
+        payload = dataclasses.asdict(state)
+        payload["_state_sig"] = _compute_state_sig(payload)
+        raw_payload = json.dumps(payload, indent=2, ensure_ascii=False)
+        self._state_path.write_text(raw_payload + "\n", encoding="utf-8")
     def _get_steps(self, flow_type: str) -> list[StepSpec]:
         if flow_type == "solve":
             return _build_solve_steps()
@@ -776,6 +1304,98 @@ def _diff_added_contents(diff_text: str) -> tuple[str, ...]:
 def _diff_has_capability_keywords(diff_text: str) -> bool:
     added = "\n".join(_diff_added_contents(diff_text)).lower()
     return any(keyword in added for keyword in GAP_CAPABILITY_KEYWORDS)
+
+
+def _validate_gap_record_structure(diff_text: str) -> tuple[bool, list[str]]:
+    field_values = {field: [] for field in _GAP_RECORD_REQUIRED_FIELDS}
+    for line in _diff_added_contents(diff_text):
+        match = _GAP_RECORD_FIELD_RE.match(line)
+        if match is None:
+            continue
+        field_values[match.group(1).lower()].append(match.group(2).strip())
+    validators = {
+        "issue_id": lambda value: _GAP_RECORD_ISSUE_ID_RE.fullmatch(value) is not None,
+        "detection_type": lambda value: _GAP_RECORD_DETECTION_TYPE_RE.fullmatch(value) is not None,
+        "description": lambda value: len(value.strip()) >= 20,
+    }
+    missing_fields = [
+        field
+        for field in _GAP_RECORD_REQUIRED_FIELDS
+        if not any(validators[field](value) for value in field_values[field])
+    ]
+    return not missing_fields, missing_fields
+
+
+def _parse_completed_ids(tracker_text: str) -> set[str]:
+    header_lines, _ = _split_tracker_parts(tracker_text)
+    completed_ids: set[str] = set()
+    for line in header_lines:
+        if any(keyword in line for keyword in TRACKER_COMPLETION_KEYWORDS):
+            completed_ids.update(REVIEW_ISSUE_RE.findall(line))
+    return completed_ids
+
+
+def _find_active_sections(tracker_text: str) -> dict[str, str]:
+    _, body_lines = _split_tracker_parts(tracker_text)
+    active_sections: dict[str, str] = {}
+    index = 0
+    while index < len(body_lines):
+        issue_id = _tracker_heading_issue_id(body_lines[index])
+        if issue_id is None:
+            index += 1
+            continue
+        end = _tracker_section_end(body_lines, index + 1)
+        active_sections[issue_id] = "\n".join(body_lines[index:end]).strip()
+        index = end
+    return active_sections
+
+
+def _archive_content_details(completed_ids: set[str], active_sections: dict[str, str]) -> list[dict]:
+    active_completed_ids = sorted(issue_id for issue_id in active_sections if issue_id in completed_ids)
+    if active_completed_ids:
+        return [
+            _detail(
+                "tracker archive content (advisory)",
+                False,
+                f"completed item {issue_id} still has active section in tracker "
+                "(source: header completed marker)",
+            )
+            for issue_id in active_completed_ids
+        ]
+    if not completed_ids:
+        return [_detail("tracker archive content (advisory)", True, "no completed markers found in tracker header")]
+    return [
+        _detail(
+            "tracker archive content (advisory)",
+            True,
+            "completed header markers have no matching active sections",
+        )
+    ]
+
+
+def _split_tracker_parts(tracker_text: str) -> tuple[list[str], list[str]]:
+    lines = tracker_text.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == TRACKER_SECTION_SEPARATOR:
+            return lines[:index], lines[index + 1:]
+    return lines, lines
+
+
+def _tracker_heading_issue_id(line: str) -> str | None:
+    if not line.startswith(TRACKER_HEADING_PREFIX):
+        return None
+    match = REVIEW_ISSUE_RE.search(line)
+    return None if match is None else match.group(0)
+
+
+def _tracker_section_end(lines: list[str], start: int) -> int:
+    index = start
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() == TRACKER_SECTION_SEPARATOR or line.startswith(TRACKER_HEADING_PREFIX):
+            return index
+        index += 1
+    return len(lines)
 
 
 def _flow_dir(state: FlowState) -> pathlib.Path:

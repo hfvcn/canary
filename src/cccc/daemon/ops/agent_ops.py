@@ -22,6 +22,7 @@ from .capability_ops import (
     _load_capability_yaml,
     _load_capabilities_from_dir,
 )
+from .model_selection import match_model_for_task
 
 
 # Default paths relative to project root
@@ -115,7 +116,7 @@ def _load_agent_yaml(path: Path) -> Optional[Agent]:
         # Handle nested model structure from YAML
         if "model" in data and isinstance(data["model"], dict):
             model_data = data.pop("model")
-            data["model_runtime"] = model_data.get("runtime", "claude")
+            data["model_runtime"] = model_data.get("runtime", "codex")
             data["model_id"] = model_data.get("model_id", "")
 
         return Agent(**data)
@@ -142,7 +143,7 @@ def _save_agent_yaml(agent: Agent, path: Path) -> bool:
         # Restructure model fields for cleaner YAML
         if "model_runtime" in data or "model_id" in data:
             data["model"] = {
-                "runtime": data.pop("model_runtime", "claude"),
+                "runtime": data.pop("model_runtime", "codex"),
                 "model_id": data.pop("model_id", ""),
             }
 
@@ -153,12 +154,126 @@ def _save_agent_yaml(agent: Agent, path: Path) -> bool:
         return False
 
 
+def generate_tuned_candidate(
+    agent_id: str,
+    optimized_prompt: str,
+    score_summary: dict,
+    agents_dir: Path,
+    performance_dir: Path,
+) -> Optional["TunedAgentVersion"]:
+    """Generate a TunedAgentVersion candidate for an agent.
+
+    Creates a candidate file in performance_dir/agent_versions/{agent_id}/
+    with status="candidate". Does NOT modify the active agent YAML.
+    """
+    import yaml
+    from ...contracts.v1.tuned_agent import TunedAgentVersion
+    from ...util.time import utc_now_iso
+
+    versions_dir = performance_dir / "agent_versions" / agent_id
+    versions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine next version number
+    existing = sorted(versions_dir.glob("v*.yaml"))
+    next_num = len(existing) + 1
+    version = f"v{next_num}"
+
+    # Get base prompt from current agent
+    agent = _load_agent_yaml(agents_dir / f"{agent_id}.yaml")
+    base_prompt = agent.prompt if agent else ""
+
+    candidate = TunedAgentVersion(
+        agent_id=agent_id,
+        version=version,
+        base_prompt=base_prompt,
+        tuned_prompt=optimized_prompt,
+        score_summary=score_summary,
+        created_at=utc_now_iso(),
+        status="candidate",
+    )
+
+    try:
+        candidate_path = versions_dir / f"{version}.yaml"
+        data = candidate.to_dict()
+        content = yaml.dump(data, default_flow_style=False, allow_unicode=True)
+        candidate_path.write_text(content, encoding="utf-8")
+        return candidate
+    except Exception:
+        return None
+
+
+def promote_agent_version(
+    agent_id: str,
+    version: str,
+    agents_dir: Path,
+    performance_dir: Path,
+) -> bool:
+    """Promote a TunedAgentVersion candidate to active agent.
+
+    Updates the active agent YAML prompt field with the candidate tuned_prompt,
+    and marks the candidate status as "promoted".
+
+    Returns True if promotion successful, False otherwise.
+    """
+    candidate_path = performance_dir / "agent_versions" / agent_id / f"{version}.yaml"
+    if not candidate_path.exists():
+        return False
+
+    data = yaml.safe_load(candidate_path.read_text(encoding="utf-8"))
+    if data.get("status") != "candidate":
+        return False
+
+    agent_path = agents_dir / f"{agent_id}.yaml"
+    agent = _load_agent_yaml(agent_path)
+    if agent is None:
+        return False
+
+    agent_data = agent.model_dump()
+    agent_data["prompt"] = data["tuned_prompt"]
+    updated_agent = Agent(**agent_data)
+
+    if not _save_agent_yaml(updated_agent, agent_path):
+        return False
+
+    data["status"] = "promoted"
+    content = yaml.dump(data, default_flow_style=False, allow_unicode=True)
+    candidate_path.write_text(content, encoding="utf-8")
+
+    return True
+
+
+def reject_agent_version(
+    agent_id: str,
+    version: str,
+    reason: str,
+    performance_dir: Path,
+) -> bool:
+    """Reject a TunedAgentVersion candidate.
+
+    Marks the candidate status as "rejected" with a reason.
+    """
+    candidate_path = performance_dir / "agent_versions" / agent_id / f"{version}.yaml"
+    if not candidate_path.exists():
+        return False
+
+    data = yaml.safe_load(candidate_path.read_text(encoding="utf-8"))
+    if data.get("status") != "candidate":
+        return False
+
+    data["status"] = "rejected"
+    data["rejection_reason"] = reason
+    content = yaml.dump(data, default_flow_style=False, allow_unicode=True)
+    candidate_path.write_text(content, encoding="utf-8")
+
+    return True
+
+
 def create_agent(
     agent_id: str,
     name: str,
     agents_dir: Path,
     *,
-    model_runtime: str = "claude",
+    model_runtime: str = "codex",
     model_id: str = "",
     role_type: str = "worker",
     capabilities: Optional[List[str]] = None,
@@ -172,7 +287,7 @@ def create_agent(
         agent_id: Unique identifier for the agent
         name: Human-readable display name
         agents_dir: Directory to store agent YAML files
-        model_runtime: Agent CLI runtime (e.g., "claude", "gemini")
+        model_runtime: Agent CLI runtime (default "codex"; use "claude" only when explicitly requested)
         model_id: Specific model identifier
         role_type: Agent's responsibility level (worker/reviewer/specialist)
         capabilities: List of capability IDs
@@ -447,9 +562,17 @@ def select_model_for_task(
     required_strengths = required_strengths or []
     avoid_weaknesses = avoid_weaknesses or []
 
-    candidates: List[tuple[str, int]] = []
+    source_priority = {
+        "strengths": 3,
+        "best_for": 2,
+        "description": 1,
+    }
+    candidates: List[tuple[str, int, int, float]] = []
 
     for key, model in registry.models.items():
+        if not model.enabled:
+            continue
+
         # Check required strengths
         has_required = all(s in model.strengths for s in required_strengths)
         if not has_required:
@@ -460,13 +583,25 @@ def select_model_for_task(
         if has_avoided:
             continue
 
-        # Score by number of matching strengths
-        score = len([s for s in model.strengths if task_type in s.lower()])
-        candidates.append((key, score))
+        match = match_model_for_task(model, task_type)
+        if match is None:
+            continue
+        candidates.append(
+            (
+                key,
+                source_priority.get(match.source, 0),
+                match.score,
+                # Foreman's accumulated evaluation feeds back into selection: among
+                # equally-matching models, the higher-rated one wins. This closes the
+                # rate->select loop (ratings were written but never consumed before).
+                float(model.foreman_rating) if model.foreman_rating is not None else 0.0,
+            )
+        )
 
     if not candidates:
         return None
 
-    # Return highest scoring model
-    candidates.sort(key=lambda x: x[1], reverse=True)
+    # Prefer direct capability matches over fallback metadata, then score within that
+    # tier, then the foreman's evaluation rating as the final routing signal.
+    candidates.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
     return candidates[0][0]

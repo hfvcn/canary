@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current agent ops and tests,DONE,Relevant functions and fixtures understood,rg/find_symbol reads complete,2026-05-31,0,
+2,Implement promote and reject operations,DONE,Functions exist after generate_tuned_candidate and follow existing YAML helpers,python -m pytest tests/test_agent_promotion.py -v,2026-05-31,0,
+3,Add promotion workflow tests,DONE,Requested eight tests are present and executable,python -m pytest tests/test_agent_promotion.py -v,2026-05-31,0,
+4,Run focused verification,DONE,Focused pytest command passes,python -m pytest tests/test_agent_promotion.py -v,2026-05-31,0,

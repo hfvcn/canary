@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate existing registry operations,DONE,Relevant registry loading and model fields identified,rg/sed/serena overview,2026-05-31T00:00:00+08:00,0,
+2,Implement validate_registry_completeness,DONE,Function exists in model_ops.py after record_model_usage,python -m pytest tests/test_registry_completeness.py -v,2026-05-31T00:00:00+08:00,0,
+3,Add focused registry completeness tests,DONE,All requested warning cases covered,python -m pytest tests/test_registry_completeness.py -v,2026-05-31T00:00:00+08:00,0,
+4,Run requested verification,DONE,Targeted pytest passes,python -m pytest tests/test_registry_completeness.py -v,2026-05-31T00:00:00+08:00,0,9 passed in 0.90s

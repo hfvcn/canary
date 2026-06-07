@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Scaffold taskmaster records,DONE,"SPEC.md TODO.csv PROGRESS.md created","test -f .codex-tasks/20260605-rv52-gap-structure/SPEC.md && test -f .codex-tasks/20260605-rv52-gap-structure/TODO.csv && test -f .codex-tasks/20260605-rv52-gap-structure/PROGRESS.md",2026-06-05 13:55,0,
+2,Implement gap record structure validation,DONE,"flow_engine gap check handles advisory structure validation","pytest tests/ralph/test_flow_engine.py -v -k gap_structure",2026-06-05 13:55,0,
+3,Run targeted pytest validation,DONE,"gap_structure tests pass","pytest tests/ralph/test_flow_engine.py -v -k gap_structure",2026-06-05 13:55,0,

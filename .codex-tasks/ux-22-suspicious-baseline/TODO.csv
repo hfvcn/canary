@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read T12 and existing implementation,DONE,T12 and relevant source/test patterns understood,rg -n "T12|UX-22" plan.yaml,2026-05-31,0,
+2,Implement suspicious duration exemptions,DONE,compileall/stat/wc/head/cat and python command-pattern exemptions are handled,python -m pytest tests/test_suspicious_baseline.py -q,2026-05-31,0,
+3,Add focused baseline tests,DONE,Four requested scenarios are covered in tests/test_suspicious_baseline.py,python -m pytest tests/test_suspicious_baseline.py -q,2026-05-31,0,
+4,Run targeted verification,DONE,Targeted tests pass within 60 seconds,python -m pytest tests/test_suspicious_baseline.py -q,2026-05-31,0,"baseline and related suspicious-duration tests passed; ruff unavailable; targeted diff check passed"

@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing agent pool contracts,DONE,Relevant signatures and fixtures understood,rg/read existing code,2026-05-31T19:21:43+08:00,0,
+2,Implement lease state and acquire/release methods,DONE,AgentPoolManager exposes requested methods without breaking existing assignment flow,python -m pytest tests/test_agent_acquire_release.py -v,2026-05-31T19:21:43+08:00,0,
+3,Add focused acquire/release tests,DONE,All requested scenarios covered in new test file,python -m pytest tests/test_agent_acquire_release.py -v,2026-05-31T19:21:43+08:00,0,
+4,Run verification,DONE,Specified pytest command passes,python -m pytest tests/test_agent_acquire_release.py -v,2026-05-31T19:21:43+08:00,0,8 passed in 1.07s

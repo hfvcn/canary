@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm T13 spec and current rule surface,DONE,T13 requirements and missing dependencies identified,test -f plan.yaml,2026-05-31,0,
+2,Close missing signoff structure validation dependency,DONE,W_SIGNOFF_STRUCTURE_WEAK is emitted and rule is registered,python -m pytest tests/ralph/test_v51_integration.py -v,2026-05-31,0,import and registration check passed
+3,Add v51 validate integration tests,DONE,tests/ralph/test_v51_integration.py covers all T13 scenarios,python -m pytest tests/ralph/test_v51_integration.py -v,2026-05-31,0,
+4,Run target verification,DONE,target pytest command passes,python -m pytest tests/ralph/test_v51_integration.py -v,2026-05-31,1,macOS lacks GNU timeout; used Python subprocess timeout wrapper

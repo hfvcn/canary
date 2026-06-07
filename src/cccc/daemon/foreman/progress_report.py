@@ -62,6 +62,8 @@ class ProgressState:
     workflow_start_time: float = 0.0
     total_batches: int = 0
     completed_batches: int = 0
+    batch_e2e_status: str = "none"
+    batch_e2e_exempted: bool = False
     tasks: Dict[str, TaskInfo] = field(default_factory=dict)
     current_batch_task_ids: List[str] = field(default_factory=list)
 

@@ -24,6 +24,7 @@ class TaskContext:
 
     goal: str = ""
     completed_steps: List[str] = field(default_factory=list)
+    decisions: List[str] = field(default_factory=list)
     unresolved: List[str] = field(default_factory=list)
     next_steps: List[str] = field(default_factory=list)
     iteration: int = 0
@@ -80,6 +81,10 @@ class ContextStore:
             lines.append("**已完成**:")
             for step in context.completed_steps:
                 lines.append(f"- {step}")
+        if context.decisions:
+            lines.append("**决策审计**:")
+            for item in context.decisions:
+                lines.append(f"- {item}")
         if context.unresolved:
             lines.append("**未解决**:")
             for item in context.unresolved:

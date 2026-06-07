@@ -6,6 +6,7 @@ These are module-level helpers called by WorkflowOrchestrator.apply_task_event.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,9 +15,15 @@ from ...contracts.v1.ralph_ipc import VerificationCheck, VerificationResult
 from ...kernel.workflow_state import WorkflowTaskStatus
 from ...kernel.workflow_state_types import TaskState
 from ...ralph.aegis import effective_intent
+from ...ralph.module_acceptance import (
+    W_MODULE_ACCEPTANCE_SKIPPED_MISSING_CONTEXT,
+    verify_task_modules,
+)
+from ...ralph.shallow_check_classifier import is_shallow_check
 from .workflow_monitor import (
-    check_completer_mismatch,
     MonitorMode,
+    check_completer_mismatch,
+    check_file_overstepping,
 )
 
 logger = logging.getLogger("cccc.daemon.foreman.orchestrator")
@@ -60,18 +67,8 @@ SHALLOW_CHECK_FAILURE = (
 SHALLOW_CHECK_WARNING = (
     "shallow_check_depth warning: all verification checks are import/compile-only — no behavioral verification"
 )
-_SHALLOW_PATTERNS = ("import", "compile", "syntax", "lint")
-_BEHAVIORAL_PATTERNS = (
-    "test",
-    "assert",
-    "behavior",
-    "endpoint",
-    "response",
-    "result",
-    "output",
-    "pytest",
-    "unittest",
-)
+MODULE_ACCEPTANCE_CHECK_NAME = "module_acceptance"
+MODULE_ACCEPTANCE_FAILURE = "module_acceptance failed"
 SECURITY_LINT_HIT_LIMIT = 20
 ENTRYPOINT_DEBUG_HIT_LIMIT = 10
 _TRIVIAL_EVIDENCE = frozenset({"done", "completed", "完成", "已完成"})
@@ -171,6 +168,10 @@ def process_completed_event(
     changed_files = payload.get("changed_files") if isinstance(payload.get("changed_files"), list) else []
     evidence_summary = extract_evidence_summary_fn(payload)
     attempt_id = str(payload.get("attempt_id") or "").strip()
+    payload_evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    self_test = payload.get("self_test")
+    if self_test is None:
+        self_test = payload_evidence.get("self_test")
 
     if state.status in (
         WorkflowTaskStatus.COMPLETED,
@@ -214,10 +215,24 @@ def process_completed_event(
             "duration_seconds": duration_seconds,
             "changed_files": list(changed_files),
             "idempotency_key": str(payload.get("idempotency_key") or "").strip(),
+            "self_test": self_test,
         },
         hook_ctx=hook_ctx,
         attempt_id=attempt_id,
     )
+    scope_alert = check_file_overstepping(
+        task_id,
+        list(changed_files),
+        list(getattr(state.task, "claimed_paths", []) or []),
+    )
+    if scope_alert:
+        _record_verification_warning(
+            engine=engine,
+            task_id=task_id,
+            warning_type=scope_alert.alert_type,
+            message=scope_alert.message,
+            evidence=scope_alert.evidence,
+        )
 
     assigned_agent = str(getattr(state, "agent_id", "") or "").strip()
     completing_agent = str(payload.get("agent_id") or "").strip()
@@ -288,6 +303,13 @@ def process_completed_event(
         )
         verification = _apply_shallow_check_gate(
             verification=verification,
+            task_ref=gate_task_ref,
+        )
+        verification = _apply_module_acceptance_gate(
+            verification=verification,
+            engine=engine,
+            task_id=task_id,
+            workspace_root=workspace_root,
             task_ref=gate_task_ref,
         )
     engine.record_verification_result(task_id, verification, hook_ctx=hook_ctx)
@@ -516,9 +538,16 @@ def _check_aegis_evidence(payload: Dict[str, Any], task_ref: Any) -> List[Verifi
         return []
 
     evidence = _aegis_evidence_text(payload)
-    mode = _verification_mode(task_ref)
     checks: List[VerificationCheck] = []
     has_trivial_evidence = _is_trivial_evidence(evidence)
+    if has_trivial_evidence:
+        return [
+            _aegis_evidence_check(
+                message=AEGIS_EVIDENCE_MISSING_ERROR,
+                severity="error",
+                evidence_text=evidence,
+            )
+        ]
 
     intent = effective_intent(task_ref)
     evidence_search = evidence.casefold()
@@ -532,12 +561,6 @@ def _check_aegis_evidence(payload: Dict[str, Any], task_ref: Any) -> List[Verifi
         checks.append(_aegis_evidence_check(
             message=AEGIS_REFACTOR_RETIREMENT_WARNING,
             severity="warning",
-            evidence_text=evidence,
-        ))
-    if has_trivial_evidence:
-        checks.append(_aegis_evidence_check(
-            message=AEGIS_EVIDENCE_MISSING_ERROR,
-            severity="error" if mode == "challenge" else "warning",
             evidence_text=evidence,
         ))
     return checks
@@ -560,8 +583,30 @@ def _aegis_evidence_text(payload: Dict[str, Any]) -> str:
     if summary:
         return summary
     evidence = payload.get("evidence")
+    if isinstance(evidence, str):
+        parsed_evidence = _json_dict_from_text(evidence)
+        if parsed_evidence is None:
+            return evidence.strip()
+        evidence = parsed_evidence
     if not isinstance(evidence, dict):
         return ""
+    return _aegis_evidence_from_dict(evidence)
+
+
+def _json_dict_from_text(value: str) -> Optional[Dict[str, Any]]:
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _aegis_evidence_from_dict(evidence: Dict[str, Any]) -> str:
     for key in ("summary", "text", "message"):
         value = str(evidence.get(key) or "").strip()
         if value:
@@ -810,14 +855,6 @@ def _input_robustness_gap_blocks(plan_data: Optional[Dict[str, Any]]) -> bool:
     return False
 
 
-def _is_shallow_check(check_name: str, check_command: str) -> bool:
-    text = f"{check_name} {check_command}".casefold()
-    return _has_any_keyword(text, _SHALLOW_PATTERNS) and not _has_any_keyword(
-        text,
-        _BEHAVIORAL_PATTERNS,
-    )
-
-
 def _verification_check_spec_value(check: Any, field: str) -> str:
     if isinstance(check, dict):
         return str(check.get(field) or "")
@@ -838,7 +875,7 @@ def _all_checks_shallow(task_ref: Any) -> bool:
     if not checks:
         return False
     return all(
-        _is_shallow_check(
+        is_shallow_check(
             _verification_check_spec_value(check, "name"),
             _verification_check_spec_value(check, "command"),
         )
@@ -868,6 +905,121 @@ def _apply_shallow_check_gate(
             "summary": gate_summary,
         }
     )
+
+
+def _apply_module_acceptance_gate(
+    *,
+    verification: VerificationResult,
+    engine: Any,
+    task_id: str,
+    workspace_root: Path,
+    task_ref: Any,
+) -> VerificationResult:
+    if verification.overall_outcome in {"failed", "force_passed", "agent_pending", "infra_error"}:
+        return verification
+    if not getattr(task_ref, "modules", None):
+        return verification
+    acceptance = verify_task_modules(
+        task_ref,
+        workspace_root=_module_acceptance_root(workspace_root),
+        recorder=lambda event: _record_module_acceptance_event(engine=engine, task_id=task_id, event=event),
+    )
+    if acceptance.skipped_reason is not None or acceptance.overall_pass:
+        return verification
+    message = _module_acceptance_failure_message(acceptance)
+    _record_verification_failure(
+        engine=engine,
+        task_id=task_id,
+        failure_type=MODULE_ACCEPTANCE_CHECK_NAME,
+        message=message,
+        evidence=_module_acceptance_details(acceptance),
+    )
+    return _fail_verification_for_module_acceptance(verification, acceptance, message)
+
+
+def _module_acceptance_root(workspace_root: Path | None) -> Path | None:
+    if workspace_root is None or not workspace_root.is_dir():
+        return None
+    return workspace_root
+
+
+def _record_module_acceptance_event(
+    *,
+    engine: Any,
+    task_id: str,
+    event: Dict[str, Any],
+) -> None:
+    code = str(event.get("code") or MODULE_ACCEPTANCE_CHECK_NAME)
+    reason = str(event.get("reason") or "module acceptance event")
+    if code == W_MODULE_ACCEPTANCE_SKIPPED_MISSING_CONTEXT:
+        logger.warning("module acceptance skipped for task %s: %s", task_id, reason)
+    _record_verification_warning(
+        engine=engine,
+        task_id=task_id,
+        warning_type=code,
+        message=reason,
+        evidence=dict(event),
+    )
+
+
+def _fail_verification_for_module_acceptance(
+    verification: VerificationResult,
+    acceptance: Any,
+    message: str,
+) -> VerificationResult:
+    return verification.model_copy(
+        update={
+            "overall_outcome": "failed",
+            "checks": [*verification.checks, _module_acceptance_failure_check(acceptance, message)],
+            "summary": _module_acceptance_failure_summary(verification.summary, message),
+        }
+    )
+
+
+def _module_acceptance_failure_check(acceptance: Any, message: str) -> VerificationCheck:
+    return VerificationCheck(
+        name=MODULE_ACCEPTANCE_CHECK_NAME,
+        outcome="failed",
+        message=message,
+        details=_module_acceptance_details(acceptance),
+    )
+
+
+def _module_acceptance_failure_summary(summary: str, message: str) -> str:
+    current = str(summary or "").strip()
+    if not current:
+        return message
+    return f"{current}; {message}"
+
+
+def _module_acceptance_failure_message(acceptance: Any) -> str:
+    reasons = [
+        f"{module.module_id}: {module.reason}"
+        for module in acceptance.module_results
+        if module.status != "pass"
+    ]
+    if acceptance.issues:
+        reasons.extend(str(issue) for issue in acceptance.issues)
+    detail = "; ".join(reasons[:3])
+    if not detail:
+        return MODULE_ACCEPTANCE_FAILURE
+    return f"{MODULE_ACCEPTANCE_FAILURE}: {detail}"
+
+
+def _module_acceptance_details(acceptance: Any) -> Dict[str, Any]:
+    return {
+        "issues": list(acceptance.issues),
+        "module_results": [_module_acceptance_result_payload(module) for module in acceptance.module_results],
+    }
+
+
+def _module_acceptance_result_payload(module: Any) -> Dict[str, Any]:
+    return {
+        "module_id": module.module_id,
+        "status": module.status,
+        "reason": module.reason,
+        "io_evidence": dict(module.io_evidence),
+    }
 
 
 def _fail_verification_for_input_robustness(

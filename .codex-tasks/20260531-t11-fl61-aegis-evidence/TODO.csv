@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect T11 spec and current Aegis evidence gate,DONE,"T11 and existing gate behavior are understood","sed -n '470,510p' plan.yaml && sed -n '520,620p' src/cccc/daemon/foreman/verification_gate.py",2026-05-31T00:00:00+08:00,0,
+2,Implement evidence parsing and missing outcome consistency,DONE,"String JSON evidence is parsed and missing evidence check always fails","python -m pytest tests/test_aegis_evidence_consistency.py -v",2026-05-31T00:00:00+08:00,0,
+3,Add requested consistency regression tests,DONE,"New test file covers T11 acceptance criteria","python -m pytest tests/test_aegis_evidence_consistency.py -v",2026-05-31T00:00:00+08:00,0,
+4,Run final validation,DONE,"Target pytest command passes","python -m pytest tests/test_aegis_evidence_consistency.py -v",2026-05-31T00:00:00+08:00,0,

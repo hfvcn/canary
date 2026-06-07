@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing AF contracts and tests,DONE,Relevant imports and patterns identified,python -m pytest tests/agentflow/test_actor_runner.py -q,2026-05-31,0,
+2,Implement actor_runner.py,DONE,src/cccc/agentflow/actor_runner.py exists with requested runner behavior,python -m py_compile src/cccc/agentflow/actor_runner.py,2026-05-31,0,
+3,Add actor runner tests,DONE,tests/agentflow/test_actor_runner.py covers requested cases,python -m pytest tests/agentflow/test_actor_runner.py -v,2026-05-31,0,
+4,Run verification and close task,DONE,Requested pytest command passes,python -m pytest tests/agentflow/test_actor_runner.py -v,2026-05-31,0,

@@ -10,9 +10,10 @@ import hashlib
 import json
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from ..contracts.v1.ralph_ipc import MockTestCase
+from .task_typing import infer_task_type
 
 
 # ---------------------------------------------------------------------------
@@ -125,9 +126,78 @@ class ModuleSpec(BaseModel):
     description: str = ""
     input_spec: Dict[str, Any] = Field(default_factory=dict)
     output_spec: Dict[str, Any] = Field(default_factory=dict)
+    purpose: str = ""
+    interface: Dict[str, Any] = Field(default_factory=dict)
+    mock_inputs: List[Dict[str, Any]] = Field(default_factory=list)
+    expected_outputs: List[Dict[str, Any]] = Field(default_factory=list)
+    black_box_tests: List[Dict[str, Any]] = Field(default_factory=list)
+    integration_contract: Dict[str, Any] = Field(default_factory=dict)
+    completion_evidence: Dict[str, Any] = Field(default_factory=dict)
     internal_depends_on: List[str] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="ignore")
+
+    @model_validator(mode="after")
+    def validate_black_box_tests(self) -> "ModuleSpec":
+        _validate_black_box_tests(self.black_box_tests)
+        return self
+
+
+def _normalize_contract_entries(entries: Any) -> List[Dict[str, Any]]:
+    if isinstance(entries, dict):
+        return [{"name": name, "value": value} for name, value in sorted(entries.items())]
+    if not isinstance(entries, list):
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            if "name" in entry:
+                normalized.append(dict(entry))
+                continue
+            if len(entry) == 1:
+                name, value = next(iter(entry.items()))
+                normalized.append({"name": str(name), "value": value})
+                continue
+            normalized.append(dict(entry))
+            continue
+        normalized.append({"name": str(entry), "value": ""})
+    return sorted(
+        normalized,
+        key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False),
+    )
+
+
+def _validate_black_box_tests(entries: List[Dict[str, Any]]) -> None:
+    for entry in entries:
+        if "command" not in entry:
+            raise ValueError("black_box_tests entries must contain 'command'")
+        if "expected" in entry:
+            raise ValueError(
+                "black_box_tests entries must not contain 'expected'; "
+                "use expected_outputs as the single oracle"
+            )
+
+
+def normalize_module(m: Union["ModuleSpec", Dict[str, Any]]) -> Dict[str, Any]:
+    module = m if isinstance(m, ModuleSpec) else ModuleSpec.model_validate(m)
+    data = module.model_dump()
+    interface = data.get("interface") or {}
+    provides_source = interface.get("provides") if "provides" in interface else data.get("output_spec", {})
+    consumes_source = interface.get("consumes") if "consumes" in interface else data.get("input_spec", {})
+    return {
+        "purpose": data.get("purpose", ""),
+        "provides": _normalize_contract_entries(provides_source),
+        "consumes": _normalize_contract_entries(consumes_source),
+        "mock_inputs": data.get("mock_inputs", []),
+        "expected_outputs": data.get("expected_outputs", []),
+        "black_box_tests": data.get("black_box_tests", []),
+        "integration_contract": data.get("integration_contract", {}),
+        "completion_evidence": data.get("completion_evidence", {}),
+        "internal_depends_on": data.get("internal_depends_on", []),
+        "id": data["id"],
+        "description": data.get("description", ""),
+    }
 
 
 class RepairTrack(BaseModel):
@@ -177,7 +247,7 @@ class TaskSpec(BaseModel):
     id: str
     title: str = ""
     role: TaskRole = "leaf"
-    type: Literal["frontend", "backend", "general"] = "general"  # WF-4 alignment
+    type: Literal["frontend", "backend", "general", "security_review"] = "general"  # WF-4 alignment
     depends_on: List[str] = Field(default_factory=list)
     claimed_paths: List[str] = Field(default_factory=list)
     awareness_paths: List[str] = Field(default_factory=list)
@@ -231,6 +301,7 @@ class TaskSpec(BaseModel):
         """Convert this TaskSpec to a TaskRef for IPC transmission."""
         from ..contracts.v1.ralph_ipc import TaskRef, VerificationSpec
 
+        task_type = infer_task_type(self.title, self.goal_behavior, self.type)
         verification_spec = None
         if self.verification is not None:
             covers = self.verification.covers
@@ -258,7 +329,7 @@ class TaskSpec(BaseModel):
         return TaskRef(
             id=self.id,
             title=self.title,
-            type=self.type,
+            type=task_type,
             role=self.role,
             depends_on=self.depends_on,
             claimed_paths=self.claimed_paths,
@@ -313,6 +384,8 @@ class FindingRef(BaseModel):
     id: str = ""
     mitigation: str = ""
     enforced_by: List[str] = Field(default_factory=list)
+    status: str = ""
+    status_reason: str = ""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -428,6 +501,7 @@ class Plan(BaseModel):
     """Top-level plan document — the file Ralph reads."""
 
     schema_version: Optional[str] = None
+    execution_engine: Optional[str] = None  # "af" | "legacy" | None
 
     tasks: List[TaskSpec] = Field(default_factory=list)
     state: PlanState = Field(default_factory=PlanState)

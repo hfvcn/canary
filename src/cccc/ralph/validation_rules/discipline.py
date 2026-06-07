@@ -7,37 +7,30 @@ from typing import Any, Callable, List
 
 from ..aegis import effective_intent
 from ..models import Plan, ValidationIssue
+from .discipline_agent_prompt import build_agent_prompt_direct_modification_issues
+from .discipline_registration import check_rule_registration_completeness
 from .discipline_security import _check_aegis_security_chain, _check_fts_cjk_coverage, _check_silent_degradation_pattern, _check_ssrf_route_binding
 from .discipline_second_wave import (
-    check_decision_hygiene_missing,
-    check_drift_check_missing,
-    check_patch_shape_triage_missing,
-    check_plan_compat_boundary_missing,
-    check_ripple_triage_missing,
-    check_ripple_verification_too_narrow,
+    check_decision_hygiene_missing, check_drift_check_missing,
+    check_patch_shape_triage_missing, check_plan_compat_boundary_missing,
+    check_ripple_triage_missing, check_ripple_verification_too_narrow,
 )
 
 DisciplineRule = Callable[[Plan], List[ValidationIssue]]
 
-PLACEHOLDER_TOKENS = (
-    "tbd",
-    "todo",
-    "placeholder",
-    "fill in",
-    "implement later",
-)
+PLACEHOLDER_TOKENS = ("tbd", "todo", "placeholder", "fill in", "implement later")
 PLACEHOLDER_PATTERN = re.compile(
-    "|".join(rf"\b{re.escape(token)}\b(?![/\\.\-])" for token in PLACEHOLDER_TOKENS),
-    re.IGNORECASE,
+    "|".join(rf"\b{re.escape(token)}\b(?![/\\.\-])" for token in PLACEHOLDER_TOKENS), re.IGNORECASE,
 )
 CODE_FENCE_PATTERN = re.compile(r"```.*?```|~~~.*?~~~|`[^`\n]*`", re.DOTALL)
 TEST_PATH_MARKERS = ("test_", "_test", "tests/")
 COMPLEX_DEPENDENCY_COUNT = 3
 RETIREMENT_INTENTS = ("refactor", "migration")
 RETIREMENT_SHAPE_KEYWORDS = ("fallback", "adapter", "provider")
-
-# RL-22/RL-25 are known limitations: agent-runtime judgment and dynamic
-# execution behavior are out of scope for static plan analysis here.
+W_REVIEW_FINDING_NO_ADOPTION = "W_REVIEW_FINDING_NO_ADOPTION"
+_FINDING_ADOPTION_STATUSES = frozenset(
+    {"accepted", "rejected", "deferred", "partially-accepted"}
+)
 
 
 def collect_discipline_issues(plan: Plan) -> List[ValidationIssue]:
@@ -142,12 +135,58 @@ def _check_complex_baseline(plan: Plan) -> List[ValidationIssue]:
     return issues
 
 
+def _check_agent_prompt_direct_modification(plan: Plan) -> List[ValidationIssue]:
+    """Reject direct agent prompt edits without promotion-structured evidence."""
+    return build_agent_prompt_direct_modification_issues(plan)
+
+
+def _check_finding_adoption(plan: Plan) -> List[ValidationIssue]:
+    """Require each finding reference to record an adoption decision and reason."""
+    issues: List[ValidationIssue] = []
+    for ref in plan.finding_refs:
+        normalized_status = ref.status.strip()
+        if not normalized_status:
+            continue
+        if normalized_status not in _FINDING_ADOPTION_STATUSES:
+            issues.append(ValidationIssue(
+                code=W_REVIEW_FINDING_NO_ADOPTION,
+                severity="warning",
+                message=(
+                    f"finding '{ref.id}' 缺采纳状态"
+                    "(accepted/rejected/deferred/partially-accepted)"
+                ),
+                task_ids=[],
+                evidence={
+                    "finding_ref_id": ref.id,
+                    "field": "status",
+                    "status": ref.status,
+                },
+            ))
+            continue
+        if ref.status_reason.strip():
+            continue
+        issues.append(ValidationIssue(
+            code=W_REVIEW_FINDING_NO_ADOPTION,
+            severity="warning",
+            message=f"finding '{ref.id}' status '{normalized_status}' 缺采纳原因",
+            task_ids=[],
+            evidence={
+                "finding_ref_id": ref.id,
+                "field": "status_reason",
+                "status": ref.status,
+            },
+        ))
+    return issues
+
+
 _DISCIPLINE_RULES: List[DisciplineRule] = [
     _check_placeholder_content,
     _check_retirement_track,
     _check_fix_repair_track,
     _check_tdd_test_path,
     _check_complex_baseline,
+    _check_agent_prompt_direct_modification,
+    _check_finding_adoption,
     check_patch_shape_triage_missing,
     check_ripple_triage_missing,
     check_decision_hygiene_missing,

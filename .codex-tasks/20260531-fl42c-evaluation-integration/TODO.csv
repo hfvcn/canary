@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Confirm FL-42 context,DONE,Existing model_ops and related tests are understood,rg -n "record_model_usage|should_trigger_review|create_prompt_candidate|parse_optimized_prompt" src/cccc tests,2026-05-31,0,Found model_ops functions and T1/T2 unit coverage
+2,Add evaluation integration test,DONE,tests/test_evaluation_integration.py covers T3 flow,test -f tests/test_evaluation_integration.py,2026-05-31,0,
+3,Run target verification,DONE,Target pytest passes,python -m pytest tests/test_evaluation_integration.py -v,2026-05-31,1,5 passed; initial timeout wrapper command failed because GNU timeout is unavailable on macOS

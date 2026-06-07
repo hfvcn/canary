@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,读取 T2 目标实现与测试上下文,DONE,定位 producer 链路和 monitor 注册点,rg -n "TaskCompletedRequest|process_completed_event|create_completer_mismatch_hook|MonitorConfig|report_worker_completion" src tests,2026-06-07T16:11:36Z,0,
+2,实现 self_test producer 透传链路,DONE,REST/AF/verification_gate 都透传 self_test,python -m pytest tests/test_verification_gate.py -v,2026-06-07T16:11:36Z,0,
+3,实现 INV-7 monitor guard 与 orchestrator 注册,DONE,MonitorConfig/default/hook/register 全落地,python -m pytest tests/test_workflow_monitor.py tests/test_workflow_orchestrator_apply_event.py -v,2026-06-07T16:11:36Z,0,
+4,补齐回归测试并运行用户指定 pytest,DONE,指定 4 组 pytest 全通过,python -m pytest tests/ralph/test_bclass_bpa3_inv7.py tests/test_workflow_monitor.py tests/test_workflow_orchestrator_apply_event.py tests/test_verification_gate.py -v,2026-06-07T16:11:36Z,0,48 passed

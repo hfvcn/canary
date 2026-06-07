@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Review target helper and existing test patterns,DONE,Implementation site and matching test style identified,rg -n "_task_has_check_token|verification.command|mock_tests" src tests/ralph,2026-06-04T15:00:25+0800,0,
+2,Implement unified helper behavior,DONE,_task_has_check_token includes verification.command and excludes mock_tests,python -m pytest tests/ralph/test_check_token_unified.py -q,2026-06-04T15:01:12+0800,0,
+3,Add focused tests and run validation,DONE,Requested scenarios pass in pytest,python -m pytest tests/ralph/test_check_token_unified.py -q && python -m pytest tests/ralph/test_validation_rbac_auth.py tests/ralph/test_validation_identity_surface.py -q,2026-06-04T15:01:12+0800,0,16 tests passed

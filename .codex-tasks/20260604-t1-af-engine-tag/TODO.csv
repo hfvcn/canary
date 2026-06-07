@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect orchestrator evaluation path and test conventions,DONE,"Target methods and test style identified","rg -n \"_write_workflow_evaluation|WorkflowOrchestrator\\(\" src/cccc/daemon/foreman/workflow_orchestrator.py tests",2026-06-04 15:01,0,Read orchestrator method and related workflow evaluation tests.
+2,Implement AF engine tag helpers and metric row,DONE,"Helpers exist and evaluation writes execution_engine row","rg -n \"_af_engine_enabled|_execution_engine_tag|execution_engine\" src/cccc/daemon/foreman/workflow_orchestrator.py",2026-06-04 15:05,0,Environment gating now happens before the lazy AF import.
+3,Add engine tag tests and run targeted pytest,DONE,"Three requested tests pass","pytest tests/agentflow/test_engine_tag.py tests/test_workflow_eval_detail.py tests/test_workflow_test_stats_reliability.py -q",2026-06-04 15:06,0,Targeted pytest passed with 11 tests.

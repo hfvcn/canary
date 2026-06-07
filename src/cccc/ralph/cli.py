@@ -3,10 +3,13 @@
 Usage:
     ralph validate plan.yaml
     ralph suggest plan.yaml [--format json|text]
+    ralph module verify plan.yaml [--format json|text]
     ralph verify plan.yaml --task T1 [--changed-files a.py b.py] [--project-root .]
     ralph explain plan.yaml --task T1
     ralph explain --code E_DUPLICATE_TASK_ID
     ralph audit --ledger .cccc/group/ledger.jsonl [--format json|text]
+    ralph regression list
+    ralph regression run [--scenario RS-V62-1] [--format json|text]
 """
 
 from __future__ import annotations
@@ -25,17 +28,22 @@ from typing import Any, Dict, List
 
 from ..daemon.server import call_daemon
 from .agent import (
-    AgentConfig,
     AgentSuggestion,
-    GEMINI_PROVIDER,
     build_error_envelope,
     create_agent,
     _is_debug_traceback_enabled,
     RULE_DOCS,
 )
-from .core import suggest, verify
+from .core import compute_estimated_parallelism, suggest, verify
 from .models import Plan, ValidationIssue, ValidationReport, compute_issue_instance_id
+from .module_acceptance import verify_task_modules
 from .plan_io import _read_plan_workflow_id, load_plan, save_plan_state
+from .regression_scenarios import (
+    format_run_text as format_regression_run_text,
+    list_scenarios as list_regression_scenarios,
+    run_scenarios,
+    select_scenarios,
+)
 from .report_diff import (
     diff_validation_reports,
     format_report_diff_json,
@@ -43,6 +51,7 @@ from .report_diff import (
     load_validation_report,
 )
 from .security_check_generator import generate_llm_security_checks, generate_security_checks
+from .validation_rules import _non_suppressible_codes
 from .validator import _sort_issues, validate, validate_with_project
 
 
@@ -437,6 +446,26 @@ def main(argv: List[str] | None = None) -> int:
         help="Git ref for diff base (default: last commit that touched the guide file)",
     )
 
+    # --- regression ---
+    p_regression = sub.add_parser("regression", help="Run fixed regression scenarios")
+    regression_sub = p_regression.add_subparsers(dest="regression_action")
+    p_regression_run = regression_sub.add_parser("run", help="Run regression scenarios")
+    p_regression_run.add_argument(
+        "--scenario",
+        action="append",
+        default=[],
+        help="Scenario ID to run (repeatable)",
+    )
+    p_regression_run.add_argument("--format", choices=["json", "text"], default="text")
+    regression_sub.add_parser("list", help="List regression scenarios")
+
+    # --- module ---
+    p_module = sub.add_parser("module", help="Run module acceptance commands")
+    module_sub = p_module.add_subparsers(dest="module_action")
+    p_module_verify = module_sub.add_parser("verify", help="Run module acceptance verification")
+    p_module_verify.add_argument("plan", type=Path, help="Path to plan.yaml or plan.json")
+    p_module_verify.add_argument("--format", choices=["json", "text"], default="text")
+
     # --- tracker ---
     p_tracker = sub.add_parser("tracker", help="Tracker maintenance commands")
     tracker_sub = p_tracker.add_subparsers(dest="tracker_action")
@@ -474,6 +503,20 @@ def main(argv: List[str] | None = None) -> int:
             return _cmd_guide(args)
         except Exception as exc:
             _emit_error_envelope("guide", exc)
+            return _EXIT_INTERNAL_ERROR
+
+    if args.command == "regression":
+        try:
+            return _cmd_regression(args)
+        except Exception as exc:
+            _emit_error_envelope("regression", exc)
+            return _EXIT_INTERNAL_ERROR
+
+    if args.command == "module":
+        try:
+            return _cmd_module(args)
+        except Exception as exc:
+            _emit_error_envelope("module", exc)
             return _EXIT_INTERNAL_ERROR
 
     if args.command == "flow":
@@ -578,6 +621,83 @@ def _cmd_show_schema() -> None:
         *_schema_example_sections(),
     ]
     print("\n".join(sections))
+
+
+def _cmd_regression(args: argparse.Namespace) -> int:
+    if args.regression_action == "list":
+        return _cmd_regression_list()
+    if args.regression_action == "run":
+        return _cmd_regression_run(args)
+    print("error: regression requires a subcommand (run/list)", file=sys.stderr)
+    return _EXIT_VALIDATION_FAILURE
+
+
+def _cmd_regression_list() -> int:
+    for item in list_regression_scenarios():
+        print(f"{item['scenario_id']}: {item['description']}")
+    return _EXIT_OK
+
+
+def _cmd_regression_run(args: argparse.Namespace) -> int:
+    try:
+        scenarios = select_scenarios(args.scenario)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_VALIDATION_FAILURE
+    result = run_scenarios(scenarios=scenarios)
+    if args.format == "json":
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_regression_run_text(result))
+    return _EXIT_OK if result["overall_pass"] else _EXIT_VALIDATION_FAILURE
+
+
+def _cmd_module(args: argparse.Namespace) -> int:
+    if args.module_action == "verify":
+        return _cmd_module_verify(args)
+    print("error: module requires a subcommand (verify)", file=sys.stderr)
+    return _EXIT_VALIDATION_FAILURE
+
+
+def _cmd_module_verify(args: argparse.Namespace) -> int:
+    plan = load_plan(args.plan)
+    workspace_root = args.plan.resolve().parent
+    results = [
+        verify_task_modules(task, workspace_root=workspace_root)
+        for task in plan.tasks
+        if task.modules
+    ]
+    payload = {
+        "overall_pass": all(result.overall_pass for result in results),
+        "workspace_root": str(workspace_root),
+        "tasks": [result.__dict__ | {"module_results": [module.__dict__ for module in result.module_results]} for result in results],
+    }
+    if args.format == "json":
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(_format_module_verify_text(payload))
+    return _EXIT_OK if payload["overall_pass"] else _EXIT_VALIDATION_FAILURE
+
+
+def _format_module_verify_text(payload: Dict[str, Any]) -> str:
+    tasks = payload["tasks"]
+    if not tasks:
+        return "PASS module verification (0 tasks with modules)"
+
+    lines = [
+        f"{'PASS' if payload['overall_pass'] else 'FAIL'} module verification "
+        f"({len(tasks)} task(s))"
+    ]
+    for task in tasks:
+        task_status = "PASS" if task["overall_pass"] else "FAIL"
+        lines.append(f"{task_status} {task['task_id']}")
+        if task["skipped_reason"]:
+            lines.append(f"  skipped: {task['skipped_reason']}")
+        for module in task["module_results"]:
+            lines.append(f"  {module['status'].upper()} {module['module_id']}: {module['reason']}")
+        for issue in task["issues"]:
+            lines.append(f"  issue: {issue}")
+    return "\n".join(lines)
 
 
 def _schema_model_sections() -> list[str]:
@@ -687,7 +807,10 @@ def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
     except Exception as exc:
         issue = _agent_review_failure_issue(exc)
         issue.issue_instance_id = compute_issue_instance_id(issue)
-        if issue.code in plan.suppress_codes:
+        if (
+            issue.code in plan.suppress_codes
+            and issue.code not in _non_suppressible_codes(plan)
+        ):
             report.hints.append(issue)
         else:
             report.warnings.append(issue)
@@ -721,7 +844,6 @@ def _cmd_validate(plan: Plan, args: argparse.Namespace) -> int:
 def _print_generated_security_checks(plan_path: Path) -> None:
     checks = _merged_generated_security_checks(plan_path)
     print(json.dumps(checks, indent=2, ensure_ascii=False))
-
 
 def _merged_generated_security_checks(plan_path: Path) -> list[dict[str, object]]:
     deterministic_checks = generate_security_checks(str(plan_path))
@@ -827,7 +949,6 @@ def _review_beyond_scope_with_agent(
     agent = create_agent(
         _agent_checklist_path(project_root=project_root, plan_path=plan_path),
         plan=plan,
-        config=AgentConfig(provider=GEMINI_PROVIDER),
     )
     agent.warm_up()
     return agent.review_beyond_scope(beyond_scope)
@@ -1050,9 +1171,14 @@ def _cmd_suggest(plan: Plan, args: argparse.Namespace) -> int:
         ledger_path=_resolve_suggest_ledger_path(args),
         workflow_id=workflow_id,
     )
+    task_map = {task.id: task for task in plan.tasks}
+    ready_tasks = [task_map[task_id] for task_id in result.ready if task_id in task_map]
+    estimated_parallelism = compute_estimated_parallelism(ready_tasks)
 
     if args.format == "json":
-        print(json.dumps(result.model_dump(), indent=2, ensure_ascii=False))
+        payload = result.model_dump()
+        payload["estimated_parallelism"] = estimated_parallelism
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         if result.ready:
             print(f"Ready ({len(result.ready)}):")
@@ -1060,8 +1186,10 @@ def _cmd_suggest(plan: Plan, args: argparse.Namespace) -> int:
                 task = next((t for t in plan.tasks if t.id == tid), None)
                 title = f" — {task.title}" if task and task.title else ""
                 print(f"  {tid}{title}")
+            print(f"\nEstimated parallelism: {estimated_parallelism}")
         else:
             print("No tasks ready.")
+            print("\nEstimated parallelism: 1")
 
         if result.blocked:
             print(f"\nBlocked ({len(result.blocked)}):")

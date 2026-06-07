@@ -1,0 +1,19 @@
+plan_scope:
+  - app
+tasks:
+  - id: T1
+    title: Reproduce claimed-only coverage blind spot
+    role: integration
+    claimed_paths:
+      - src/silent_fallback.py
+      - src/guard_after_side_effect.py
+    goal_behavior: "Validate scans claimed production files outside plan_scope"
+    acceptance_criteria: "Validate emits silent fallback and guard ordering warnings"
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_placeholder.py -q"
+      checks:
+        - name: behavior
+          command: "python -m pytest tests/test_placeholder.py -q"
+      covers:
+        tasks: ["T1"]

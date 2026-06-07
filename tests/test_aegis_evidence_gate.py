@@ -25,14 +25,18 @@ def test_empty_evidence_challenge_mode_fails_verification(evidence_text: str) ->
 
 
 @pytest.mark.parametrize("evidence_text", ["", "completed", "已完成"])
-def test_empty_evidence_ralph_mode_warns_but_passes(evidence_text: str) -> None:
-    result = _apply(evidence_text, _task_ref(verification_mode="ralph", aegis={"intent": "feature"}))
+def test_empty_evidence_ralph_mode_fails_verification(evidence_text: str) -> None:
+    result = _apply(
+        evidence_text,
+        _task_ref(verification_mode="ralph", aegis={"intent": "feature"}),
+    )
 
-    assert result.overall_outcome == "passed"
+    assert result.overall_outcome == "failed"
     assert result.checks[-1].name == AEGIS_EVIDENCE_CHECK_NAME
-    assert result.checks[-1].outcome == "passed"
-    assert result.checks[-1].details["warnings"] == [AEGIS_EVIDENCE_MISSING_ERROR]
-    assert AEGIS_EVIDENCE_MISSING_ERROR in result.warnings
+    assert result.checks[-1].outcome == "failed"
+    assert result.checks[-1].details["errors"] == [AEGIS_EVIDENCE_MISSING_ERROR]
+    assert result.checks[-1].details["warnings"] == []
+    assert result.warnings == []
 
 
 def test_fix_evidence_without_root_cause_warns() -> None:

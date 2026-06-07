@@ -14,6 +14,8 @@ from .im_cmds import *  # noqa: F401,F403
 from .system_cmds import *  # noqa: F401,F403
 from .workflow_cmds import *  # noqa: F401,F403
 from .model_cmds import *  # noqa: F401,F403
+from .agent_cmds import *  # noqa: F401,F403
+from .agent_profile_cmds import *  # noqa: F401,F403
 
 
 def _apply_invocation_web_overrides(args: argparse.Namespace) -> tuple[dict[str, Optional[str]], dict[str, str]]:
@@ -141,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_actor_add.add_argument(
         "--runtime",
         choices=["claude", "codex", "droid", "amp", "auggie", "neovate", "gemini", "cursor", "kilocode", "opencode", "copilot", "custom"],
-        default="codex",
+        default=None,
         help="Agent runtime (auto-sets command if not provided)",
     )
     p_actor_add.add_argument("--command", default="", help="Command to run (shell-like string; optional, auto-set by --runtime)")
@@ -204,10 +206,59 @@ def build_parser() -> argparse.ArgumentParser:
     p_model = sub.add_parser("model", help="Model-related operations")
     model_sub = p_model.add_subparsers(dest="action", required=True)
 
+    p_model_list = model_sub.add_parser("list", help="List available models and their evaluations")
+    p_model_list.add_argument("--all", action="store_true", help="Include disabled models")
+    p_model_list.add_argument("--registry", default="", help="Registry YAML path (default: .cccc/models/registry.yaml)")
+    p_model_list.set_defaults(func=cmd_model_list)
+
     p_model_review = model_sub.add_parser("review", help="Ask Foreman for a brief practical review of a model")
     p_model_review.add_argument("model_key", help="Model key to review")
     p_model_review.add_argument("--group", default="", help="Target group_id (default: active group)")
     p_model_review.set_defaults(func=cmd_model_review)
+
+    p_model_rate = model_sub.add_parser("rate", help="Record a Foreman rating for a model")
+    p_model_rate.add_argument("model_key", help="Model key to rate")
+    p_model_rate.add_argument("--rating", type=int, required=True, help="Rating from 1 to 5")
+    p_model_rate.add_argument("--notes", default="", help="Optional notes for this rating")
+    p_model_rate.add_argument("--registry", default="", help="Registry YAML path (default: .cccc/models/registry.yaml)")
+    p_model_rate.set_defaults(func=cmd_model_rate)
+
+    p_model_suggest = model_sub.add_parser("suggest", help="Suggest runtime/model for a task type or Ralph plan")
+    p_model_suggest.add_argument("target", help="Task type (backend/frontend/general) or plan.yaml path")
+    p_model_suggest.add_argument("--registry", default="", help="Registry YAML path (default: .cccc/models/registry.yaml)")
+    p_model_suggest.set_defaults(func=cmd_model_suggest)
+
+    p_agent = sub.add_parser("agent", help="Manage persistent agent pool and saved worker profiles")
+    agent_sub = p_agent.add_subparsers(dest="action", required=True)
+
+    p_agent_list = agent_sub.add_parser("list", help="List agents in the persistent agent pool")
+    p_agent_list.add_argument("--project-root", default=".", help="Project root (default: current directory)")
+    p_agent_list.set_defaults(func=cmd_agent_list)
+
+    p_agent_rate = agent_sub.add_parser("rate", help="Rate an agent for future reuse")
+    p_agent_rate.add_argument("agent_id", help="Agent id")
+    p_agent_rate.add_argument("--score", type=float, required=True, help="Score from 1.0 to 5.0")
+    p_agent_rate.add_argument("--notes", default="", help="Optional notes for this score")
+    p_agent_rate.add_argument("--project-root", default=".", help="Project root (default: current directory)")
+    p_agent_rate.set_defaults(func=cmd_agent_rate)
+
+    p_agent_profile = agent_sub.add_parser("profile", help="Manage saved worker prompt profiles")
+    agent_profile_sub = p_agent_profile.add_subparsers(dest="profile_action", required=True)
+
+    p_agent_profile_save = agent_profile_sub.add_parser("save", help="Save a default worker prompt profile")
+    p_agent_profile_save.add_argument("--role", required=True, choices=["executor", "reviewer", "security-reviewer"], help="Profile role")
+    p_agent_profile_save.add_argument("--runtime", required=True, help="Runtime name (for example: codex, claude)")
+    p_agent_profile_save.add_argument("--prompt", default="", help="Prompt text to save")
+    p_agent_profile_save.add_argument("--prompt-file", default="", help="Read prompt text from this file")
+    p_agent_profile_save.add_argument("--source", default="", help="Optional source label written into the profile YAML")
+    p_agent_profile_save.add_argument("--project-root", default=".", help="Project root (default: current directory)")
+    p_agent_profile_save.set_defaults(func=cmd_agent_profile_save)
+
+    p_agent_profile_list = agent_profile_sub.add_parser("list", help="List saved worker prompt profiles")
+    p_agent_profile_list.add_argument("--role", default="", choices=["", "executor", "reviewer", "security-reviewer"], help="Optional role filter")
+    p_agent_profile_list.add_argument("--runtime", default="", help="Optional runtime filter")
+    p_agent_profile_list.add_argument("--project-root", default=".", help="Project root (default: current directory)")
+    p_agent_profile_list.set_defaults(func=cmd_agent_profile_list)
 
     p_inbox = sub.add_parser("inbox", help="List unread messages for an actor (chat messages + system notifications)")
     p_inbox.add_argument("--actor-id", required=True, help="Target actor id")

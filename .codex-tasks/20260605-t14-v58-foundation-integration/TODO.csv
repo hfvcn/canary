@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read target implementations and nearby tests,DONE,All target signatures and assertion surfaces confirmed,"rg -n \"_syncable_task_id_from_ledger_line|sync_plan_state|_build_scope_warnings|_extract_friction_events|_build_task_ref|engine_preference\" src/cccc tests",2026-06-05,0,
+2,Add fixture-driven integration test file,DONE,Requested scenarios exist with precise assertions,test -f tests/test_v58_foundation_integration.py,2026-06-05,0,
+3,Run requested pytest and fix failures if any,DONE,Target pytest passes,"pytest tests/test_v58_foundation_integration.py -v",2026-06-05,0,8 passed in 1.03s

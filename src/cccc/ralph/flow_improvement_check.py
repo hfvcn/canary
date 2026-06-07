@@ -16,13 +16,79 @@ ARCHIVE_ADVISORY_MESSAGE = (
 _COMPLETED_HEADER_RE = re.compile(r"已完成（v\d+[^）]*）：([^\n]+)")
 _COMPLETED_HEADER_ADDITION_RE = re.compile(r"已完成|v\d+\s*代码修复")
 _CODE_FIX_HEADER_RE = re.compile(r"v\d+\s*代码修复")
+_VERIFIED_HEADER_RE = re.compile(r"已验证(?:生效)?|已修复")
+_ARCHIVE_BEHAVIOR_EVIDENCE_RE = re.compile(
+    r"(?:"
+    r"E2E\s*行为确认"
+    r"|行为已确认"
+    r"|已验证生效"
+    r"|运行时确认"
+    r"|主路径调用确认"
+    r"|\bbehavior\s+confirmed\b"
+    r"|\bobserved\b"
+    r")",
+    re.IGNORECASE,
+)
 _TRACKER_ID_RE = re.compile(r"[A-Z]{1,3}-\d+")
 _TRACKER_ID_SPLIT_RE = re.compile(r"[/,、\s]+")
+_STRIKETHROUGH_ISSUE_RE = re.compile(r"~~([A-Z]{1,3}-\d+)~~")
+_COMPLETED_SUMMARY_LINE_RE = re.compile(r"^>\s*已完成|^>\s*已验证|^>\s*v\d+\s*代码修复")
+_EVIDENCE_BUNDLE_REQUIRED_FIELDS = frozenset({
+    "issue_id",
+    "original_symptom",
+    "claimed_fix",
+    "changed_paths",
+    "active_entrypoint",
+    "active_path_trace",
+    "runtime_conditions",
+    "verification_commands",
+    "expected_behavior",
+    "observed_behavior",
+    "fallback_behavior",
+    "evidence_locations",
+    "regression_test",
+    "archive_decision",
+})
+_ARCHIVABLE_STATUSES = frozenset({"behavior-verified", "fail-closed", "archived"})
+_EVIDENCE_FIELD_LINE_RE = re.compile(
+    r"^\s*(?:-\s*)?(?:\*\*)?(?P<field>[a-z_]+)(?:\*\*)?\s*:\s*(?P<value>.*?)\s*$",
+    re.IGNORECASE,
+)
+_ARCHIVABLE_STATUS_RE = re.compile(
+    r"\b(?:behavior\-verified|fail\-closed|archived)\b",
+    re.IGNORECASE,
+)
+_ARCHIVE_PARAGRAPH_TERMINATOR = (
+    r"(?=^####\s+|^###\s+|^##\s+|^---\s*$|^\*\*.*\*\*\s*$|\Z)"
+)
+_QUARANTINE_ARCHIVABLE_STATUSES = frozenset({"behavior-verified", "fail-closed"})
+_QUARANTINE_NEGATIVE_BEHAVIOR_CJK_KEYWORD_SEQUENCES = (
+    (
+        ("仍", "仍然", "依旧", "依然", "还是"),
+        ("复现", "存在", "失败", "报错"),
+        ("未", "没", "没有", "不"),
+    ),
+    (
+        ("未", "没", "尚未", "没有"),
+        ("修复", "消失", "解决", "通过"),
+        (),
+    ),
+)
+_QUARANTINE_NEGATIVE_BEHAVIOR_STILL_SEQUENCE_RE = re.compile(
+    r"\bstill\b[^.。；;\n]*\b(?:reproduc\w*|fail\w*|present|broken)\b"
+)
+_QUARANTINE_NEGATIVE_BEHAVIOR_ENGLISH_NEGATION_RE = re.compile(r"\b(?:not|no)\b")
+_QUARANTINE_NEGATIVE_BEHAVIOR_ENGLISH_PATTERNS = (
+    re.compile(r"\bpersist(?:s|ed|ing)?\b"),
+    re.compile(r"\bnot\b\s+(?:fixed|resolved|gone)\b"),
+    re.compile(r"\bregress(?:ed|es|ing)?\b"),
+)
 _TRACKER_HEADER_END = "---"
 _TRACKER_SECTION_PREFIX = "#### "
 _PRE_FLOW_SNAPSHOT_PARAM = "tracker_pre_flow_snapshot"
 _PRE_FLOW_SNAPSHOT_TRACKERS = "trackers"
 _PRE_FLOW_SNAPSHOT_STARTED_AT = "started_at"
+_MARKDOWN_HEADER_PREFIXES = ("# ", "## ", "### ", "#### ", "**")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,6 +97,57 @@ class _TrackerCheckContext:
     version: str
     started_at: str
     pre_flow_snapshots: dict[str, str]
+
+
+@dataclasses.dataclass(frozen=True)
+class _QuarantineDomain:
+    issue_ids: frozenset[str]
+    id_prefixes: frozenset[str]
+    keywords: frozenset[str]
+
+
+_QUARANTINE_DOMAINS = {
+    "af_engine": _QuarantineDomain(
+        issue_ids=frozenset({"AF-07", "RV-AF-05", "RV-AF-06"}),
+        id_prefixes=frozenset({"AF-", "RV-AF-"}),
+        keywords=frozenset({"agentflow", "af_engine", "af engine"}),
+    ),
+    "select_model": _QuarantineDomain(
+        issue_ids=frozenset({"FC-1", "FC-2", "FL-40", "FL-43"}),
+        id_prefixes=frozenset(),
+        keywords=frozenset({
+            "model selection",
+            "select_model",
+            "select_model_for_task",
+        }),
+    ),
+    "evaluation_loop": _QuarantineDomain(
+        issue_ids=frozenset({"FL-42", "RV-47"}),
+        id_prefixes=frozenset(),
+        keywords=frozenset({
+            "评价闭环",
+            "evaluation loop",
+            "feedback loop",
+            "foreman_rating",
+            "rating 消费",
+        }),
+    ),
+    "workflow_evaluation": _QuarantineDomain(
+        issue_ids=frozenset({"UX-23", "FL-63", "FL-70", "FC-4"}),
+        id_prefixes=frozenset(),
+        keywords=frozenset({"workflow_evaluation", "workflow evaluation"}),
+    ),
+    "suppress_codes": _QuarantineDomain(
+        issue_ids=frozenset({"FL-52"}),
+        id_prefixes=frozenset(),
+        keywords=frozenset({
+            "suppress_codes",
+            "suppress_instances",
+            "suppression lease",
+            "plan suppress",
+        }),
+    ),
+}
 
 
 def _check_improvement_register(state: FlowState) -> CheckResult:
@@ -55,6 +172,12 @@ def _check_improvement_register(state: FlowState) -> CheckResult:
 
     details.extend(_check_archive_migration(cwd, tracker_short, tracker_full, short_diff, full_diff))
     details.extend(_check_short_tracker_archive_advisory(cwd, tracker_short))
+    try:
+        current_short_text = _read_worktree_tracker_text(cwd, tracker_short)
+        details.extend(_check_short_tracker_strikethrough(current_short_text))
+        details.extend(_check_short_tracker_completed_summaries(current_short_text))
+    except OSError:
+        pass
     passed = _details_passed(details)
     return CheckResult(passed, details)
 
@@ -213,11 +336,21 @@ def _check_short_tracker_archive_advisory(cwd: str, tracker_short: str) -> list[
         baseline = _git_head_tracker_text(cwd, tracker_short)
         current = _read_worktree_tracker_text(cwd, tracker_short)
         completed_ids = _new_completed_tracker_ids(baseline, current)
-        remnants = _completed_section_remnants(current, completed_ids)
+        verified_ids = _new_verified_tracker_ids(baseline, current)
+        remnants = _completed_section_remnants(current, completed_ids | verified_ids)
     except OSError:
         return []
     if not remnants:
         return []
+    verified_remnants = sorted(remnants & verified_ids)
+    if verified_remnants:
+        return [
+            _detail(
+                "short tracker archive blocking",
+                False,
+                f"verified-but-not-archived: {verified_remnants} — archive these to full tracker before proceeding",
+            )
+        ]
     return [
         _detail(
             "short tracker archive blocking",
@@ -225,6 +358,39 @@ def _check_short_tracker_archive_advisory(cwd: str, tracker_short: str) -> list[
             f"completed-but-not-archived: {sorted(remnants)} — archive these to full tracker before proceeding",
         )
     ]
+
+
+def _check_short_tracker_strikethrough(current: str) -> list[dict]:
+    """Detect ~~XX-NN~~ strikethrough items in the short tracker body."""
+    body_lines = _tracker_body_lines(current)
+    ids: list[str] = []
+    for line in body_lines:
+        ids.extend(_STRIKETHROUGH_ISSUE_RE.findall(line))
+    if not ids:
+        return []
+    unique_ids = sorted(set(ids))
+    return [
+        _detail(
+            "short tracker strikethrough",
+            False,
+            f"short tracker contains strikethrough items: {unique_ids} — move to full tracker",
+        )
+    ]
+
+
+def _check_short_tracker_completed_summaries(current: str) -> list[dict]:
+    """Detect completed/verified summary lines in the short tracker body."""
+    body_lines = _tracker_body_lines(current)
+    for line in body_lines:
+        if _COMPLETED_SUMMARY_LINE_RE.match(line.strip()):
+            return [
+                _detail(
+                    "short tracker completed summaries",
+                    False,
+                    "short tracker contains completed/verified summary lines — these belong in full tracker only",
+                )
+            ]
+    return []
 
 
 def _check_archive_migration(
@@ -244,17 +410,22 @@ def _check_archive_migration(
             _detail("short tracker archived deletions", False, message),
             _detail("full tracker archive paragraph additions", False, message),
         ]
-    completed_ids = _new_completed_tracker_ids(baseline_short, current_short)
-    if not completed_ids:
+    archived_ids = _new_archived_tracker_ids(baseline_short, current_short)
+    verified_ids = _new_verified_tracker_ids(baseline_short, current_short)
+    if not archived_ids:
         message = "no newly completed items added in short tracker"
         return [
             _detail("short tracker archived deletions", True, message),
             _detail("full tracker archive paragraph additions", True, message),
         ]
-    return [
-        _short_tracker_archive_detail(short_diff, completed_ids),
-        _full_tracker_archive_detail(full_diff, current_full, completed_ids),
+    details = [
+        _short_tracker_archive_detail(short_diff, archived_ids),
+        _full_tracker_archive_detail(full_diff, current_full, archived_ids),
     ]
+    details.extend(_check_archive_evidence_bundle(current_full, archived_ids))
+    if verified_ids:
+        details.append(_verified_archive_behavior_detail(current_full, verified_ids))
+    return details
 
 
 def _short_tracker_archive_detail(short_diff: str, completed_ids: set[str]) -> dict:
@@ -290,6 +461,247 @@ def _full_tracker_archive_detail(full_diff: str, current_full: str, completed_id
     )
 
 
+def _verified_archive_behavior_detail(current_full: str, verified_ids: set[str]) -> dict:
+    missing_ids = _archive_behavior_evidence_missing(current_full, verified_ids)
+    if missing_ids:
+        return _detail(
+            "verified archive behavior evidence",
+            False,
+            f"verified-but-no-behavior-evidence: {missing_ids} — 归档前需补 E2E 行为确认",
+        )
+    return _detail(
+        "verified archive behavior evidence",
+        True,
+        f"verified archive behavior evidence confirmed for: {sorted(verified_ids)}",
+    )
+
+
+def _archive_behavior_evidence_missing(current_full: str, verified_ids: set[str]) -> list[str]:
+    return sorted(
+        issue_id
+        for issue_id in verified_ids
+        if not _archive_paragraph_has_behavior_evidence(current_full, issue_id)
+    )
+
+
+def _archive_paragraph_has_behavior_evidence(current_full: str, issue_id: str) -> bool:
+    paragraph = _full_tracker_archive_paragraph(current_full, issue_id)
+    return bool(paragraph) and _ARCHIVE_BEHAVIOR_EVIDENCE_RE.search(paragraph) is not None
+
+
+def _check_archive_evidence_bundle(current_full: str, archived_ids: set[str]) -> list[dict]:
+    """Check that each archived ID's section in the full tracker contains all required evidence bundle fields."""
+    details: list[dict] = []
+    for issue_id in sorted(archived_ids):
+        paragraph = _full_tracker_archive_paragraph(current_full, issue_id)
+        if not paragraph:
+            details.append(
+                _detail(
+                    "archive evidence bundle",
+                    False,
+                    f"{issue_id}: archive section not found in full tracker",
+                )
+            )
+            continue
+        parsed_fields = _parse_archive_evidence_fields(paragraph)
+        missing_fields = _missing_archive_evidence_fields(parsed_fields)
+        archive_decision = parsed_fields.get("archive_decision", "")
+        observed_behavior = parsed_fields.get("observed_behavior", "")
+        quarantine_domain = _is_quarantined(issue_id, paragraph)
+        problems = _archive_evidence_bundle_problems(missing_fields, archive_decision)
+        if quarantine_domain is not None:
+            problems.extend(
+                _quarantine_archive_evidence_problems(
+                    missing_fields,
+                    archive_decision,
+                    observed_behavior,
+                )
+            )
+        details.append(
+            _detail(
+                "archive evidence bundle",
+                not problems,
+                _archive_evidence_bundle_message(issue_id, problems, quarantine_domain),
+            )
+        )
+    return details
+
+
+def _full_tracker_archive_paragraph(current_full: str, issue_id: str) -> str:
+    matches = [
+        match
+        for match in (
+            _heading_archive_paragraph_match(current_full, issue_id),
+            _evidence_bundle_archive_paragraph_match(current_full, issue_id),
+        )
+        if match is not None
+    ]
+    if not matches:
+        return ""
+    return min(matches, key=lambda match: match.start()).group(0)
+
+
+def _parse_archive_evidence_fields(paragraph: str) -> dict[str, str]:
+    parsed_fields: dict[str, str] = {}
+    for line in paragraph.splitlines():
+        field_entry = _parse_archive_field_line(line)
+        if field_entry is None:
+            continue
+        field_name, field_value = field_entry
+        parsed_fields[field_name] = field_value
+    return parsed_fields
+
+
+def _parse_archive_field_line(line: str) -> tuple[str, str] | None:
+    match = _EVIDENCE_FIELD_LINE_RE.match(line)
+    if match is None:
+        return None
+    field_name = match.group("field").strip().lower()
+    return field_name, match.group("value").strip()
+
+
+def _missing_archive_evidence_fields(parsed_fields: dict[str, str]) -> list[str]:
+    return sorted(
+        field
+        for field in _EVIDENCE_BUNDLE_REQUIRED_FIELDS
+        if not parsed_fields.get(field, "").strip()
+    )
+
+
+def _archive_evidence_bundle_problems(missing_fields: list[str], archive_decision: str) -> list[str]:
+    problems: list[str] = []
+    if missing_fields:
+        problems.append(f"missing evidence bundle fields: {missing_fields}")
+    if archive_decision and not _archive_decision_is_archivable(archive_decision):
+        problems.append(
+            "archive status must include one of "
+            f"{sorted(_ARCHIVABLE_STATUSES)} in archive_decision"
+        )
+    return problems
+
+
+def _archive_decision_is_archivable(archive_decision: str) -> bool:
+    return _ARCHIVABLE_STATUS_RE.search(archive_decision) is not None
+
+
+def _is_quarantined(issue_id: str, paragraph: str) -> str | None:
+    normalized_issue_id = issue_id.strip().upper()
+    for domain_id, domain in _QUARANTINE_DOMAINS.items():
+        if normalized_issue_id in domain.issue_ids:
+            return domain_id
+        if any(normalized_issue_id.startswith(prefix) for prefix in domain.id_prefixes):
+            return domain_id
+    normalized_paragraph = paragraph.casefold()
+    for domain_id, domain in _QUARANTINE_DOMAINS.items():
+        if any(keyword in normalized_paragraph for keyword in domain.keywords):
+            return domain_id
+    return None
+
+
+def _quarantine_archive_evidence_problems(
+    missing_fields: list[str],
+    archive_decision: str,
+    observed_behavior: str,
+) -> list[str]:
+    problems: list[str] = []
+    if archive_decision and not _archive_decision_is_quarantine_ready(archive_decision):
+        problems.append(
+            "quarantine archive status must include one of "
+            f"{sorted(_QUARANTINE_ARCHIVABLE_STATUSES)} in archive_decision"
+        )
+    if missing_fields or not observed_behavior:
+        return problems
+    if _observed_behavior_has_negative_quarantine_token(observed_behavior):
+        problems.append("quarantine observed_behavior still shows the original symptom")
+        return problems
+    if _ARCHIVE_BEHAVIOR_EVIDENCE_RE.search(observed_behavior) is None:
+        problems.append("quarantine observed_behavior must prove the original symptom disappeared")
+    return problems
+
+
+def _archive_decision_is_quarantine_ready(archive_decision: str) -> bool:
+    normalized_value = archive_decision.casefold()
+    return any(status in normalized_value for status in _QUARANTINE_ARCHIVABLE_STATUSES)
+
+
+def _observed_behavior_has_negative_quarantine_token(observed_behavior: str) -> bool:
+    normalized_value = _normalize_observed_behavior(observed_behavior)
+    if _contains_negative_quarantine_cjk_sequence(normalized_value):
+        return True
+    if _contains_negative_quarantine_still_sequence(normalized_value):
+        return True
+    return any(
+        pattern.search(normalized_value) is not None
+        for pattern in _QUARANTINE_NEGATIVE_BEHAVIOR_ENGLISH_PATTERNS
+    )
+
+
+def _normalize_observed_behavior(observed_behavior: str) -> str:
+    return " ".join(observed_behavior.casefold().split())
+
+
+def _contains_negative_quarantine_cjk_sequence(normalized_value: str) -> bool:
+    return any(
+        _contains_ordered_keywords(normalized_value, first_keywords, second_keywords, blockers)
+        for first_keywords, second_keywords, blockers in _QUARANTINE_NEGATIVE_BEHAVIOR_CJK_KEYWORD_SEQUENCES
+    )
+
+
+def _contains_ordered_keywords(
+    normalized_value: str,
+    first_keywords: tuple[str, ...],
+    second_keywords: tuple[str, ...],
+    blockers: tuple[str, ...],
+) -> bool:
+    for first_keyword in first_keywords:
+        start_index = normalized_value.find(first_keyword)
+        while start_index != -1:
+            search_start = start_index + len(first_keyword)
+            for second_keyword in second_keywords:
+                second_index = normalized_value.find(second_keyword, search_start)
+                if second_index == -1:
+                    continue
+                if blockers and any(blocker in normalized_value[search_start:second_index] for blocker in blockers):
+                    continue
+                return True
+            start_index = normalized_value.find(first_keyword, search_start)
+    return False
+
+
+def _contains_negative_quarantine_still_sequence(normalized_value: str) -> bool:
+    for match in _QUARANTINE_NEGATIVE_BEHAVIOR_STILL_SEQUENCE_RE.finditer(normalized_value):
+        if _QUARANTINE_NEGATIVE_BEHAVIOR_ENGLISH_NEGATION_RE.search(match.group(0)) is None:
+            return True
+    return False
+
+
+def _archive_evidence_bundle_message(
+    issue_id: str,
+    problems: list[str],
+    quarantine_domain: str | None = None,
+) -> str:
+    prefix = f"{issue_id}:"
+    if quarantine_domain is not None:
+        prefix = f"{issue_id}: quarantine {quarantine_domain}:"
+    if not problems:
+        return f"{prefix} all evidence bundle fields present"
+    return f"{prefix} {'; '.join(problems)}"
+
+
+def _heading_archive_paragraph_match(current_full: str, issue_id: str) -> re.Match[str] | None:
+    section_re = re.compile(
+        rf"(?ms)^####\s+{re.escape(issue_id)}\b.*?{_ARCHIVE_PARAGRAPH_TERMINATOR}"
+    )
+    return section_re.search(current_full)
+
+
+def _evidence_bundle_archive_paragraph_match(current_full: str, issue_id: str) -> re.Match[str] | None:
+    section_re = re.compile(
+        rf"(?ims)^\*\*{re.escape(issue_id)}\s+evidence\s+bundle\*\*\s*$.*?{_ARCHIVE_PARAGRAPH_TERMINATOR}"
+    )
+    return section_re.search(current_full)
+
+
 def _deleted_tracker_ids(diff_text: str) -> set[str]:
     return _tracker_ids_in_text("\n".join(_diff_deleted_contents(diff_text)))
 
@@ -306,11 +718,24 @@ def _is_archive_paragraph_line(content: str) -> bool:
     stripped = content.strip()
     if not stripped or stripped == _TRACKER_HEADER_END:
         return False
-    if _is_completed_header_addition(f"+{stripped}") or stripped.startswith("#### "):
+    if _looks_like_archive_header_line(stripped) or stripped.startswith("#### "):
         return False
     if stripped.startswith("|"):
         return not _is_table_separator_row(stripped)
     return not _looks_like_header_line(stripped)
+
+
+def _looks_like_archive_header_line(content: str) -> bool:
+    return _is_completed_header_addition(f"+{content}") or _is_verified_header_line(content)
+
+
+def _is_verified_header_line(content: str) -> bool:
+    stripped = content.strip()
+    if not stripped or _VERIFIED_HEADER_RE.search(stripped) is None:
+        return False
+    if stripped.startswith(">") or stripped.startswith("已验证") or stripped.startswith("已修复"):
+        return True
+    return any(stripped.startswith(prefix) for prefix in _MARKDOWN_HEADER_PREFIXES)
 
 
 def _is_table_separator_row(content: str) -> bool:
@@ -345,6 +770,23 @@ def _new_completed_tracker_ids(baseline: str, current: str) -> set[str]:
         if match is not None:
             ids.update(_extract_tracker_ids(match.group(1)))
     return ids
+
+
+def _new_verified_tracker_ids(baseline: str, current: str) -> set[str]:
+    baseline_lines = set(baseline.splitlines())
+    ids: set[str] = set()
+    for line in current.splitlines():
+        if line in baseline_lines or not _is_verified_header_line(line):
+            continue
+        ids.update(_tracker_ids_in_text(line))
+    return ids
+
+
+def _new_archived_tracker_ids(baseline: str, current: str) -> set[str]:
+    return _new_completed_tracker_ids(baseline, current) | _new_verified_tracker_ids(
+        baseline,
+        current,
+    )
 
 
 def _extract_tracker_ids(raw_ids: str) -> set[str]:

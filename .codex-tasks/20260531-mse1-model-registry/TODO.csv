@@ -1,0 +1,6 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect registry and capability docs,DONE,"Relevant current data is understood","test -f .cccc/models/registry.yaml && test -f docs/foreman-capability-guide.md",2026-05-31,0,
+2,Update model registry data,DONE,"registry.yaml contains requested descriptions, enabled states, and strengths","python -c \"import yaml; from pathlib import Path; data=yaml.safe_load(Path('.cccc/models/registry.yaml').read_text()); assert isinstance(data, dict); assert isinstance(data.get('models'), dict)\"",2026-05-31,0,
+3,Sync capability guide table,DONE,"Capability table has weaknesses and enabled columns synced with registry","rg 'weaknesses|enabled' docs/foreman-capability-guide.md",2026-05-31,0,
+4,Add registry data tests,DONE,"tests/test_registry_data.py exists and asserts requested data constraints","test -f tests/test_registry_data.py",2026-05-31,0,
+5,Run requested pytest,DONE,"Focused registry data tests pass","python subprocess timeout=60: python -m pytest tests/test_registry_data.py -v",2026-05-31,1,"Initial timeout(1) command unavailable on macOS; reran exact pytest command through Python subprocess timeout."

@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,确认 task_map 生成点与渲染调用链,DONE,已确认 breakdown/task_map 在 orchestrator 中生成且需透传到 summary/metric,rg -n "_workflow_evaluation_test_summary_lines|_workflow_evaluation_test_metric_rows|_workflow_evaluation_result_breakdown_detail" src/cccc/daemon/foreman/workflow_evaluation.py src/cccc/daemon/foreman/workflow_orchestrator.py,2026-06-05,0,
+2,实现 independently_reviewed 任务列表输出,DONE,summary/metric 在 independently_reviewed>0 且 task_map 可用时输出排序后的任务 ID,python -m pytest tests/test_workflow_evaluation_task_map.py -v,2026-06-05,0,已同时补充 orchestrator 调用链透传
+3,补充并通过定向测试,DONE,四个兼容与一致性场景全部通过,python -m pytest tests/test_workflow_evaluation_task_map.py -v,2026-06-05,0,额外回归 tests/test_workflow_eval_detail.py 通过

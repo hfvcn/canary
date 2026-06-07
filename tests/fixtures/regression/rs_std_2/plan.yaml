@@ -1,0 +1,29 @@
+plan_scope:
+  - src
+critical_entrypoints:
+  - src/main.py
+# Isolate this fixture to its subject (dormant-path WARNING). Suppress incidental
+# critical/verification ERRORS from this minimal fixture so the plan stays valid
+# (W_INTEGRATION_DORMANT_PATH is a warning and does not flip validity) — matches
+# RS-STD-2.expect_valid=True.
+suppress_codes:
+  - E_CRITICAL_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_ENTRYPOINT_UNOWNED
+  - E_CRITICAL_FLOW_UNCOVERED
+  - E_VERIFICATION_TARGET_MISSING_FILE
+tasks:
+  - id: T1
+    title: Integrate dormant module into production
+    role: integration
+    claimed_paths:
+      - src/dormant_module.py
+    goal_behavior: "Wire dormant_module into the production call graph"
+    acceptance_criteria: "dormant_module is reachable from entrypoint"
+    verification:
+      level: integration
+      command: "python -m pytest tests/test_placeholder.py -q"
+      checks:
+        - name: behavior
+          command: "python -m pytest tests/test_placeholder.py -q"
+      covers:
+        tasks: ["T1"]

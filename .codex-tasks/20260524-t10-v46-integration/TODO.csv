@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Locate real imports and existing coverage,DONE,Imports and behaviors identified,n/a,2026-05-24T00:00:00,0,Confirmed FlowEngine/agent_ops/workflow_monitor/ralph_service integration points.
+2,Create v46 integration test file,DONE,tests/e2e/test_v46_integration.py exists,test -f tests/e2e/test_v46_integration.py,2026-05-24T00:00:00,0,Added five integration tests covering HMAC flow transitions, tamper detection, model priority chain, and unified scope code.
+3,Run targeted pytest,DONE,pytest target passes,pytest tests/e2e/test_v46_integration.py -v,2026-05-24T00:00:00,0,Initial run exposed select_model_for_task priority bug; patched source-priority sort and reran to 5/5 passing.

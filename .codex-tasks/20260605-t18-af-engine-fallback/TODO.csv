@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect orchestrator AF path and existing engine-tag coverage,DONE,Relevant code paths and tests reviewed,rg -n "_compile_af_bundle|_write_workflow_evaluation|_execution_engine_tag" src/cccc/daemon/foreman/workflow_orchestrator.py tests,2026-06-05,0,
+2,Implement two-stage AF fallback entrypoint and migrate call sites,DONE,workflow_orchestrator uses _try_af_execution with fail-loud semantics,rg -n "_try_af_execution|_compile_af_bundle" src/cccc/daemon/foreman/workflow_orchestrator.py tests/test_foreman_workflow.py,2026-06-05,0,
+3,Add targeted AF fallback tests,DONE,tests/agentflow/test_engine_fallback.py covers requested scenarios,test -f tests/agentflow/test_engine_fallback.py,2026-06-05,0,
+4,Run requested pytest,DONE,Targeted pytest passes,python -m pytest tests/agentflow/test_engine_fallback.py -v,2026-06-05,0,4 passed in 0.95s

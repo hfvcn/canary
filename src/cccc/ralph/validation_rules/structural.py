@@ -9,7 +9,15 @@ import pathlib
 import re
 from typing import Any, Dict, List, NamedTuple, Optional, Set
 
-from cccc.kernel.claimed_paths import normalize_write_set as _normalize_write_set, paths_overlap as _paths_overlap
+from ...daemon.foreman.workflow_evaluation import (
+    WORKFLOW_EVALUATION_PLACEHOLDER,
+    _check_placeholder_content,
+)
+from cccc.kernel.claimed_paths import (
+    normalize_path as _normalize_path,
+    normalize_write_set as _normalize_write_set,
+    paths_overlap as _paths_overlap,
+)
 from ..graph_utils import transitive_deps, detect_cycle, find_components
 from ..models import (
     CheckSpec,
@@ -17,6 +25,7 @@ from ..models import (
     TaskSpec,
     Verification,
     ValidationIssue,
+    normalize_module,
 )
 
 
@@ -25,12 +34,26 @@ MAX_OVERLAP_EVIDENCE = 5
 WRITE_CONFLICT_CODE = "E_WRITE_CONFLICT"
 SHARED_PATH_CODE = "W_SHARED_PATH_NO_DEPENDENCY"
 CLAIMED_PATH_INCOMPLETE_CODE = "W_CLAIMED_PATH_INCOMPLETE"
+TASK_PATH_OUTSIDE_PLAN_SCOPE_CODE = "E_TASK_PATH_OUTSIDE_PLAN_SCOPE"
 GOAL_REFERENCES_UNCLAIMED_CODE = "W_GOAL_REFERENCES_UNCLAIMED_PATH"
 GOAL_SYMBOL_NOT_IN_CLAIMED_CODE = "W_GOAL_SYMBOL_NOT_IN_CLAIMED_PATH"
 GOAL_CJK_TOKENIZATION_HINT_CODE = "W_GOAL_CJK_TOKENIZATION_HINT"
 E2E_COMPILE_CHECK_CODE = "W_E2E_MISSING_COMPILE_CHECK"
+WORKFLOW_EVALUATION_PLACEHOLDER_REMAINING_CODE = "W_EVALUATION_PLACEHOLDER_REMAINING"
+W_MODULE_STRUCTURE_INCOMPLETE = "W_MODULE_STRUCTURE_INCOMPLETE"
+W_MODULE_NO_BLACKBOX_EVIDENCE = "W_MODULE_NO_BLACKBOX_EVIDENCE"
+W_MODULE_INTEGRATION_CONTRACT_UNRESOLVED = "W_MODULE_INTEGRATION_CONTRACT_UNRESOLVED"
 COMPILE_REQUIRED_LEVELS = frozenset({"api", "e2e", "integration"})
 COMPILE_SKIP_LEVELS = frozenset({"compile", "unit"})
+MODULE_BLUEPRINT_FIELDS = (
+    "black_box_tests",
+    "expected_outputs",
+    "completion_evidence",
+    "integration_contract",
+)
+MODULE_IO_BLUEPRINT_FIELDS = ("mock_inputs", "expected_outputs", "black_box_tests")
+MODULE_LINK_DIRECTIONS = ("upstream", "downstream")
+MODULE_COMPLETION_REQUIRED_KEY = "required"
 PYTHON_IMPORT_TOKEN_RE = re.compile(r"\b(import|from)\b")
 GOAL_FILE_PATH = r"([A-Za-z0-9_./\\-]+\.(?:py|js|ts|yaml|yml|json))"
 GOAL_BACKTICK_SYMBOL_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*(?:\(\))?)`")
@@ -276,6 +299,31 @@ def _check_claimed_path_incomplete(plan: Plan) -> List[ValidationIssue]:
     return issues
 
 
+def _check_task_paths_outside_plan_scope(plan: Plan) -> List[ValidationIssue]:
+    if not plan.plan_scope:
+        return []
+
+    issues: List[ValidationIssue] = []
+    for task in plan.tasks:
+        for kind, paths in (
+            ("claimed_paths", task.claimed_paths),
+            ("awareness_paths", task.awareness_paths or []),
+        ):
+            offending_paths = [
+                path for path in paths
+                if not _path_in_scope(path, plan.plan_scope)
+            ]
+            if not offending_paths:
+                continue
+            issues.append(_task_path_scope_issue(
+                task=task,
+                kind=kind,
+                offending_paths=offending_paths,
+                plan_scope=plan.plan_scope,
+            ))
+    return issues
+
+
 def _check_goal_mentions_unclaimed_path(plan: Plan) -> List[ValidationIssue]:
     issues: List[ValidationIssue] = []
     for task in plan.tasks:
@@ -334,6 +382,32 @@ def _check_goal_symbol_in_claimed_paths(
     return issues
 
 
+def _check_workflow_evaluation_placeholder(
+    plan: Plan,
+    *,
+    project_root: pathlib.Path | None = None,
+) -> List[ValidationIssue]:
+    del plan
+    if project_root is None:
+        return []
+    evaluation_path = project_root / "WORKFLOW_EVALUATION.md"
+    if not evaluation_path.is_file():
+        return []
+    content = evaluation_path.read_text(encoding="utf-8", errors="replace")
+    if WORKFLOW_EVALUATION_PLACEHOLDER not in content:
+        return []
+    remaining_sections = _check_placeholder_content(content)
+    evidence = {"path": evaluation_path.name}
+    if remaining_sections:
+        evidence["remaining_sections"] = remaining_sections
+    return [ValidationIssue(
+        code=WORKFLOW_EVALUATION_PLACEHOLDER_REMAINING_CODE,
+        severity="warning",
+        message="WORKFLOW_EVALUATION.md contains remaining foreman placeholder content",
+        evidence=evidence,
+    )]
+
+
 def _check_goal_cjk_tokenization_hint(plan: Plan) -> List[ValidationIssue]:
     """Hint when goal describes text tokenization in CJK context."""
     issues: List[ValidationIssue] = []
@@ -361,6 +435,45 @@ def _check_goal_cjk_tokenization_hint(plan: Plan) -> List[ValidationIssue]:
 
 def _normalize_task_paths(paths: List[str]) -> List[str]:
     return _normalize_write_set(paths) if paths else []
+
+
+def _path_in_scope(path: str, plan_scope: List[str]) -> bool:
+    normalized_path = _normalize_scope_path(path)
+    for scope in plan_scope:
+        normalized_scope = _normalize_scope_path(scope)
+        if not normalized_scope:
+            continue
+        if normalized_path == normalized_scope:
+            return True
+        if normalized_path.startswith(f"{normalized_scope}/"):
+            return True
+    return False
+
+
+def _normalize_scope_path(path: str) -> str:
+    normalized = _normalize_path(path)
+    return normalized.rstrip("/") if normalized != "/" else normalized
+
+
+def _task_path_scope_issue(
+    *,
+    task: TaskSpec,
+    kind: str,
+    offending_paths: List[str],
+    plan_scope: List[str],
+) -> ValidationIssue:
+    return ValidationIssue(
+        code=TASK_PATH_OUTSIDE_PLAN_SCOPE_CODE,
+        severity="error",
+        message=f"task '{task.id}' has {kind} outside plan_scope",
+        task_ids=[task.id],
+        evidence={
+            "task_id": task.id,
+            "kind": kind,
+            "offending_paths": list(offending_paths),
+            "plan_scope": list(plan_scope),
+        },
+    )
 
 
 def _extract_goal_symbols(goal: str) -> List[str]:
@@ -924,3 +1037,240 @@ def _check_module_consistency(plan: Plan) -> List[ValidationIssue]:
                         evidence={"module_id": mod.id, "unknown_dep": dep},
                     ))
     return issues
+
+
+def _check_module_dep_cycle(plan: Plan) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    for task in plan.tasks:
+        if not task.modules:
+            continue
+        graph = _task_module_graph(task)
+        issues.extend(_module_self_loop_issues(task.id, task.modules))
+        for cycle in _task_module_cycles(graph):
+            issues.append(ValidationIssue(
+                code="E_MODULE_DEP_CYCLE",
+                severity="error",
+                message=f"task '{task.id}' has a module dependency cycle",
+                task_ids=[task.id],
+                evidence={"task_id": task.id, "cycle": cycle, "kind": "cycle"},
+            ))
+    return issues
+
+
+def _check_module_structure(
+    plan: Plan,
+    *,
+    project_root: pathlib.Path | None = None,
+    **_: object,
+) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    for task in plan.tasks:
+        modules = [normalize_module(module) for module in task.modules or []]
+        if not modules:
+            continue
+        module_ids = {str(module["id"]) for module in modules}
+        for module in modules:
+            issues.extend(_module_structure_issues(task.id, module, module_ids))
+    return issues
+
+
+def _module_structure_issues(
+    task_id: str,
+    module: Dict[str, Any],
+    module_ids: Set[str],
+) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    missing_fields = _module_missing_blueprint_fields(module)
+    if missing_fields:
+        issues.append(_module_structure_incomplete_issue(task_id, module, missing_fields))
+    if module.get("expected_outputs") and not module.get("black_box_tests"):
+        issues.append(_module_no_blackbox_issue(task_id, module))
+    for direction in MODULE_LINK_DIRECTIONS:
+        for linked_id in _module_linked_ids(module, direction):
+            if linked_id not in module_ids:
+                issues.append(_module_unresolved_contract_issue(task_id, module, direction, linked_id))
+    return issues
+
+
+def _module_missing_blueprint_fields(module: Dict[str, Any]) -> List[str]:
+    if not any(module.get(field) for field in MODULE_BLUEPRINT_FIELDS):
+        return []
+    missing: List[str] = []
+    if any(module.get(field) for field in MODULE_IO_BLUEPRINT_FIELDS):
+        if not str(module.get("purpose") or "").strip():
+            missing.append("purpose")
+        if not _module_has_interface(module):
+            missing.append("interface")
+    completion_evidence = module.get("completion_evidence") or {}
+    if completion_evidence and not completion_evidence.get(MODULE_COMPLETION_REQUIRED_KEY):
+        missing.append(f"completion_evidence.{MODULE_COMPLETION_REQUIRED_KEY}")
+    return missing
+
+
+def _module_has_interface(module: Dict[str, Any]) -> bool:
+    return bool(module.get("provides") or module.get("consumes"))
+
+
+def _module_linked_ids(module: Dict[str, Any], direction: str) -> List[str]:
+    raw_ids = (module.get("integration_contract") or {}).get(direction) or []
+    if isinstance(raw_ids, str):
+        raw_ids = [raw_ids]
+    if not isinstance(raw_ids, list):
+        return []
+    return [str(linked_id).strip() for linked_id in raw_ids if str(linked_id).strip()]
+
+
+def _module_structure_incomplete_issue(
+    task_id: str,
+    module: Dict[str, Any],
+    missing_fields: List[str],
+) -> ValidationIssue:
+    return ValidationIssue(
+        code=W_MODULE_STRUCTURE_INCOMPLETE,
+        severity="warning",
+        message=(
+            f"task '{task_id}' module '{module['id']}' partially specifies blueprint "
+            f"fields but is missing {', '.join(missing_fields)}"
+        ),
+        task_ids=[task_id],
+        evidence=_module_issue_evidence(module, missing_fields=missing_fields),
+    )
+
+
+def _module_no_blackbox_issue(task_id: str, module: Dict[str, Any]) -> ValidationIssue:
+    return ValidationIssue(
+        code=W_MODULE_NO_BLACKBOX_EVIDENCE,
+        severity="warning",
+        message=(
+            f"task '{task_id}' module '{module['id']}' declares expected_outputs "
+            "without black_box_tests"
+        ),
+        task_ids=[task_id],
+        evidence=_module_issue_evidence(module, missing_fields=["black_box_tests"]),
+    )
+
+
+def _module_unresolved_contract_issue(
+    task_id: str,
+    module: Dict[str, Any],
+    direction: str,
+    linked_id: str,
+) -> ValidationIssue:
+    return ValidationIssue(
+        code=W_MODULE_INTEGRATION_CONTRACT_UNRESOLVED,
+        severity="warning",
+        message=(
+            f"task '{task_id}' module '{module['id']}' references unknown "
+            f"{direction} module '{linked_id}'"
+        ),
+        task_ids=[task_id],
+        evidence=_module_issue_evidence(
+            module,
+            contract_direction=direction,
+            missing_module_id=linked_id,
+        ),
+    )
+
+
+def _module_issue_evidence(
+    module: Dict[str, Any],
+    *,
+    missing_fields: List[str] | None = None,
+    contract_direction: str | None = None,
+    missing_module_id: str | None = None,
+) -> Dict[str, Any]:
+    evidence: Dict[str, Any] = {
+        "module_id": module["id"],
+        "purpose": module.get("purpose", ""),
+        "provides": [item.get("name") for item in module.get("provides") or []],
+        "consumes": [item.get("name") for item in module.get("consumes") or []],
+        "expected_outputs": [item.get("name") for item in module.get("expected_outputs") or []],
+        "black_box_tests": len(module.get("black_box_tests") or []),
+        "integration_contract": dict(module.get("integration_contract") or {}),
+    }
+    if missing_fields:
+        evidence["missing_fields"] = list(missing_fields)
+    if contract_direction is not None:
+        evidence["direction"] = contract_direction
+    if missing_module_id is not None:
+        evidence["missing_module_id"] = missing_module_id
+    return evidence
+
+
+def _task_module_graph(task: TaskSpec) -> Dict[str, List[str]]:
+    assert task.modules is not None
+    module_ids = {module.id for module in task.modules}
+    return {
+        module.id: [
+            dep for dep in module.internal_depends_on
+            if dep in module_ids and dep != module.id
+        ]
+        for module in task.modules
+    }
+
+
+def _module_self_loop_issues(task_id: str, modules: List[Any]) -> List[ValidationIssue]:
+    issues: List[ValidationIssue] = []
+    for module in modules:
+        if module.id not in module.internal_depends_on:
+            continue
+        issues.append(ValidationIssue(
+            code="E_MODULE_DEP_CYCLE",
+            severity="error",
+            message=f"task '{task_id}' module '{module.id}' depends on itself",
+            task_ids=[task_id],
+            evidence={"task_id": task_id, "module_id": module.id, "kind": "self-loop"},
+        ))
+    return issues
+
+
+def _task_module_cycles(graph: Dict[str, List[str]]) -> List[List[str]]:
+    state = {module_id: 0 for module_id in graph}
+    stack: List[str] = []
+    seen_cycles: Set[tuple[str, ...]] = set()
+    cycles: List[List[str]] = []
+    for module_id in graph:
+        _walk_module_cycles(module_id, graph, state, stack, seen_cycles, cycles)
+    return cycles
+
+
+def _walk_module_cycles(
+    module_id: str,
+    graph: Dict[str, List[str]],
+    state: Dict[str, int],
+    stack: List[str],
+    seen_cycles: Set[tuple[str, ...]],
+    cycles: List[List[str]],
+) -> None:
+    if state[module_id] != 0:
+        return
+    state[module_id] = 1
+    stack.append(module_id)
+    for dep_id in graph[module_id]:
+        dep_state = state.get(dep_id, 2)
+        if dep_state == 0:
+            _walk_module_cycles(dep_id, graph, state, stack, seen_cycles, cycles)
+            continue
+        if dep_state == 1:
+            cycle = _cycle_from_stack(stack, dep_id)
+            cycle_key = _canonical_cycle_key(cycle)
+            if cycle_key not in seen_cycles:
+                seen_cycles.add(cycle_key)
+                cycles.append(cycle)
+    stack.pop()
+    state[module_id] = 2
+
+
+def _cycle_from_stack(stack: List[str], entry_id: str) -> List[str]:
+    start = stack.index(entry_id)
+    cycle = stack[start:]
+    return [*cycle, entry_id]
+
+
+def _canonical_cycle_key(cycle: List[str]) -> tuple[str, ...]:
+    nodes = cycle[:-1]
+    rotations = [
+        tuple(nodes[index:] + nodes[:index])
+        for index in range(len(nodes))
+    ]
+    return min(rotations)

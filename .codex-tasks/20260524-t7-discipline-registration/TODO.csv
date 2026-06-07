@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect current discipline rule wiring,DONE,Target modules and hook point are identified,,2026-05-24,0,Read discipline.py validator.py and tests
+2,Implement rule registration completeness check,DONE,Meta-check reports unregistered rule functions and ignores registered or internally used ones,,2026-05-24,0,Implemented in discipline_registration.py and re-exported via discipline.py
+3,Hook meta-check into validator infrastructure,DONE,Validator runs the meta-check outside collect_discipline_issues,,2026-05-24,0,Added explicit validator hook and kept collect_discipline_issues unchanged
+4,Add and run discipline rule tests,DONE,tests/test_aegis_discipline_rules.py passes,python -m pytest tests/test_aegis_discipline_rules.py -v,2026-05-24,0,18 tests passed

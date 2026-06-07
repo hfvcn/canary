@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read T1 spec and existing validation patterns,DONE,Relevant code paths and issue shape understood,rg/sed reads complete,2026-05-31,0,
+2,Implement structural rule and registration,DONE,Rule is exposed via get_all_rules and structural collection,python -m compileall src/cccc/ralph,2026-05-31,0,
+3,Add RV-30 acceptance tests,DONE,Five criteria covered in tests/ralph/test_validation_task_scope.py,pytest tests/ralph/test_validation_task_scope.py,2026-05-31,0,
+4,Run focused validation,DONE,Focused tests pass within timeout,python -c subprocess.run pytest timeout=60,2026-05-31,0,

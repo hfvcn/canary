@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Trace AF-08 submit path and fixture requirements,DONE,"Confirmed register_and_suggest -> _submit_ready_suggestion bypass and identified AF-ready test fixture requirements","rg -n \"_submit_ready_suggestion|process_batch_suggestion|handle_ralph_register_and_suggest\" src tests todo/问题清单-v5-ralph.md",2026-06-06,0,
+2,Route initial submit through orchestrator AF wrapper,DONE,"workflow_orchestrator accepts allowed_existing_task_ids and _submit_ready_suggestion calls owner wrapper without changing AF gate semantics","python -m pytest tests/agentflow/test_af08_initial_submit_routing.py -v",2026-06-06,0,
+3,Add AF-08 regression tests,DONE,"AF-ready path calls _try_af_execution and no-transport path stays legacy","python -m pytest tests/agentflow/test_af08_initial_submit_routing.py -v",2026-06-06,0,
+4,Run targeted and full pytest validation,DONE,"Targeted file and full suite executed; only routing-related expectation changes applied if needed","python -m pytest tests/ -q",2026-06-06,0,

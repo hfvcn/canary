@@ -40,6 +40,7 @@ class TestRalphIPCContracts(unittest.TestCase):
         self.assertEqual(len(suggestion.tasks), 2)
         self.assertEqual(suggestion.tasks[0].type, "backend")
         self.assertEqual(suggestion.estimated_parallelism, 2)
+        self.assertEqual(suggestion.engine_preference, "auto")
 
     def test_verification_result_model(self) -> None:
         from cccc.contracts.v1.ralph_ipc import VerificationResult, VerificationCheck
@@ -427,6 +428,13 @@ class TestRalphServiceVerificationCompatibility(unittest.TestCase):
 
 class TestRalphIPCHandler(unittest.TestCase):
     """Test Ralph IPC daemon operations."""
+
+    def setUp(self) -> None:
+        from cccc.daemon.ralph_ipc_handler import _ACTOR_STATUS_CACHE, _RALPH_STATE
+
+        for state in _RALPH_STATE.values():
+            state.clear()
+        _ACTOR_STATUS_CACHE.clear()
 
     def _with_home(self):
         old_home = os.environ.get("CCCC_HOME")

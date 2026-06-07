@@ -7,6 +7,7 @@ import pytest
 from cccc.contracts.v1.agent import Agent, ModelCapability, ModelRegistry
 from cccc.contracts.v1.ralph_ipc import TaskRef
 from cccc.daemon.foreman.agent_pool import AgentPoolManager, _parse_context_window
+from cccc.daemon.ops.agent_ops import select_model_for_task
 
 
 def _make_pool_manager(tmp_path, monkeypatch, model: ModelCapability) -> AgentPoolManager:
@@ -22,6 +23,10 @@ def _make_pool_manager(tmp_path, monkeypatch, model: ModelCapability) -> AgentPo
     registry = ModelRegistry(models={"test-model": model})
     monkeypatch.setattr(manager, "get_model_registry", lambda: registry)
     return manager
+
+
+def _make_registry(model: ModelCapability) -> ModelRegistry:
+    return ModelRegistry(models={"test-model": model})
 
 
 def _make_agent() -> Agent:
@@ -91,15 +96,68 @@ def test_best_for_match(tmp_path, monkeypatch):
     model = ModelCapability(
         runtime="claude",
         model_id="test-model",
-        strengths=["backend"],
-        best_for="Backend development and API work",
+    )
+    model.best_for = ["backend"]  # type: ignore[assignment]
+    manager = _make_pool_manager(tmp_path, monkeypatch, model)
+
+    score, reasons = manager._score_model_for_task(model, _make_task())
+
+    assert score == 10
+    assert reasons == ["Model best_for match: backend"]
+
+
+def test_description_fallback_backend_chinese(tmp_path, monkeypatch):
+    model = ModelCapability(
+        runtime="claude",
+        model_id="test-model",
+        description="后端开发",
     )
     manager = _make_pool_manager(tmp_path, monkeypatch, model)
 
-    score, reasons = manager._score_agent_for_task(_make_agent(), _make_task())
+    score, reasons = manager._score_model_for_task(model, _make_task())
 
-    assert score == 110
-    assert "Model best_for match: Backend development and API work" in reasons
+    assert score == 1
+    assert reasons == ["Model description match: backend"]
+
+
+def test_description_fallback_frontend(tmp_path, monkeypatch):
+    model = ModelCapability(
+        runtime="claude",
+        model_id="test-model",
+        description="frontend UI",
+    )
+    manager = _make_pool_manager(tmp_path, monkeypatch, model)
+
+    score, reasons = manager._score_model_for_task(model, _make_task(task_type="frontend"))
+
+    assert score == 1
+    assert reasons == ["Model description match: frontend"]
+
+
+def test_all_empty_returns_none():
+    model = ModelCapability(
+        runtime="claude",
+        model_id="test-model",
+    )
+
+    selected = select_model_for_task("backend", _make_registry(model))
+
+    assert selected is None
+
+
+def test_strengths_takes_priority(tmp_path, monkeypatch):
+    model = ModelCapability(
+        runtime="claude",
+        model_id="test-model",
+        strengths=["backend"],
+        description="frontend UI and backend API",
+    )
+    manager = _make_pool_manager(tmp_path, monkeypatch, model)
+
+    score, reasons = manager._score_model_for_task(model, _make_task())
+
+    assert score == 10
+    assert reasons == ["Model strength: backend"]
 
 
 def test_context_window_bonus(tmp_path, monkeypatch):

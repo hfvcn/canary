@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect validator and existing signoff tests,DONE,Relevant validator and test patterns identified,rg W_SIGNOFF_STRUCTURE_WEAK src/cccc tests/ralph,2026-05-31T00:00:00+08:00,0,
+2,Add RV-34 validate integration tests,DONE,tests/ralph/test_rv34_integration.py contains six requested validate() scenarios,test -f tests/ralph/test_rv34_integration.py,2026-05-31T00:00:00+08:00,0,
+3,Run targeted pytest,DONE,Targeted RV-34 integration tests pass,python -m pytest tests/ralph/test_rv34_integration.py -v,2026-05-31T00:00:00+08:00,0,

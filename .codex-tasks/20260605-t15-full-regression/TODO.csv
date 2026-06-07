@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Scaffold task tracking,DONE,"SPEC.md, TODO.csv, PROGRESS.md exist","test -f .codex-tasks/20260605-t15-full-regression/SPEC.md && test -f .codex-tasks/20260605-t15-full-regression/TODO.csv && test -f .codex-tasks/20260605-t15-full-regression/PROGRESS.md","2026-06-05 00:00",0,"Taskmaster full single initialized"
+2,Run full pytest and capture first failure,DONE,"User command reproduces first failure or passes cleanly","python -m pytest --timeout=120 -x -q","2026-06-05 00:01",0,"Failed at tests/test_module_split.py::test_orchestrator_size; workflow_orchestrator.py measured 2736 lines"
+3,Fix regression root cause,DONE,"Targeted failing tests and impacted suite pass","python -m pytest --timeout=120 -q tests/test_module_split.py -q","2026-06-05 00:02",0,"Extracted FeishuAdapterWrapper; workflow_orchestrator.py now 2694 lines and targeted split tests pass"
+4,Re-run full pytest to 0 failed,DONE,"Full pytest finishes with 0 failed","python -m pytest --timeout=120 -x -q","2026-06-05 00:06",2,"Two additional failures surfaced during full reruns and were fixed before final green run"

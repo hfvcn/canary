@@ -99,7 +99,13 @@ def _status(orch, task_id: str) -> WorkflowTaskStatus:
     return state.status
 
 
-def test_auto_dispatches_linear_downstream_batches(orchestrator) -> None:
+def test_auto_dispatches_linear_downstream_batches(orchestrator, monkeypatch) -> None:
+    from cccc.daemon.foreman.workflow_orchestrator import AF_ENGINE_ENABLED_ENV_VAR
+
+    # This test drives the legacy auto-dispatch state machine with manually-reported
+    # completion. AF is default-on and uses synthetic completion (tasks auto-complete
+    # on send), which is incompatible with manual driving — pin to the legacy path.
+    monkeypatch.setenv(AF_ENGINE_ENABLED_ENV_VAR, "0")
     workflow_id = "wf-auto-dispatch"
     agent_id = "agent-1"
     tasks = _linear_tasks()

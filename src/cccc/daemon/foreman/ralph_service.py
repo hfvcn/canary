@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 
 _logger = logging.getLogger("cccc.daemon.foreman.ralph_service")
@@ -36,6 +36,7 @@ from ...ralph.agent import (
     RalphAgent,
     build_error_envelope,
 )
+from ...ralph.core import compute_estimated_parallelism
 from ...ralph.aegis import effective_intent, suggest_aegis_issues
 from ...ralph.plan_io import compute_structural_plan_digest, load_plan
 from ...kernel.claimed_paths import (
@@ -62,10 +63,22 @@ DEFAULT_VERIFICATION_CLEANUP_PATTERNS = [
     ".pytest_cache",
 ]
 SUSPICIOUS_DURATION_THRESHOLD_MS = 50
+PYTEST_SUSPICIOUS_DURATION_THRESHOLD_MS = 500
 _SHELL_OPERATOR_TOKENS = {"&&", "||", "|", ";"}
 _TRIVIAL_VERIFY_COMMANDS = {"true", ":", "echo", "printf"}
 _SUSPICIOUS_DURATION_EXEMPT_COMMANDS = frozenset(
-    {"grep", "test", "[", "true", "false"}
+    {
+        "grep",
+        "test",
+        "[",
+        "true",
+        "false",
+        "compileall",
+        "stat",
+        "wc",
+        "head",
+        "cat",
+    }
 )
 WORKER_SCOPE_WARNING_CODE = "W_WORKER_EXCEEDED_SCOPE"
 CHALLENGE_DEGRADED_WARNING_CODE = "W_CHALLENGE_DEGRADED"
@@ -77,6 +90,7 @@ AGENT_VERIFICATION_FAILED_PREFIX = "agent verification failed:"
 AGENT_VERIFICATION_INFRA_ERROR_PREFIX = "agent verification infrastructure error:"
 AGENT_REVIEW_SKIPPED_WARNING_CODE = "W_AGENT_REVIEW_SKIPPED"
 MAX_SCOPE_WARNING_FILES = 5
+_SCOPE_EXEMPT_PATTERNS = {"__init__.py", "conftest.py"}
 SOURCE_CONTEXT_MAX_BYTES = 50_000
 SOURCE_FILE_MAX_BYTES = 16_000
 _SOURCE_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx"}
@@ -114,6 +128,24 @@ def _trim_source_text(text: str, total: int) -> str:
     if len(text) > remaining:
         text = text[:remaining] + "\n... (truncated)"
     return text
+
+
+def _claimed_parent_directories(paths: List[str]) -> set[str]:
+    return {
+        str(PurePosixPath(path).parent)
+        for path in paths
+        if path != "/"
+    }
+
+
+def _is_scope_exempt_basename(path: str) -> bool:
+    return PurePosixPath(path).name in _SCOPE_EXEMPT_PATTERNS
+
+
+def _is_same_directory_scope_exempt(path: str, claimed_parent_dirs: set[str]) -> bool:
+    if not _is_scope_exempt_basename(path):
+        return False
+    return str(PurePosixPath(path).parent) in claimed_parent_dirs
 
 
 _ENV_VAR_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=\S")
@@ -159,14 +191,44 @@ def _has_shell_operators(command: str) -> bool:
     return in_single or in_double
 
 
-def _first_command_base(command: str) -> str | None:
+def _command_tokens(command: str) -> list[str]:
     try:
-        tokens = shlex.split(command)
+        return shlex.split(command)
     except ValueError:
-        return None
+        return []
+
+
+def _command_base(tokens: list[str]) -> str | None:
     if not tokens:
         return None
     return tokens[0].rsplit("/", 1)[-1]
+
+
+def _first_command_base(command: str) -> str | None:
+    return _command_base(_command_tokens(command))
+
+
+def _is_python_command(base: str | None) -> bool:
+    if base is None:
+        return False
+    return base == "python" or re.fullmatch(r"python\d+(\.\d+)*", base) is not None
+
+
+def _is_python_module_command(tokens: list[str], module_name: str) -> bool:
+    return (
+        _is_python_command(_command_base(tokens))
+        and len(tokens) >= 3
+        and tokens[1] == "-m"
+        and tokens[2] == module_name
+    )
+
+
+def _is_python_inline_command(tokens: list[str]) -> bool:
+    return (
+        _is_python_command(_command_base(tokens))
+        and len(tokens) >= 2
+        and tokens[1] == "-c"
+    )
 
 
 def _is_trivial_command(command: str) -> bool:
@@ -175,11 +237,26 @@ def _is_trivial_command(command: str) -> bool:
 
 
 def _is_suspicious_duration_exempt_command(command: str) -> bool:
-    base = _first_command_base(command)
+    tokens = _command_tokens(command)
+    base = _command_base(tokens)
     return (
         base in _TRIVIAL_VERIFY_COMMANDS
         or base in _SUSPICIOUS_DURATION_EXEMPT_COMMANDS
+        or _is_python_module_command(tokens, "compileall")
+        or _is_python_inline_command(tokens)
     )
+
+
+def _is_pytest_command(command: str) -> bool:
+    tokens = _command_tokens(command)
+    base = _command_base(tokens)
+    return base == "pytest" or _is_python_module_command(tokens, "pytest")
+
+
+def _suspicious_duration_threshold_ms(command: str) -> int:
+    if _is_pytest_command(command):
+        return PYTEST_SUSPICIOUS_DURATION_THRESHOLD_MS
+    return SUSPICIOUS_DURATION_THRESHOLD_MS
 
 
 def _agent_checks(raw_checks: Any) -> List[VerificationCheck]:
@@ -496,7 +573,7 @@ class RalphService:
             workflow_id=workflow_id,
             tasks=ready,
             rationale=_ready_batch_rationale(len(ready), aegis_notes),
-            estimated_parallelism=len(ready),
+            estimated_parallelism=compute_estimated_parallelism(ready),
         )
 
     def apply_task_event(self, event: TaskEvent) -> Dict[str, Any]:
@@ -1434,10 +1511,13 @@ class RalphService:
             for path in (getattr(task_ref, "claimed_paths", []) or [])
         ]
         normalized_changed_files = [_normalize_path_fn(path) for path in changed_files]
+        claimed_parent_dirs = _claimed_parent_directories(claimed)
         exceeded = [
             path
             for path in normalized_changed_files
             if not any(_paths_overlap(path, claimed_path) for claimed_path in claimed)
+            if not _is_same_directory_scope_exempt(path, claimed_parent_dirs)
+            if not _is_scope_exempt_basename(path)
         ]
         if not exceeded:
             return []
@@ -1715,7 +1795,8 @@ class RalphService:
         }
 
         # RV-25: flag suspiciously fast completions
-        if outcome == "passed" and duration_ms < SUSPICIOUS_DURATION_THRESHOLD_MS:
+        threshold_ms = _suspicious_duration_threshold_ms(command)
+        if outcome == "passed" and duration_ms < threshold_ms:
             if not _is_suspicious_duration_exempt_command(command):
                 message = f"[SUSPICIOUS: completed in {duration_ms}ms] {message}"
                 details["suspicious_duration"] = True

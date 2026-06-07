@@ -5,6 +5,391 @@
 
 ---
 
+## E2E v70 实战归档（2026-06-08）— v60–v69 反假完成机制真实 daemon 活体收口（live-verified）
+
+> 报告：[e2e-实战评估报告-v70.md](./e2e-实战评估报告-v70.md)。项目：FastAPI 短链接服务（API Key 鉴权 + 限流 + 点击分析 + SSRF）。
+> 注：「E2E v70」为 E2E 报告序列（v58→v70），区别于本归档中 solve 批次标签 v70/v71。
+
+v60–v69 期间大量 **in-process** 验证（真实代码链但非子进程 ccccd）的反假完成机制，本轮首次在**真实 daemon E2E** 下全面活体背书，全部 ✅ 生效：
+
+- **模型选择保真**（FL-74 默认 codex / MSE / AF-09）：foreman(claude) 读 foreman-capability-guide.md 后给 T1–T6/T8 执行任务全选 codex-gpt-5.4、仅 T7 安全审查用 claude；观察者实时监控 daemon 确认 actor runtime 分布为 3 codex(exec-a/b/c) + 1 claude(sec-rev) + foreman(claude)。
+- **FL-73 并行度强制门**（D≥min(E,2)）：`ralph suggest` estimated_parallelism=3 → foreman 建 3 codex 执行者；B2 实测 `running=3` 三任务并行 fan-out，无串行退化（opus4.6→4.8 并行回归确认已修）。
+- **AF 真异步 suspend-until-terminal**（AF-07/08）：WORKFLOW_EVALUATION execution_engine=af；8/8 完成，全程无死循环、无 deferred 卡死；执行期两次 fail→override 恢复链正常工作。
+- **反假完成 / AEGIS evidence gate**：T1 compile + 6/6 pytest 全绿，仍因 `cccc task complete` 缺 `--evidence` 被 `E_AEGIS_EVIDENCE_MISSING` 拦下——"测试绿≠完成"活体复现。
+- **章节实质化门**（M2-C / UX-23 修复）：flow step-4 检查逐项 PASS（正面反馈 833 / 负面反馈 1248 / 手工干预 837 / Worker 563 / 评分 599 chars）；预备版(01:41)空章节 → 定稿(01:49)补全，**UX-23 第五轮未复现**。
+- **诚实测试统计**：自动采集 collection failed → `test_stats_reliable=false` + foreman 手动复跑 51 passed，未伪造绿。
+
+**衍生开放项**（已登入短版 tracker「E2E v70 实战新发现」）：RV-64（state 不覆盖全任务/override 散落）、DG-43（model_key 默认漂移未覆盖 usage 日志）、FL-76（派发无视 --assignments）、FL-77（verifier 不走 shell）、FL-78（retry 状态机死锁）、FL-79（路由日志非 per-attempt）、RV-65（独立审查一等化）、DG-42（forbidden_flows/coverage_hints）、RV-66（交付代码缺陷 validate 盲点）、UX-24（派发原语/SUSPICIOUS 误报）。Codex 双盲：results=adjust/74，process=revise/43。
+
+---
+
+## 代码修复归档（2026-06-07）— v63 第二阶段里程碑：M1-5 verification 主路径行为命令门（behavior-verified）
+
+> 来源：plan.yaml v63 批次（T1 M1-5）。用户指令「读取记忆中 solve flow，修复下一阶段问题」。经 solve flow
+> 6/6 步通过 + Codex 设计评审（step-3 verdict=adjust，5 finding 全裁决：F1/F2/F4/F5 ACCEPTED 并改 plan，
+> F3 PARTIAL → DG-18 + critical-flow 升 error DEFERRED）+ 独立 CLI 对抗验证（真实 `ralph validate` 翻转）。
+> 全量套件 **3788 passed / 120 skipped / 0 failed**。衍生检测能力缺口 DG-18（主路径命令与被覆盖 flow 因果
+> 关联）/ DG-19（launcher/wrapper/subshell 命令解析残余）记入短版 DG 规则族。
+
+| ID | 标题 | 状态 | 归档原因 |
+|----|------|------|---------|
+| M1-5 | verification 主路径行为命令门 | behavior-verified | 真实 `ralph validate` CLI：运行时行为 task（role=integration / level=e2e / 覆盖 critical_flow）仅 pytest → W_VERIFICATION_NO_MAIN_PATH_COMMAND；含 cccc/ralph CLI 或 .log grep 不报；13 验收用例 + CLI 双向翻转 |
+
+**evidence bundle（M1-5）**：
+- issue_id: M1-5
+- root_cause: `ralph validate` 无规则强制运行时行为 task 的 verification 含主路径命令；`_is_behavioral_check`(coverage.py:34) 把 pytest 直接判为 behavioral → pytest-only 运行时 task 一律放行（FL-66/RV-48 在 plan 层的温床）
+- fix: 新增 `_check_verification_main_path_command` + `W_VERIFICATION_NO_MAIN_PATH_COMMAND`（coverage.py:136/334），helper `_split_shell_subcommands`/`_command_program`/`_is_main_path_command`/`_task_is_runtime_behavior`（coverage.py:287-331）
+- canonical_owner: src/cccc/ralph/validation_rules/coverage.py::_check_verification_main_path_command
+- active_path: 登记 get_all_rules()（__init__.py:139）+ __all__（:229/:240）+ 接入 validator._collect_structural_issues（validator.py:264，即 CLI `ralph validate` 活跃路径，非死代码）
+- trigger_semantics: role=="integration" OR level=="e2e" OR 覆盖 critical_flow（复用 `_task_covers_flow`，认 covers.flows 与 claimed critical entrypoint 两种覆盖，采纳 Codex F2）
+- candidate_semantics: 与 core.py::_resolve_verification_specs 真实执行一致 —— checks 非空只认 required check.command，否则才看 verification.command（采纳 Codex F1，堵「永不执行的 top 命令」与「非 required check」两条空投旁路）
+- main_path_predicate: 程序名（经 filesystem_validator._unwrap_command 剥离 env/timeout/uv run/poetry run/pipenv run + sudo，shlex 切词，basename 小写）∈ {cccc,ralph}，或 ∈ {grep,rg,egrep,fgrep,zgrep} 且子命令含 ".log"；pytest（python）不算（采纳 Codex F4；按程序名而非 substring，不被 `python -m pytest tests/ralph/...` 路径里的 "ralph" 蒙混）
+- behavior_verification_unit: tests/ralph/test_verification_main_path.py 13 passed（含负向 1/2/3/3b/7/7b/7c、正向 4/5/6/6b/8、登记 9）
+- behavior_verification_cli: 独立 `ralph validate plan_neg.yaml --no-agent`（pytest-only integration task）→ W_VERIFICATION_NO_MAIN_PATH_COMMAND 命中 1；`plan_pos.yaml`（check=`cccc model suggest backend`）→ 命中 0（真实主路径双向翻转）
+- regression: tests/ralph/test_integration_call_evidence.py + tests/test_module_split.py 全绿；全量 3788 passed / 120 skipped
+- codex_review: step-3 verdict=adjust，5 finding 全裁决（F1/F2/F4/F5 ACCEPTED 落地；F3 PARTIAL → DG-18 记缺口 + critical-flow 升 error DEFERRED，evidence 带 covered_critical_flows 供后续升级）
+- severity_scope: warning 可 suppress、不入 _NON_SUPPRESSIBLE_ALWAYS（强制门升级待误报率验证，沿用 DG-1/3/4 约定）
+- derived_gaps: DG-18（causal-linkage）、DG-19（launcher-wrapper-resolution）
+- regression_lock: python -m pytest tests/ralph/test_verification_main_path.py -v
+
+---
+
+## 代码修复归档（2026-06-07）— v62 第二阶段批量：DG-3 + DG-4 + M2-C/UX-23 + M2-B（behavior-verified）
+
+> 来源：plan.yaml v62 批次（T1 DG-3 / T2 DG-4 / T3 M2-C+UX-23 / T4 M2-B / T5 集成脊柱）。用户在 solve flow
+> 明确「都修复」。经 solve flow 6/6 步通过 + Codex 设计评审（step-3 verdict=incomplete，9 finding 全 accepted 并改 plan）
+> + **独立对抗验证两轮**：首轮 verdict=defects-found（4 真实缺陷），修复后复核 3/4 CLOSED、第 4 项确认为
+> 「warning 不翻 valid」的设计本意（非缺陷）。全量套件 3775 passed / 120 skipped / 0 failed。
+> 衍生检测能力缺口 DG-15（writer↔checker 标题 parity）/ DG-16（跨函数守卫支配）/ DG-17（兜底信号可达性）记入短版 DG 规则族。
+
+| ID | 标题 | 状态 | 归档原因 |
+|----|------|------|---------|
+| DG-3 | observable-fallback（except 静默兜底告警） | behavior-verified | 真实 `ralph validate`：except 吞异常/非抛出退出且无 warning+/ledger-emit → W_SILENT_FALLBACK；有信号不报；扫 plan_scope∪claimed 生产文件；独立复核 CLOSED |
+| DG-4 | guard-ordering（守卫先于副作用） | behavior-verified | 真实 `ralph validate`：守卫晚于 emit_workflow_terminal → W_GUARD_AFTER_SIDE_EFFECT；真实 complete_workflow 正确顺序不误报；独立复核 CLOSED |
+| M2-C | 空/不实质 EVALUATION 阻断 workflow.completed | behavior-verified | 真实 complete_workflow：空/占位/<40 字/八维缺失/改名标题 → pending + workflow.evaluation_incomplete，不 emit terminal；独立复核 CLOSED |
+| UX-23 | 定性章节持续为空——系统级强制 | behavior-verified | 由 M2-C min_chars + 八维 writer/parser 一致 + 精确标题行匹配覆盖；独立复核改名绕过 CLOSED |
+| M2-B | 选型决策留痕 + override 留痕（主路径） | behavior-verified | 真实 process_batch_suggestion 显式+pool 两路径均写 model.selection_decision；override 写 model.selector_bypass；独立复核 pool path CLOSED |
+
+**DG-3 evidence bundle（v62）**
+- issue_id: DG-3（warning 级第一道防线；间接信号可达性 → DG-17）
+- original_symptom: 无规则检测 except handler 吞异常/静默回落（无 >=WARNING 日志/无 ledger emit）→ 静默 fallback 无人察觉
+- claimed_fix: 新增 `_check_observable_fallback` + `W_SILENT_FALLBACK`（coverage.py），扫 plan_scope∪claimed 生产 .py；except 内非抛出退出（return 任意/continue/break/pass）且无 logger.warning+/logging.warning+/append_event/publish_event → warning
+- changed_paths: src/cccc/ralph/validation_rules/coverage.py, __init__.py, validator.py, tests/ralph/test_observable_fallback.py
+- active_entrypoint: CLI `ralph validate` → validate_with_project → _collect_structural_issues → _check_observable_fallback（validator.py:269，紧随 _check_active_path_reachability）
+- active_path_trace: plan_scope∪claimed 生产模块 → AST 遍历 except handler → 无信号静默退出 → emit W_SILENT_FALLBACK（evidence: file/function/lineno）
+- runtime_conditions: plan_scope 或 claimed_paths 含 src/**/*.py 非测试文件
+- expected_behavior: 静默 except 回落被标记 warning；有 WARNING 日志/ledger emit 的不标记
+- observed_behavior: 独立复现：app.py `except Exception: return "fallback"` → W_SILENT_FALLBACK；带 logger.warning 不报；claimed-only（plan_scope 空）也能扫到
+- fallback_behavior: warning 级、可 suppress（第一道防线，非可压制强制门待误报率验证升级，记 DG-14 族）；不翻 valid:true（warning 设计本意）
+- evidence_locations: .ralph-flow/step-5-execute/T1.json, adversarial_verify.json, reverify.json
+- regression_test: python -m pytest tests/ralph/test_observable_fallback.py tests/ralph/test_integration_call_evidence.py -v
+- archive_decision: 双独立验证（首轮发现自违例 + claimed-paths 盲区，已修复 CLOSED），全量 3775 passed
+
+**DG-4 evidence bundle（v62）**
+- issue_id: DG-4（同函数级；跨函数守卫支配 → DG-16）
+- original_symptom: 无规则检测「声称阻断 X 的守卫晚于 X 副作用」（守卫顺序漂移）
+- claimed_fix: 新增 `_check_guard_ordering` + `W_GUARD_AFTER_SIDE_EFFECT`，窄映射 {emit_workflow_terminal,on_workflow_completed}↔{workflow_evaluation_empty_sections,_check_section_substantive}；同函数内 min(guard lineno) > side-effect lineno → warning
+- changed_paths: src/cccc/ralph/validation_rules/coverage.py, __init__.py, validator.py, tests/ralph/test_guard_ordering.py
+- active_entrypoint: CLI `ralph validate` → _collect_structural_issues → _check_guard_ordering（紧随 _check_observable_fallback）
+- active_path_trace: 函数体按 lineno 收集 ast.Call → side-effect 先于其映射 guard → emit（evidence: function/side_effect_call/guard_call + 两 lineno）
+- runtime_conditions: plan_scope∪claimed 生产文件含受管副作用与对应守卫调用同函数
+- expected_behavior: 守卫晚于副作用告警；守卫先于副作用或无守卫不告警；真实 complete_workflow（守卫先）不误报
+- observed_behavior: 独立复现：负例告警、正例不报、真实 workflow_orchestrator.py 锚定不误报、claimed-only 也能扫到
+- fallback_behavior: warning 级可 suppress；不翻 valid:true（设计本意）
+- evidence_locations: .ralph-flow/step-5-execute/T2.json, adversarial_verify.json, reverify.json
+- regression_test: python -m pytest tests/ralph/test_guard_ordering.py tests/ralph/test_integration_call_evidence.py tests/ralph/test_observable_fallback.py -v
+- archive_decision: 双独立验证（claimed-paths 盲区已修 CLOSED），全量 3775 passed
+
+**M2-C / UX-23 evidence bundle（v62）**
+- issue_id: M2-C + UX-23
+- original_symptom: complete_workflow 仅按 5 section「strip 非空」阻断；单字符过闸；八维定性维度未生成/未解析/未强制；定性章节持续空（v50/51/57/58）
+- claimed_fix: _check_section_substantive(content,*,min_chars=40) + WORKFLOW_EVALUATION_RETRO_DIMENSIONS(8 维)；writer(workflow_evaluation_io.py) 生成 8 个 `## 维度` 子标题带占位符；parser 精确「## heading」整行匹配（修复改名前缀绕过）；judging 集合=5 section+8 维
+- changed_paths: src/cccc/daemon/foreman/workflow_evaluation.py, workflow_evaluation_io.py, tests/test_workflow_evaluation_substantive.py（+回归更新 tests/test_foreman_workflow.py）
+- active_entrypoint: WorkflowOrchestrator.complete_workflow → workflow_evaluation_empty_sections(min_chars=40) → 阻断在 emit_workflow_terminal/on_workflow_completed 之前（守卫顺序满足 DG-4）
+- active_path_trace: 写评估文件 → empty_sections（含八维）非空 → emit workflow.evaluation_incomplete + 返回 pending，不 emit terminal；补齐后才 completed
+- runtime_conditions: complete_workflow 真实执行
+- expected_behavior: 空/占位/<40 字/八维缺失/改名标题 → 阻断 workflow.completed
+- observed_behavior: 独立复现：缺八维→pending 无 completed；全填→completed；`## runtime 选择（改名）`→仍 incomplete（绕过 CLOSED）
+- fallback_behavior: gate 不通过则 pending（不静默完成）
+- evidence_locations: .ralph-flow/step-5-execute/T3.json, adversarial_verify.json, reverify.json
+- regression_test: python -m pytest tests/test_workflow_evaluation_substantive.py tests/test_foreman_workflow.py -v
+- archive_decision: 双独立验证（首轮改名绕过已修 CLOSED），全量 3775 passed
+
+**M2-B evidence bundle（v62，部分闭合：留痕已落主路径；读端 selection/rating 算法 FC-1/FC-2 既有）**
+- issue_id: M2-B（本批闭合 read-end 留痕 + override 留痕；rating 消费已在 select_model_for_task）
+- original_symptom: 选型决策无可审计留痕事件；override 仅 logger.warning（@staticmethod 无 ledger 上下文）不可审计
+- claimed_fix: _build_explicit_assignment_result 写 model.selection_decision；pool 分支 _evaluate_batch 后统一补发 model.selection_decision（不重复显式分支）；_warn_on_explicit_runtime_override 改实例方法 + 写 model.selector_bypass；except 内 logger.warning（非静默）
+- changed_paths: src/cccc/daemon/foreman/assignment_batches.py, tests/test_model_selection_main_path.py
+- active_entrypoint: WorkflowOrchestrator.process_batch_suggestion →（显式 _build_explicit_assignment_result / pool _evaluate_batch）→ append_event(group.ledger_path, kind="model.selection_decision"/"model.selector_bypass")
+- active_path_trace: 真实 process_batch_suggestion 两分支均写 selection_decision（data: task_id/chosen_runtime/chosen_model_key/...）；runtime 不一致写 selector_bypass
+- runtime_conditions: process_batch_suggestion 真实执行（显式 + pool）
+- expected_behavior: 两路径均留痕；override 写 bypass；runtime 一致不误发 bypass
+- observed_behavior: 独立复现：pool path（无显式 assignments）ledger 出现 model.selection_decision（chosen_runtime=codex）；override 写 selector_bypass
+- fallback_behavior: ledger 写失败 best-effort + logger.warning（非 DG-3 静默）
+- evidence_locations: .ralph-flow/step-5-execute/T4.json, adversarial_verify.json, reverify.json
+- regression_test: python -m pytest tests/test_model_selection_main_path.py -v
+- archive_decision: 双独立验证（首轮 pool-path 缺失已修 CLOSED）；**仍开放（移交短版 M2-B 表）**：rating 变化驱动 suggest 的 E2E、命名空间统一、actor add CLI 读端 等子项未在本批闭合，仅闭合留痕主路径
+
+---
+
+## 代码修复归档（2026-06-07）— v61 第二阶段开篇：DG-1 active-path reachability（模块级，behavior-verified）
+
+> 来源：plan.yaml DG-1 批次（T1：新增 `_check_active_path_reachability` + `W_INTEGRATION_DORMANT_PATH`）。
+> 经 solve flow（6/6 步通过）+ Codex 设计评审（step-3 verdict=incomplete，5 finding 全 accepted/deferred）
+> + **双独立验证**（我方真实 CLI `ralph validate` 非 git 临时项目 + Codex 独立对抗复核）。
+> Codex 独立对抗首轮发现 1 major 误报缺陷（自注册但无人 import 的模块被误判 dormant），已修；
+> 复核 verdict=works、prior_defect_fixed=True、cli_warning_behaves_correctly=True、real_defects=[]。
+> 全量套件 3751 passed / 120 skipped / 0 failed。衍生检测能力缺口 DG-14（函数级可达性 + 动态/re-export
+> 导入解析 + 强制门升级）记入短版 DG 规则族，通用规则待后续。
+
+| ID | 标题 | 状态 | 归档原因 |
+|----|------|------|---------|
+| DG-1 | active-path reachability（模块级 heuristic） | behavior-verified | 真实 `ralph validate` CLI：休眠路径告警 / 可达不告警 / opt-in 不启用 / 自注册无 import 不误报；Codex 独立复核 verdict=works real_defects=[] |
+
+**DG-1 evidence bundle（v61）**
+- issue_id: DG-1（模块级范围；函数级/动态导入剩余盲点 → DG-14）
+- original_symptom: `_check_integration_call_evidence` 只验证「某生产文件 import+call 了 claimed 模块」，不验证该使用点从默认 entrypoint 可达 → 接到休眠/legacy 死路径的组件被放行（FL-66 v53 AF 引擎「零件造好没装到车上」、RV-48 死路径伪集成）
+- claimed_fix: 新增 `_check_active_path_reachability(plan, *, project_root)` + 常量 `W_INTEGRATION_DORMANT_PATH`（coverage.py），从 plan 声明 entrypoint（critical_entrypoints / critical_flows[].entrypoints，复用 `_normalize_entrypoint` 支持 `::symbol`）做 seed，在 plan_scope 生产模块上构建 call-edge（import+call）+ activation-edge（import + 被导模块 import-time 自注册）有向图求可达闭包；per claimed module 判定「已 wired（被其它生产模块 import 且 call 或自注册）但从任一 entrypoint 不可达」→ warning。opt-in：未声明 entrypoint 时禁用，既有行为不变
+- changed_paths: src/cccc/ralph/validation_rules/coverage.py, src/cccc/ralph/validation_rules/__init__.py, src/cccc/ralph/validator.py, tests/ralph/test_active_path_reachability.py
+- active_entrypoint: CLI `ralph validate <plan>` → `validate_with_project(plan, project_root)` → `_collect_structural_issues` → `_check_active_path_reachability`（紧随 `_check_integration_call_evidence`，validator.py:267）
+- active_path_trace: 声明 entrypoint → seed 生产模块 → call/activation 边闭包求 reachable → integration task 每个 claimed module：wired-but-unreachable → emit W_INTEGRATION_DORMANT_PATH（evidence 含 claimed_module / declared_entrypoints / reachable_modules）
+- runtime_conditions: plan 声明 ≥1 个落在 plan_scope 内的生产 entrypoint（opt-in）
+- verification_commands: 真实 CLI `ralph validate <tmp>/plan.yaml`（非 git 临时项目）；python -m pytest tests/ralph/test_active_path_reachability.py tests/ralph/test_integration_call_evidence.py tests/ralph/test_integration_call_patterns.py -v
+- expected_behavior: 休眠 fixture（claimed 模块仅被不可达模块 import+call）→ CLI 输出含 W_INTEGRATION_DORMANT_PATH；可达 fixture（main→orchestrator→target）→ 不含；自注册被可达模块 import（activation-edge）→ 不含；自注册但无人 import → 不含（never-wired）；opt-in 无 entrypoint → 不含；`::symbol` entrypoint → 仍识别
+- observed_behavior: 原始症状已消失、行为已确认——**双独立验证**：(1) 我方真实 `ralph validate` CLI 于非 git 临时项目：dormant 告警、reachable 不告警、opt-in 不启用、Codex 缺陷场景（自注册无 import）修复后不误报、dormant（import+call 不可达）仍告警；(2) Codex 独立对抗复核（全新临时 fixture×6，validate_with_project + 真实 CLI 双轨）verdict=works、prior_defect_fixed=True、cli_warning_behaves_correctly=True、real_defects=[]。targeted 17 passed；全仓 3751 passed / 120 skipped
+- fallback_behavior: 不引入运行时 fallback（纯 validate 检测规则）。warning 且默认可 suppress（未入 _NON_SUPPRESSIBLE_ALWAYS）——「能检测」≠「能封堵」，强制门升级待误报率验证（DG-14）
+- known_limitations: 模块级语法启发式——(i) 可达文件死分支/未调用函数内的 call 仍连边 → 可能漏报（保守不误伤）；(ii) 动态 importlib/getattr、`from x import *` 星号导入、package __init__ 相对导入 / re-export → 可能误判可达性。均记入 DG-14，本批不修
+- codex_findings_adoption: step-3 设计评审 5 finding——blocker（self-wiring 误报）ACCEPT→activation-edge；major（per-task 去重不成立）ACCEPT→per-module；major（__init__ 相对导入盲点）DEFER→DG-14；major（过/欠近似）ACCEPT 收窄定位 + DEFER→DG-14；minor（`::symbol` 语义）ACCEPT。独立复核 major（自注册无 import 误报）ACCEPT→wired 改为「须被其它模块 import」+ 回归 test_self_wiring_without_import_not_dormant；star-import miss = DG-14 已声明限制（已列「星号导入」），不计新缺陷
+- evidence_locations: tests/ralph/test_active_path_reachability.py（8 场景，走 validate_with_project 公共入口）；.ralph-flow/step-3-review/dg1-design.json（设计评审 verdict=incomplete 已采纳）；.ralph-flow/step-5-execute/T1.json（实现）；.ralph-flow/step-5-execute/T1-independent-verify.json（Codex 独立对抗，发现 major 误报）；.ralph-flow/step-5-execute/T1-reverify.json（Codex 复核 verdict=works real_defects=[]）
+- regression_test: python -m pytest tests/ralph/test_integration_call_evidence.py tests/ralph/test_integration_call_patterns.py（既有规则不回归）；全仓 3751 passed / 120 skipped
+- archive_decision: behavior-verified（真实 `ralph validate` CLI 主路径双独立验证，模块级 dormant-path 检测在活跃 validate 路径翻转 pass/fail；FL-66/RV-48 部分覆盖，函数级/动态导入剩余盲点 → DG-14）
+
+---
+
+## 代码修复归档（2026-06-07）— v60 第一阶段收尾：AF-07 异步重构 + AF-08 主路径接入（behavior-verified）
+
+> 来源：plan.yaml AF-07 批次（T1~T6 真异步 suspend-until-terminal）+ 2 修复（线程生命周期/超时、orchestrator <2700 抽 AFDispatchMixin）+ AF-08（初始提交 AF 路由）。
+> 经 solve flow（6/6 步通过）+ Codex 设计评审（F1/F3/F4 ACCEPT、F2 ACCEPT-core）+ **双独立 live 主路径验证**（我方 in-process 真实代码链 + Codex 对抗性独立脚本）。
+> 全量套件 3739 passed / 120 skipped / 0 failed。Codex 独立验证两轮：首轮发现 AF-08 主路径绕过（已修），复验 verdict=works 6/6。
+> 新发现 AF-09（AF compile 丢 task.type → 选错 worker model，独立于死循环，留短版跟踪）。
+
+| ID | 标题 | 状态 | 归档原因 |
+|----|------|------|---------|
+| AF-07 | AF 引擎 fire-and-forget 死循环 → 真异步 suspend-until-terminal | behavior-verified | live 9/9×4：无瞬时合成完成、无死循环风暴、真实 terminal 单次完成；Codex verdict=works |
+| AF-08 | plan 初始提交 register_and_suggest 绕过 AF → 接入 AF wrapper | behavior-verified | live 7/7（此前 4/7）：_try_af_execution=1、非 legacy prompt；无 transport 回归 legacy；Codex 复验 6/6 |
+
+**AF-07 evidence bundle**
+- issue_id: AF-07
+- original_symptom: AF 引擎 fire-and-forget——ActorGatewayBridge.send_task 后毫秒级合成 task_completed，节点秒级 completed，验证失败→foreman override→重派→又走 AF→死循环（v59 实测 T4~T9 毫秒级假完成）
+- claimed_fix: 真异步 suspend-until-terminal——废除 auto_complete_after_send（默认 False，无合成完成）；runner 挂起轮询等真实 worker terminal；attempt_id 端到端贯通 IPC/ops（completed+failed）；apply_task_event 按 attempt_id 精确桥接 + 旧 attempt 不唤醒新 + 移除 AF 回灌（验证门只跑一次）；caller 线程登记防丢唤醒(F1) + (wf,node,attempt) 去重 + per-task max-attempt 熔断(F3) + 严格 fail-closed + runtime readiness 强化 + 后台线程 cooperative cancel/conftest join + 超时 0.25→1800s(env 可调)
+- changed_paths: src/cccc/daemon/foreman/af_gateway_bridge.py, src/cccc/agentflow/actor_runner.py, src/cccc/daemon/ralph_ipc_handler.py, src/cccc/daemon/ops/workflow_task_ops.py, src/cccc/daemon/foreman/workflow_orchestrator.py, src/cccc/daemon/foreman/af_dispatch_mixin.py, tests/conftest.py
+- active_entrypoint: orchestrator.process_batch_suggestion（DAG auto-advance / process_pending / batch_suggest auto_process）→ _try_af_execution → AFExecutionEngine.execute_bundle → CCCCActorRunner.execute；真实 terminal 经 handle_ralph_task_event → apply_task_event → _bridge_af_terminal_event
+- active_path_trace: try_af_execution(caller 线程登记 active_gateway/inflight) → 后台线程 execute_bundle → runner 挂起 poll_terminal；worker terminal → handle_ralph_task_event → complete_task(attempt_id) → apply_task_event → 验证门 + record_terminal(attempt_id) → runner 唤醒 → "[af] execution done"
+- runtime_conditions: CCCC_AF_ENGINE_ENABLED 默认启用 + AF runtime ready（transport + pool.acquire 可用）
+- verification_commands: python /tmp/af07_live_check.py（真实 group+orchestrator+handle_ralph_task_event IPC ingress）；python -m pytest tests/agentflow/test_af_async_terminal_integration.py -v
+- expected_behavior: engine=af；无瞬时合成完成（task 停 ASSIGNED）；terminal 扣留时无死循环重派风暴；真实 terminal 唤醒挂起 runner、恰好一次过验证门完成；无静默 legacy fallback
+- observed_behavior: 原始症状已消失、行为已确认——live 9/9 稳定 ×4：execution_engine_tag=af、status_after_dispatch=ASSIGNED（非秒完成）、sends 1→1（无风暴）、真实 worker terminal 经真实 apply_task_event 唤醒挂起 runner、final_status=COMPLETED 单次过门、gateway ~0.11s 清理、无 af_fallback 事件；Codex 独立对抗脚本 verdict=works
+- fallback_behavior: AF 不可用非严格→显式 fallback（on_fallback 一次 + ledger af_fallback，无静默）；严格(CCCC_AF_STRICT)→fail-closed（af.execution_unavailable，不降级 legacy）；后台线程 module 级 cooperative cancel + tests/conftest.py hookwrapper join af-exec-* 杜绝泄漏
+- evidence_locations: tests/agentflow/test_af_async_terminal_integration.py / test_gateway_bridge_terminal.py / test_actor_runner_suspend.py / test_apply_event_terminal_bridge.py / test_af_dispatch_guard.py；.ralph-flow/step-5-execute/AF07-independent-verification.json + AF0708-reverify.json；/tmp/af07_live_check.py
+- regression_test: python -m pytest tests/agentflow/ tests/test_foreman_workflow.py tests/test_af_fallback_observability.py（全仓 3739 passed）
+- archive_decision: behavior-verified（真实主路径 live 双独立验证，v59 死循环消除）
+
+**AF-08 evidence bundle**
+- issue_id: AF-08
+- original_symptom: plan 驱动初始提交（CLI op ralph_register_and_suggest）→ orchestrator.register_and_suggest → register_and_suggest_inner → _submit_ready_suggestion → AssignmentController.process_batch_suggestion（legacy _start_assigned_agents）→ **完全绕过 AF**，_try_af_execution=0、发 [Foreman Assignment]，AF 仅再派发帧生效
+- claimed_fix: WorkflowOrchestrator.process_batch_suggestion 新增 kw-only allowed_existing_task_ids 并透传 controller；assignment_batches._submit_ready_suggestion 改走 self._owner.process_batch_suggestion（AF wrapper）；wrapper 的 _should_run_af_execution 门保证 runtime 未就绪时仍走 controller legacy（最小爆破面）
+- changed_paths: src/cccc/daemon/foreman/workflow_orchestrator.py, src/cccc/daemon/foreman/assignment_batches.py
+- active_entrypoint: handle_ralph_register_and_suggest(auto_process=True, auto_start_agents=True) → orchestrator.register_and_suggest → register_and_suggest_inner → _submit_ready_suggestion → orchestrator.process_batch_suggestion（AF wrapper）
+- active_path_trace: _submit_ready_suggestion → self._owner.process_batch_suggestion → _should_run_af_execution(ready=True) → controller.process_batch_suggestion(auto_start_agents=False) 注册 + _try_af_execution 派发
+- runtime_conditions: AF enabled + runtime ready + plan_path 提交（op ralph_register_and_suggest，auto_process=True 为 CLI/web 默认）
+- verification_commands: python /tmp/af07_ipc_path_check.py（真实 handle_ralph_register_and_suggest IPC 提交）；python -m pytest tests/agentflow/test_af08_initial_submit_routing.py -v
+- expected_behavior: register_and_suggest(auto_process=True) 经 AF wrapper、_try_af_execution 被调用、非 legacy [Foreman Assignment] prompt、无瞬时完成；无 transport（runtime not ready）时仍 legacy
+- observed_behavior: 原始症状已消失、行为已确认——live 7/7（此前 4/7）：_try_af_execution calls=1、legacy_prompt_seen=False、status=ASSIGNED、sends 1→1、真实 terminal 单次 COMPLETED；无 transport→runtime not ready→legacy（回归保持）；Codex 独立复验 verdict=works 6/6
+- fallback_behavior: AF runtime not ready → AF wrapper 经 _should_run_af_execution 走 controller legacy（优雅降级，旧行为不回归）
+- evidence_locations: tests/agentflow/test_af08_initial_submit_routing.py；.ralph-flow/step-5-execute/AF0708-reverify.json；/tmp/af07_ipc_path_check.py
+- regression_test: python -m pytest tests/agentflow/test_af08_initial_submit_routing.py tests/ -q（3739 passed / 0 failed）
+- archive_decision: behavior-verified（真实 IPC 主提交路径 live 双独立验证）
+
+---
+
+## 代码修复归档（2026-06-07）— v60 第一阶段收尾续：AF-09 模型选择保真（behavior-verified）
+
+> 来源：plan.yaml AF-09 批次（T1：task_ref_to_plan_task 白名单补 type）。
+> 经 solve flow（6/6 步通过）+ Codex 设计评审（verdict=adjust，已采纳：scope 收窄 + 测试改到运行时选型层 + 真实链路负向复现）。
+> 负向复现确认：删白名单 type → 4/4 测试 fail；补回 → 4/4 pass（真实链路翻转，非死规则）。关联回归 99 passed，step-5 flow auto-verify 全仓套件通过。
+> 衍生检测能力缺口 DG-12（AF adapter 字段 parity）/ DG-13（双引擎选型 parity）已记入短版 DG 规则族，通用规则待后续。
+
+| ID | 标题 | 状态 | 归档原因 |
+|----|------|------|---------|
+| AF-09 | AF compile 丢 task.type → 选错 worker model（降级 general） | behavior-verified | 4/4 真实链路测试 pass；负向复现 4/4 fail；resolve_model_for_task 层断言 AF 与控制面选同一 model_key 且 != general fallback |
+
+**AF-09 evidence bundle**
+- issue_id: AF-09
+- original_symptom: af_gateway_bridge.task_ref_to_plan_task 字段白名单不含 "type" → AF 编译丢 TaskRef.type → PlanCompiler._build_task_ref 回落 DEFAULT_TASK_TYPE="general" → agent_pool 按 task.type 选 worker 降级（实测 AF 选 codex-general-worker，控制面 legacy assignment 对同一 backend task 选 codex-backend-worker）
+- claimed_fix: task_ref_to_plan_task 字段元组加入 "type"（唯一断点，保留既有 model_dump(exclude_none=True)/is not None 过滤逻辑不变；consumer 侧 PlanCompiler/agent_pool 已消费 task.type，未改）
+- changed_paths: src/cccc/daemon/foreman/af_gateway_bridge.py, tests/agentflow/test_af_node_task_type.py
+- active_entrypoint: AF 派发 — try_af_execution → task_ref_to_plan_task → PlanCompiler.compile → CCCCActorRunner._build_acquire_request(task=cccc_meta.task) → AgentPoolManager.acquire/resolve_model_for_task(task.type)
+- active_path_trace: TaskRef(type="backend") → task_ref_to_plan_task（输出含 type）→ PlanCompiler._build_task_ref(type="backend"，非 general 回落) → bundle.cccc_meta[id].task.type=="backend" → resolve_model_for_task 读 task.type=="backend" → select_model_for_task 选 backend worker model
+- runtime_conditions: AF compile 路径（CCCC_AF_ENGINE_ENABLED）+ task.type 为非 general（backend/frontend）
+- verification_commands: python -m pytest tests/agentflow/test_af_node_task_type.py -v
+- expected_behavior: task_ref_to_plan_task 输出 dict 含 type；AF node bundle.cccc_meta[id].task.type=="backend"（非 general）；受控 registry(backend≠general) 下 resolve_model_for_task 对 AF 节点 task 与控制面 TaskRef 选同一 model_key 且 != general fallback
+- verified_scope: 已验证范围 = AF compile→新建 agent 选型路径（task_ref_to_plan_task→compile→_build_acquire_request→acquire/resolve_model_for_task）。AF/control-plane 更广 parity（suggestion 兑现 + reuse 旁路）不在本 scope，见 fallback_behavior + DG-13
+- observed_behavior: 原始症状已消失、行为已确认——**双独立核验**：(1) 我方 live 真实函数链路 /tmp/af09_live_check.py ALL PASS，_generate_agent_id(af_task.type)=="codex-backend-worker"（原症状 codex-general-worker 已消失），af_key==cp_key=="backend-model"!=gen_key=="general-model"；(2) Codex 独立对抗脚本复现 acquire_lease.agent_id=="codex-backend-worker"/model_id=="backend-model-id"，负例删 type→compiled_type=="general"。targeted 4/4 passed；负向复现（删白名单 type）4/4 fail（真实链路翻转，非死规则）；关联回归 99 passed、tests/agentflow+test_foreman_workflow 197 passed；step-5 flow auto-verify 全仓套件通过
+- fallback_behavior: 不引入新 fallback。Codex 独立核验 verdict=incomplete 仅针对 AF-09 未声称的更广 parity，复现两个 AF-09 范围外的既有旁路（即便 type 已修仍存在）：①suggestion_gap——AF runner 不消费 control-plane 已算 preferred_model_key/task_model_suggestions；②group-peer reuse——_find_group_peer_agent 复用分支不经 resolve_model_for_task，backend 任务复用 peer 时仍可拿 general 模型。二者均超出本批 scope（采纳 Codex 设计评审收窄建议），已记 tracker DG-13（检测能力 + 运行时行为缺口 + 已知局限），未修
+- evidence_locations: tests/agentflow/test_af_node_task_type.py；/tmp/af09_live_check.py（我方 live 核验 ALL PASS）；.ralph-flow/step-3-review/af09-review.json（设计评审 verdict=adjust 已采纳）；.ralph-flow/step-5-execute/t1.json；.ralph-flow/step-5-execute/af09-independent-verify.json（Codex 独立对抗核验，verdict=incomplete 仅指 scope 外旁路）
+- regression_test: python -m pytest tests/test_foreman_workflow.py tests/agentflow/test_engine_fallback.py tests/agentflow/test_plan_compiler.py tests/agentflow/test_plan_compiler_adapter.py -q（99 passed）；python -m pytest tests/agentflow tests/test_foreman_workflow.py -q（197 passed）
+- archive_decision: behavior-verified（双独立核验确认 AF-09-scoped 原症状消失：真实 compile→新建 agent 选型链路 + 删字段负向复现 4/4 翻转；scope 外更广 parity 旁路另记 DG-13）
+
+---
+
+## 代码修复归档（2026-06-06）— v60 第二批：M0 归档纪律 + FL-75（behavior-verified）
+
+> 来源：plan.yaml M0 批次（T1=MT1/M0-3、T2=MT2/M0-2+M0-1、T3=MT3/FL-75、T4=MT4/M0-4、T5=MT5/M0-5、T6=集成）。
+> 经 solve flow（6/6 步通过）+ Codex review（11 findings 全采纳）+ 双重真实主路径验证（我 + Codex 对抗性，无 no-op/无回归）。
+> 全量套件 916 passed（tests/ralph）/ 3703 passed（全仓）。Codex 对抗性验证确认 5 项均非死规则，仅存静态文本博弈面（见下「遗留局限」）。
+
+| ID | 标题 | 状态 | 归档原因 |
+|----|------|------|---------|
+| M0-3 | 3 个集成/行为 warning 无条件不可抑制 | behavior-verified | `ralph validate` CLI 实证：加入 suppress 仍不降级 |
+| M0-2 | evidence bundle 4→14 字段，按行 field:value 解析、值非空 | behavior-verified | 真实 `**ID evidence bundle**` 格式命中（死规则已修），缺字段拦 |
+| M0-1 | archive_decision 状态分类门 | behavior-verified | implemented 等不可归档状态被拦 |
+| M0-4 | false-completion-quarantine 隔离域 | behavior-verified | id→domain 映射 + 负向 observed 反例拦截 |
+| M0-5 | 连续 2 轮 deferral→escalated→_check_plan 阻断 | behavior-verified | 真实 begin_round 两轮升级 + _check_plan 阻断，跳轮重置/clear 重启 |
+| FL-75 | solve flow step-4 归档检查 advisory→blocking | behavior-verified | 真实 solve step-4 check_fn 在删除线短版上 result.passed=False |
+
+**MT1 evidence bundle**
+- issue_id: MT1
+- original_symptom: W_VERIFICATION_BEHAVIOR_MISMATCH 等 3 个集成/行为 warning 可被 plan 作者写入 suppress_codes 豁免，掩盖主干逻辑缺乏生产调用测试
+- claimed_fix: security.py 新增 _NON_SUPPRESSIBLE_ALWAYS（3 个 code），_non_suppressible_codes(plan) 无条件并入
+- changed_paths: src/cccc/ralph/validation_rules/security.py
+- active_entrypoint: ralph validate <plan>（CLI）→ validator._apply_suppression(non_suppressible_codes=_non_suppressible_codes(plan))
+- active_path_trace: validate → _apply_suppression → suppress_set.difference_update(non_suppressible) → 3 个 code 被剔出可抑制集
+- runtime_conditions: plan 触发该 warning 且 suppress_codes 含该 code（无论是否安全关键流）
+- verification_commands: ralph validate /tmp/plan_bm.yaml（suppress W_VERIFICATION_BEHAVIOR_MISMATCH）
+- expected_behavior: 该 warning 仍列于 Warnings 段，不出现 [suppressed] 降级
+- observed_behavior: 原始症状已消失、行为已确认——CLI 实测 suppress_codes 含该 code 时仍无法豁免（Warnings 段保留 W_VERIFICATION_BEHAVIOR_MISMATCH、无 [suppressed] 降级）；非 always code 抑制不变（对照）
+- fallback_behavior: 安全关键流时与 _NON_SUPPRESSIBLE_WHEN_SECURITY 取并集，不丢失既有安全不可抑制集
+- evidence_locations: tests/ralph/test_non_suppressible_always.py（3 个 code 各一条 validate 真实链）；CLI 输出实测
+- regression_test: python -m pytest tests/ralph/test_non_suppressible_always.py
+- archive_decision: behavior-verified（ralph validate 主路径 CLI 行为已确认）
+
+**MT2 evidence bundle**
+- issue_id: MT2
+- original_symptom: evidence bundle 只校验 4 字段且用整段 substring 包含；段落定位器只匹配 `#### ID`，但真实 full tracker 是 `**ID evidence bundle**` → 检查在真实数据上静默失效（死规则）
+- claimed_fix: 必填字段扩到 14；按行解析 field:value（值非空）；locator 支持 `#### ID` 与 `**ID evidence bundle**`；新增 _ARCHIVABLE_STATUSES 状态门（archive_decision 本行）
+- changed_paths: src/cccc/ralph/flow_improvement_check.py
+- active_entrypoint: E2E flow step-6 _check_improvement_register / solve flow step-4（经 FL-75）
+- active_path_trace: _check_improvement_register → _check_archive_evidence_bundle → _full_tracker_archive_paragraph(双格式) → 按行字段解析 + 状态门
+- runtime_conditions: 短版出现新归档完成项，full tracker 含对应段落
+- verification_commands: python -m pytest tests/ralph/test_archive_evidence_bundle.py tests/ralph/test_archive_status_taxonomy.py -v
+- expected_behavior: 14 字段齐全 + 合法状态→过；缺字段/空值→列缺失 fail；状态 implemented→archive status fail；真实 `**ID evidence bundle**` 格式命中
+- observed_behavior: full13 真实格式 PASS；缺 fallback_behavior/regression_test→FAIL 列缺失；implemented→FAIL "archive status must include one of [...]" ✅
+- fallback_behavior: locator 在两种段落标题间正确截断；非归档 ID 不触发
+- evidence_locations: tests/ralph/test_archive_status_taxonomy.py（含真实格式 + 空值 + 非法状态端到端）
+- regression_test: python -m pytest tests/ralph/test_archive_evidence_bundle.py tests/ralph/test_archive_status_taxonomy.py
+- archive_decision: behavior-verified（真实 `_check_improvement_register` 链路确认，含真实 tracker 格式样本）
+
+**MT4 evidence bundle**
+- issue_id: MT4
+- original_symptom: AF/模型选择/评价闭环/WORKFLOW_EVALUATION/suppress 等反复假完成域，归档时仅靠关键词 + 词袋行为证据，可省略词绕过、泛词误伤、负向反例放行
+- claimed_fix: _QUARANTINE_DOMAINS 注册表 + _is_quarantined（id→domain 映射优先，关键词补充）；隔离项强制 14 字段 + behavior-verified/fail-closed 状态 + observed 正向证据且负向 token（规范化多组同义词表）直接 fail
+- changed_paths: src/cccc/ralph/flow_improvement_check.py
+- active_entrypoint: _check_improvement_register → _check_archive_evidence_bundle（隔离项分支）
+- active_path_trace: 归档 ID → _is_quarantined(id,paragraph) 命中 domain → 叠加全字段 + 状态 + observed 正反向判定
+- runtime_conditions: 归档项属隔离域（id 映射或关键词命中）
+- verification_commands: python -m pytest tests/ralph/test_false_completion_quarantine.py -v
+- expected_behavior: 隔离项 4 字段→fail(quarantine+domain)；archived 状态→fail；observed 含 仍/依旧 复现→fail；普通项不误判
+- observed_behavior: 原始症状已消失、行为已确认——is_quarantined("AF-9")→"af_engine"（无关键词亦识别）；隔离项仅 4 字段被拦（quarantine af_engine）；observed 含负向同义表达的样本被正确拒绝（加固后扩同义词表）
+- fallback_behavior: 非隔离项走 MT2 标准路径不变；泛词（普通 FL 段落含 rating 文本）不被误判
+- evidence_locations: tests/ralph/test_false_completion_quarantine.py（含 id 映射、负向同义词、泛词误判对照）
+- regression_test: python -m pytest tests/ralph/test_false_completion_quarantine.py
+- archive_decision: behavior-verified（真实 archive check + 加固后同义词回归）
+
+**MT5 evidence bundle**
+- issue_id: MT5
+- original_symptom: 问题被连续标记"不在本次范围/已知局限"无升级机制；M0-5 要求连续 2 轮 defer→P0-Blocker→冻结新 plan
+- claimed_fix: 新建 deferral_ledger.py（streak_count/last_deferred_version/cleared_version，begin_round 按轮结算、跳轮 reset、clear 重启）；_check_plan 叠加 deferral P0 blocker 门；_check_gap_record 解析"已知局限/不在本次范围"区按轮自动落账（生产写入点）
+- changed_paths: src/cccc/ralph/deferral_ledger.py, src/cccc/ralph/flow_engine.py
+- active_entrypoint: solve flow step-2 _check_plan（阻断）+ step-4 _check_gap_record（写入点）
+- active_path_trace: 写：_check_gap_record→begin_round(默认 ledger 路径)；读：_check_plan→escalated_blockers(同一默认路径, evidence_fn 复用 MT2 evidence-bundle 判定)
+- runtime_conditions: 提供 version（state.version/params）；ledger 缺失视为无 blocker（fail-open，见局限）
+- verification_commands: python -m pytest tests/ralph/test_deferral_ledger.py -v
+- expected_behavior: 连续两轮 escalated；跳轮不升级；clear 后重启；_check_plan 在未清 escalated 时 passed=False
+- observed_behavior: 真实 begin_round v1/v2→escalated=['ZZ-1']；跳轮→[]；clear 重启→[]；_check_plan→passed=False "escalated deferrals missing evidence bundle: ZZ-1"；写/读端同一默认 ledger 路径 ✅
+- fallback_behavior: ledger 不存在→escalated_blockers 返回 []（fail-open）；无 version→写入 no-op
+- evidence_locations: tests/ralph/test_deferral_ledger.py（含真实 _check_gap_record→ledger→_check_plan 链）
+- regression_test: python -m pytest tests/ralph/test_deferral_ledger.py
+- archive_decision: behavior-verified（真实写入/读取链 + _check_plan 主路径阻断确认）
+
+**FL-75 evidence bundle**
+- issue_id: FL-75
+- original_symptom: solve flow 对清单归档约束不足——step-4 归档检查全为 advisory 不阻断；删除线/已完成摘要/未归档项可留存短版
+- claimed_fix: _check_gap_record 新增三个 blocking 子检查（strikethrough/completed-summaries/archive-blocking）计入 base_passed，对齐 E2E step-6；函数体内延迟 import 解 flow_improvement_check↔flow_engine 双向顶层循环
+- changed_paths: src/cccc/ralph/flow_engine.py
+- active_entrypoint: ralph flow next（solve flow step-4 gaps）→ _check_gap_record
+- active_path_trace: ralph flow next → _run_step_check(step4) → _check_gap_record → 延迟 import flow_improvement_check 三个子检查 → base_passed
+- runtime_conditions: solve flow，--tracker 提供
+- verification_commands: 真实 solve flow step-4 check_fn on 含 ~~ID~~ 删除线短版（/tmp/fl75_test）
+- expected_behavior: 短版 body 含删除线/完成摘要/未归档完成项→result.passed=False；干净短版通过
+- observed_behavior: 实测 result.passed=False，"short tracker contains strikethrough items: ['AB-2'] — move to full tracker"；既有 test_archive_content_check_fail 口径已翻转 ✅
+- fallback_behavior: _tracker_body_lines 只扫 `---` 之后 body，header 历史完成摘要不误伤
+- evidence_locations: tests/ralph/test_solve_flow_archive_blocking.py；tests/ralph/test_flow_engine.py::test_archive_content_check_fail（翻转）
+- regression_test: python -m pytest tests/ralph/test_solve_flow_archive_blocking.py tests/ralph/test_flow_engine.py
+- archive_decision: behavior-verified（真实 solve step-4 check_fn 主路径阻断确认）
+
+> **新发现检测能力缺口**（已记入短版 DG-5/6/7）：规则定位器与真实数据格式漂移（死规则）、阻断门无生产写入点（休眠门，DG-1 镜像）、substring vs 字段值解析（填词绕过）。本批修复具体实例，通用检测规则待后续。
+> **遗留局限**（Codex 对抗性验证确认，属静态文本博弈上限，同 RV-51/59）：(1) `**ID evidence bundle**` locator 接受非真实归档区的注入文本（需完整 14 字段 + 合法状态才过，门槛已显著抬高但非不可绕过）；(2) quarantine 负向 token 虽已扩同义词表仍非穷尽；(3) M0-5 _check_plan 门只冻结 solve flow plan step，不拦直接编辑 plan.yaml / 独立 ralph validate，ledger 缺失为 fail-open。
+
+---
+
+## 代码修复归档（2026-06-06）— v60 FC 批次 Phase 1：FC-1 / FC-2（behavior-verified）
+
+> 来源：plan.yaml FC 批次第一阶段（T1=FC-1 / T2=FC-2）+ 本轮 Codex review 修复（F1 复用路径 enabled gate / F2 create_agent 默认）。
+> 经 solve flow（6/6 步通过）+ Layer-6 行为证据 + 反事实因果验证。全量套件 3669 passed, 0 failed。
+
+| ID | 标题 | 状态 | 归档原因 |
+|----|------|------|---------|
+| FC-1 | agent_pool 默认执行 runtime claude→codex（legacy 主链 + 全部兜底点） | behavior-verified | 主路径行为已确认改变，反事实证因果，负向 grep 清零 |
+| FC-2 | select_model_for_task 过滤 enabled=false（+ 复用路径 F1 闭合） | behavior-verified | disabled 模型选择/复用两路径均已排除，回归锁定 |
+
+**FC-1 evidence bundle**
+- issue_id: FC-1
+- original_symptom: 默认执行 runtime 兜底为 claude；v58 实跑 legacy 主链时 worker 仍起 claude
+- claimed_fix: `_acquire_auto_agent`/`create_agent_for_task` 兜底 `or "codex"`；`assignment_actor_registration` 兜底 `or "codex"`；`create_agent` helper 默认 codex（F2）
+- changed_paths: src/cccc/daemon/foreman/agent_pool.py, src/cccc/daemon/foreman/assignment_actor_registration.py, src/cccc/daemon/ops/agent_ops.py
+- active_entrypoint: process_batch_suggestion(auto_start_agents=True)（AF 不就绪时回退 legacy 主链 = v58 事实路径）
+- active_path_trace: process_batch_suggestion → create_or_reuse_agent → create_agent_for_task → resolve_model_for_task → actor_add(runtime)
+- runtime_conditions: registry model.runtime 为空时兜底；显式 runtime 优先不被覆盖
+- verification_commands: `python -m pytest tests/test_agent_pool_default_runtime.py -v`
+- expected_behavior: 空→codex；claude→claude；codex→codex；legacy 主链 actor_add runtime=codex
+- observed_behavior: 原始症状已消失、行为已确认——空→'codex'、claude→'claude'、codex→'codex'；Layer-6 集成测试 actor_add runtime='codex' ✅
+- fallback_behavior: 仅空值兜底 codex，显式值穿透（反事实：源码翻回 `or "claude"` → 行为立即变 'claude'，恢复后回 'codex'，证因果）
+- evidence_locations: `test_process_batch_suggestion_legacy_path_defaults_runtime_to_codex`；`grep -rn 'or "claude"' src/` 已无执行兜底
+- regression_test: `python -m pytest tests/test_agent_pool_default_runtime.py`
+- archive_decision: behavior-verified（主路径行为已确认）+ 反事实证因果 + 负向 grep 清零
+
+**FC-2 evidence bundle**
+- issue_id: FC-2
+- original_symptom: disabled 模型仍可被选；复用打分路径未过滤 enabled（Codex F1 发现）
+- claimed_fix: `select_model_for_task` `if not model.enabled: continue`（锁定）；`evaluate_for_task` 复用路径增加 enabled gate（F1）
+- changed_paths: src/cccc/daemon/ops/agent_ops.py, src/cccc/daemon/foreman/agent_pool.py
+- active_entrypoint: select_model_for_task / find_best_agent → evaluate_for_task
+- active_path_trace: create_or_reuse_agent → find_best_agent → evaluate_for_task →（绑定 disabled 模型的 agent 被排除）
+- runtime_conditions: registry 含 enabled=false 模型；agent YAML enabled 但绑定模型已禁用
+- verification_commands: `python -m pytest tests/test_select_model_enabled_filter.py -v`
+- expected_behavior: disabled 高分模型不选；全 disabled→None；复用路径排除 disabled-bound agent
+- observed_behavior: 原始症状已消失、行为已确认——选 'codex-safe'；全 disabled→None；候选集 {enabled-bound}，复用 'enabled-bound' ✅
+- fallback_behavior: registry 中不存在的模型（unknown）不被排除，仅显式 enabled=false 排除
+- evidence_locations: tests/test_select_model_enabled_filter.py（含 reuse-path 回归）
+- regression_test: `python -m pytest tests/test_select_model_enabled_filter.py`
+- archive_decision: behavior-verified；Codex review 复用路径盲区（F1）已闭合
+
+> **关联开放项**：M2-B 的「数据修正：codex 覆盖执行类 task type」「enabled 过滤」两子点由本批满足并归档；M2-B 其余子点（读端闭合 / rating 消费 / override 留痕 / E2E 验证）仍开放，保留短版跟踪。
+> **遗留检测缺口**：`ralph validate` 仍无法检测「兜底默认散落未同步」与「过滤不变量跨消费端缺失」——见短版 DG-2 实证。修复已落地但**检测规则未补**。
+> **未达层级**：当前为 behavior-verified（主路径行为确认），尚未做活体 daemon + 真实 codex worker 进程级 E2E（runtime-ready 的最后一环）。
+
+---
+
 ## v51 归档：RV-15/16/17/33 已解决或已知局限（2026-05-31）
 
 | ID | 标题 | 归档原因 |
@@ -666,3 +1051,84 @@ v42 foreman 创建了 2 个 worker，角色定义仅为"backend core"和"tests"�
 - **FL-65**（P3）：independently_reviewed 分类缺任务级映射——result_breakdown 无法审计追溯。
 - **UX-23**（P3）：WORKFLOW_EVALUATION 初始生成为占位符后 foreman 补充实质——补充过程成功但初始占位符可改进。
 - **RV-39**（P3）：validate 不检测 plan 目标（声明 410）与实现（实际 404）状态码漂移。
+
+### v57 E2E 验证归档（2026-06-05）
+
+> v57 E2E 验证（FastAPI 多租户任务队列 API JWT+RBAC+多租户隔离+任务状态机+审计日志）：综合 3.5/5（结果 3.5 / 过程 3.5 / 体验 3.5）
+> 团队：lead(foreman,claude) + worker-a(claude) + worker-b(claude) + security-reviewer(claude)
+> 10 tasks 全完成（passed=6, overridden=2, independently_reviewed=2），66 tests pass，~35min。
+
+**已验证生效并归档（v57 E2E 确认）：**
+- **RV-29**（注册提权三层闭合）：✅ `extra="forbid"` + 数据库权限源，role/is_admin/is_superuser/permissions/scope 全部被拒。
+- **FL-33**（secret_preflight）：✅ step 4 首次失败因 CODEX_BRIDGE_SECRET 未配置，配置后通过。
+- **FL-38**（auto-dispatch）：✅ T7/T8 并行执行，batch 机制生效。
+- **FL-42**（评价系统闭环）：✅ WORKFLOW_EVALUATION.md 自动生成 6033 bytes，结构化数据完整。
+- **FL-48**（override 路径）：✅ T3/T4 通过 foreman override 闭合，workflow 继续推进。
+- **FL-55**（安全告警不可压制）：✅ validate 报 E_AEGIS_SECURITY_CHAIN_MISSING（4 errors），迫使 plan 迭代修复。
+- **FL-58**（result_breakdown 分类）：✅ passed=6/overridden=2/independently_reviewed=2 正确分类。
+- **FL-65**（independently_reviewed 任务级映射）：✅ independently_reviewed_tasks: T10-security-review, T9-integration。
+
+**复现/部分生效（v57 确认，保留在短版待修复）：**
+- **UX-23**（WORKFLOW_EVALUATION 定性章节空）：⚠️ 复现——正面反馈/负面反馈/手工干预/Worker 可靠性/改进建议全部为空。
+- **FL-63**（test_stats_reliable 自动化判定）：⚠️ 复现——foreman 写 false 但 evaluation 文档仍有不可信表述。
+- **FL-64**（forbidden_flow 字段覆盖）：⚠️ 复现——ff-self-role-assignment 未声明 fields 数组。
+
+**v57 交叉确认（以下条目在之前版本已归档，v57 编辑短版归档行时触发再确认）：**
+- FL-31（负载均衡+并行度）v47 ✅ → v57 短版归档行更新
+- FL-32（state HMAC）v47 ✅ → v57 短版归档行更新
+- FL-40（模型选择双路径）v47 ✅ → v57 短版归档行更新
+- FL-50（函数级隔离）v51 ✅ → v57 短版归档行更新
+- FL-56（sign-off 弱检测）v51 ✅ → v57 短版归档行更新
+- FL-57（场景未触发）v51 归档 → v57 短版归档行更新
+- FL-59（YAML 原子写入）v51 ✅ → v57 短版归档行更新
+- FL-60（ledger 状态转换）v51 ✅ → v57 短版归档行更新
+- FL-61（entrypoint 格式，场景未触发）v51 归档 → v57 短版归档行更新
+- FL-62（其他 v51 修复）v51 ✅ → v57 短版归档行更新
+- RO-112（FTS5 CJK）v47 ✅ → v57 短版归档行更新
+- RO-113（JWT 默认密钥）v47 ✅ → v57 短版归档行更新
+- RV-30（路径越界检测）v51 ✅ → v57 短版归档行更新
+- RV-31/RV-32（场景未触发）v51 归档 → v57 短版归档行更新
+- UX-22（SUSPICIOUS 不阻断）v51 ✅ → v57 短版归档行更新
+
+### v57 E2E 新发现登记（2026-06-05）
+
+- **FL-67**（P2）：plan.yaml state 段不记录 override 完成的任务——台账 10/10 但 plan.yaml 只记录 8/10。
+- **FL-68**（P2）：security-reviewer 创建但 T10 实际派给 worker-a——审查独立性形式满足但实质不足。
+- **FL-69**（P2）：claimed_paths 不精确导致大量越界告警——T8 未 claim router 文件、T5/T6 未 claim main.py。
+- **FL-70**（P3）：WORKFLOW_EVALUATION 过程摩擦记录不完整——未记录 task_failed/task_deferred/W_WORKER_EXCEEDED_SCOPE。
+- **RV-53**（P2）：auth.py sub 类型注入 → 500 而非 401——validate 不检测认证边界畸形输入。
+- **RV-54**（P3）：task claim 非原子操作并发竞争窗口——validate 不检测状态机并发安全。
+
+### v58 E2E 归档（2026-06-05）
+
+**v58 E2E 验证（FastAPI 实时事件通知服务 JWT+RBAC+频道+订阅+事件+通知+审计）：综合 3.5/5**
+团队：lead(foreman)+worker-1(claude)+sec-reviewer(claude)，8 tasks 全完成（passed=4, overridden=2, independently_reviewed=4 标记但实际仅 T7），96 tests pass，99% 覆盖，~17min。
+
+已验证归档（v58 再次确认）：
+- FL-38（auto-dispatch）v57→v58 再次确认 ✅
+- FL-48（override 路径）v57→v58 再次确认 ✅（T2+T3 均 override）
+- FL-33（secret_preflight）v57→v58 再次确认 ✅
+- FL-42（WORKFLOW_EVALUATION 自动生成）v57→v58 再次确认 ✅
+- FL-58（result_breakdown 分类）v57→v58 再次确认 ✅
+- RV-29（注册 role 提权）v57→v58 再次确认 ✅
+
+新归档（v58 首次确认）：
+- **FL-68**（P2→✅）：security-reviewer 实际分配安全审查任务——v58 daemon log 确认 T7 分配给 sec-reviewer 而非 worker-1。v57 的核心修复。
+- **FL-69**（P2→✅）：claimed_paths 文件级精度——v58 Codex 审查确认 plan.yaml 路径均为文件级。
+- **RV-53**（P2→✅）：JWT sub 类型注入 → 401——verify_token() int(sub) + ValueError→401 代码路径生效，test_jwt_string_sub_returns_401_not_500 测试通过。
+
+复现/部分生效（v58）：
+- UX-23 ⚠️ 第四轮复现：定性章节（正面反馈/负面反馈/Worker 可靠性/评分+改进建议）全空
+- FL-67 ⚠️ 复现：plan.yaml state 只记录 T1/T4/T5/T6/T7/T8，缺失 T2/T3（overridden）
+- FL-64 ⚠️ 复现：forbidden_flows 无 fields 数组
+- FL-70 ⚠️ 部分：手工干预记录有内容但定性章节空
+- FL-63 ⚠️ 标记 false，pytest-randomly 已安装
+
+### v58 E2E 新发现登记（2026-06-05）
+
+- **FL-71**（P2）：auth 测试使用不鉴权端点 /health 验证认证链路——test_reject_invalid_token 接受 200 作为通过条件。
+- **FL-72**（P1）：通知隔离测试断言逻辑失效——允许 notif_ids_a == notif_ids_b，跨用户泄漏不可检测。
+- **RV-62**（P2）：independently_reviewed 标记缺乏独立 actor 证据——T5/T6/T8 由 worker-1 执行但标为 independently_reviewed。
+- **FL-73**（P1，系统性）：Worker 全用 Claude 未使用 Codex 做主力执行——v57/v58 连续两轮 foreman 无视 runtime 选型指导，所有 worker 均 `--runtime claude`。
+- **FL-74**（P1，系统性）：AF 引擎从未实际启用——v53→v58 连续 5 轮声称修复但 `execution_engine: legacy` 路径不变，`_try_af_execution` 只 compile 未 execute。
+- **RV-63**（P2）：depends_on 与 consumes 契约不一致——T4/T5/T6/T7 消费 T1 产物但 depends_on 未列 T1。

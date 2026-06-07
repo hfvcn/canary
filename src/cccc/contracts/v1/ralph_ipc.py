@@ -107,7 +107,7 @@ class TaskRef(BaseModel):
     """Reference to a task in the workflow."""
     id: str
     title: str = ""
-    type: Literal["frontend", "backend", "general"] = "general"
+    type: Literal["frontend", "backend", "general", "security_review"] = "general"
     depends_on: List[str] = Field(default_factory=list)
     claimed_paths: List[str] = Field(default_factory=list)
     awareness_paths: List[str] = Field(default_factory=list)
@@ -156,7 +156,11 @@ class ReadyBatchSuggestion(BaseModel):
     created_at: str = Field(default_factory=utc_now_iso)
     # ARCH-1: Foreman-explicit task→actor assignments (empty = agent pool decides)
     assignments: Dict[str, str] = Field(default_factory=dict)
+    engine_preference: str = "auto"
     fallback_allowed: bool = False
+    # Per-task model suggestions from ralph (task_id -> model_key).
+    # Foreman uses these as the default; overrides only when justified.
+    task_model_suggestions: Dict[str, str] = Field(default_factory=dict)
     # Worker prompt projection metadata. Values are serialized to keep this IPC
     # layer independent from Ralph implementation classes.
     prompt_issues: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)

@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect T19 scope and adjacent AgentFlow contracts,DONE,T19 plan and existing agentflow patterns inspected,rg -n "T19|AF-M4b|AFExecutionEngine|af_engine" plan.yaml,2026-05-31T19:33:15+08:00,0,
+2,Implement AFExecutionEngine module,DONE,src/cccc/agentflow/af_engine.py exists with requested API,python -m pytest tests/agentflow/test_af_engine.py -v,2026-05-31T19:34:49+08:00,0,
+3,Add AFExecutionEngine tests,DONE,tests cover empty bundle engine marker status availability import and verification flag,python -m pytest tests/agentflow/test_af_engine.py -v,2026-05-31T19:34:49+08:00,0,
+4,Run target validation,DONE,target pytest passes within 60s,python -m pytest tests/agentflow/test_af_engine.py -v,2026-05-31T19:34:49+08:00,0,

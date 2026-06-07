@@ -1,0 +1,5 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Read T7 and existing contract style,DONE,T7 requirements and local style confirmed,"rg -n ""T7|AgentLease|AssignmentPolicy"" plan.yaml src tests",2026-05-31,0,
+2,Implement agent lease contracts,DONE,agent_lease.py defines all three frozen dataclasses,"python -m pytest tests/test_agent_lease_contracts.py -v",2026-05-31,0,
+3,Add focused contract tests,DONE,tests cover instantiation frozen defaults asdict and module import,"python -m pytest tests/test_agent_lease_contracts.py -v",2026-05-31,0,
+4,Run requested verification,DONE,pytest command passes,"python -m pytest tests/test_agent_lease_contracts.py -v",2026-05-31,0,

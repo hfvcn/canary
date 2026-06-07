@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Inspect existing scope warning logic and workspace state,DONE,"Gap between requested FL-69 behavior and current worktree is understood","rg -n \"_build_scope_warnings|_SCOPE_EXEMPT_PATTERNS\" src/cccc/daemon/foreman/ralph_service.py tests/test_scope_warnings.py","2026-06-05 00:00",0,"Confirmed current worktree already contains the requested scope exemption helpers and test cases"
+2,Apply minimal code and test updates for FL-69,DONE,"Scope exemptions and the 4 requested tests are present","pytest tests/test_scope_warnings.py -q","2026-06-05 00:00",0,"No additional source patch required because the existing worktree already satisfies FL-69"
+3,Run final targeted validation,DONE,"Targeted pytest passes","pytest tests/test_scope_warnings.py -v","2026-06-05 00:01",0,"Passed under a 60-second hard timeout wrapper"

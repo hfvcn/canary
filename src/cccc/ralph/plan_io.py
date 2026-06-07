@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 import yaml
 from pydantic import ValidationError
@@ -32,6 +34,7 @@ _LEGACY_BANNER = (
 )
 
 _SYNCABLE_VERIFICATION_KINDS = frozenset({
+    "workflow.foreman_override",
     "workflow.verification_passed",
 })
 
@@ -131,6 +134,15 @@ class PlanLoadIssue:
     field_path: str
     message: str
     suggested_format: str = ""
+
+
+@dataclass(frozen=True)
+class _CompletedListContext:
+    key_start: int
+    key_line_end: int
+    key_indent: str
+    item_indent: str
+    rest_of_line: str
 
 
 class PlanLoadError(Exception):
@@ -567,7 +579,7 @@ class SchemaUnknownFieldError(Exception):
 
 
 def sync_plan_state(plan_path: Path, ledger_path: Path) -> int:
-    """Sync completed_task_ids from passed verification events to plan.yaml."""
+    """Sync completed_task_ids from syncable completion events to plan.yaml."""
     plan = load_plan(plan_path)
     plan_task_ids = {task.id for task in plan.tasks if task.id}
     if not ledger_path.exists() or not plan_task_ids:
@@ -694,13 +706,13 @@ def save_plan_state(path: Path, completed_task_id: str) -> None:
 
     if suffix == ".json":
         data = json.loads(text)
-        state = data.setdefault("state", {})
-        completed = state.setdefault("completed_task_ids", [])
+        completed = _completed_task_ids_from_raw_data(data)
         if completed_task_id not in completed:
-            completed.append(completed_task_id)
-            path.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
+            new_data = _data_with_completed_task_id(data, completed_task_id)
+            _atomic_write_text(
+                path,
+                json.dumps(new_data, indent=2, ensure_ascii=False) + "\n",
+                _validate_json_file,
             )
         return
 
@@ -708,16 +720,96 @@ def save_plan_state(path: Path, completed_task_id: str) -> None:
     data = yaml.safe_load(text) or {}
 
     # Idempotency check: bail out early if already recorded.
-    state_data = data.get("state", {}) or {}
-    already_done = state_data.get("completed_task_ids") or []
+    already_done = _completed_task_ids_from_raw_data(data)
     if completed_task_id in already_done:
         return
 
     new_text = _insert_completed_task_id(text, completed_task_id)
-    path.write_text(new_text, encoding="utf-8")
+    _atomic_write_text(path, new_text, _validate_yaml_file)
+
+
+def _atomic_write_text(
+    path: Path,
+    text: str,
+    validate_file: Callable[[Path], None],
+) -> None:
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        validate_file(temp_path)
+        os.replace(temp_path, path)
+    except Exception:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+        raise
+
+
+def _validate_yaml_file(path: Path) -> None:
+    yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _validate_json_file(path: Path) -> None:
+    json.loads(path.read_text(encoding="utf-8"))
+
+
+def _completed_task_ids_from_raw_data(data: Any) -> list[Any]:
+    state = _state_mapping_from_raw_data(data)
+    completed = state.get("completed_task_ids")
+    if completed is None:
+        return []
+    if not isinstance(completed, list):
+        raise ValueError("plan.state.completed_task_ids must be a list")
+    return completed
+
+
+def _state_mapping_from_raw_data(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("plan data must be a mapping")
+    state = data.get("state")
+    if state is None:
+        return {}
+    if not isinstance(state, dict):
+        raise ValueError("plan.state must be a mapping")
+    return state
+
+
+def _data_with_completed_task_id(
+    data: Dict[str, Any],
+    task_id: str,
+) -> Dict[str, Any]:
+    state = _state_mapping_from_raw_data(data)
+    completed = _completed_task_ids_from_raw_data(data)
+    if task_id in completed:
+        return data
+    updated_state = {**state, "completed_task_ids": [*completed, task_id]}
+    return {**data, "state": updated_state}
 
 
 def _insert_completed_task_id(text: str, task_id: str) -> str:
+    new_text = _insert_completed_task_id_surgical(text, task_id)
+    try:
+        yaml.safe_load(new_text)
+    except yaml.YAMLError:
+        return _dump_completed_task_id(text, task_id)
+    return new_text
+
+
+def _dump_completed_task_id(text: str, task_id: str) -> str:
+    data = yaml.safe_load(text) or {}
+    new_data = _data_with_completed_task_id(data, task_id)
+    return yaml.safe_dump(new_data, sort_keys=False, allow_unicode=True)
+
+
+def _insert_completed_task_id_surgical(text: str, task_id: str) -> str:
     """Return *text* with *task_id* appended to completed_task_ids.
 
     Handles four cases without touching any other part of the file:
@@ -726,40 +818,42 @@ def _insert_completed_task_id(text: str, task_id: str) -> str:
     3. ``state:`` section exists but has no ``completed_task_ids:`` key.
     4. No ``state:`` section at all — append one at the end.
     """
-    # ------------------------------------------------------------------ #
-    # Locate the ``state:`` top-level block.                              #
-    # A top-level key starts at column 0 (no leading spaces).            #
-    # ------------------------------------------------------------------ #
+    state_bounds = _find_state_block(text)
+    if state_bounds is None:
+        return _append_state_block(text, task_id)
+    state_start, state_end, state_block = state_bounds
+    new_state_block = _insert_completed_id_in_state_block(state_block, task_id)
+    return text[:state_start] + new_state_block + text[state_end:]
+
+
+def _find_state_block(text: str) -> tuple[int, int, str] | None:
     state_match = re.search(r"^state\s*:", text, re.MULTILINE)
-
     if state_match is None:
-        # Case 4: no state section — append one.
-        trailing_newline = "\n" if text.endswith("\n") else ""
-        append = f"\nstate:\n  completed_task_ids:\n    - {task_id}\n"
-        return text.rstrip("\n") + append
+        return None
 
-    state_start = state_match.start()
-
-    # Find where the state block ends: the next top-level key or EOF.
     next_top = re.search(r"^\S", text[state_match.end():], re.MULTILINE)
-    state_end = (
-        state_match.end() + next_top.start()
-        if next_top is not None
-        else len(text)
-    )
-    state_block = text[state_start:state_end]
+    state_end = state_match.end() + next_top.start() if next_top else len(text)
+    state_start = state_match.start()
+    return state_start, state_end, text[state_start:state_end]
 
-    # ------------------------------------------------------------------ #
-    # Does ``completed_task_ids:`` exist inside the state block?          #
-    # ------------------------------------------------------------------ #
-    ctids_match = re.search(r"^( +)completed_task_ids\s*:", state_block, re.MULTILINE)
+
+def _append_state_block(text: str, task_id: str) -> str:
+    append = f"\nstate:\n  completed_task_ids:\n    - {task_id}\n"
+    return text.rstrip("\n") + append
+
+
+def _insert_completed_id_in_state_block(state_block: str, task_id: str) -> str:
+    ctids_match = re.search(
+        r"^( +)completed_task_ids\s*:",
+        state_block,
+        re.MULTILINE,
+    )
 
     if ctids_match is None:
         # Case 3: state section exists, key absent — insert the key.
         indent = "  "  # standard 2-space indent for state children
         insertion = f"{indent}completed_task_ids:\n{indent}  - {task_id}\n"
-        new_state_block = state_block.rstrip("\n") + "\n" + insertion
-        return text[:state_start] + new_state_block + text[state_end:]
+        return state_block.rstrip("\n") + "\n" + insertion
 
     key_indent = ctids_match.group(1)          # e.g. "  "
     item_indent = key_indent + "  "            # e.g. "    "
@@ -768,41 +862,90 @@ def _insert_completed_task_id(text: str, task_id: str) -> str:
     # Look at the rest of the line after the colon.
     rest_of_line_match = re.match(r"[^\S\n]*(.*)", state_block[key_line_end:])
     rest_of_line = rest_of_line_match.group(1).strip() if rest_of_line_match else ""
+    context = _CompletedListContext(
+        key_start=ctids_match.start(),
+        key_line_end=key_line_end,
+        key_indent=key_indent,
+        item_indent=item_indent,
+        rest_of_line=rest_of_line,
+    )
 
-    if rest_of_line == "" or rest_of_line.startswith("["):
-        # Case 2: flow-style list (empty or non-empty) or blank value.
-        # Parse existing items from flow-style if any, then replace the
-        # whole line with block-style.
-        eol = state_block.find("\n", key_line_end)
-        eol = eol + 1 if eol != -1 else len(state_block)
-        existing_items: list[str] = []
-        if rest_of_line.startswith("["):
-            # Parse flow-style list: ["T0", "T1"] or [T0, T1] or []
-            inner = rest_of_line[1:-1].strip() if rest_of_line.endswith("]") else rest_of_line[1:].strip()
-            if inner:
-                existing_items = [
-                    item.strip().strip("\"'") for item in inner.split(",") if item.strip()
-                ]
-        items_block = "".join(f"{item_indent}- {item}\n" for item in existing_items)
-        replacement = (
-            f"{key_indent}completed_task_ids:\n"
-            f"{items_block}"
-            f"{item_indent}- {task_id}\n"
-        )
-        new_state_block = state_block[:ctids_match.start()] + replacement + state_block[eol:]
-        return text[:state_start] + new_state_block + text[state_end:]
+    if rest_of_line.startswith("["):
+        return _replace_completed_flow_list(state_block, context, task_id)
 
+    if rest_of_line == "" and not _has_completed_block_items(
+        state_block,
+        context,
+    ):
+        return _replace_completed_flow_list(state_block, context, task_id)
+
+    return _append_completed_block_item(state_block, context, task_id)
+
+
+def _has_completed_block_items(
+    state_block: str,
+    context: _CompletedListContext,
+) -> bool:
+    pos = _first_line_start_after_key(state_block, context.key_line_end)
+    item_re = re.compile(r"^" + re.escape(context.item_indent) + r"-")
+    return pos < len(state_block) and bool(item_re.match(state_block[pos:]))
+
+
+def _first_line_start_after_key(state_block: str, key_line_end: int) -> int:
+    newline = state_block.find("\n", key_line_end)
+    if newline == -1:
+        return len(state_block)
+    return newline + 1
+
+
+def _replace_completed_flow_list(
+    state_block: str,
+    context: _CompletedListContext,
+    task_id: str,
+) -> str:
+    eol = state_block.find("\n", context.key_line_end)
+    eol = eol + 1 if eol != -1 else len(state_block)
+    existing_items = _parse_flow_style_completed_items(context.rest_of_line)
+    items_block = "".join(
+        f"{context.item_indent}- {item}\n" for item in existing_items
+    )
+    replacement = (
+        f"{context.key_indent}completed_task_ids:\n"
+        f"{items_block}"
+        f"{context.item_indent}- {task_id}\n"
+    )
+    return state_block[:context.key_start] + replacement + state_block[eol:]
+
+
+def _parse_flow_style_completed_items(rest_of_line: str) -> list[str]:
+    if not rest_of_line.startswith("["):
+        return []
+    inner = (
+        rest_of_line[1:-1].strip()
+        if rest_of_line.endswith("]")
+        else rest_of_line[1:].strip()
+    )
+    if not inner:
+        return []
+    return [
+        item.strip().strip("\"'")
+        for item in inner.split(",")
+        if item.strip()
+    ]
+
+
+def _append_completed_block_item(
+    state_block: str,
+    context: _CompletedListContext,
+    task_id: str,
+) -> str:
     # Case 1: block-style list already present — find the last item and append.
     # Scan forward from key_line_end for lines that look like list items at
     # item_indent level.
-    last_item_end = key_line_end  # will advance as we find items
-    pos = key_line_end
-    # Skip to next line first (past the colon line)
-    nl = state_block.find("\n", pos)
-    if nl != -1:
-        pos = nl + 1
+    last_item_end = context.key_line_end  # will advance as we find items
+    pos = _first_line_start_after_key(state_block, context.key_line_end)
 
-    item_re = re.compile(r"^" + re.escape(item_indent) + r"-")
+    item_re = re.compile(r"^" + re.escape(context.item_indent) + r"-")
     while pos < len(state_block):
         nl = state_block.find("\n", pos)
         line_end = nl + 1 if nl != -1 else len(state_block)
@@ -813,9 +956,8 @@ def _insert_completed_task_id(text: str, task_id: str) -> str:
         else:
             break
 
-    new_item = f"{item_indent}- {task_id}\n"
-    new_state_block = state_block[:last_item_end] + new_item + state_block[last_item_end:]
-    return text[:state_start] + new_state_block + text[state_end:]
+    new_item = f"{context.item_indent}- {task_id}\n"
+    return state_block[:last_item_end] + new_item + state_block[last_item_end:]
 
 
 def _merge_repo_defaults(plan: Plan, plan_path: Path) -> Plan:

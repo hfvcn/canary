@@ -1,0 +1,4 @@
+id,task,status,completed_at,notes
+1,核对完成链路与现有模型记录实现,DONE,2026-06-05T00:00:00Z,已确认 cost_tier 已存在且 review 当前为任务级触发
+2,实现 MSE-2 MSE-4 MSE-5 代码改动,DONE,2026-06-05T00:00:00Z,已补真实 model_key 传递 终态 trace 记录 workflow 级 review 触发
+3,运行指定测试并确认结果,DONE,2026-06-05T00:00:00Z,指定回归 950 通过 追加评估/trace 相关测试 32 通过

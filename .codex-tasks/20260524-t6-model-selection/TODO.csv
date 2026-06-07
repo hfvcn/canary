@@ -1,0 +1,4 @@
+id,task,status,acceptance_criteria,validation_command,completed_at,retry_count,notes
+1,Implement shared model matching helper and update selection path,DONE,agent_ops and agent_pool use the same strengths->best_for->description matching order,,2026-05-24T13:26:27Z,,Shared helper added in src/cccc/daemon/ops/model_selection.py
+2,Add unit tests for fallback and priority cases,DONE,tests cover description fallback best_for match empty case and strengths priority,,2026-05-24T13:26:27Z,,Added 5 targeted tests in tests/test_agent_pool_scoring.py
+3,Run requested pytest target,DONE,pytest target passes,"pytest tests/test_agent_pool_scoring.py -v",2026-05-24T13:26:27Z,,17 tests passed

@@ -141,6 +141,7 @@ def assign_tasks(
     min_score: int = 50,
     prefer_reuse: bool = True,
     busy_agent_ids: Optional[set] = None,
+    task_model_suggestions: Optional[Dict[str, str]] = None,
 ) -> List[TaskAssignment]:
     """Assign tasks to agents.
 
@@ -153,11 +154,13 @@ def assign_tasks(
         min_score: Minimum score for agent reuse
         prefer_reuse: Whether to prefer reusing existing agents
         busy_agent_ids: Set of agent IDs currently busy (from engine/shadow state)
+        task_model_suggestions: Per-task model suggestions from ralph (task_id -> model_key)
 
     Returns:
         List of task assignments
     """
     assignments: List[TaskAssignment] = []
+    suggestions = task_model_suggestions or {}
 
     for task in tasks:
         assignment = pool_manager.create_or_reuse_agent(
@@ -165,6 +168,7 @@ def assign_tasks(
             min_score=min_score,
             prefer_reuse=prefer_reuse,
             busy_agent_ids=busy_agent_ids,
+            suggested_model_key=suggestions.get(task.id),
         )
         assignments.append(assignment)
 
@@ -330,6 +334,7 @@ class ForemanWorkflow:
                 validated.tasks,
                 self.pool_manager,
                 prefer_reuse=True,
+                task_model_suggestions=getattr(suggestion, "task_model_suggestions", None),
             )
             result.assignments = assignments
 
